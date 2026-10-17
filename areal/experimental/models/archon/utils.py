@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Validation helpers for Archon parallelism configurations: structural Protocols for
+# model args, and checks that attention-head and expert counts are compatible with
+# tensor (TP), context/Ulysses (CP) and expert (EP) parallel sizes, plus MoE detection
+# from a HF config. All functions are pure and raise ValueError on violations.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -7,6 +12,8 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class ModelArgsProtocol(Protocol):
+    # [CLASS DOC]
+    # Runtime-checkable Protocol for args exposing n_heads and optional n_kv_heads.
     """Protocol for model args that have head configuration."""
 
     n_heads: int
@@ -17,6 +24,9 @@ def validate_tp_constraints(
     model_args: ModelArgsProtocol,
     tp_size: int,
 ) -> None:
+    # [FUNCTION DOC]
+    # Requires n_heads and n_kv_heads (defaulting to n_heads) to both be divisible by
+    # tp_size; raises ValueError otherwise. Returns None.
     """Validate tensor parallelism constraints for attention heads.
 
     This validates that the model's attention head configuration is compatible
@@ -48,6 +58,18 @@ def validate_cp_constraints(
     cp_size: int,
     tp_size: int = 1,
 ) -> None:
+    # [FUNCTION DOC]
+    # Checks Ulysses head-scatter feasibility. Local heads after TP: q_heads =
+    # n_heads/tp, kv_heads = n_kv_heads/tp (integer division); n_rep =
+    # n_heads/n_kv_heads.
+    # Requires q_heads % cp_size == 0. If kv_heads >= cp_size, requires kv_heads %
+    # cp_size
+    # == 0; else requires cp_size % kv_heads == 0 and the KV repeat count
+    # cp_size/kv_heads
+    # to divide n_rep. Raises ValueError on any violation.
+    # KNOWN ISSUE: kv_heads == 0 (n_kv_heads < tp_size) causes ZeroDivisionError rather
+    # than
+    # a ValueError; callers should validate TP first.
     """Validate context parallelism constraints for attention heads.
 
     This validates that the model's attention head configuration is compatible
@@ -95,6 +117,8 @@ def validate_cp_constraints(
 
 @runtime_checkable
 class MoEModelArgsProtocol(Protocol):
+    # [CLASS DOC]
+    # Runtime-checkable Protocol for args exposing moe_enabled and moe_args.
     """Protocol for model args that have MoE configuration."""
 
     moe_enabled: bool
@@ -105,6 +129,9 @@ def validate_ep_constraints(
     model_args: MoEModelArgsProtocol,
     ep_size: int,
 ) -> None:
+    # [FUNCTION DOC]
+    # No-op if ep_size <= 1. Otherwise requires moe_enabled, non-None moe_args, and
+    # moe_args.num_experts divisible by ep_size; raises ValueError otherwise.
     """Validate expert parallelism constraints for MoE models.
 
     This validates that the model's MoE configuration is compatible
@@ -140,6 +167,12 @@ def validate_ep_constraints(
 
 
 def is_moe_model_config(model_config: object) -> bool:
+    # [FUNCTION DOC]
+    # Returns True when the config's num_experts (or num_local_experts fallback) is set
+    # and > 1.
+    # KNOWN ISSUE: does not look inside text_config, so composite VLM configs (e.g.
+    # Qwen3.5
+    # MoE with nested text_config) may be reported as non-MoE.
     """Check if a HuggingFace PretrainedConfig represents a Mixture-of-Experts model.
 
     Inspects common HF config attributes (num_experts, num_local_experts)

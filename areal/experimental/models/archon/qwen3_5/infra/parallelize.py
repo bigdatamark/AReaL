@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Parallelization for the Archon Qwen3.5 hybrid model. Applies, in order,
+# activation checkpointing, torch.compile (hybrid/MoE-aware) and FSDP2 sharding. TP, CP
+# and EP are not implemented for Qwen3.5 and are only warned about. Uses a lazily
+# created rank-aware logger.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -28,12 +33,20 @@ if TYPE_CHECKING:
 
 @functools.cache
 def _get_logger() -> logging.Logger:
+    # [FUNCTION DOC]
+    # HELPER: Cached; returns a logger named "[Archon Qwen3_5Parallelize Rank N]" with N
+    # the global rank (0 if torch.distributed is not initialized).
     """Get rank-aware logger for this module."""
     rank = dist.get_rank() if dist.is_initialized() else 0
     return logging.getLogger(f"[Archon Qwen3_5Parallelize Rank {rank}]")
 
 
 def _get_op_sac_save_list() -> set[torch._ops.OpOverload]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the set of ops whose outputs selective activation checkpointing
+    # should save (matmul, all SDPA variants, reduce_scatter, all_to_all, max, flex
+    # attention and AReaL's custom varlen attention op). Imports the varlen attention
+    # module for its side effect of registering torch.ops.areal._varlen_attn.
     # Import varlen to register torch.ops.areal._varlen_attn custom op
     from areal.experimental.models.archon.attention import varlen as _  # noqa: F401
 
@@ -64,6 +77,17 @@ def parallelize_qwen3_5(
     ac_config: ActivationCheckpointConfig | None = None,
     enable_compile: bool = True,
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # Parallelizes a Qwen3.5 model in place and returns it. Logs a warning if TP, CP or
+    # EP is enabled in parallel_dims (they are ignored). Applies AC via apply_ac when
+    # ac_config is given and its mode is not "none" (passing the SAC save list), then
+    # _apply_compile if enable_compile, then apply_fsdp on the "dp_shard_cp" mesh when
+    # it
+    # exists (forwarding dtypes, pp flag, cpu_offload and reshard policy). Finally, if
+    # model_args.enable_weight_tying, re-ties output.weight to tok_embeddings.weight.
+    # loss_parallel is accepted but unused.
+    # KNOWN ISSUE: weight tying is re-established after fully_shard by plain attribute
+    # assignment, which bypasses FSDP's per-module parameter management.
     """Apply parallelization to Qwen3.5 hybrid model.
 
     Currently applies FSDP only. TP, CP, EP are not yet supported and will
@@ -152,6 +176,16 @@ def apply_fsdp(
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
 ) -> None:
+    # [FUNCTION DOC]
+    # Wraps the model with FSDP2 fully_shard using a MixedPrecisionPolicy (param/reduce
+    # dtypes) on dp_mesh, plus CPUOffloadPolicy if cpu_offload. reshard_after_forward is
+    # "always" -> True, "never" -> False, "default" -> not pp_enabled; other values
+    # raise
+    # ValueError. Shards the embedding, each transformer block, then the final norm,
+    # output
+    # and score together (reshard only when policy is "always"), then the root. Logs
+    # info.
+    # Mutates model in place; returns None.
     """Apply FSDP2 to Qwen3.5 model.
 
     Wraps each component with FSDP for memory-efficient training:
@@ -224,6 +258,21 @@ def apply_fsdp(
 
 
 def _apply_compile(model: Compilable) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Compiles the model's blocks with inductor fullgraph. Sets dynamo
+    # capture_scalar_outputs and disables the eval-frame LRU cache when available
+    # (PyTorch
+    # issue workaround). For MoE blocks (unwrapping a CheckpointWrapper), compiles each
+    # child separately: for the MoE module all children except "experts"; skips the two
+    # norms; other children compiled whole. Non-MoE blocks are replaced in model.layers
+    # by
+    # their compiled version. Then patches grouped_experts._run_experts_grouped_mm with
+    # a
+    # compiled version unless its qualname shows it is already the dynamic variant. Logs
+    # the number of compiled blocks. Mutates global torch config and module state.
+    # KNOWN ISSUE: the docstring says grouped_mm is compiled only if MoE is present, but
+    # it
+    # is patched unconditionally (global module state) even for dense models.
     """Apply torch.compile to Qwen3.5 model (hybrid-aware).
 
     Both full_attention and linear_attention TransformerBlocks are compiled.

@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Model hyperparameter dataclass for the Archon Qwen3 (dense and MoE) model, plus
+# conversion from a HuggingFace PretrainedConfig. Adapted from torchtitan.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/qwen3/model/args.py
@@ -16,6 +19,15 @@ if TYPE_CHECKING:
 
 @dataclass
 class Qwen3ModelArgs(BaseModelArgs):
+    # [CLASS DOC]
+    # Dataclass (extends BaseModelArgs) with Qwen3 architecture hyperparameters;
+    # defaults correspond to Qwen3-0.6B. Fields: transformer sizes (dim, n_layers,
+    # n_heads,
+    # n_kv_heads, vocab_size, head_dim, hidden_dim), norm_eps, rope_theta, qk_norm,
+    # max_seq_len, depth_init (depth-scaled init std), eos_id, enable_weight_tying,
+    # is_critic/num_labels (value head instead of LM head), and MoE settings
+    # (moe_enabled,
+    # moe_inter_dim, moe_args, decoder_sparse_step selecting which layers are MoE).
     """Model arguments for Qwen3. Default values are for Qwen3-0.6B.
 
     Attributes:
@@ -59,6 +71,24 @@ class Qwen3ModelArgs(BaseModelArgs):
         is_critic: bool = False,
         **kwargs,
     ) -> Qwen3ModelArgs:
+        # [FUNCTION DOC]
+        # Classmethod building Qwen3ModelArgs from a HF config. MoE is enabled when
+        # num_experts (or fallback num_local_experts) exists and is > 1; then MoEArgs is
+        # built
+        # via MoEArgs.from_hf_config, num_shared_experts copied if present, and
+        # router_dtype
+        # overridden from kwargs if given. Missing optional HF attributes fall back to
+        # defaults
+        # (n_kv_heads -> n_heads, head_dim -> hidden_size // n_heads, qk_norm True,
+        # max_seq_len 4096, eos 151645, tie_word_embeddings False, moe_intermediate_size
+        # 768,
+        # decoder_sparse_step 1). rope_theta via the base-class _get_rope_theta helper.
+        # attn_type taken from kwargs or BaseModelArgs default. is_critic passed
+        # through.
+        # Returns the new instance; no side effects.
+        # KNOWN ISSUE: eos_token_id from HF may be a list, which is stored as-is despite
+        # the
+        # int annotation.
         # Check if MoE is enabled
         num_experts = getattr(hf_config, "num_experts", None)
         if num_experts is None:

@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Internal agent used by OpenAIProxyWorkflow in "online" mode, where trajectories are
+# produced by external users rather than by a local agent function. Not for direct use.
 # SPDX-License-Identifier: Apache-2.0
 
 """Internal agent for online training mode.
@@ -21,6 +24,10 @@ from .server import INTERNAL_WAIT_FOR_SESSION_PATHNAME
 
 
 class _OnlineAgent:
+    # [CLASS DOC]
+    # HELPER: Agent object whose run() blocks until an external user completes a full
+    # session (start, interact, set reward, end) on the assigned proxy worker, by
+    # long-polling the proxy gateway. Holds gateway address, admin API key and timeout.
     """Internal agent that waits for external user sessions.
 
     Registers the assigned proxy worker as "ready" on the proxy
@@ -44,6 +51,8 @@ class _OnlineAgent:
         admin_api_key: str,
         timeout: float = 3600.0,
     ):
+        # [FUNCTION DOC]
+        # Stores proxy_gateway_addr, admin_api_key and timeout seconds (default 3600).
         self.proxy_gateway_addr = proxy_gateway_addr
         self.admin_api_key = admin_api_key
         self.timeout = timeout
@@ -51,6 +60,15 @@ class _OnlineAgent:
     async def run(
         self, data: dict[str, Any], **extra_kwargs: Any
     ) -> CompletedSessionInfo:
+        # [FUNCTION DOC]
+        # POSTs {"worker_addr": base_url} with Bearer admin key to the gateway's
+        # internal
+        # wait-for-session endpoint using the shared workflow-context aiohttp session
+        # and a
+        # total timeout of self.timeout; raises for non-2xx status (and aiohttp timeout
+        # errors).
+        # Returns CompletedSessionInfo built from the JSON response. data is ignored;
+        # extra_kwargs must contain base_url (KeyError otherwise).
         """Wait for an external user to complete a session.
 
         Parameters

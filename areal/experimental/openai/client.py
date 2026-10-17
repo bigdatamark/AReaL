@@ -1,3 +1,17 @@
+# [MODULE DOC]
+# ArealOpenAI: a drop-in AsyncOpenAI client whose chat.completions.create and
+# responses.create run generation on an AReaL rollout/inference engine (anything with an
+# async agenerate(ModelRequest) -> ModelResponse) instead of calling a remote API. Each
+# call tokenizes the conversation locally (HF chat template, or "concat" mode which
+# reuses the parent interaction's exact tokens and appends only new turn tokens), builds
+# GenerationHyperparameters, generates, parses tool calls/reasoning, builds OpenAI
+# response objects, and records an InteractionWithTokenLogpReward (token ids, logprobs,
+# output messages) in an InteractionCache so rewards can be attached and trajectories
+# exported for RL training. Also contains message normalization helpers (pydantic ->
+# dict, Responses input items -> chat messages, image extraction for VLMs, tool schema
+# alignment with SGLang rendering). Streaming is simulated from a full generation.
+# Side effect at import: sets OPENAI_API_KEY and OPENAI_BASE_URL env vars to "none" if
+# unset so the base AsyncOpenAI constructor does not fail.
 # SPDX-License-Identifier: Apache-2.0
 
 import datetime
@@ -64,7 +78,12 @@ if TYPE_CHECKING:
 
 
 class _AsyncGenerateEngine(Protocol):
+    # [CLASS DOC]
+    # HELPER: Structural Protocol for the engine dependency: an object with async
+    # agenerate(ModelRequest) -> ModelResponse.
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
+        # [FUNCTION DOC]
+        # Protocol method; the default body raises NotImplementedError.
         raise NotImplementedError()
 
 
@@ -78,6 +97,18 @@ logger = logging.getLogger("OpenAIClient")
 
 
 def _align_tools_with_sglang(tools_list: list) -> list[dict]:
+    # [FUNCTION DOC]
+    # HELPER: Normalizes tool definitions so the tools block rendered by the chat
+    # template
+    # matches SGLang's own /v1/chat/completions path. For each tool: pydantic models are
+    # model_dump'ed, mappings copied to dicts, other types passed through with a
+    # warning;
+    # flat Responses-style function tools are nested under "function"; then, if SGLang's
+    # protocol Tool model is importable, the dict is round-tripped through it
+    # (validation
+    # failures logged and the dict kept). If SGLang is missing, warns once (flag stored
+    # as a
+    # function attribute) and only normalizes shapes. Returns the new list.
     """Round-trip tools through sglang's pydantic Tool model so the dicts
     fed to ``apply_chat_template`` byte-match what sglang's serving_chat
     produces on its own ``/v1/chat/completions`` path.
@@ -109,6 +140,10 @@ def _align_tools_with_sglang(tools_list: list) -> list[dict]:
     """
 
     def _to_chat_format(t_dict: dict) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: If a dict is a flat function tool (type "function", has "name", no
+        # "function" key) returns {"type": "function", "function": <other fields>}; else
+        # returns it unchanged.
         # Flat Responses FunctionToolParam → nested Chat shape. sglang's
         # Function model drops fields it doesn't declare (e.g. defer_loading),
         # so the dump still matches the chat-completions path. Chat tools
@@ -174,6 +209,13 @@ def _ensure_message_dict_list(
     name: str,
     value: list[Any],
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # HELPER: Validates value is a list whose items are dicts or pydantic models
+    # (TypeError
+    # otherwise, naming the argument and index) and recursively normalizes them: models
+    # via
+    # model_dump(exclude_none=True), mappings with None values removed, non-string
+    # iterables to lists. Returns the new list of dicts.
     """Validate that ``value`` is a list of dictionaries or BaseModel objects.
 
     Args:
@@ -195,6 +237,10 @@ def _ensure_message_dict_list(
         )
 
     def _normalize(item: Any):
+        # [FUNCTION DOC]
+        # HELPER: Recursive normalizer described in the parent (models first, since they
+        # are
+        # also iterable).
         # we should convert BaseModel first, because BaseModel is also Iterable
         if isinstance(item, BaseModel):
             return item.model_dump(exclude_none=True)
@@ -222,7 +268,12 @@ def _ensure_message_dict_list(
 
 
 def _find_kth(lst: list, target, k: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the index of the k-th (1-based) occurrence of target in lst, or -1
+    # if there are fewer than k occurrences. For k <= 0 returns -1.
     def target_indices():
+        # [FUNCTION DOC]
+        # HELPER: Generator yielding indices where lst equals target.
         for i, char in enumerate(lst):
             if char == target:
                 yield i
@@ -244,6 +295,15 @@ _DATA_URI_RE = re.compile(r"^data:image/[a-zA-Z0-9.+-]+;base64,(.+)$", re.DOTALL
 def _extract_images_from_messages(
     messages: list[dict[str, Any]],
 ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    # [FUNCTION DOC]
+    # HELPER: Scans list-typed message contents for image_url parts. Returns
+    # (image_data, messages_for_tokenizer, vision_messages_for_vllm): image_data holds
+    # the
+    # base64 payload of data:image URIs or the raw URL otherwise, in order;
+    # messages_for_tokenizer replaces each image part by {"type": "image"} for HF VLM
+    # templates; vision_messages_for_vllm keeps image_url parts with url "placeholder"
+    # (real data injected later by the vLLM backend). Non-image parts are deep-copied.
+    # Raises ValueError for an image part with empty/missing url.
     """Extract image data from OpenAI-format messages.
 
     Scans message ``content`` lists for ``image_url`` content parts,
@@ -333,6 +393,10 @@ def _extract_images_from_messages(
 def _convert_tool_output_format(
     item: dict,
 ) -> ChatCompletionToolMessageParam | dict:
+    # [FUNCTION DOC]
+    # HELPER: Converts a Responses FunctionCallOutput dict (type "function_call_output"
+    # with "output") into a chat tool message {"role": "tool", "content": output,
+    # "tool_call_id": call_id if present}; returns other inputs unchanged.
     """Convert custom tool output format to standard chat template format.
 
     Converts openai.types.responses.response_input_item_param.FunctionCallOutput
@@ -364,6 +428,19 @@ def _convert_tool_output_format(
 
 
 def _build_messages_list(item: dict) -> list[dict]:
+    # [FUNCTION DOC]
+    # HELPER: Converts one normalized Responses input item into chat messages. String
+    # content -> one message. List content: output_text/input_text parts become text
+    # parts,
+    # input_image parts become image_url parts (with optional detail; ValueError if
+    # image_url missing); any other part type or non-dict part raises ValueError. With
+    # any
+    # image the result is a single message with list content, otherwise one message per
+    # text part. Items without content (e.g. function_call_output) are converted via
+    # _convert_tool_output_format and deep-copied. Other content types raise ValueError.
+    # KNOWN ISSUE: Responses function_call items (no content, type "function_call") pass
+    # through unconverted, so the assistant's tool-call turn is not expressed in chat
+    # form.
     """Convert a Responses API input item into Chat Completions message dicts.
 
     Handles ``output_text``, ``input_text``, ``input_image``, and
@@ -441,6 +518,9 @@ def _resolve_max_total_tokens(
     max_new_tokens: int,
     engine_max_tokens: int | None,
 ) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns min(prompt_len + max_new_tokens, engine_max_tokens or 32768), the
+    # total-length cap passed to the engine.
     # Fall back to a fixed context-length ceiling when the deployment does not
     # configure engine_max_tokens, so a large client max_tokens cannot push
     # prompt + generation past the backend model's context window.
@@ -449,6 +529,13 @@ def _resolve_max_total_tokens(
 
 
 def _parse_tool_call_arguments(messages: list[dict]) -> list[dict]:
+    # [FUNCTION DOC]
+    # HELPER: Returns a new list where any message tool_calls whose function.arguments
+    # is
+    # a JSON string are copied with arguments parsed to an object (invalid JSON left as
+    # is).
+    # Untouched messages are shared, not copied. Needed for chat templates that iterate
+    # over argument items.
     """Return a new message list with tool_call arguments parsed from JSON strings
     to dicts. Some chat templates (e.g. GLM-5.1) iterate over arguments with
     .items(), which fails when arguments is a JSON string per OpenAI API convention.
@@ -492,6 +579,22 @@ def concat_prompt_token_ids_with_parent(
     tools: Iterable[ChatCompletionToolParam] | None = None,
     extra_body: Body = {},
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # Builds prompt token ids for "concat" mode so a child turn extends its parent's
+    # exact
+    # token sequence. If parent is given (ValueError if it has no model_response),
+    # parent
+    # tokens = parent input tokens + output tokens without stop + one EOS token, and the
+    # parent's messages and output messages are prepended to message_list. The whole
+    # conversation is chat-templated (tool-call args parsed, generation prompt added,
+    # chat_template_kwargs from extra_body). With E EOS tokens in the parent tokens, the
+    # template output is cut after its E-th EOS and the remainder appended to the parent
+    # tokens (RuntimeError if no such EOS or nothing follows it). Without a parent
+    # returns
+    # the full templated ids. Returns a list of ints.
+    # KNOWN ISSUE: alignment counts EOS ids, so it breaks if the template or generated
+    # text
+    # contains EOS-equal tokens elsewhere; stop strings are unsupported (TODO in code).
     """
     Concatenate prompt token IDs with parent interaction's tokens.
     """
@@ -557,6 +660,15 @@ def concat_prompt_token_ids_with_parent(
 
 
 class AsyncCompletionsWithReward(BaseAsyncCompletions):
+    # [CLASS DOC]
+    # Subclass of the OpenAI SDK AsyncCompletions resource that generates locally via
+    # the
+    # engine and caches interactions. Holds engine, tokenizer, tool-call and reasoning
+    # parser names, the default cache, engine_max_tokens (context cap),
+    # chat_template_type
+    # ("hf" or "concat") and LoRA adapter name. A class-level _warned_parameters set
+    # exists
+    # for one-time warnings (currently unused).
     """Extended AsyncCompletions that adds caching and reward functionality."""
 
     # Class-level set to track which parameters have been warned about
@@ -575,6 +687,10 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         chat_template_type: str = "hf",
         lora_name: str = "",
     ):
+        # [FUNCTION DOC]
+        # Calls the SDK resource init with the parent client and stores all
+        # collaborators and
+        # settings as attributes.
         super().__init__(client)
         self.engine = engine
         self.tokenizer = tokenizer
@@ -593,6 +709,12 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         tool_calls: list | None,
         response: ModelResponse,
     ) -> tuple[ChatCompletion, ChatCompletionMessage]:
+        # [FUNCTION DOC]
+        # HELPER: Builds the assistant ChatCompletionMessage (tool_calls None if empty)
+        # and a
+        # single-choice ChatCompletion with the engine stop reason as finish_reason,
+        # model
+        # "None", and usage counted from input/output token lengths. Returns both.
         """Build ChatCompletion and ChatCompletionMessage objects.
 
         Args:
@@ -634,6 +756,10 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         )
         return chat_completion, output_message
 
+    # [FUNCTION DOC]
+    # Typing-only overload of create (stream=True -> async chunk generator; otherwise
+    # ChatCompletion). No runtime behavior.
+    # (Placed above the definition because the body is on the signature line.)
     @overload
     async def create(
         self,
@@ -658,6 +784,10 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         **kwargs: Any,
     ) -> AsyncGenerator[ChatCompletionChunk, None]: ...
 
+    # [FUNCTION DOC]
+    # Typing-only overload of create (stream=True -> async chunk generator; otherwise
+    # ChatCompletion). No runtime behavior.
+    # (Placed above the definition because the body is on the signature line.)
     @overload
     async def create(
         self,
@@ -704,6 +834,47 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         areal_cache: InteractionCache | None = None,
         **kwargs: Any,
     ) -> ChatCompletion | AsyncGenerator[ChatCompletionChunk, None]:
+        # [FUNCTION DOC]
+        # OpenAI-compatible chat completion backed by the engine. Steps: validate
+        # messages
+        # (TypeError if not iterable, ValueError if empty; n != 1 raises
+        # NotImplementedError),
+        # normalize to dicts. Unless store is False, creates an interaction (deep copy
+        # of
+        # messages, template type) in areal_cache or the default cache under a fresh
+        # "chatcmpl-" id (ValueError on id collision); insertion links it to its parent.
+        # Tools
+        # are listified (TypeError if not iterable) and aligned to SGLang format when
+        # the engine
+        # class name contains "sglang". Images are extracted. Prompt ids come from the
+        # HF chat
+        # template ("hf") or concat_prompt_token_ids_with_parent using the interaction's
+        # remaining (new) messages ("concat"); other types raise RuntimeError. Token
+        # limits:
+        # max_tokens is an alias of max_completion_tokens (ValueError if both given);
+        # the total
+        # budget is min(max_total_tokens, engine_max_tokens); max_new_tokens = budget -
+        # prompt
+        # length (ValueError if <= 0) further capped by max_completion_tokens, else
+        # default 512
+        # with a warning. Interaction is removed from cache on these ValueErrors.
+        # temperature
+        # defaults 1.0 (0 means greedy), top_p 1.0, stop normalized to a list (dropped
+        # with a
+        # warning in concat mode), frequency_penalty 0. Builds ModelRequest (random rid,
+        # metadata, image data, vLLM vision messages; stop ids are EOS and PAD) and
+        # awaits
+        # engine.agenerate. Decodes output without stop tokens, parses tool calls unless
+        # tool_choice is "none" (JSON errors logged). For streaming, records completion,
+        # model_response and output message in the cache before returning the
+        # _create_stream
+        # generator; otherwise records the same and returns the ChatCompletion. Extra
+        # kwargs
+        # are ignored.
+        # KNOWN ISSUE: if generation or templating raises after the interaction was
+        # inserted,
+        # the incomplete interaction stays in the cache (export skips it with a
+        # warning).
         """Override create method to use AReaL engine and cache responses."""
 
         is_streaming = not is_omitted(stream) and stream is True
@@ -978,6 +1149,15 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
         tool_calls: list | None,
         response: ModelResponse,
     ) -> AsyncGenerator[ChatCompletionChunk, None]:
+        # [FUNCTION DOC]
+        # HELPER: Async generator simulating streaming from a finished generation:
+        # yields a
+        # role chunk, one content chunk with the full text (if any), two chunks per tool
+        # call
+        # (name+id with empty arguments, then arguments; split for LiteLLM Anthropic
+        # adapter
+        # compatibility), and a final chunk with finish_reason and usage. No cache
+        # updates.
         """Generate streaming ChatCompletionChunk objects.
 
         Since Inference engine doesn't support true streaming, we simulate it by
@@ -1108,6 +1288,10 @@ class AsyncCompletionsWithReward(BaseAsyncCompletions):
 
 
 class AsyncResponsesWithReward(BaseAsyncResponses):
+    # [CLASS DOC]
+    # Subclass of the OpenAI SDK AsyncResponses resource implementing Responses API
+    # create() on the AReaL engine with interaction caching; same attributes as
+    # AsyncCompletionsWithReward.
     """Extended AsyncResponses that adds caching and reward functionality."""
 
     def __init__(
@@ -1122,6 +1306,8 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         chat_template_type: str = "hf",
         lora_name: str = "",
     ):
+        # [FUNCTION DOC]
+        # Calls the SDK resource init and stores collaborators and settings.
         super().__init__(client)
         self.engine = engine
         self.tokenizer = tokenizer
@@ -1150,6 +1336,37 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         areal_cache: dict[str, InteractionWithTokenLogpReward] | None = None,
         **kwargs: Any,
     ) -> Response:
+        # [FUNCTION DOC]
+        # Responses API create backed by the engine. Generates "resp-"/"msg-" ids
+        # (ValueError
+        # on cache collision). Builds chat messages: optional system message from
+        # instructions,
+        # then a string input becomes one user message, or a list input is normalized
+        # and each
+        # item converted with _build_messages_list; other input types or missing input
+        # raise
+        # ValueError; non-empty include raises NotImplementedError. Always caches an
+        # interaction (messages copy, template type, deep copy of input as input_data).
+        # Tools,
+        # images and prompt tokenization as in chat completions (hf or concat).
+        # max_new_tokens =
+        # engine_max_tokens - prompt length (ValueError if <= 0, interaction removed),
+        # capped by
+        # max_output_tokens, default 512 with warning. stop comes from kwargs (ignored
+        # in concat
+        # mode). Generates, decodes, parses tool calls in Responses format, counts
+        # reasoning
+        # tokens between <think> tags, and builds a Response whose output is the tool-
+        # call items
+        # if any, else a single output_text message, with usage. Stores a deep copy of
+        # the
+        # Response, model_response and dumped output items in the cache; returns the
+        # Response.
+        # KNOWN ISSUE: when tool calls are present the assistant text (if any) is
+        # dropped from
+        # the output; store is not honored; tool_choice is reported as "none" when
+        # omitted even
+        # if tools are given.
         """Override create method to use AReaL engine"""
         # Initialize IDs and timestamps
         resp_id = f"resp-{uuid.uuid4().hex[:29]}"
@@ -1414,6 +1631,11 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
         thinking_start_token: str = "<think>",
         thinking_end_token: str = "</think>",
     ) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Returns the number of tokenizer tokens (no special tokens) between the
+        # first
+        # thinking_start_token and the following thinking_end_token (or end of text if
+        # unclosed); 0 if no start token.
         """
         Count reasoning tokens from output text by extracting content within thinking start and end tokens.
         """
@@ -1427,6 +1649,12 @@ class AsyncResponsesWithReward(BaseAsyncResponses):
 
 
 class ArealOpenAI(AsyncOpenAI):
+    # [CLASS DOC]
+    # AsyncOpenAI subclass wiring a shared InteractionCache into custom
+    # chat.completions and responses resources, plus reward/export helpers. Typical use:
+    # an
+    # agent workflow calls the client like OpenAI, then sets rewards and exports
+    # interactions for training.
     """
     Extended AsyncOpenAI client that uses AReaL's inference engine
     and supports reward setting.
@@ -1443,6 +1671,13 @@ class ArealOpenAI(AsyncOpenAI):
         lora_name: str = "",
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Passes kwargs to AsyncOpenAI, stores engine, tokenizer, parser names and LoRA
+        # name,
+        # creates an empty InteractionCache and replaces self.responses and
+        # self.chat.completions with the reward-aware resources sharing that cache and
+        # the
+        # engine_max_tokens / chat_template_type settings.
         super().__init__(**kwargs)
         self.engine = engine
         self.tokenizer = tokenizer
@@ -1480,22 +1715,34 @@ class ArealOpenAI(AsyncOpenAI):
         )
 
     def get_interaction(self, id: str) -> InteractionWithTokenLogpReward | None:
+        # [FUNCTION DOC]
+        # Returns the cached interaction for id, or None.
         """Get completion/response with its reward from cache."""
         return self._cache.get(id)
 
     def set_reward(self, id: str, reward: float) -> None:
+        # [FUNCTION DOC]
+        # Sets the reward for interaction id; raises KeyError if not cached.
         """Set reward for a specific completion/response by its ID."""
         if id not in self._cache:
             raise KeyError(f"Interaction with ID {id} not found in cache")
         return self._cache.set_reward(id, reward)
 
     def set_last_reward(self, reward: float) -> None:
+        # [FUNCTION DOC]
+        # Sets the reward of the most recent interaction; RuntimeError if the cache is
+        # empty.
         """Set reward for the most recent completion/response."""
         if not self._cache:
             raise RuntimeError("No interaction in cache to set reward for")
         return self._cache.set_last_reward(reward)
 
     def apply_reward_discount(self, turn_discount: float = 1.0) -> None:
+        # [FUNCTION DOC]
+        # Delegates to InteractionCache.apply_reward_discount (one-shot backward
+        # geometric
+        # discounting) and returns its result.
+        # KNOWN ISSUE: annotated as returning None but returns the dict from the cache.
         """Apply backward discounted rewards across cached completions/responses.
 
         This method iterates over the cached completions/responses in reverse creation
@@ -1528,6 +1775,10 @@ class ArealOpenAI(AsyncOpenAI):
     def export_interactions(
         self, style: str
     ) -> dict[str, InteractionWithTokenLogpReward]:
+        # [FUNCTION DOC]
+        # Delegates to InteractionCache.export_interactions(style) ("concat" leaves or
+        # "individual" all) without discount or orphan dropping.
+        # KNOWN ISSUE: docstring says style defaults to 'concat', but it is required.
         """Export cached completions/responses in different formats.
 
         When ``style='concat'``, this method constructs a conversation tree by
@@ -1561,6 +1812,10 @@ class ArealOpenAI(AsyncOpenAI):
 
 
 def is_omitted(value) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if value is NOT_GIVEN, None, an openai Omit instance, or any object
+    # whose
+    # class name is "NotGiven" or "Omit"; else False.
     """Check if a value is NOT_GIVEN or Omit type or None."""
     if value is NOT_GIVEN or value is None:
         return True

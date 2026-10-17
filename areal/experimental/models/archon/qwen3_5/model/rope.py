@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Partial rotary position embedding (RoPE) utilities for Qwen3.5: only the first
+# rotary_dim = int(head_dim * partial_rotary_factor) channels of each head are rotated
+# (HF "rotate_half" convention); remaining channels pass through unchanged. The cache
+# layout is [max_seq_len, 2 * rotary_dim] with cos in the first half, sin in the second.
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
@@ -5,6 +10,8 @@ from torch.distributed.tensor import DTensor
 
 
 def _maybe_to_local(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns x.to_local() for DTensors, else x.
     """Convert DTensor to local tensor if needed."""
     if isinstance(x, DTensor):
         return x.to_local()
@@ -17,6 +24,12 @@ def precompute_rope_cache(
     partial_rotary_factor: float = 1.0,
     base: float = 10_000.0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Computes inverse frequencies base^(-2i/rotary_dim) for i < rotary_dim/2, outer
+    # product with positions 0..max_seq_len-1, duplicates the angles to width
+    # rotary_dim,
+    # and returns cos and sin concatenated along the last dim: float32 tensor
+    # [max_seq_len, 2 * rotary_dim]. CPU tensor unless a device context is active.
     """Precompute partial RoPE cos/sin cache.
 
     Args:
@@ -42,6 +55,8 @@ def precompute_rope_cache(
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Splits the last dim in halves (x1, x2) and returns concat(-x2, x1).
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2 :]
@@ -54,6 +69,13 @@ def reshape_for_broadcast(
     positions: torch.Tensor | None = None,
     rotary_dim: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Selects RoPE rows for x of shape [bz, seqlen, heads, head_dim] and returns
+    # them shaped for broadcasting: positions None -> first seqlen rows as
+    # [1, seqlen, 1, 2*rotary_dim]; positions with batch 1 -> rows indexed by positions
+    # in
+    # the same shape; otherwise gathers per-batch rows to [bz, seqlen, 1, 2*rotary_dim].
+    # rotary_dim defaults to half the cache width.
     """Reshape RoPE cache for broadcasting with input tensor.
 
     Args:
@@ -93,6 +115,13 @@ def apply_rotary_emb(
     rope_cache: torch.Tensor,
     positions: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Applies partial RoPE to xq [b, s, heads, head_dim] and xk [b, s, kv_heads,
+    # head_dim]. Converts DTensor cache/positions to local, derives rotary_dim from the
+    # cache width, gathers cos/sin for the positions, casts to xq's dtype/device,
+    # rotates
+    # the first rotary_dim channels (x*cos + rotate_half(x)*sin) and concatenates the
+    # untouched rest. Returns (q, k) with input shapes and dtypes.
     """Apply partial rotary position embedding to query and key tensors.
 
     Only the first ``rotary_dim`` dimensions participate in rotation;
@@ -127,6 +156,10 @@ def apply_rotary_emb(
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Repeats each KV head n_rep times consecutively (head-interleaved expand+reshape),
+    # [bs, slen, n_kv, d] -> [bs, slen, n_kv*n_rep, d]; returns x unchanged if n_rep ==
+    # 1.
     """Repeat KV heads to match number of query heads.
 
     Args:

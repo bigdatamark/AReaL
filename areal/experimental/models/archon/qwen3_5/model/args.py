@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Hyperparameter dataclass for the Archon Qwen3.5 hybrid model (full-attention plus
+# GatedDeltaNet linear-attention layers, dense or MoE) and conversion from HF configs,
+# including composite VLM configs that nest a text_config.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -14,6 +18,14 @@ if TYPE_CHECKING:
 
 @dataclass
 class Qwen3_5ModelArgs(BaseModelArgs):
+    # [CLASS DOC]
+    # Dataclass extending BaseModelArgs. Defaults describe a 36-layer dense model.
+    # Adds partial RoPE (partial_rotary_factor), per-layer layer_types ("full_attention"
+    # /
+    # "linear_attention"; empty means the model decides), GatedDeltaNet sizes
+    # (conv kernel, key/value head dims and head counts), attention_bias, and MoE fields
+    # (moe_inter_dim, shared_expert_intermediate_size, num_experts, num_experts_per_tok,
+    # moe_args). Other fields mirror Qwen3ModelArgs.
     """Model arguments for Qwen3.5 (dense + MoE, hybrid architecture).
 
     Qwen3.5 is a hybrid architecture with both full_attention and
@@ -89,6 +101,9 @@ class Qwen3_5ModelArgs(BaseModelArgs):
     moe_args: MoEArgs | None = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Validates that a non-empty layer_types has exactly n_layers entries; raises
+        # ValueError otherwise.
         if self.layer_types and len(self.layer_types) != self.n_layers:
             raise ValueError(
                 f"layer_types length ({len(self.layer_types)}) must equal "
@@ -102,6 +117,21 @@ class Qwen3_5ModelArgs(BaseModelArgs):
         is_critic: bool = False,
         **kwargs,
     ) -> Qwen3_5ModelArgs:
+        # [FUNCTION DOC]
+        # Classmethod. Uses hf_config.text_config if present. partial_rotary_factor is
+        # read
+        # top-level, else from rope_parameters (default 0.25); rope_theta via
+        # _get_rope_theta.
+        # MoE enabled when num_experts / num_local_experts > 1; then builds MoEArgs, and
+        # if
+        # shared_expert_intermediate_size > 0 sets it on moe_args and enables the
+        # shared-expert
+        # gate; copies num_shared_experts if present. Fills all fields with HF values or
+        # defaults (hidden_dim from intermediate_size or 0 for MoE configs, layer_types
+        # truncated to num_hidden_layers, num_experts 0 when absent). attn_type from
+        # kwargs.
+        # Returns the instance (may raise ValueError from __post_init__).
+        # KNOWN ISSUE: router_dtype kwarg (honored by Qwen3) is ignored here.
         # Handle composite VLM config (model_type="qwen3_5" or "qwen3_5_moe")
         if hasattr(hf_config, "text_config"):
             hf_config = hf_config.text_config

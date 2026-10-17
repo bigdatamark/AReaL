@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# HF <-> Archon state-dict conversion for Qwen3 dense and MoE models (adapted from
+# torchtitan). Renames keys via templated maps ("{}" placeholders for layer/expert ids),
+# splits/merges MoE expert weights between HF per-expert 2D tensors (or newer fused 3D
+# gate_up_proj/down_proj tensors) and Archon stacked 3D tensors [num_experts, out, in],
+# and handles weight tying. DTensor (EP/TP sharded) expert weights are delegated to
+# MoEWeightConverter so distributed checkpoints stay sharded.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/qwen3/model/state_dict_adapter.py
@@ -21,6 +28,13 @@ if TYPE_CHECKING:
 
 
 class Qwen3StateDictAdapter(BaseStateDictAdapter):
+    # [CLASS DOC]
+    # BaseStateDictAdapter subclass for Qwen3. Holds from_hf_map / to_hf_map key
+    # templates, MoE detection (moe_enabled, num_experts), the weight-tying flag, HF
+    # expert
+    # key templates and, for MoE models, a MoEWeightConverter plus MoEConversionState
+    # used
+    # to accumulate DTensor expert shards across calls. No weight permutation is needed.
     """State dict adapter for Qwen3 Dense and MoE models.
 
     Handles:
@@ -33,6 +47,17 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
     def __init__(
         self, model_config: PretrainedConfig, hf_assets_path: str | None = None
     ):
+        # [FUNCTION DOC]
+        # Calls base init with the HF config and optional assets path, builds the
+        # HF->Archon
+        # map (rotary inv_freq maps to None = dropped) and its reverse. Determines
+        # num_experts
+        # from num_experts, num_local_experts or moe_args.num_experts; MoE is enabled if
+        # num_experts > 1 or config.moe_enabled is True. Raises ValueError if MoE is
+        # enabled
+        # but num_experts is unknown. Reads tie_word_embeddings and creates the MoE
+        # converter
+        # and state only for MoE models.
         super().__init__(model_config, hf_assets_path)
 
         # HuggingFace -> Archon key mapping
@@ -111,6 +136,13 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
         self._moe_state = MoEConversionState() if self.moe_enabled else None
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Converts an Archon state dict to HF. Skips output.weight when weight tying is
+        # enabled; expert keys ("moe.experts.w") are split into per-expert 2D HF entries
+        # (distributed split for DTensors, plain unbind otherwise); other keys renamed
+        # via
+        # _convert_key_to_hf, dropping unmapped ones. Returns a new dict.
+        # KNOWN ISSUE: critic "score.weight" has no mapping and is silently dropped.
         """Convert Archon state dict to HuggingFace format.
 
         Main transformations:
@@ -142,6 +174,21 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
         return hf_state_dict
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Converts an HF state dict to Archon. With weight tying and missing lm_head,
+        # copies (shallowly) the input dict and aliases lm_head to embed_tokens. For
+        # expert keys
+        # on MoE models: fused 3D keys are split/stored directly; per-expert 2D DTensors
+        # are
+        # accumulated per layer/abstract key and passed to the converter, which returns
+        # the
+        # concatenated 3D DTensor once complete; plain tensors go into a preallocated 3D
+        # buffer
+        # via _collect_expert_weight. Other keys are renamed (unmapped/None dropped).
+        # Expert
+        # keys on non-MoE models fall through to regular renaming. Returns the Archon
+        # dict;
+        # mutates the converter's state.
         """Convert HuggingFace state dict to Archon format.
 
         Main transformations:
@@ -220,6 +267,14 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
     def convert_single_to_hf(
         self, name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Converts one Archon (name, tensor) for incremental weight sync. Strips
+        # "._checkpoint_wrapped_module" and "._orig_mod" wrapper segments, splits expert
+        # 3D
+        # weights into per-expert HF pairs (gathering DTensors), otherwise renames.
+        # Returns a
+        # list of (hf_name, tensor); empty when the name is unmapped.
+        # KNOWN ISSUE: unlike to_hf, does not skip output.weight under weight tying.
         """Convert a single Archon (name, tensor) pair to HuggingFace format.
 
         Used for incremental weight updates.
@@ -244,6 +299,11 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
             return []
 
     def _convert_key_to_hf(self, archon_key: str) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Maps an Archon key to HF via exact lookup, else by replacing the first
+        # "layers.N." with a template, looking it up and substituting N into the first
+        # "{}".
+        # Returns None if unmapped.
         """Convert a Archon key to HuggingFace key."""
         # Try direct match first
         if archon_key in self.to_hf_map:
@@ -262,6 +322,10 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
         return None
 
     def _convert_key_from_hf(self, hf_key: str) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Inverse of _convert_key_to_hf using from_hf_map; returns None for
+        # unmapped
+        # keys or keys explicitly mapped to None.
         """Convert a HuggingFace key to Archon key."""
         # Try direct match first
         if hf_key in self.from_hf_map:
@@ -282,6 +346,9 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
         return None
 
     def _parse_expert_key(self, hf_key: str) -> tuple[str, int, str] | None:
+        # [FUNCTION DOC]
+        # HELPER: Regex-parses a per-expert HF key into (layer_id string, expert_id int,
+        # Archon abstract key w1/w3/w2 for gate/up/down). Returns None if no match.
         """Parse HF expert key into (layer_id, expert_id, archon_abstract_key)."""
         match = re.match(
             r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight",
@@ -310,6 +377,10 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
     )
 
     def _parse_fused_expert_key(self, hf_key: str) -> tuple[str, str] | None:
+        # [FUNCTION DOC]
+        # HELPER: Matches fused keys
+        # "model.layers.N.mlp.experts.(gate_up_proj|down_proj)"
+        # with optional ".weight" suffix; returns (layer_id, proj_type) or None.
         """Parse fused HF expert key into (layer_id, proj_type).
 
         Matches keys from newer HuggingFace format where expert weights
@@ -329,6 +400,15 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
         value: torch.Tensor,
         state_dict: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Gathers DTensors to full tensors, then for gate_up_proj splits dim 1
+        # in half
+        # into w1 (first half, gate) and w3 (second half, up) as contiguous copies;
+        # down_proj is
+        # stored as w2 unchanged. Writes into state_dict in place.
+        # KNOWN ISSUE: shapes are taken as-is; HF fused layouts that store (experts, in,
+        # out)
+        # would need a transpose that is not performed here.
         """Handle fused 3D expert weights from newer HF format.
 
         Args:
@@ -357,6 +437,12 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
     def _split_moe_experts_distributed(
         self, archon_key: str, weight_3d: DTensor
     ) -> dict[str, DTensor]:
+        # [FUNCTION DOC]
+        # HELPER: For a 3D DTensor expert weight, derives layer id and the HF expert
+        # template
+        # and delegates to MoEWeightConverter.split_expert_weights_dtensor (keeps
+        # sharding).
+        # Returns {} if the key is unrecognized.
         """Split 3D DTensor expert weight into 2D DTensors for distributed checkpoint."""
         match = re.search(r"layers\.(\d+)\.", archon_key)
         if not match:
@@ -378,6 +464,12 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
     def _split_moe_experts(
         self, archon_key: str, weight_3d: torch.Tensor
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Gathers DTensor to full, then unbinds the 3D weight along dim 0 into
+        # per-expert
+        # 2D views keyed "model.layers.L.mlp.experts.E.{gate|down|up}_proj.weight" for
+        # w1/w2/w3.
+        # Returns {} for unrecognized keys.
         """Split 3D expert weight into HuggingFace format 2D weights.
 
         Args:
@@ -427,6 +519,13 @@ class Qwen3StateDictAdapter(BaseStateDictAdapter):
         buffer: dict[str, tuple[torch.Tensor, int]],
         state_dict: dict[str, Any],
     ):
+        # [FUNCTION DOC]
+        # HELPER: Places one per-expert 2D HF weight into a preallocated 3D tensor
+        # (num_experts, out, in) kept in buffer with a fill count; when all num_experts
+        # are
+        # filled, moves the tensor into state_dict and removes the buffer entry. Ignores
+        # keys
+        # that do not parse.
         """Collect expert weights and merge into 3D when complete.
 
         Uses pre-allocated 3D tensor for better performance with large MoE models.

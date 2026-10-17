@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Client-side helper for the OpenAI proxy rollout server's RL session protocol.
+# OpenAIProxyClient starts a session (receiving a session id and per-session API key
+# that the agent uses for its OpenAI calls), sets rewards, ends the session and exports
+# recorded interactions over HTTP via a caller-provided aiohttp session. Also provides
+# generic JSON POST helpers with tenacity-based retry on transient HTTP errors.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -37,6 +43,12 @@ logger = getLogger("OpenAIProxyClient")
 
 
 class OpenAIProxyClient:
+    # [CLASS DOC]
+    # Async context manager for one RL session on a proxy server. Entering starts the
+    # session with the admin key; exiting ends it with the session key. Holds the
+    # aiohttp session, base_url (normalized to end with "/"), task_id, admin key, and
+    # after
+    # start the session_id and session API key.
     """Client session for interacting with the OpenAI proxy server.
 
     This class manages RL session lifecycle (start/end session) and provides
@@ -86,6 +98,10 @@ class OpenAIProxyClient:
         task_id: str,
         admin_api_key: str,
     ):
+        # [FUNCTION DOC]
+        # Stores the HTTP session, normalized base URL, task id and admin key; session
+        # id
+        # and session key start as None.
         self._session = session
         self.base_url = ensure_end_with_slash(base_url)
         self.task_id = task_id
@@ -95,22 +111,36 @@ class OpenAIProxyClient:
 
     @property
     def session_api_key(self) -> str:
+        # [FUNCTION DOC]
+        # Property returning the per-session API key; ValueError if the session has not
+        # started.
         """Return the session API key for this session."""
         if self._session_api_key is None:
             raise ValueError("Session API key is not set")
         return self._session_api_key
 
     def _admin_auth_headers(self) -> dict[str, str]:
+        # [FUNCTION DOC]
+        # HELPER: Returns a Bearer Authorization header with the admin key.
         """Return Authorization headers with admin API key."""
         return {"Authorization": f"Bearer {self._admin_api_key}"}
 
     def _session_auth_headers(self) -> dict[str, str]:
+        # [FUNCTION DOC]
+        # HELPER: Returns a Bearer Authorization header with the session key; ValueError
+        # if
+        # unset.
         """Return Authorization headers with session API key."""
         if self._session_api_key is None:
             raise ValueError("Session API key is not set")
         return {"Authorization": f"Bearer {self._session_api_key}"}
 
     async def set_reward(self, completion_id: str, reward: float):
+        # [FUNCTION DOC]
+        # Sets the reward of interaction completion_id by POSTing to rl/set_reward with
+        # the
+        # session key (retried on transient errors; HTTP 400 logged instead of raised).
+        # ValueError if no session.
         """Set reward for a specific completion/response by its ID."""
         if self.session_id is None:
             raise ValueError("Session ID is not set")
@@ -123,6 +153,9 @@ class OpenAIProxyClient:
         )
 
     async def set_last_reward(self, reward: float):
+        # [FUNCTION DOC]
+        # Same as set_reward but with interaction_id None, meaning the session's most
+        # recent interaction.
         """Set reward for the most recent completion/response."""
         if self.session_id is None:
             raise ValueError("Session ID is not set")
@@ -139,6 +172,15 @@ class OpenAIProxyClient:
         style: str = "individual",
         drop_retry_orphans: bool = False,
     ) -> dict[str, InteractionWithTokenLogpReward]:
+        # [FUNCTION DOC]
+        # POSTs {session_id, discount, style, drop_retry_orphans} to export_trajectories
+        # with admin auth (the server waits for the session to finish), raises for HTTP
+        # errors,
+        # and returns deserialized interactions. ValueError if session_id is unset. No
+        # retry.
+        # KNOWN ISSUE: docstring lists styles "individual"/"merged", but the cache
+        # accepts
+        # "individual"/"concat"; "merged" would be rejected server-side.
         """Export interactions for this session via HTTP.
 
         This method should be called after the session context exits
@@ -191,6 +233,12 @@ class OpenAIProxyClient:
             return deserialize_interactions(data["interactions"])
 
     async def __aenter__(self) -> OpenAIProxyClient:
+        # [FUNCTION DOC]
+        # POSTs StartSessionRequest(task_id) to rl/start_session with admin auth,
+        # retrying
+        # forever on transient errors; stores session_id and api_key from the reply;
+        # returns
+        # self.
         """Start the RL session via HTTP request."""
         data = await _start_session(
             self._session,
@@ -208,6 +256,10 @@ class OpenAIProxyClient:
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ):
+        # [FUNCTION DOC]
+        # If a session was started, POSTs rl/end_session with the session key (up to 10
+        # retries), even when exiting due to an exception; on failure logs a warning and
+        # re-raises. Does not suppress exceptions.
         """End the RL session via HTTP request.
 
         Always attempts to end the session, even on exception, to avoid
@@ -236,6 +288,11 @@ async def post_json(
     total_timeout: int = 10,
     headers: dict[str, str] | None = None,
 ) -> dict:
+    # [FUNCTION DOC]
+    # POSTs payload (None -> {}, pydantic model -> model_dump) as JSON with an aiohttp
+    # total timeout and optional headers; raises ClientResponseError on non-2xx; returns
+    # the
+    # parsed JSON body.
     timeout = aiohttp.ClientTimeout(total=total_timeout)
 
     if payload is None:
@@ -251,6 +308,9 @@ async def post_json(
 
 
 def should_retry(exception: Exception):
+    # [FUNCTION DOC]
+    # HELPER: True for ClientResponseError with status 504/503/502/429/408, any
+    # ClientConnectionError, or asyncio.TimeoutError; else False.
     """Check if exception is a retryable HTTP error (503, 502, 429, etc.)"""
     if isinstance(exception, aiohttp.ClientResponseError):
         return exception.status in [504, 503, 502, 429, 408]
@@ -262,6 +322,9 @@ def should_retry(exception: Exception):
 
 
 def log_retry(retry_state: RetryCallState):
+    # [FUNCTION DOC]
+    # HELPER: tenacity before_sleep callback logging the attempt number and exception
+    # ("Timeout" for timeouts) as a warning. Currently not wired in.
     exception = retry_state.outcome.exception()
 
     exception_message = (
@@ -274,6 +337,11 @@ def log_retry(retry_state: RetryCallState):
 def get_retry_strategy(
     allowed_attempt: int, multiplier: float = 0.5, min: float = 0.5, max: float = 5
 ):
+    # [FUNCTION DOC]
+    # HELPER: Returns a tenacity retry decorator retrying on should_retry exceptions
+    # with
+    # exponential backoff (multiplier, min, max seconds), stopping after allowed_attempt
+    # attempts or never if allowed_attempt < 0, re-raising the last exception.
     return retry(
         retry=retry_if_exception(should_retry),
         wait=wait_exponential(multiplier=multiplier, min=min, max=max),
@@ -291,6 +359,8 @@ async def post_json_with_retry(
     total_timeout: float = 10,
     headers: dict[str, str] | None = None,
 ) -> dict:
+    # [FUNCTION DOC]
+    # post_json wrapped with up to 10 attempts on transient errors.
     return await post_json(session, url, payload, total_timeout, headers=headers)
 
 
@@ -301,6 +371,10 @@ async def _set_reward(
     url: str = RL_SET_REWARD_PATHNAME,
     headers: dict[str, str] | None = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: POSTs SetRewardRequest(interaction_id, reward) with retry; a 400 response
+    # is
+    # logged as an error and swallowed, other HTTP errors re-raised.
     payload = SetRewardRequest(interaction_id=interaction_id, reward=reward)
     try:
         await post_json_with_retry(
@@ -320,6 +394,8 @@ async def set_interaction_reward(
     url: str = RL_SET_REWARD_PATHNAME,
     headers: dict[str, str] | None = None,
 ):
+    # [FUNCTION DOC]
+    # Sets the reward for a specific interaction id via _set_reward.
     await _set_reward(
         http_session,
         interaction_id=interaction_id,
@@ -335,6 +411,8 @@ async def set_last_interaction_reward(
     url: str = RL_SET_REWARD_PATHNAME,
     headers: dict[str, str] | None = None,
 ):
+    # [FUNCTION DOC]
+    # Sets the reward for the session's latest interaction (interaction_id None).
     await _set_reward(
         http_session, interaction_id=None, reward=reward, url=url, headers=headers
     )
@@ -342,4 +420,7 @@ async def set_last_interaction_reward(
 
 @get_retry_strategy(allowed_attempt=-1)
 async def _start_session(*args, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: post_json retried indefinitely on transient errors (used to start sessions
+    # while the server may still be booting or at capacity).
     return await post_json(*args, **kwargs)

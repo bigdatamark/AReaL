@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Registers the Qwen3.5 ModelSpec with the Archon model registry. Defines
+# QWEN3_5_SPEC bundling Qwen3_5Model, Qwen3_5ModelArgs, Qwen3_5StateDictAdapter,
+# parallelize_qwen3_5 and pipeline_llm, for HF model types qwen3_5, qwen3_5_text,
+# qwen3_5_moe and qwen3_5_moe_text. Side effect: register_model_spec on import.
 # SPDX-License-Identifier: Apache-2.0
 
 from areal.experimental.models.archon.model_spec import ModelSpec, register_model_spec

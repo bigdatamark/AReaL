@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Stateless-ish FastAPI proxy gateway placed in front of all proxy rollout workers so
+# external users (OpenAI/Anthropic SDKs) can use one endpoint. It routes requests by
+# session API key to the worker hosting that session, keeps an LRU pool of issued keys
+# (so a client can "refresh" its session under the same key), and implements the
+# online-training handshake: _OnlineAgent registers a worker in a readiness queue via
+# internal/wait_for_session and blocks until an external user starts and ends a session
+# on it. All state lives in closures of create_proxy_gateway_app; no session data or
+# interactions are stored here. Logs via "ProxyGateway"; backend forwarding uses a 120 s
+# timeout; wait_for_session waits up to one hour.
 # SPDX-License-Identifier: Apache-2.0
 
 """Proxy gateway server: lightweight, stateless FastAPI gateway.
@@ -50,6 +60,10 @@ _DEFAULT_WAIT_TIMEOUT = 3600.0
 
 @dataclass
 class _ReadyWorkerEntry:
+    # [CLASS DOC]
+    # HELPER: Readiness-queue item: worker address and an asyncio Future resolved with
+    # CompletedSessionInfo when the session started on that worker ends (or rejected /
+    # cancelled on failure).
     """A proxy worker registered as ready to accept an external session.
 
     Created by ``_OnlineAgent`` via ``/internal/wait_for_session``.
@@ -69,6 +83,9 @@ class _ReadyWorkerEntry:
 
 @dataclass
 class CompletedSessionInfo:
+    # [CLASS DOC]
+    # Dataclass with session_api_key, session_id and worker_addr of a finished external
+    # session; returned to _OnlineAgent so the workflow can export its trajectories.
     """Credentials of a completed external session.
 
     Returned by ``/internal/wait_for_session`` and used by
@@ -92,6 +109,9 @@ class CompletedSessionInfo:
 
 @dataclass
 class _SessionRoute:
+    # [CLASS DOC]
+    # HELPER: Routing entry per session key: worker address, backend session id and the
+    # optional online-mode future to settle at end_session.
     """Routing entry for an active session.
 
     Attributes
@@ -116,6 +136,11 @@ class _SessionRoute:
 
 
 def _extract_bearer_token(request: Request) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns the token after a case-insensitive "Bearer " prefix in the
+    # Authorization header, or None.
+    # KNOWN ISSUE: unlike the rollout server, x-api-key (Anthropic SDK default) is not
+    # accepted, so Anthropic clients must send a Bearer token to reach the gateway.
     """Extract the bearer token from the Authorization header."""
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
@@ -124,6 +149,9 @@ def _extract_bearer_token(request: Request) -> str | None:
 
 
 def _forwarding_headers(raw_headers: dict[str, str]) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns only the authorization and content-type headers (case-insensitive)
+    # from raw_headers for forwarding.
     """Select headers to forward to the backend."""
     out: dict[str, str] = {}
     for key, value in raw_headers.items():
@@ -143,6 +171,19 @@ def create_proxy_gateway_app(
     refresh_timeout: float = 120.0,
     key_pool_size: int = 4096,
 ) -> FastAPI:
+    # [FUNCTION DOC]
+    # Builds the gateway FastAPI app over backend worker addresses proxy_addrs with
+    # closure state: routes (session key -> _SessionRoute), an asyncio readiness queue,
+    # a round-robin index, an LRU OrderedDict of known keys capped at key_pool_size, a
+    # set
+    # of keys being refreshed, and a set of background tasks. admin_api_key guards
+    # start_session and wait_for_session; refresh_timeout bounds how long a refresh
+    # waits
+    # for a ready worker. Registers /health, rl/start_session, chat/completions,
+    # responses,
+    # v1/messages, rl/set_reward, rl/end_session and internal/wait_for_session. Returns
+    # the
+    # app (served by the caller). Not thread-safe; relies on single event loop.
     """Create and configure the proxy gateway FastAPI app.
 
     Parameters
@@ -176,6 +217,10 @@ def create_proxy_gateway_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):  # noqa: ARG001
+        # [FUNCTION DOC]
+        # HELPER: App lifespan: logs startup, creates one aiohttp ClientSession stored
+        # on
+        # app.state.http_session for forwarding, closes it and logs at shutdown.
         logger.info(
             "Proxy gateway starting — %d backend worker(s): %s",
             len(proxy_addrs),
@@ -196,6 +241,12 @@ def create_proxy_gateway_app(
         body: bytes,
         headers: dict[str, str],
     ) -> Response:
+        # [FUNCTION DOC]
+        # HELPER: POSTs raw body to <worker_addr>/<path> with filtered headers and
+        # returns a
+        # FastAPI Response mirroring status, body and content type. On timeout, client
+        # or
+        # runtime errors logs and returns 502 "Backend unreachable".
         """Forward an HTTP request to a backend proxy worker."""
         url = f"{worker_addr}/{path}"
         fwd_headers = _forwarding_headers(headers)
@@ -220,6 +271,8 @@ def create_proxy_gateway_app(
         future: asyncio.Future | None,
         info: CompletedSessionInfo,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sets info as the result of future if it exists and is not done.
         """Resolve an online-mode future with session info, if unsettled."""
         if future is not None and not future.done():
             future.set_result(info)
@@ -228,6 +281,8 @@ def create_proxy_gateway_app(
         future: asyncio.Future | None,
         reason: str,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sets RuntimeError(reason) on future if it exists and is not done.
         """Reject an online-mode future with a RuntimeError, if unsettled."""
         if future is not None and not future.done():
             future.set_exception(RuntimeError(reason))
@@ -238,6 +293,9 @@ def create_proxy_gateway_app(
 
     @app.get("/health")
     async def health():
+        # [FUNCTION DOC]
+        # GET /health: logs counts of workers, active routes and queued ready workers;
+        # returns {"status": "ok", "workers": N}.
         active = len(routes)
         queued = ready_workers.qsize()
         logger.info(
@@ -251,6 +309,14 @@ def create_proxy_gateway_app(
     # -- Key pool management --
 
     def _track_key(api_key: str) -> list[tuple[str, _SessionRoute]]:
+        # [FUNCTION DOC]
+        # HELPER: Marks api_key most recently used in the LRU pool; while the pool
+        # exceeds
+        # key_pool_size evicts the oldest keys, removing their routes, rejecting their
+        # online
+        # futures and logging. Returns the (key, route) pairs whose backend sessions
+        # should be
+        # ended.
         """Record *api_key* in the bounded LRU pool of known keys.
 
         Returns list of ``(evicted_key, evicted_route)`` pairs whose
@@ -278,6 +344,10 @@ def create_proxy_gateway_app(
     async def _end_evicted_sessions(
         evicted: list[tuple[str, _SessionRoute]],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Best-effort: forwards rl/end_session with each evicted key to its
+        # worker,
+        # ignoring failures (debug log).
         """Best-effort end backend sessions for evicted routes."""
         for evicted_key, route in evicted:
             try:
@@ -297,6 +367,10 @@ def create_proxy_gateway_app(
     def _schedule_eviction_cleanup(
         evicted: list[tuple[str, _SessionRoute]],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If there are evicted routes, starts _end_evicted_sessions as a
+        # background
+        # task kept referenced in the task set until done.
         """Fire-and-forget cleanup for evicted sessions."""
         if not evicted:
             return
@@ -307,6 +381,11 @@ def create_proxy_gateway_app(
     # -- Refresh helper (end old session, resolve future) --
 
     async def _end_and_resolve(api_key: str, old_route: _SessionRoute) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Refresh step: ends the old session on its worker with the old key; on
+        # HTTP
+        # >= 400 logs and rejects the old route's future; otherwise logs the returned
+        # interaction_count and resolves the future with the old session's info.
         """End the old session on the worker and resolve the online-mode future."""
         end_headers = {
             "authorization": f"Bearer {api_key}",
@@ -351,6 +430,32 @@ def create_proxy_gateway_app(
 
     @app.post(f"/{RL_START_SESSION_PATHNAME}")
     async def start_session(request: Request):
+        # [FUNCTION DOC]
+        # POST rl/start_session (admin Bearer required, else 401; compared in constant
+        # time).
+        # Body: task_id and optional api_key. Returns 429 if a refresh for that key is
+        # in
+        # progress. Refresh path (key known and currently routed): pops the route, ends
+        # the old
+        # session (resolving its online future), waits up to refresh_timeout for a non-
+        # stale
+        # ready worker (on timeout forgets the key and returns 429), forwards
+        # start_session
+        # with the same key there and on 200 routes the key to the new session (tracking
+        # the key
+        # and scheduling eviction cleanup); on worker rejection cancels the ready future
+        # and
+        # forgets the key. Unexpected errors forget the key, reject both futures and re-
+        # raise.
+        # Otherwise: unknown keys are stripped from the body so the worker issues a new
+        # one;
+        # first tries a non-stale ready worker from the queue (online mode; on rejection
+        # cancels
+        # its future), else round-robins over all workers, returning the first 200, the
+        # first
+        # non-429 error, or the last 429 (or a plain 429 if there are no workers).
+        # Successful
+        # starts add a route and track the key. Returns the worker's response.
         token = _extract_bearer_token(request)
         if not hmac.compare_digest(token or "", admin_api_key):
             return Response(status_code=401, content=b"Unauthorized")
@@ -576,6 +681,10 @@ def create_proxy_gateway_app(
     # -- Session-routed forwarding endpoints ---------------------------
 
     async def _session_forward(request: Request, path: str) -> Response:
+        # [FUNCTION DOC]
+        # HELPER: Looks up the route for the Bearer token (401 "Invalid session key" if
+        # missing/unknown) and forwards the request body and headers to that worker at
+        # path.
         token = _extract_bearer_token(request)
         if token is None or token not in routes:
             return Response(status_code=401, content=b"Invalid session key")
@@ -585,6 +694,10 @@ def create_proxy_gateway_app(
 
     @app.post(f"/{CHAT_COMPLETIONS_PATHNAME}")
     async def chat_completions(request: Request):
+        # [FUNCTION DOC]
+        # POST chat/completions: logs the routed session if known, then
+        # _session_forward.
+        # Streaming responses are buffered (whole body read) before being returned.
         token = _extract_bearer_token(request)
         route = routes.get(token) if token else None
         if route:
@@ -597,6 +710,8 @@ def create_proxy_gateway_app(
 
     @app.post(f"/{RESPONSES_PATHNAME}")
     async def responses(request: Request):
+        # [FUNCTION DOC]
+        # POST responses: logs the routed session if known, then _session_forward.
         token = _extract_bearer_token(request)
         route = routes.get(token) if token else None
         if route:
@@ -609,6 +724,9 @@ def create_proxy_gateway_app(
 
     @app.post(f"/{ANTHROPIC_MESSAGES_PATHNAME}")
     async def messages(request: Request):
+        # [FUNCTION DOC]
+        # POST v1/messages (Anthropic): logs the routed session if known, then
+        # _session_forward.
         token = _extract_bearer_token(request)
         route = routes.get(token) if token else None
         if route:
@@ -621,6 +739,8 @@ def create_proxy_gateway_app(
 
     @app.post(f"/{RL_SET_REWARD_PATHNAME}")
     async def set_reward(request: Request):
+        # [FUNCTION DOC]
+        # POST rl/set_reward: logs the routed session if known, then _session_forward.
         token = _extract_bearer_token(request)
         route = routes.get(token) if token else None
         if route:
@@ -635,6 +755,14 @@ def create_proxy_gateway_app(
 
     @app.post(f"/{RL_END_SESSION_PATHNAME}")
     async def end_session(request: Request):
+        # [FUNCTION DOC]
+        # POST rl/end_session (session key; 401 if unknown): forwards to the worker,
+        # removes
+        # the route regardless of outcome (the key stays in the LRU pool for reuse),
+        # then on
+        # success resolves the online future with the session info and logs; on failure
+        # rejects
+        # the future and logs (error for 5xx). Returns the worker response.
         token = _extract_bearer_token(request)
         if token is None or token not in routes:
             return Response(status_code=401, content=b"Invalid session key")
@@ -684,6 +812,19 @@ def create_proxy_gateway_app(
 
     @app.post(f"/{INTERNAL_WAIT_FOR_SESSION_PATHNAME}")
     async def wait_for_session(request: Request):
+        # [FUNCTION DOC]
+        # POST internal/wait_for_session (admin Bearer, else 401). Parses
+        # WaitForSessionRequest, enqueues a _ReadyWorkerEntry with a new future and
+        # waits up to
+        # one hour. Returns WaitForSessionResponse JSON on success; 503 if the future
+        # was
+        # cancelled, 408 on timeout, 500 if it was rejected with RuntimeError.
+        # KNOWN ISSUE: catching CancelledError also swallows cancellation of the handler
+        # task
+        # itself (e.g. client disconnect), returning 503 instead of propagating; on
+        # timeout the
+        # stale entry remains queued until skipped (its future is cancelled by
+        # wait_for).
         token = _extract_bearer_token(request)
         if not hmac.compare_digest(token or "", admin_api_key):
             return Response(status_code=401, content=b"Unauthorized")

@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# OpenAIProxyWorkflow: a RolloutWorkflow that trains on trajectories from arbitrary
+# agent code talking to an OpenAI/Anthropic-compatible proxy server (one per rollout
+# worker) instead of calling ArealOpenAI directly. Modes: "inline" (await agent.run in
+# the workflow's event loop with base_url/api_key/http_client kwargs), "subproc" (run
+# the
+# agent in a shared lazily created ProcessPoolExecutor with OPENAI_/ANTHROPIC_ base URL
+# and API key env vars) and "online" (wait for an external user session via the proxy
+# gateway). Each episode grants proxy capacity, opens an RL session, runs the agent,
+# assigns rewards, and exports interactions.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -34,6 +44,12 @@ _executor_max_workers: int | None = None
 
 
 def _get_executor(max_workers: int = 4) -> ProcessPoolExecutor:
+    # [FUNCTION DOC]
+    # HELPER: Returns the module-global ProcessPoolExecutor, creating it on first use
+    # with
+    # max_workers (double-checked locking) and registering _shutdown_executor at exit.
+    # Later
+    # max_workers values are ignored.
     """Get or create the shared process pool executor.
 
     Parameters
@@ -55,6 +71,8 @@ def _get_executor(max_workers: int = 4) -> ProcessPoolExecutor:
 
 
 def _shutdown_executor() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Shuts down the global executor without waiting and clears the global.
     """Shutdown the shared process pool executor if it exists."""
     global _executor
     if _executor is not None:
@@ -63,6 +81,11 @@ def _shutdown_executor() -> None:
 
 
 def _wrap_run(agent: Any, data: dict[str, Any], extra_envs: dict[str, str]):
+    # [FUNCTION DOC]
+    # HELPER: Runs inside a pool worker process: writes extra_envs into os.environ (they
+    # persist in that worker for later tasks), then runs agent.run(data) to completion
+    # with
+    # asyncio.run and returns its result (must be picklable, as must agent and data).
     """Run agent in subprocess with environment variables."""
     for key, value in extra_envs.items():
         os.environ[key] = value
@@ -70,6 +93,14 @@ def _wrap_run(agent: Any, data: dict[str, Any], extra_envs: dict[str, str]):
 
 
 class OpenAIProxyWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow running an agent against the proxy. Config: mode, agent (object
+    # with
+    # async run(data, **kwargs) returning a float reward for the last interaction or a
+    # dict
+    # {interaction_id: reward}), proxy_addr, admin API key, reward discount, export
+    # style,
+    # subprocess pool size, and drop_retry_orphans.
     def __init__(
         self,
         mode: str,
@@ -82,6 +113,12 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         proxy_gateway_addr: str | None = None,
         drop_retry_orphans: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Validates mode (ValueError if not inline/subproc/online). Online mode requires
+        # proxy_gateway_addr (ValueError) and replaces agent with an _OnlineAgent; other
+        # modes
+        # require an agent (ValueError) whose run attribute is callable and a coroutine
+        # function (TypeError otherwise). Stores settings.
         if mode not in ("inline", "subproc", "online"):
             raise ValueError(
                 f"Invalid mode: {mode}. Must be 'inline', 'subproc', or 'online'"
@@ -122,6 +159,15 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
 
     @trace_session("run_agent")
     async def _run_agent(self, session_api_key: str, data: dict):
+        # [FUNCTION DOC]
+        # HELPER: Traced as "run_agent". Inline: awaits agent.run(data,
+        # base_url=proxy_addr,
+        # http_client=shared httpx client, api_key=session key). Subproc: runs _wrap_run
+        # in the
+        # process pool with OpenAI/Anthropic base URL and key env vars. Online: awaits
+        # agent.run with the admin key (returns CompletedSessionInfo). Returns the agent
+        # result;
+        # ValueError for unknown mode.
         if self.mode == "inline":
             http_client = await workflow_context.get_httpx_client()
             extra_kwargs = {
@@ -156,6 +202,10 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
         raise ValueError(f"Unsupported mode: {self.mode}")
 
     async def _grant_capacity(self, session: aiohttp.ClientSession) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs to <proxy_addr>/grant_capacity with admin auth, allowing one
+        # more agent
+        # session to start (staleness control); raises on HTTP error.
         """Grant capacity via HTTP."""
         url = f"{self.proxy_addr}/{GRANT_CAPACITY_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
@@ -166,6 +216,26 @@ class OpenAIProxyWorkflow(RolloutWorkflow):
     async def arun_episode(
         self, engine: TRolloutEngine, data: dict[str, Any]
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
+        # [FUNCTION DOC]
+        # Runs one episode (within a perf-tracer session context). Derives proxy task id
+        # "<task_id>:<sample_idx>" (or task_id), grants capacity, then:
+        # Online: waits for a completed external session, exports its interactions by
+        # session id (admin auth); returns None with a warning if empty, else records
+        # the last
+        # interaction's reward in stats and returns the interactions.
+        # Inline/subproc: opens an OpenAIProxyClient session, runs the agent (exceptions
+        # logged
+        # and re-raised, the session still ended), sets rewards from the result (dict ->
+        # per id,
+        # float -> last; other types ValueError), ends the session, exports with
+        # discount,
+        # style and orphan dropping, records the last reward stat and returns the
+        # interactions
+        # dict (possibly empty). The engine argument is unused (generation goes through
+        # the
+        # proxy).
+        # KNOWN ISSUE: an int reward (e.g. 1) is rejected because only float is
+        # accepted.
         context = workflow_context.get()
         task_id = context.task_id
         # Qualify the proxy session with the group sample index so each group

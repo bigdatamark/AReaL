@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Per-session cache of recorded LLM interactions (completions/responses with token ids,
+# logprobs and rewards) for agentic RL. Builds a conversation tree by linking each new
+# interaction to the longest previous interaction whose input+output messages are a
+# prefix of the new input, supports reward assignment, backward discounted reward
+# propagation, removal of SDK-retry orphans, and export as all interactions or tree
+# leaves. Optional debug dumps of prefix mismatches are written to the directory in env
+# AREAL_OPENAI_CACHE_MISMATCH_DUMP_DIR (limit via
+# AREAL_OPENAI_CACHE_MISMATCH_DUMP_LIMIT,
+# default 20; <= 0 means unlimited). Logs via the "OpenAICache" logger.
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
@@ -26,12 +36,21 @@ _DEFAULT_MISMATCH_DUMP_LIMIT = 20
 
 @runtime_checkable
 class PrefixMatcher(Protocol):
+    # [CLASS DOC]
+    # Runtime-checkable Protocol for a callable (a, b) -> bool deciding whether message
+    # list a is a prefix of message list b.
     """Protocol for custom message prefix matching functions."""
 
+    # [FUNCTION DOC]
+    # Protocol signature only; no implementation. (Placed above the definition because
+    # the body is on the signature line.)
     def __call__(self, a: list[dict], b: list[dict]) -> bool: ...
 
 
 def default_prefix_matcher(a: list[dict], b: list[dict]) -> bool:
+    # [FUNCTION DOC]
+    # Returns True iff len(a) <= len(b) and the first len(a) messages of b equal a
+    # (deep dict equality).
     """Default exact prefix matcher: ``b[:len(a)] == a``."""
     if len(a) > len(b):
         return False
@@ -39,6 +58,11 @@ def default_prefix_matcher(a: list[dict], b: list[dict]) -> bool:
 
 
 class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
+    # [CLASS DOC]
+    # OrderedDict mapping interaction id -> InteractionWithTokenLogpReward, in insertion
+    # (creation) order. Extra state: session id (for logs/dumps), the prefix matcher,
+    # prefix-mismatch counter, running total reward, a flag preventing repeated reward
+    # discounting, and a threading.Lock guarding reward updates and orphan removal.
     def __init__(
         self,
         *args,
@@ -48,6 +72,10 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         | None = None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Initializes extra state (prefix_matcher defaults to default_prefix_matcher)
+        # and
+        # forwards positional/keyword args to OrderedDict.
         self._match_fail_count = 0
         self._session_id = session_id
         self._prefix_matcher: Callable[[list[dict], list[dict]], bool] = (
@@ -59,6 +87,12 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         self._lock = threading.Lock()
 
     def __deepcopy__(self, memo):
+        # [FUNCTION DOC]
+        # Supports copy.deepcopy only for an empty cache (asserts emptiness, since Lock
+        # is not
+        # copyable): returns a new empty cache with the same session id and matcher,
+        # registered
+        # in memo.
         """Allow deep-copy of the empty cache.
 
         ``threading.Lock`` cannot be deep-copied.  Controllers that hold
@@ -79,13 +113,26 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
 
     @property
     def last_interaction_id(self) -> str:
+        # [FUNCTION DOC]
+        # Property: key of the most recently inserted interaction; StopIteration if
+        # empty.
         return next(reversed(self))
 
     @property
     def total_reward(self) -> float:
+        # [FUNCTION DOC]
+        # Property: running sum of rewards set via set_reward (minus dropped orphans).
         return self._total_reward
 
     def set_reward(self, interaction_id: str, reward: float) -> None:
+        # [FUNCTION DOC]
+        # Under the lock, sets the interaction's reward, updates the running total
+        # (removing
+        # its previous reward), and if the interaction has a cached tensor dict,
+        # refreshes its
+        # "rewards" tensor and "original_rewards" tensor (original_reward if set, else
+        # reward).
+        # KeyError if the id is unknown.
         """Set reward for a specific completion/response by its ID."""
         with self._lock:  # usually no need to lock, but just in case
             interaction = self[interaction_id]
@@ -104,10 +151,23 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
             self._total_reward += reward
 
     def set_last_reward(self, reward: float) -> None:
+        # [FUNCTION DOC]
+        # Sets the reward of the most recently inserted interaction.
         """Set reward for the most recent completion/response."""
         self.set_reward(self.last_interaction_id, reward)
 
     def _find_retry_orphan_ids(self) -> set[str]:
+        # [FUNCTION DOC]
+        # HELPER: Finds interactions created by SDK timeouts/retries. Collects ids that
+        # are
+        # some entry's parent, groups entries by SHA1 of their JSON-serialized (sorted
+        # keys)
+        # input messages (skipping unserializable/None), and for each group of >= 2
+        # confirmed
+        # equal entries: if any member has children, all childless members are orphans;
+        # otherwise all but the one with the greatest (created_at, insertion index) are
+        # orphans.
+        # Returns the set of orphan ids; no mutation.
         """Identify retry-orphan completions/responses.
 
         Among a group of interactions sharing identical input messages
@@ -190,6 +250,12 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         return orphan_ids
 
     def drop_retry_orphans(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Raises RuntimeError if apply_reward_discount already ran. Under the lock,
+        # deletes
+        # each orphan and subtracts its reward from the running total; logs dropped ids
+        # at info.
+        # Returns the list of dropped ids.
         """Remove retry-orphan entries in place; return the dropped IDs.
 
         Must be called BEFORE :meth:`apply_reward_discount`, otherwise the
@@ -221,6 +287,16 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
     def apply_reward_discount(
         self, turn_discount: float = 1.0
     ) -> dict[str, InteractionWithTokenLogpReward]:
+        # [FUNCTION DOC]
+        # One-shot (RuntimeError on second call). Walks interactions newest to oldest,
+        # treating unset rewards as 0.0 (warning if the newest is unset), and replaces
+        # each
+        # reward with its own reward plus turn_discount times the next newer
+        # interaction's
+        # discounted reward. Mutates interactions in place; returns a plain dict copy.
+        # KNOWN ISSUE: the warning says rewards become None but they are set to 0.0; the
+        # running total and the cached "rewards" tensors are not updated with discounted
+        # values.
         """Apply backward discounted rewards across cached completions/responses.
 
         This method iterates over the cached completions/responses in reverse creation
@@ -275,6 +351,19 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         key: str,
         value: InteractionWithTokenLogpReward,
     ) -> None:
+        # [FUNCTION DOC]
+        # Inserts an interaction, first linking it to a parent. Raises ValueError if
+        # value.messages is None. Scans existing entries from longest input to shortest,
+        # skipping ones still in flight (no output_message_list); the first whose
+        # messages + output messages prefix-matches the new input becomes value.parent.
+        # When only
+        # the parent's input (not input+output) is a prefix, increments the mismatch
+        # counter,
+        # logs a warning, optionally dumps a debug file, and logs a hint if the last
+        # messages
+        # agree on shared keys (helper _is_similar_on_last_message). Then stores the
+        # entry.
+        # Not lock-protected.
         """Add a new interaction to the cache, automatically building parent-child relationships."""
         if value.messages is None:
             raise ValueError(
@@ -284,6 +373,11 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         def _is_similar_on_last_message(
             a: list[dict], b: list[dict]
         ) -> tuple[bool, dict[str, Any] | None, dict[str, Any] | None]:
+            # [FUNCTION DOC]
+            # HELPER: Compares a's last message with b's message at the same index:
+            # False if a is
+            # longer than b or any shared key differs; else True plus the keys/values
+            # unique to each.
             if len(a) > len(b):
                 return False, None, None
             last_a_message = a[-1]
@@ -368,6 +462,14 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         parent_id: str | None,
         child_key: str,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If the dump-dir env var is set and the mismatch count is within the
+        # limit,
+        # writes a JSON file "mismatch_<session>_<n>_<timestamp>.json" with ids,
+        # lengths, the
+        # first differing index and both message lists, creating the directory. All
+        # errors are
+        # caught and logged as warnings. File I/O side effect.
         """Dump mismatched parent/child messages to a JSON file for debugging."""
         dump_dir_env = os.environ.get(_MISMATCH_DUMP_DIR_ENV)
         if not dump_dir_env:
@@ -419,6 +521,21 @@ class InteractionCache(OrderedDict[str, InteractionWithTokenLogpReward]):
         reward_discount: float | None = None,
         drop_retry_orphans: bool = False,
     ) -> dict[str, InteractionWithTokenLogpReward]:
+        # [FUNCTION DOC]
+        # Optionally drops retry orphans, then applies reward discount if
+        # reward_discount is
+        # given and discounting has not run yet. Skips (with warning) in-flight
+        # interactions
+        # lacking interaction_id or output; raises ValueError if an entry's
+        # interaction_id
+        # differs from its key. style "individual" returns all complete entries; style
+        # "concat"
+        # requires every entry's chat_template_type to be "concat" (ValueError
+        # otherwise) and
+        # returns only leaves (entries no other entry has as parent). Unknown style
+        # raises
+        # ValueError. Returns {} when nothing is complete.
+        # KNOWN ISSUE: docstring claims style defaults to 'concat', but it is required.
         """Export cached completions/responses in different formats.
 
         When ``style='concat'``, this method constructs a conversation tree by

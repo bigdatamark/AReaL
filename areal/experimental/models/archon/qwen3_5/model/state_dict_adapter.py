@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# HF <-> Archon state-dict conversion for Qwen3.5 dense/MoE hybrid models. Extends
+# the Qwen3 scheme with GatedDeltaNet (linear_attn.*) keys including bare A_log/dt_bias
+# parameters, MoE shared-expert and shared-expert-gate keys, and support for composite
+# VLM checkpoints whose text weights live under "model.language_model." (detected from
+# the HF safetensors index and normalized to/from the text-only "model." namespace).
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -19,6 +25,12 @@ if TYPE_CHECKING:
 
 
 class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
+    # [CLASS DOC]
+    # BaseStateDictAdapter for Qwen3.5. State: composite prefix and whether the source
+    # checkpoint uses it, from_hf_map/to_hf_map key templates, MoE detection
+    # (moe_enabled, num_experts, read from text_config when present), weight-tying flag,
+    # expert key templates and a MoEWeightConverter/MoEConversionState for DTensor
+    # experts.
     """State dict adapter for Qwen3.5 Dense and MoE models.
 
     Handles:
@@ -34,6 +46,21 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
     def __init__(
         self, model_config: PretrainedConfig, hf_assets_path: str | None = None
     ):
+        # [FUNCTION DOC]
+        # Calls base init (which loads fqn_to_index_mapping from hf_assets_path),
+        # detects
+        # the composite namespace, builds the key maps (rotary inv_freq -> None),
+        # determines
+        # num_experts from num_experts / num_local_experts / moe_args.num_experts of the
+        # text
+        # config, enables MoE when > 1 or moe_enabled is True (ValueError if enabled but
+        # count
+        # unknown), reads tie_word_embeddings from the top-level config and creates the
+        # MoE
+        # converter/state for MoE models.
+        # KNOWN ISSUE: tie_word_embeddings is read from the top-level config only, not
+        # from
+        # text_config, unlike the MoE settings.
         super().__init__(model_config, hf_assets_path)
         self._composite_text_prefix = "model.language_model."
         self._use_composite_text_namespace = self._detect_composite_text_namespace()
@@ -135,6 +162,15 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
         self._moe_state = MoEConversionState() if self.moe_enabled else None
 
     def to_hf(self, archon_state_dict: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Archon -> HF: skips output.weight under weight tying, splits expert 3D weights
+        # into
+        # per-expert HF entries (DTensor-aware), renames other keys (into composite
+        # namespace if
+        # detected), dropping unmapped keys. Returns a new dict.
+        # KNOWN ISSUE: expert keys are always emitted in the text-only "model.layers..."
+        # namespace even when the composite namespace is in use; critic score.weight is
+        # dropped.
         """Convert Archon state dict to HuggingFace format.
 
         Main transformations:
@@ -163,6 +199,17 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
         return hf_state_dict
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HF -> Archon: under weight tying with no lm_head, aliases lm_head to the
+        # embedding
+        # found by _find_hf_embed_tokens_key (on a shallow copy). Expert keys (MoE only)
+        # are
+        # handled as fused 3D, per-expert DTensor (accumulated through the converter) or
+        # plain
+        # per-expert tensors (preallocated 3D buffer). Other keys are normalized from
+        # the
+        # composite namespace and renamed; unmapped keys dropped. Returns the Archon
+        # dict.
         """Convert HuggingFace state dict to Archon format.
 
         Main transformations:
@@ -234,6 +281,12 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
     def convert_single_to_hf(
         self, name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Converts one Archon parameter for incremental weight sync: strips activation
+        # checkpoint and torch.compile wrapper segments, splits expert weights
+        # (gathering
+        # DTensors), otherwise renames. Returns a list of (hf_name, tensor), empty if
+        # unmapped.
         """Convert a single Archon (name, tensor) pair to HuggingFace format.
 
         Used for incremental weight updates.
@@ -253,6 +306,9 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
             return []
 
     def _convert_key_to_hf(self, archon_key: str) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Exact or layer-templated lookup in to_hf_map, then remapped into the
+        # composite namespace when needed. Returns None if unmapped.
         """Convert an Archon key to HuggingFace key."""
         if archon_key in self.to_hf_map:
             return self._maybe_composite_hf_key(self.to_hf_map[archon_key])
@@ -270,6 +326,10 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
         return None
 
     def _convert_key_from_hf(self, hf_key: str) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Normalizes composite keys to "model.", then exact or layer-templated
+        # lookup
+        # in from_hf_map. Returns None for unmapped or None-mapped keys.
         """Convert a HuggingFace key to Archon key."""
         hf_key = self._normalize_hf_text_key(hf_key)
         if hf_key in self.from_hf_map:
@@ -289,6 +349,9 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
         return None
 
     def _parse_expert_key(self, hf_key: str) -> tuple[str, int, str] | None:
+        # [FUNCTION DOC]
+        # HELPER: After namespace normalization, regex-parses a per-expert key into
+        # (layer_id str, expert_id int, Archon abstract key w1/w3/w2). None if no match.
         """Parse HF expert key into (layer_id, expert_id, archon_abstract_key)."""
         hf_key = self._normalize_hf_text_key(hf_key)
         match = re.match(
@@ -318,6 +381,9 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
     )
 
     def _parse_fused_expert_key(self, hf_key: str) -> tuple[str, str] | None:
+        # [FUNCTION DOC]
+        # HELPER: After normalization, matches fused gate_up_proj/down_proj expert keys;
+        # returns (layer_id, proj_type) or None.
         """Parse fused HF expert key into (layer_id, proj_type).
 
         Matches keys from newer HuggingFace format where expert weights
@@ -332,18 +398,27 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
         return match.group(1), match.group(2)
 
     def _normalize_hf_text_key(self, hf_key: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Rewrites "model.language_model.X" to "model.X"; other keys unchanged.
         """Normalize composite Qwen3.5 text keys to text-only namespace."""
         if hf_key.startswith(self._composite_text_prefix):
             return "model." + hf_key.removeprefix(self._composite_text_prefix)
         return hf_key
 
     def _maybe_composite_hf_key(self, hf_key: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: When the composite namespace is in use, rewrites "model.X" to
+        # "model.language_model.X"; otherwise returns the key unchanged.
         """Map text-only HF keys into composite text namespace when needed."""
         if self._use_composite_text_namespace and hf_key.startswith("model."):
             return self._composite_text_prefix + hf_key.removeprefix("model.")
         return hf_key
 
     def _detect_composite_text_namespace(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if any key in the base-class fqn_to_index_mapping (from the HF
+        # index
+        # file) starts with the composite prefix; False if no mapping is loaded.
         """Detect whether source HF assets use composite Qwen3.5 text keys."""
         if not self.fqn_to_index_mapping:
             return False
@@ -353,6 +428,9 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
         )
 
     def _find_hf_embed_tokens_key(self, hf_state_dict: dict[str, Any]) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns the first embedding key present in hf_state_dict among the
+        # namespace-adjusted, text-only and composite variants, or None.
         """Find the embedding weight key in text-only or composite checkpoints."""
         for key in (
             self._maybe_composite_hf_key("model.embed_tokens.weight"),
@@ -370,6 +448,11 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
         value: torch.Tensor,
         state_dict: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Gathers DTensor to full; gate_up_proj is split in half along dim 1
+        # into w1
+        # (gate) and w3 (up) contiguous tensors; down_proj stored as w2. Writes into
+        # state_dict.
         """Handle fused 3D expert weights from newer HF format.
 
         Args:
@@ -398,6 +481,9 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
     def _split_moe_experts_distributed(
         self, archon_key: str, weight_3d: DTensor
     ) -> dict[str, DTensor]:
+        # [FUNCTION DOC]
+        # HELPER: Delegates a 3D DTensor expert weight to the converter's
+        # split_expert_weights_dtensor using the HF expert template; {} if unrecognized.
         """Split 3D DTensor expert weight into 2D DTensors."""
         match = re.search(r"layers\.(\d+)\.", archon_key)
         if not match:
@@ -419,6 +505,10 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
     def _split_moe_experts(
         self, archon_key: str, weight_3d: torch.Tensor
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Gathers DTensor to full and unbinds dim 0 into per-expert 2D views
+        # keyed
+        # "model.layers.L.mlp.experts.E.{gate|down|up}_proj.weight"; {} if unrecognized.
         """Split 3D expert weight into HuggingFace format 2D weights."""
         if isinstance(weight_3d, DTensor):
             weight_3d = weight_3d.full_tensor()
@@ -455,6 +545,10 @@ class Qwen3_5StateDictAdapter(BaseStateDictAdapter):
         buffer: dict[str, tuple[torch.Tensor, int]],
         state_dict: dict[str, Any],
     ):
+        # [FUNCTION DOC]
+        # HELPER: Copies one per-expert 2D weight into a lazily preallocated
+        # [num_experts, out, in] buffer; when all experts have arrived, moves it into
+        # state_dict and drops the buffer entry.
         """Collect expert weights and merge into 3D when complete."""
         parsed = self._parse_expert_key(hf_key)
         if parsed is None:

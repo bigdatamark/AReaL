@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Per-rollout-worker proxy server (FastAPI + uvicorn, run as a standalone process via
+# main()). It hosts an AReaL inference engine created remotely through RPC-style
+# endpoints (create_engine, call "initialize"), wraps it in an ArealOpenAI client, and
+# exposes OpenAI chat/completions, responses and Anthropic v1/messages endpoints so
+# unmodified agents can generate through the engine. Each agent run is an RL session
+# identified by a per-session API key; interactions are recorded per session in
+# SessionData and exported (with reward discounting) to the training workflow. Admin
+# endpoints (grant_capacity, start_session, export_trajectories) require the admin key.
+# Sessions require granted capacity, giving the rollout controller staleness control.
+# State is kept in module globals guarded by a threading lock. Optional deterministic
+# sampling derives per-request seeds from the session identity and request index.
+# AREAL_PROXY_WARN_ONCE=1 deduplicates warnings.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -77,10 +90,15 @@ _warn_lock = threading.Lock()
 
 
 def _deterministic_sampling_seed(session_id: str, request_index: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns seeding.derive_deterministic_seed(session_id, request_index).
     return seeding.derive_deterministic_seed(session_id, request_index)
 
 
 def _warn_once(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Logs msg as a warning; when AREAL_PROXY_WARN_ONCE=1, only the first time
+    # each distinct message is seen (thread-safe).
     """Log a warning message, optionally only once if AREAL_PROXY_WARN_ONCE=1."""
     if not _warn_once_enabled:
         logger.warning(msg)
@@ -147,6 +165,10 @@ _etcd3_addr: str = "localhost:2379"
 
 
 async def validate_json_request(raw_request: Request):
+    # [FUNCTION DOC]
+    # FastAPI dependency: raises RequestValidationError (422) unless the content-type
+    # media
+    # type is application/json.
     """Validate that the request content-type is application/json."""
     content_type = raw_request.headers.get("content-type", "").lower()
     media_type = content_type.split(";", maxsplit=1)[0]
@@ -168,6 +190,10 @@ async def validate_json_request(raw_request: Request):
 
 
 def _extract_bearer_token(request: Request) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the token from "Authorization: Bearer" (case-insensitive,
+    # stripped)
+    # or else the x-api-key header; raises HTTPException 401 if neither is present.
     """Extract API token from Authorization header or x-api-key header.
 
     Supports both 'Authorization: Bearer <token>' (OpenAI SDK, case-insensitive
@@ -188,6 +214,11 @@ def _extract_bearer_token(request: Request) -> str:
 
 
 def _require_admin_key(request: Request) -> str:
+    # [FUNCTION DOC]
+    # HELPER: FastAPI dependency; constant-time compares the token with the admin key,
+    # raising 403 on mismatch; returns the token. Before configuration the admin key is
+    # a
+    # random secret, so admin calls fail.
     """Validate that the request carries the admin API key.
 
     Uses constant-time comparison to prevent timing attacks.
@@ -199,6 +230,9 @@ def _require_admin_key(request: Request) -> str:
 
 
 def _require_session_key(request: Request) -> str:
+    # [FUNCTION DOC]
+    # HELPER: FastAPI dependency mapping the request's session key to its session_id
+    # under the lock; 401 if unknown. Returns the session id.
     """Resolve session_id from the session API key in the Authorization header."""
     token = _extract_bearer_token(request)
     with _lock:
@@ -211,6 +245,9 @@ def _require_session_key(request: Request) -> str:
 
 
 def _remove_api_keys_for_session(session_id: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Removes both directions of the key<->session mapping for session_id.
+    # Caller must hold _lock.
     """Remove the API key mapping for the given session.
 
     Must be called with _lock held.
@@ -229,11 +266,18 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
+    # [FUNCTION DOC]
+    # GET /health: returns status ok and whether the engine has been created.
     return {"status": "ok", "initialized": _engine is not None}
 
 
 @app.post("/alloc_ports")
 async def alloc_ports(raw_request: Request):
+    # [FUNCTION DOC]
+    # POST /alloc_ports {"count": n}: finds n free ports excluding previously allocated
+    # ones, records them and returns {status, ports, host}. 400 for missing/non-positive
+    # count; other errors logged and returned as 500. Exists for SlurmScheduler fork
+    # compatibility.
     """Allocate multiple free ports.
 
     Expected JSON payload:
@@ -274,6 +318,18 @@ async def alloc_ports(raw_request: Request):
 
 
 def _setup_openai_client():
+    # [FUNCTION DOC]
+    # HELPER: Called after the engine's initialize. From engine.config: sets
+    # deterministic sampling, loads the HF tokenizer, builds the global ArealOpenAI with
+    # the
+    # agent config (parsers, engine_max_tokens, chat template type) and LoRA name, sets
+    # the
+    # session timeout, validates the configured admin key (refusing the public default
+    # key
+    # when reachable from outside localhost; raises before changing anything) then
+    # installs
+    # it, instantiates message preprocessors from import paths, and loads the optional
+    # prefix matcher. Mutates module globals.
     global _openai_client, _session_timeout_seconds, _admin_api_key
     global _message_preprocessors, _prefix_matcher, _deterministic_sampling
     config = _engine.config
@@ -322,6 +378,9 @@ def _setup_openai_client():
 
 @app.post("/configure")
 async def configure(raw_request: Request):
+    # [FUNCTION DOC]
+    # POST /configure: deserializes config and sets random seeds with key "proxy<rank>".
+    # Returns success. No authentication.
     data = await raw_request.json()
     config = deserialize_value(data.get("config"))
     rank = data.get("rank", 0)
@@ -331,6 +390,10 @@ async def configure(raw_request: Request):
 
 @app.post("/set_env")
 async def set_env(raw_request: Request):
+    # [FUNCTION DOC]
+    # POST /set_env: writes each {"env": {k: v}} pair into os.environ (stringified).
+    # KNOWN ISSUE: unauthenticated; any client reaching the port can alter the process
+    # environment.
     data = await raw_request.json()
     for key, value in data.get("env", {}).items():
         os.environ[key] = str(value)
@@ -339,6 +402,12 @@ async def set_env(raw_request: Request):
 
 @app.post("/create_engine")
 async def create_engine(raw_request: Request):
+    # [FUNCTION DOC]
+    # POST /create_engine: imports the engine class from the given import path and
+    # instantiates it with deserialized init_kwargs into the global engine; 400 if one
+    # exists.
+    # KNOWN ISSUE: unauthenticated arbitrary class import/instantiation from request
+    # data.
     global _engine
     if _engine is not None:
         raise HTTPException(status_code=400, detail="Engine already exists")
@@ -352,6 +421,12 @@ async def create_engine(raw_request: Request):
 
 @app.post("/call")
 async def call_engine_method(raw_request: Request):
+    # [FUNCTION DOC]
+    # POST /call: calls engine.<method>(*args, **kwargs) with deserialized arguments
+    # (synchronously, blocking the event loop), and after "initialize" sets up the
+    # OpenAI
+    # client. Returns the serialized result. 400 if no engine; unknown methods raise
+    # AttributeError (500). Unauthenticated.
     global _engine, _openai_client
     if _engine is None:
         raise HTTPException(status_code=400, detail="Engine not initialized")
@@ -377,6 +452,9 @@ async def call_engine_method(raw_request: Request):
 
 @app.post(f"/{GRANT_CAPACITY_PATHNAME}", dependencies=[Depends(_require_admin_key)])
 def grant_capacity():
+    # [FUNCTION DOC]
+    # POST grant_capacity (admin): increments the session capacity counter under the
+    # lock and returns the new value.
     """Grant capacity for a new session."""
     global _capacity
     with _lock:
@@ -390,6 +468,10 @@ def grant_capacity():
 
 
 def _cleanup_stale_sessions():
+    # [FUNCTION DOC]
+    # HELPER: At most once per 60 s: removes sessions whose last access exceeds the
+    # session timeout (with their key mappings, logged), then removes key mappings whose
+    # session no longer exists. Caller must hold _lock.
     """Remove stale sessions and orphaned API key mappings.
 
     Called periodically (at most once per minute) during start_session to clean up
@@ -437,6 +519,14 @@ def _cleanup_stale_sessions():
 
 @app.post(f"/{RL_START_SESSION_PATHNAME}", dependencies=[Depends(_require_admin_key)])
 def start_session(request: StartSessionRequest) -> StartSessionResponse:
+    # [FUNCTION DOC]
+    # POST rl/start_session (admin): under the lock, runs stale cleanup, returns 429 if
+    # capacity <= 0, picks session id "<task_id>-<n>" with the smallest unused n. With a
+    # requested api_key: 400 if it equals the admin key, 409 if it is bound to an
+    # unfinished session, otherwise drops any stale binding and reuses it; without one,
+    # generates a fresh random key distinct from existing and admin keys. Decrements
+    # capacity, creates SessionData (seed identity = task_id, configured prefix matcher)
+    # and records the key mappings. Returns StartSessionResponse.
     """Start a new RL session and allocate a unique session API key.
 
     If ``request.api_key`` is provided, reuse that key instead of generating
@@ -504,6 +594,11 @@ def start_session(request: StartSessionRequest) -> StartSessionResponse:
 
 @app.post(f"/{RL_END_SESSION_PATHNAME}")
 def end_session(session_id: str = Depends(_require_session_key)):
+    # [FUNCTION DOC]
+    # POST rl/end_session (session key): 410 if the session is gone; otherwise marks it
+    # finished (outside the lock) and returns {"message": "success",
+    # "interaction_count"}.
+    # Ending an already finished session succeeds again.
     """End an RL session.
 
     Returns the number of recorded interactions so callers (e.g. the proxy
@@ -527,6 +622,11 @@ def end_session(session_id: str = Depends(_require_session_key)):
 def set_reward(
     request: SetRewardRequest, session_id: str = Depends(_require_session_key)
 ):
+    # [FUNCTION DOC]
+    # POST rl/set_reward (session key): 410 if the session is gone; refreshes last
+    # access;
+    # uses the latest interaction when interaction_id is None (400 if none) or validates
+    # the id exists (400 otherwise), then sets the reward in the session cache.
     """Set reward for an interaction in a session."""
     interaction_id = request.interaction_id
     reward = request.reward
@@ -568,6 +668,22 @@ async def _call_client_create(
     extra_ignored_args: list[str] | None = None,
     stream: bool = False,
 ) -> ChatCompletion | Response | AsyncGenerator[ChatCompletionChunk, None]:
+    # [FUNCTION DOC]
+    # HELPER: Shared request handling for chat completions / responses. Requires an
+    # initialized client (500) and a live session (410; refreshes its access time);
+    # reserves
+    # a sampling request index when deterministic sampling is on. Keeps only kwargs that
+    # are
+    # parameters of create_fn (dropping "model", extra_ignored_args and "areal_cache"),
+    # warning (deduplicated) about dropped arguments with non-default values. Defaults
+    # temperature and top_p to 1.0 with warnings; under deterministic sampling fills a
+    # derived seed if absent. Removes any "stream" from the body and sets it only when
+    # stream=True. Calls create_fn with the session's InteractionCache as areal_cache
+    # and
+    # returns its result; any exception is converted to HTTPException 500 (ValueError
+    # message kept, others prefixed with the exception type).
+    # KNOWN ISSUE: client errors such as an over-long prompt (ValueError) surface as 500
+    # rather than 4xx; HTTPExceptions raised inside create_fn are also wrapped as 500.
     """Common logic for chat completions and responses."""
     if _openai_client is None:
         raise HTTPException(
@@ -606,6 +722,10 @@ async def _call_client_create(
         del kwargs[k]
 
     def _is_default_value(k: str, v: Any) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: For pydantic requests, True if v equals the model field's default;
+        # always
+        # False for dict requests.
         if isinstance(request, BaseModel):
             return v == type(request).model_fields[k].default
         return False
@@ -671,6 +791,12 @@ async def _call_client_create(
 async def chat_completions(
     request: CompletionCreateParams, session_id: str = Depends(_require_session_key)
 ) -> ChatCompletion | StreamingResponse:
+    # [FUNCTION DOC]
+    # POST chat/completions (JSON, session key): 500 if uninitialized. When stream is
+    # true, obtains the simulated chunk generator and returns a text/event-stream
+    # StreamingResponse emitting "data: <chunk json>" lines and a final "data: [DONE]",
+    # wrapped by _safe_stream_wrapper (setup errors close the stream and become 500).
+    # Otherwise returns the ChatCompletion.
     """OpenAI-compatible chat completions endpoint.
 
     Supports both streaming (stream=True) and non-streaming requests.
@@ -700,6 +826,10 @@ async def chat_completions(
             async def _openai_sse_generator(
                 chunk_stream: AsyncGenerator[ChatCompletionChunk, None],
             ) -> AsyncGenerator[str, None]:
+                # [FUNCTION DOC]
+                # HELPER: Async generator converting chunks to OpenAI SSE "data:" lines
+                # and
+                # appending the [DONE] sentinel.
                 async for chunk in chunk_stream:
                     yield f"data: {chunk.model_dump_json()}\n\n"
                 yield "data: [DONE]\n\n"
@@ -735,6 +865,10 @@ async def chat_completions(
 async def responses(
     request: ResponseCreateParams, session_id: str = Depends(_require_session_key)
 ) -> Response:
+    # [FUNCTION DOC]
+    # POST responses (JSON, session key): 500 if uninitialized; returns the Response
+    # from
+    # the ArealOpenAI Responses resource via _call_client_create. No streaming.
     """OpenAI-compatible responses endpoint."""
     if _openai_client is None:
         raise HTTPException(
@@ -749,6 +883,9 @@ async def responses(
 
 
 def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Translates an Anthropic request using the configured message
+    # preprocessors.
     """Translate an Anthropic Messages API request to OpenAI format."""
     return translate_anthropic_request(
         anthropic_request,
@@ -759,6 +896,9 @@ def _translate_anthropic_to_openai_request(anthropic_request: dict[str, Any]) ->
 async def _safe_stream_wrapper(
     stream: AsyncGenerator,
 ) -> AsyncGenerator:
+    # [FUNCTION DOC]
+    # HELPER: Re-yields items from stream; logs client-disconnect cancellation and
+    # re-raises it; always closes the underlying stream (aclose) in finally.
     """Wrap an async generator to handle client disconnection gracefully.
 
     Ensures proper cleanup of the underlying stream when the client disconnects
@@ -789,6 +929,15 @@ async def _safe_stream_wrapper(
 async def anthropic_messages(
     raw_request: Request, session_id: str = Depends(_require_session_key)
 ) -> Message | StreamingResponse:
+    # [FUNCTION DOC]
+    # POST v1/messages (JSON, session key): 500 if uninitialized. Translates the
+    # Anthropic request to OpenAI kwargs (ValueError/TypeError/KeyError -> 400, other
+    # errors -> 500), then calls the chat completions client. Streaming: converts the
+    # chunk
+    # stream to Anthropic SSE events with litellm and returns a StreamingResponse (setup
+    # errors -> 500). Non-streaming: translates the ChatCompletion to an Anthropic
+    # Message
+    # (conversion errors -> 500).
     """Anthropic Messages API compatible endpoint.
 
     Converts Anthropic format requests to OpenAI format, processes through
@@ -898,6 +1047,16 @@ async def anthropic_messages(
 async def export_trajectories(
     request: ExportTrajectoriesRequest,
 ) -> ExportTrajectoriesResponse:
+    # [FUNCTION DOC]
+    # POST export_trajectories (admin): 404 if the session is unknown; waits (no
+    # timeout)
+    # until the session is ended, exports interactions with the requested discount,
+    # style
+    # and orphan dropping, removes the session and its key mapping, and returns the
+    # serialized interactions.
+    # KNOWN ISSUE: waits indefinitely if the session is never ended (it may later be
+    # removed
+    # by stale cleanup while the wait continues).
     """Export interactions for a completed session.
 
     The caller must supply an explicit ``session_id`` in the request body
@@ -939,6 +1098,8 @@ async def export_trajectories(
 
 
 def cleanup_engine():
+    # [FUNCTION DOC]
+    # Calls destroy() on the global engine if present (errors logged) and clears it.
     """Clean up engine on shutdown."""
     global _engine
     if _engine is not None:
@@ -956,6 +1117,18 @@ def cleanup_engine():
 
 
 def main():
+    # [FUNCTION DOC]
+    # CLI entry point. Parses --port (0 = pick a free port), --host (0.0.0.0 replaced by
+    # the
+    # host IP), experiment/trial names, role, worker index (overridden by SLURM_PROCID;
+    # ValueError if still -1), name-resolve settings and an ignored --fileroot; unknown
+    # args
+    # are ignored. Stores globals, reconfigures name_resolve and registers
+    # "<host>:<port>" under the worker-discovery key, then runs uvicorn (blocking) and
+    # destroys the engine on exit.
+    # KNOWN ISSUE: because host 0.0.0.0 is replaced by the host IP before uvicorn.run,
+    # the
+    # server binds only that interface, not all interfaces.
     """Main entry point for the proxy rollout server."""
     parser = argparse.ArgumentParser(description="Proxy Rollout Server")
     parser.add_argument(

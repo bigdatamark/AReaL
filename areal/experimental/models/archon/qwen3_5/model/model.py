@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Archon implementation of the Qwen3.5 hybrid transformer for training on packed
+# (varlen) batches. Each layer is either a gated full-attention layer (GatedAttention,
+# flash varlen attention with partial RoPE and a sigmoid output gate) or a GatedDeltaNet
+# linear-attention layer, followed by a dense SwiGLU FFN or MoE. Optional GPU kernels:
+# causal_conv1d (depthwise causal conv) and flash-linear-attention (fla: chunked gated
+# delta rule, fused gated RMSNorm); they are imported best-effort and set to None when
+# missing (the delta-rule kernel is then mandatory at runtime). Designed to match the
+# HuggingFace Qwen3.5 implementation numerically.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -34,6 +43,10 @@ except ImportError:
 
 
 class Qwen3_5RMSNorm(nn.Module):
+    # [CLASS DOC]
+    # RMSNorm with "1-centered" weight: output = norm(x) * (1 + weight), weight starts
+    # at zero; computed in fp32 and cast back. Used for block norms, final norm and Q/K
+    # norm.
     """RMSNorm with ``(1 + weight) * norm(x)`` semantics.
 
     Used for: ``input_layernorm``, ``post_attention_layernorm``, final
@@ -45,21 +58,33 @@ class Qwen3_5RMSNorm(nn.Module):
     """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
+        # [FUNCTION DOC]
+        # Creates a zero-initialized weight of size hidden_size and stores eps.
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Normalizes over the last dim in fp32, scales by (1 + weight) and casts to the
+        # input
+        # dtype. Same shape as x.
         input_dtype = x.dtype
         x_fp32 = x.float()
         output = x_fp32 * torch.rsqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps)
         return (output * (1.0 + self.weight.float())).to(input_dtype)
 
     def reset_parameters(self):
+        # [FUNCTION DOC]
+        # Zeroes the weight.
         nn.init.zeros_(self.weight)
 
 
 class Qwen3_5RMSNormGated(nn.Module):
+    # [CLASS DOC]
+    # Pure-PyTorch per-head gated RMSNorm used inside GatedDeltaNet when the fla fused
+    # kernel is unavailable: weight * norm(x) * silu(gate). Inputs must be flattened to
+    # [-1, head_v_dim]. Weight initialized to ones.
     """Gated RMSNorm: ``weight * norm(x) * silu(gate)``.
 
     Used **only** inside GatedDeltaNet layers.  The norm dimension is
@@ -71,6 +96,8 @@ class Qwen3_5RMSNormGated(nn.Module):
     """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
+        # [FUNCTION DOC]
+        # Creates a ones-initialized weight of size hidden_size and stores eps.
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
@@ -78,6 +105,11 @@ class Qwen3_5RMSNormGated(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, gate: torch.Tensor | None = None
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Normalizes hidden_states in fp32, casts to input dtype and multiplies by
+        # weight;
+        # if gate is given multiplies by silu(gate) computed in fp32; returns input
+        # dtype.
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.float()
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
@@ -88,10 +120,16 @@ class Qwen3_5RMSNormGated(nn.Module):
         return hidden_states.to(input_dtype)
 
     def reset_parameters(self):
+        # [FUNCTION DOC]
+        # Fills weight with ones.
         nn.init.ones_(self.weight)
 
 
 def cu_seqlens_to_seq_idx(cu_seqlens: torch.Tensor, total_len: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Converts cumulative sequence lengths [N+1] to a per-token int32 sequence index of
+    # length sum(lengths) via repeat_interleave (e.g. [0,3,5] -> [0,0,0,1,1]), on
+    # cu_seqlens' device. total_len is accepted but not used for validation.
     """Convert ``cu_seqlens`` to ``seq_idx`` for ``causal_conv1d_fn``.
 
     Args:
@@ -118,6 +156,10 @@ def compute_decay_beta(
     a: torch.Tensor,
     b: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Returns (beta, g) for the gated delta rule: beta = sigmoid(b) and
+    # g = -exp(A_log) * softplus(a + dt_bias), with A_log and a in fp32. Shapes [B, T,
+    # H].
     """Compute decay (*g*) and beta for GatedDeltaNet.
 
     Args:
@@ -139,6 +181,13 @@ def compute_decay_beta(
 
 
 class GatedDeltaNet(nn.Module):
+    # [CLASS DOC]
+    # Training-only GatedDeltaNet linear-attention layer (no recurrent cache). Projects
+    # hidden states to a combined QKV stream that passes through a depthwise causal conv
+    # with SiLU, splits into multi-head Q/K/V, computes per-head decay g and write-
+    # strength
+    # beta, runs fla's chunked gated delta rule (with in-kernel Q/K L2 norm) respecting
+    # packing boundaries, applies per-head gated RMSNorm with gate z, and projects out.
     """GatedDeltaNet for ``linear_attention`` layers in Qwen3.5.
 
     Training-only module (no KV-cache / decode paths).  Uses:
@@ -155,6 +204,16 @@ class GatedDeltaNet(nn.Module):
     """
 
     def __init__(self, args: Qwen3_5ModelArgs, layer_idx: int) -> None:
+        # [FUNCTION DOC]
+        # Reads head counts/dims from args, computes key_dim, value_dim and conv_dim
+        # (2*key_dim + value_dim). Creates a depthwise bias-free Conv1d with causal
+        # padding
+        # kernel-1, bare dt_bias (ones) and A_log (log of uniform(0,16)) parameters, the
+        # gated
+        # norm (fla FusedRMSNormGated with silu if available, else Qwen3_5RMSNormGated),
+        # and
+        # bias-free projections in_proj_qkv, in_proj_z, in_proj_a, in_proj_b and
+        # out_proj.
         super().__init__()
         self.hidden_size = args.dim
         self.num_v_heads = args.linear_num_value_heads
@@ -206,6 +265,28 @@ class GatedDeltaNet(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
         seq_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # x: [B, T, dim]. If cu_seqlens is None uses [0, T]; if seq_idx is None derives
+        # it.
+        # Projects qkv, z, a, b. Causal conv over time: with causal_conv1d_fn, passes
+        # squeezed
+        # conv weights, silu activation and seq_idx (unsqueezed to [1, T]) to isolate
+        # packed
+        # sequences; otherwise falls back to nn.Conv1d + SiLU per packed segment (using
+        # .item(),
+        # a GPU sync) or on the whole sequence, truncating padding. Splits into Q, K
+        # (num_k_heads
+        # x head_k_dim) and V (num_v_heads x head_v_dim), computes beta/g, repeat-
+        # interleaves
+        # Q/K heads when num_v_heads > num_k_heads, asserts the fla kernel is installed
+        # (AssertionError otherwise) and runs chunk_gated_delta_rule with cu_seqlens.
+        # Applies
+        # gated norm per head with z, reshapes to [B, T, value_dim] and applies
+        # out_proj.
+        # Returns [B, T, dim].
+        # KNOWN ISSUE: the fallback conv path slices along time per segment but ignores
+        # batch,
+        # so it assumes B == 1 for packed inputs (as do the varlen kernels).
         """Forward pass.
 
         Args:
@@ -308,6 +389,10 @@ class GatedDeltaNet(nn.Module):
         return self.out_proj(core_attn_out)
 
     def init_weights(self) -> None:
+        # [FUNCTION DOC]
+        # Resets dt_bias to ones and A_log to log(uniform(0,16)) in place. Projections,
+        # conv
+        # and norm are not re-initialized.
         """Re-initialise bare parameters (for from-scratch training)."""
         nn.init.ones_(self.dt_bias)
         with torch.no_grad():
@@ -320,6 +405,10 @@ class GatedDeltaNet(nn.Module):
 
 
 class GatedAttention(nn.Module):
+    # [CLASS DOC]
+    # Gated GQA full attention: wq produces 2x width per head that is split into query
+    # and an output gate; after flash varlen attention the output is multiplied by
+    # sigmoid(gate) before wo. Uses Qwen3_5RMSNorm for Q/K norm and partial RoPE.
     """Gated multi-head attention for Qwen3.5 full_attention layers.
 
     Key difference from standard attention: ``q_proj`` outputs 2x width,
@@ -331,6 +420,12 @@ class GatedAttention(nn.Module):
     """
 
     def __init__(self, args: Qwen3_5ModelArgs):
+        # [FUNCTION DOC]
+        # Stores head counts, n_rep, head_dim and scaling head_dim^-0.5; builds wq (dim
+        # ->
+        # 2*n_heads*head_dim), wk, wv, wo (bias per attention_bias), q_norm, k_norm and
+        # a
+        # VarlenAttentionWrapper.
         super().__init__()
         self.n_heads = args.n_heads
         self.n_kv_heads = args.n_kv_heads
@@ -366,6 +461,16 @@ class GatedAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # x [B, T, dim]. Splits wq output per head into query and gate halves (gate
+        # flattened
+        # to [B, T, n_heads*head_dim]), projects K/V, applies Q/K norm and partial RoPE
+        # at
+        # positions, repeats K/V heads for GQA, transposes to [B, H, T, D], runs varlen
+        # flash
+        # attention with cu_seqlens/max_seqlen, transposes back and flattens, multiplies
+        # by
+        # sigmoid(gate), applies wo. Returns [B, T, dim].
         """Forward pass.
 
         Args:
@@ -427,6 +532,10 @@ class GatedAttention(nn.Module):
         return self.wo(attn_output)
 
     def init_weights(self, init_std: float) -> None:
+        # [FUNCTION DOC]
+        # Truncated-normal init: wq/wk/wv std 0.02, wo std init_std. Biases and Q/K
+        # norms
+        # are left untouched.
         """Initialise weights (for from-scratch training)."""
         for linear in (self.wq, self.wk, self.wv):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
@@ -439,27 +548,49 @@ class GatedAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
+    # [CLASS DOC]
+    # SwiGLU MLP: w2(silu(w1 x) * w3 x), bias-free.
     """SwiGLU feedforward module."""
 
     def __init__(self, dim: int, hidden_dim: int):
+        # [FUNCTION DOC]
+        # Creates w1 and w3 (dim->hidden_dim) and w2 (hidden_dim->dim).
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Returns w2(silu(w1(x)) * w3(x)).
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
     def init_weights(self, init_std: float):
+        # [FUNCTION DOC]
+        # Truncated-normal init: w1 std 0.02, w2/w3 std init_std.
         nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
         for linear in (self.w2, self.w3):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
 
 
 class TransformerBlock(nn.Module):
+    # [CLASS DOC]
+    # Pre-norm hybrid block: residual GatedAttention (for "full_attention") or
+    # GatedDeltaNet (otherwise), then residual MoE or dense FFN. The unused mixer
+    # attribute
+    # is None.
     """Hybrid transformer block — dispatches to GatedAttention or GatedDeltaNet."""
 
     def __init__(self, layer_id: int, model_args: Qwen3_5ModelArgs):
+        # [FUNCTION DOC]
+        # Picks layer_type = model_args.layer_types[layer_id] and builds the matching
+        # mixer,
+        # the two Qwen3_5RMSNorms, MoE (if moe_enabled and moe_args present, every
+        # layer) or
+        # FeedForward, and depth-scaled weight_init_std as in Qwen3.
+        # KNOWN ISSUE: layer_types is documented as optional (empty default), but an
+        # empty
+        # list raises IndexError here.
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
@@ -506,6 +637,11 @@ class TransformerBlock(nn.Module):
         max_seqlen: int,
         seq_idx: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Applies the residual mixer (full attention gets rope_cache, positions,
+        # cu_seqlens,
+        # max_seqlen; linear attention gets cu_seqlens and seq_idx), then residual
+        # MoE/FFN.
         # Attention (hybrid dispatch).
         if self.layer_type == "full_attention":
             x = x + self.attention(
@@ -530,6 +666,8 @@ class TransformerBlock(nn.Module):
         return x
 
     def init_weights(self):
+        # [FUNCTION DOC]
+        # Resets both norms, initializes the active mixer and the MoE/FFN.
         """Initialize layer parameters."""
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
@@ -543,15 +681,26 @@ class TransformerBlock(nn.Module):
             self.feed_forward.init_weights(self.weight_init_std)
 
     def init_buffers(self, buffer_device: torch.device | str):
+        # [FUNCTION DOC]
+        # Initializes MoE buffers on buffer_device if MoE is enabled.
         """Initialize layer buffers (MoE buffers if enabled)."""
         if self.moe_enabled:
             self.moe.init_buffers(buffer_device)
 
 
 class Qwen3_5Model(BaseArchonModel):
+    # [CLASS DOC]
+    # Full Qwen3.5 model: embedding, non-persistent partial-RoPE cache, ModuleDict of
+    # hybrid blocks, final norm, and LM head or critic score head. Pipeline splitting
+    # may
+    # set submodules to None.
     """Qwen3.5 hybrid transformer model."""
 
     def __init__(self, model_args: Qwen3_5ModelArgs):
+        # [FUNCTION DOC]
+        # Stores args, builds embedding, rope cache buffer, n_layers blocks, final norm
+        # and
+        # output/score head depending on is_critic.
         super().__init__()
         self.model_args = model_args
         self.vocab_size = model_args.vocab_size
@@ -580,6 +729,10 @@ class Qwen3_5Model(BaseArchonModel):
             self.score = None
 
     def _precompute_rope_cache(self) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Returns precompute_rope_cache(head_dim, max_seq_len,
+        # partial_rotary_factor,
+        # rope_theta).
         return precompute_rope_cache(
             self.model_args.head_dim,
             self.model_args.max_seq_len,
@@ -588,6 +741,9 @@ class Qwen3_5Model(BaseArchonModel):
         )
 
     def init_weights(self):
+        # [FUNCTION DOC]
+        # Same scheme as Qwen3Model: embedding normal, per-layer init, norm reset, heads
+        # truncated normal std dim^-0.5 clipped at +-3 std.
         """Initialize model parameters."""
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
@@ -621,6 +777,9 @@ class Qwen3_5Model(BaseArchonModel):
             )
 
     def init_buffers(self, buffer_device: torch.device | str):
+        # [FUNCTION DOC]
+        # Recomputes rope_cache under the device context and initializes per-layer MoE
+        # buffers.
         """Initialize model buffers (rope_cache and MoE buffers)."""
         with torch.device(buffer_device):
             self.rope_cache = self._precompute_rope_cache()
@@ -636,6 +795,15 @@ class Qwen3_5Model(BaseArchonModel):
         max_seqlen: int | torch.Tensor,
         tree_attn_meta: None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Squeezes PP-shaped cu_seqlens [1, B+1], converts tensor max_seqlen via .item()
+        # (GPU sync), embeds tokens (or passes hidden states through), computes seq_idx
+        # once from
+        # cu_seqlens for all linear-attention layers, runs all blocks, final norm, and
+        # the score
+        # or LM head. tree_attn_meta is accepted for interface compatibility and ignored
+        # (tree
+        # attention unsupported). Returns logits, values or hidden states.
         # When pipeline parallelism enabled, cu_seqlens is [1, B+1]
         if cu_seqlens.ndim == 2:
             cu_seqlens = cu_seqlens.squeeze(0)

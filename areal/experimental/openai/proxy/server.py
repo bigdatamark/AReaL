@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Shared protocol definitions for the OpenAI proxy servers: pydantic request/response
+# models, per-session state (SessionData wrapping an InteractionCache), interaction
+# (de)serialization for HTTP transport, URL path constants used by both servers and
+# clients, the default admin API key, and SESSION_TIMEOUT_SECONDS (3600) for stale
+# session cleanup.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -24,6 +30,10 @@ SESSION_TIMEOUT_SECONDS = 3600
 
 
 class StartSessionRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of rl/start_session: task_id and optional api_key to reuse a previously
+    # issued
+    # session key (refresh).
     """Request to start a new RL session."""
 
     task_id: str
@@ -31,6 +41,8 @@ class StartSessionRequest(BaseModel):
 
 
 class StartSessionResponse(BaseModel):
+    # [CLASS DOC]
+    # Reply of rl/start_session: session_id and the session API key.
     """Response from start_session endpoint."""
 
     session_id: str
@@ -38,6 +50,8 @@ class StartSessionResponse(BaseModel):
 
 
 class SetRewardRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of rl/set_reward: optional interaction_id (None = latest) and reward.
     """Request to set reward for an interaction."""
 
     interaction_id: str | None = None
@@ -45,6 +59,9 @@ class SetRewardRequest(BaseModel):
 
 
 class ExportTrajectoriesRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of export_trajectories: session_id, discount (default 1.0), style (default
+    # "individual") and drop_retry_orphans flag.
     """Request to export trajectories for a session."""
 
     session_id: str
@@ -54,6 +71,8 @@ class ExportTrajectoriesRequest(BaseModel):
 
 
 class ExportTrajectoriesResponse(BaseModel):
+    # [CLASS DOC]
+    # Reply of export_trajectories: serialized interactions dict.
     """Response containing serialized interactions."""
 
     interactions: dict[str, Any]
@@ -65,6 +84,10 @@ class ExportTrajectoriesResponse(BaseModel):
 
 
 class SessionData:
+    # [CLASS DOC]
+    # Server-side state for one RL session: id, sampling seed identity, completion flag
+    # and threading.Event, the InteractionCache of recorded interactions, start/last
+    # access/end timestamps, a lock, and a counter for per-request sampling indices.
     """Data associated with a single RL session."""
 
     def __init__(
@@ -73,6 +96,9 @@ class SessionData:
         prefix_matcher=None,
         sampling_seed_identity: str | None = None,
     ):
+        # [FUNCTION DOC]
+        # Initializes state; sampling_seed_identity defaults to session_id; creates the
+        # InteractionCache with the session id and optional prefix matcher.
         self.session_id = session_id
         self.sampling_seed_identity = sampling_seed_identity or session_id
 
@@ -89,6 +115,9 @@ class SessionData:
         self._next_sampling_request_index = 0
 
     def next_sampling_request_index(self) -> int:
+        # [FUNCTION DOC]
+        # Atomically returns and increments the per-session request counter (used to
+        # derive deterministic sampling seeds).
         """Reserve a unique request index without serializing request execution."""
         with self._lock:
             request_index = self._next_sampling_request_index
@@ -96,30 +125,47 @@ class SessionData:
         return request_index
 
     def update_last_access(self):
+        # [FUNCTION DOC]
+        # Sets the last access time to now under the lock.
         """Update the last access time for this session."""
         with self._lock:
             self._last_access_time = time.time()
 
     def is_stale(self, timeout_seconds: float = SESSION_TIMEOUT_SECONDS) -> bool:
+        # [FUNCTION DOC]
+        # True if the last access is older than timeout_seconds (default one hour).
         """Check if this session has been inactive for too long."""
         with self._lock:
             return time.time() - self._last_access_time > timeout_seconds
 
     def finish(self):
+        # [FUNCTION DOC]
+        # Marks the session completed, records end time and sets the completion event.
         self._completed = True
         self._end_time = time.time()
         self._completed_event.set()
 
     @property
     def is_completed(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: whether finish() has been called.
         """Whether this session has been completed via ``finish()``."""
         return self._completed
 
     @property
     def completions(self):
+        # [FUNCTION DOC]
+        # Property: the session's InteractionCache.
         return self._completions
 
     async def wait_for_finish(self, timeout: float | None = None) -> bool:
+        # [FUNCTION DOC]
+        # Async-waits for finish() by polling the threading.Event in the default
+        # executor
+        # in slices of at most 1s (so task cancellation is responsive). Returns True
+        # when
+        # finished, False when timeout seconds elapse.
+        # KNOWN ISSUE: timeout=0 is treated like None (falsy) and waits forever.
         loop = asyncio.get_running_loop()
         deadline = time.monotonic() + timeout if timeout else None
         while not self._completed_event.is_set():
@@ -133,6 +179,12 @@ class SessionData:
     def export_interactions(
         self, discount: float, style: str, drop_retry_orphans: bool = False
     ) -> dict[str, InteractionWithTokenLogpReward]:
+        # [FUNCTION DOC]
+        # Returns {} if there are no interactions; otherwise optionally drops retry
+        # orphans,
+        # applies reward discount and exports with the given style.
+        # KNOWN ISSUE: a second export of the same session raises RuntimeError because
+        # apply_reward_discount is one-shot.
         if len(self.completions) == 0:
             return {}
         if drop_retry_orphans:
@@ -149,6 +201,10 @@ class SessionData:
 def serialize_interactions(
     interactions: dict[str, InteractionWithTokenLogpReward],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Converts interactions to a JSON-compatible dict via the RPC serialize_value: for
+    # interactions with tensor data, {tensor_dict, reward, interaction_id}; otherwise
+    # {messages, output_message_list, reward, interaction_id}.
     """Serialize interactions into a json-compatible format for HTTP transport."""
     from areal.infra.rpc.serialization import serialize_value
 
@@ -173,6 +229,12 @@ def serialize_interactions(
 def deserialize_interactions(
     data: dict[str, Any],
 ) -> dict[str, InteractionWithTokenLogpReward]:
+    # [FUNCTION DOC]
+    # Inverse of serialize_interactions: deserializes values and builds bare
+    # InteractionWithTokenLogpReward objects, setting the private tensor cache or the
+    # message fields, plus reward and interaction_id. Parent links and model responses
+    # are
+    # not restored.
     """Deserialize interactions from HTTP response."""
     from areal.experimental.openai.types import InteractionWithTokenLogpReward
     from areal.infra.rpc.serialization import deserialize_value
@@ -212,12 +274,17 @@ DEFAULT_ADMIN_API_KEY = "areal-admin-key"
 
 
 class WaitForSessionRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of internal/wait_for_session sent by _OnlineAgent: worker_addr.
     """Request from _OnlineAgent to register a worker and wait for a session."""
 
     worker_addr: str
 
 
 class WaitForSessionResponse(BaseModel):
+    # [CLASS DOC]
+    # Reply of internal/wait_for_session: session_api_key, session_id and worker_addr of
+    # a completed session.
     """Response with completed session credentials."""
 
     session_api_key: str
