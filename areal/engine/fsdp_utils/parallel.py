@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Parallelism setup for FSDPEngine: ParallelHelper validates DP/SP(Ulysses, stored as
+# cp_size)/TP/EP sizes and builds the N-D device mesh plus flattened submeshes,
+# apply_non_moe_tp applies a Megatron-style sequence-parallel tensor-parallel plan to HF
+# decoder models (including VLM language models), and parallelize_model combines
+# optional TP with FSDP2 sharding over the dp_sp submesh.
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
@@ -35,23 +41,39 @@ __all__ = ["ReplicateParallel", "ParallelHelper", "parallelize_model"]
 
 @dataclass
 class ParallelHelper:
+    # [CLASS DOC]
+    # Dataclass wrapping an FSDPParallelStrategy (_ps) and a lazily built world
+    # DeviceMesh. Validates sizes on construction and exposes sizes, enabled flags,
+    # process groups and derived factors. Note 'sp' here maps to the strategy's cp_size.
     _ps: FSDPParallelStrategy
     _world_mesh: DeviceMesh | None = None
 
     @classmethod
     def from_parallel_strategy(cls, fsdp_ps: FSDPParallelStrategy) -> "ParallelHelper":
+        # [FUNCTION DOC]
+        # Alternate constructor; asserts pp_size == 1 (no pipeline parallelism under
+        # FSDP) and returns a helper for the strategy.
         assert fsdp_ps.pp_size == 1, "Pipeline parallelism is not supported in FSDP"
 
         return cls(_ps=fsdp_ps)
 
     def __str__(self) -> str:
+        # [FUNCTION DOC]
+        # Returns a compact string of dp, sp, tp, ep, etp and world_size.
         _ps = self._ps
         return f"(dp={_ps.dp_size}, sp={_ps.cp_size}, tp={_ps.tp_size}, ep={_ps.ep_size}, etp={_ps.etp_size}, world_size={_ps.world_size})"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs _validate after dataclass init.
         self._validate()
 
     def _validate(self):
+        # [FUNCTION DOC]
+        # HELPER: Asserts sp/tp/ep/etp >= 1; raises ValueError if dp*sp*tp !=
+        # world_size. When ep > 1, asserts etp is tp or 1, and that ep divides properly:
+        # with etp == tp, ep is a multiple of sp and divides dp*sp; with etp == 1, ep is
+        # a multiple of sp*tp and divides dp*sp*tp.
         dp, sp, tp, ep, etp, world_size = (
             self._ps.dp_size,
             self._ps.cp_size,
@@ -78,12 +100,21 @@ class ParallelHelper:
                 assert ep % (sp * tp) == 0 and (dp * sp * tp) % ep == 0
 
     def build_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC]
+        # Builds and returns the device mesh, dispatching to the EP or non-EP variant
+        # depending on ep_size > 1. Side effect: creates process groups (collective
+        # initialisation).
         if self._ps.ep_size > 1:
             return self._build_mesh_with_ep()
         else:
             return self._build_mesh_without_ep()
 
     def _build_mesh_with_ep(self) -> DeviceMesh:
+        # [FUNCTION DOC]
+        # HELPER: Splits dp into dp_mod_ep x dp_in_ep so that ep = dp_in_ep*sp (etp ==
+        # tp) or dp_in_ep*sp*tp (etp == 1), creates a 4-D mesh (dp_mod_ep, dp_in_ep, sp,
+        # tp) on the platform device type and flattens submeshes named dp, dp_sp, sp_tp
+        # and ep. Returns the root mesh.
         dp, sp, tp, ep, etp = (
             self._ps.dp_size,
             self._ps.cp_size,
@@ -123,6 +154,9 @@ class ParallelHelper:
         return mesh
 
     def _build_mesh_without_ep(self) -> DeviceMesh:
+        # [FUNCTION DOC]
+        # HELPER: Creates a 3-D mesh (dp, sp, tp) and flattens the dp_sp and sp_tp
+        # submeshes. Returns the root mesh.
         dp, sp, tp = (self._ps.dp_size, self._ps.cp_size, self._ps.tp_size)
 
         mesh = init_device_mesh(
@@ -142,64 +176,96 @@ class ParallelHelper:
 
     @property
     def world_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC]
+        # Property: lazily builds and caches the device mesh.
         if self._world_mesh is None:
             self._world_mesh = self.build_mesh()
         return self._world_mesh
 
     @property
     def dp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: True if dp_size > 1.
         return self._ps.dp_size > 1
 
     @property
     def sp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: True if cp_size (sequence parallel) > 1.
         return self._ps.cp_size > 1
 
     @property
     def tp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: True if tp_size > 1.
         return self._ps.tp_size > 1
 
     @property
     def ep_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: True if ep_size > 1.
         return self._ps.ep_size > 1
 
     @property
     def etp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: True if etp_size > 1.
         return self._ps.etp_size > 1
 
     @property
     def dp_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: data-parallel size.
         return self._ps.dp_size
 
     @property
     def sp_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: sequence-parallel size (strategy cp_size).
         return self._ps.cp_size
 
     @property
     def tp_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: tensor-parallel size.
         return self._ps.tp_size
 
     @property
     def ep_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: expert-parallel size.
         return self._ps.ep_size
 
     @property
     def etp_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: expert tensor-parallel size.
         return self._ps.etp_size
 
     @property
     def dp_group(self) -> ProcessGroup:
+        # [FUNCTION DOC]
+        # Property: process group of the 'dp' mesh dimension (builds the mesh if
+        # needed).
         return self.world_mesh["dp"].get_group()
 
     @property
     def sp_group(self) -> ProcessGroup:
+        # [FUNCTION DOC]
+        # Property: process group of the 'sp' mesh dimension.
         return self.world_mesh["sp"].get_group()
 
     @property
     def tp_group(self) -> ProcessGroup:
+        # [FUNCTION DOC]
+        # Property: process group of the 'tp' mesh dimension.
         return self.world_mesh["tp"].get_group()
 
     @property
     def gradient_div_factor(self) -> int:
+        # [FUNCTION DOC]
+        # Property: dp_size * cp_size, the gradient division factor kept consistent for
+        # EP-sharded experts.
         # This is needed for FSDP-sharded experts when Expert Parallel is enabled.
         # Although the FSDP sharding of experts is done on a mesh of a different size than
         # other parameters, the gradient division factor should be consistent with data.
@@ -207,10 +273,15 @@ class ParallelHelper:
 
     @property
     def context_and_model_parallel_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: cp_size * tp_size.
         return self._ps.cp_size * self._ps.tp_size
 
     @property
     def seq_len_divisor(self) -> int:
+        # [FUNCTION DOC]
+        # Property: tp_size * cp_size; sequence lengths must be divisible by it for SP
+        # and Ulysses.
         # 1. Sequence Parallel requires that seq_len be divisible by TP degree.
         # 2. Ulysses Sequence Parallel requires that seq_len be divisible by SP degree.
         return self._ps.tp_size * self._ps.cp_size
@@ -222,6 +293,23 @@ def apply_non_moe_tp(
     parallel_helper: ParallelHelper,
     tp_device_mesh: DeviceMesh,
 ):
+    # [FUNCTION DOC]
+    # Applies tensor + sequence parallelism in place to a HF causal LM (or critic /
+    # VLM). Reads attention and KV head counts from model.config or its text_config and
+    # raises ValueError if not divisible by tp size; raises RuntimeError if model.model
+    # is missing. Plan for the inner model: embedding rowwise (output sharded on seq),
+    # layernorms/final norm as SequenceParallel, attention input all-gathered, q/k/v
+    # colwise, q/k norms replicated, o_proj rowwise with seq-sharded output; for non-MoE
+    # models the MLP is likewise all-gathered, gate/up colwise, down rowwise; Gemma3
+    # adds its extra feed-forward norms. Root plan: lm_head colwise from seq-sharded
+    # input; a critic 'score' head replicated with replicated output. For vision models
+    # the plan targets model.model.language_model, drops the embedding entry and instead
+    # shards layer 0's input (Qwen3-VL also gets its deepstack hook patched for TP);
+    # raises RuntimeError if language_model is missing. Otherwise parallelizes
+    # model.model. Finally parallelizes the root. Returns None.
+    # KNOWN ISSUE: for MoE models the expert MLPs are left unparallelized (the function
+    # name reflects this) and the head-count check ignores model_config, reading
+    # model.config instead.
     num_attention_heads: int
     num_key_value_heads: int
     try:
@@ -376,6 +464,12 @@ def parallelize_model(
     cpu_offload: CPUOffloadPolicy | None = None,
     wrap_policy: FSDPWrapPolicy | None = None,
 ):
+    # [FUNCTION DOC]
+    # Applies TP (via apply_non_moe_tp on the 'tp' submesh) when tp is enabled, then
+    # FSDP2-shards the model on the 'dp_sp' submesh with a mixed-precision policy (param
+    # dtype config.dtype, reduce dtype config.grad_reduce_dtype, casting forward
+    # inputs), the given CPU offload policy, reshard_after_forward=True and the wrap
+    # policy. Returns None; mutates model in place.
     tp_enabled = parallel_helper.tp_enabled
 
     if tp_enabled:

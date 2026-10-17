@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Stateless helpers shared by training engines (FSDP, Megatron, ...) for global loss
+# normalization across data-parallel ranks, evaluation-loss aggregation with pipeline
+# parallelism, and post-processing of micro-batched forward outputs back to the original
+# batch order.
 # SPDX-License-Identifier: Apache-2.0
 
 """Core operations for training engines.
@@ -32,6 +37,11 @@ def compute_total_loss_weight(
     loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     dp_group: dist.ProcessGroup,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Applies loss_weight_fn to every micro-batch in mb_list.mbs, sums the results into
+    # a detached float32 scalar, all-reduces (sum) it over dp_group and returns it.
+    # Raises AssertionError if the global total is not positive. Side effects: a
+    # collective on dp_group; the positivity assert forces a GPU-CPU sync.
     """Compute total loss weight and all_reduce across data parallel group.
 
     This aggregates the loss weights from all micro-batches and reduces
@@ -72,6 +82,16 @@ def aggregate_eval_losses(
     pp_group: dist.ProcessGroup | None = None,
     pp_src_rank: int | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # On the last pipeline stage, sums the per-micro-batch losses in float32 and all-
+    # reduces (sum) over dp_group; on other stages allocates an uninitialized 1-element
+    # float32 buffer on the current device. If pp_group is given, broadcasts the loss
+    # from pp_src_rank (global rank) over it so every stage holds the value. Returns the
+    # loss tensor. Raises AssertionError if losses is None on the last stage or
+    # pp_src_rank is missing with pp_group.
+    # KNOWN ISSUE: shape differs between stages (0-d scalar on the last stage vs shape
+    # [1] buffer elsewhere), which can break the broadcast or downstream code expecting
+    # a consistent shape.
     """Aggregate evaluation losses from micro-batches.
 
     Parameters
@@ -113,6 +133,13 @@ def reorder_and_pad_outputs(
     mb_list: MicroBatchList,
     aggregate_fn: Callable[[list[Any]], Any] = torch.cat,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Concatenates micro-batch outputs with aggregate_fn (default torch.cat), splits the
+    # packed result along dim 0 using output_seqlens permuted by
+    # mb_list.forward_indices, restores the original sample order with
+    # mb_list.backward_indices, then pads and stacks the per-sequence tensors along a
+    # new batch dimension. Returns the padded tensor [batch, max_len, ...]. No side
+    # effects.
     """Aggregate, reorder, and pad forward outputs from micro-batches.
 
     This handles the output post-processing for forward_batch:

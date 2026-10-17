@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Package of engine-shared helpers. Re-exports the loss-aggregation and output-
+# reordering utilities from train_engine (aggregate_eval_losses,
+# compute_total_loss_weight, reorder_and_pad_outputs) for use by all training engines.
 # SPDX-License-Identifier: Apache-2.0
 
 """Core utilities for training engines."""

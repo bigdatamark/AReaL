@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Dataset loader for the ViRL39K multimodal math RL dataset (parquet + local image
+# folder). Builds a HuggingFace Dataset of chat-templated prompts, PIL images and boxed
+# ground-truth answers for vision-language RL training.
 # SPDX-License-Identifier: Apache-2.0
 
 import math
@@ -14,6 +18,15 @@ def convert_image(
     min_size: int | None = 28,
     max_pixels: int | None = None,
 ) -> ImageObject:
+    # [FUNCTION DOC]
+    # Upscales an image so its longer side is at least min_size (LANCZOS, preserving
+    # aspect ratio), downscales it if its pixel count exceeds max_pixels (scale by sqrt
+    # of ratio, default resampling), and converts to RGB mode. Inputs: image (PIL
+    # Image), min_size (int, default 28), max_pixels (int or None = no cap). Returns the
+    # processed PIL Image (possibly a new object). No side effects.
+    # KNOWN ISSUE: min_size is typed as optional but passing None raises TypeError in
+    # the comparison; the docstring says it accepts any 'image object' but
+    # .size/.resize/.mode of a PIL image are required.
     """Convert and resize an image.
 
     Args:
@@ -52,6 +65,18 @@ def get_virl39k_rl_dataset(
     max_length: int | None = None,
     img_folder_path: str | None = None,
 ):
+    # [FUNCTION DOC]
+    # Loads the parquet file at path (given split) with datasets.load_dataset, resolves
+    # the image folder (defaults to the parquet's directory; raises ValueError if it
+    # lacks an 'images' subfolder, only checked when defaulted), and maps each row
+    # through process. Then drops the raw columns (question, pass rates, category,
+    # source, qid, image) and, if max_length is set, filters out samples whose
+    # processor-tokenized length (text + image tokens) exceeds max_length. Inputs: path,
+    # split, processor (HF multimodal processor with tokenizer and image_processor),
+    # max_length, img_folder_path. Returns the processed Dataset with columns messages,
+    # messages_chat, images, answer (plus any remaining columns such as the original
+    # 'answer' overwritten by the extracted one). Side effects: disk reads of parquet
+    # and images.
     instruction_following = (
         r"You FIRST think about the reasoning process as an internal monologue and then provide the final answer. "
         r"The reasoning process MUST BE enclosed within <think> </think> tags. "
@@ -66,6 +91,19 @@ def get_virl39k_rl_dataset(
             raise ValueError(f"images folder not found at {img_folder_path}")
 
     def process(example):
+        # [FUNCTION DOC]
+        # HELPER: Per-example mapper. Ensures the question contains an '<image>'
+        # placeholder (prepends one if absent), appends the think/boxed instruction,
+        # extracts the boxed answer from the answer field, opens and resizes every
+        # referenced image (min 28, max 320x320 pixels), picks the model-specific image
+        # token (Qwen vision tokens, Gemma3 boi_token, else processor.image_token), and
+        # returns a dict with the chat-templated prompt string (messages, with
+        # generation prompt, untokenized), an OpenAI-style messages_chat list (empty
+        # image_url + text), the processed images and the answer.
+        # KNOWN ISSUE: the 'processor is not None' guard in the fallback branch is
+        # useless since processor.image_processor was already dereferenced;
+        # messages_chat always contains exactly one image_url entry regardless of image
+        # count.
         problem = example["question"]
         if "<image>" not in problem:
             problem = "<image>\n" + problem
@@ -130,6 +168,11 @@ def get_virl39k_rl_dataset(
     if max_length is not None:
 
         def filter_length(sample):
+            # [FUNCTION DOC]
+            # HELPER: Filter predicate; runs the processor on the sample's templated
+            # text and images (no padding, PyTorch tensors) and returns True if the
+            # resulting input_ids length is <= max_length. CPU-heavy since it re-
+            # processes images.
             # Process the sample to get the total token count including image tokens
             processed_input = processor(
                 text=[sample["messages"]],

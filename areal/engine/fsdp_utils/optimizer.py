@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Optimizers and optimizer helpers for FSDPEngine: a dtype parser, AnyPrecisionAdamW
+# (low-precision states with optional Kahan-compensated updates), and
+# PerLayerOptimWrapper, which speeds up CPU-offloaded optimizer steps by streaming each
+# FSDP layer's params/grads/states to the device on async H2D/D2H streams, with a
+# pluggable OptimKernel (AdamKernel by default).
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -17,6 +23,9 @@ from areal.infra.platforms import current_platform
 
 
 def to_precision_dtype(dtype_str: str) -> torch.dtype:
+    # [FUNCTION DOC]
+    # HELPER: Case-insensitively maps 'bfloat16'/'bf16' to torch.bfloat16 and
+    # 'float32'/'fp32' to torch.float32. Raises ValueError for anything else.
     """
     Convert string to corresponding torch dtype, only supports bfloat16 and float32.
 
@@ -42,6 +51,11 @@ def to_precision_dtype(dtype_str: str) -> torch.dtype:
 
 # https://github.com/meta-llama/llama-cookbook/blob/v0.0.5/src/llama_cookbook/policies/anyprecision_optimizer.py
 class AnyPrecisionAdamW(torch.optim.Optimizer):
+    # [CLASS DOC]
+    # AdamW optimizer (from llama-cookbook) whose momentum, variance and Kahan
+    # compensation buffers use configurable dtypes (bf16 or fp32 strings stored in
+    # param-group defaults). Per-param state: step (float tensor), exp_avg, exp_avg_sq
+    # and, if Kahan summation is on, compensation.
     def __init__(
         self,
         params: Iterator[Parameter],
@@ -54,6 +68,10 @@ class AnyPrecisionAdamW(torch.optim.Optimizer):
         variance_dtype: str = "bfloat16",
         compensation_buffer_dtype: str = "bfloat16",
     ):
+        # [FUNCTION DOC]
+        # Builds the defaults dict (lr, betas, eps, weight_decay, use_kahan_summation
+        # and the three dtype strings) and initialises the base Optimizer with params.
+        # dtype strings are only validated lazily at step time.
         """
         AnyPrecisionAdamW: a flexible precision AdamW optimizer
         with optional Kahan summation for high precision weight updates.
@@ -102,6 +120,17 @@ class AnyPrecisionAdamW(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        # [FUNCTION DOC]
+        # Runs one update under no_grad. Optionally calls closure with grad enabled. For
+        # each param with a grad: raises RuntimeError on sparse grads; lazily creates
+        # zero states in the configured dtypes; increments step; applies decoupled
+        # weight decay (param *= 1 - lr*wd); updates the EMAs; computes bias-corrected
+        # step size and denominator sqrt(v)/sqrt(1-beta2^t)+eps; then either accumulates
+        # the update into the compensation buffer and adds it to the param while storing
+        # the rounding error back (Kahan), or applies the update directly. Mutates
+        # params and state in place.
+        # KNOWN ISSUE: the closure's loss is discarded and step returns None instead of
+        # the loss, contrary to the Optimizer contract.
         """
         Performs a single optimization step.
 
@@ -198,12 +227,19 @@ class AnyPrecisionAdamW(torch.optim.Optimizer):
 
 
 def _get_local_tensor(t: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns the local shard of a DTensor, or the tensor itself otherwise.
     """Extract the underlying tensor from a DTensor, or return as-is."""
     return t.to_local() if isinstance(t, DTensor) else t
 
 
 @dataclass
 class ParamTransferState:
+    # [CLASS DOC]
+    # Dataclass record for one parameter during a per-layer step: the Parameter, whether
+    # its local data lived off-device (p_was_cpu), the original local param tensor,
+    # device copies of param and grad, and the CPU and device versions of each optimizer
+    # state keyed by state name.
     """CPU and device copies of a parameter and its optimizer states for one H2D/D2H cycle."""
 
     param: Parameter
@@ -216,6 +252,12 @@ class ParamTransferState:
 
 
 class OptimKernel:
+    # [CLASS DOC]
+    # Abstract strategy for PerLayerOptimWrapper describing an optimizer: which state
+    # keys to stream, which hyperparameters must match across param groups, how to
+    # create and normalise state, and how to run the update on device tensor lists.
+    # Methods raise NotImplementedError unless overridden (normalize_state defaults to a
+    # no-op).
     """Base class for optimizer-specific computation in PerLayerOptimWrapper.
 
     Subclass to add support for new optimizers. Each kernel defines:
@@ -227,19 +269,30 @@ class OptimKernel:
 
     @property
     def state_keys(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Property: list of optimizer-state keys to transfer between host and device.
+        # Abstract.
         """Optimizer state keys to transfer between host and device."""
         raise NotImplementedError
 
     @property
     def hyperparam_keys(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Property: list of hyperparameter keys that must be equal across param groups.
+        # Abstract.
         """Hyperparameter keys that must be identical across param groups."""
         raise NotImplementedError
 
     def init_param_state(self, local_p: torch.Tensor) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Abstract: returns fresh CPU state tensors for a local parameter shard.
         """Create initial optimizer states on CPU for a parameter."""
         raise NotImplementedError
 
     def normalize_state(self, state: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # Hook to fix up checkpoint-loaded state in place (e.g. type conversions).
+        # Default does nothing.
         """Normalize states loaded from checkpoints (e.g., type conversions).
 
         Called once during initialization for pre-existing states.
@@ -253,19 +306,30 @@ class OptimKernel:
         states: dict[str, list[torch.Tensor]],
         group: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC]
+        # Abstract: performs the in-place optimizer update on device lists of params,
+        # grads and per-key states using hyperparameters from group.
         """Run optimizer update on device tensors. Modifies tensors in-place."""
         raise NotImplementedError
 
 
 class AdamKernel(OptimKernel):
+    # [CLASS DOC]
+    # OptimKernel for torch Adam/AdamW, delegating the math to torch's functional adam
+    # implementation.
     """Adam (AdamW) computation kernel."""
 
     @property
     def state_keys(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns exp_avg, exp_avg_sq and step.
         return ["exp_avg", "exp_avg_sq", "step"]
 
     @property
     def hyperparam_keys(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns lr, betas, eps, weight_decay, amsgrad, maximize,
+        # decoupled_weight_decay.
         return [
             "lr",
             "betas",
@@ -277,6 +341,9 @@ class AdamKernel(OptimKernel):
         ]
 
     def init_param_state(self, local_p: torch.Tensor) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Returns a float32 scalar step of 0 and CPU zero tensors for exp_avg and
+        # exp_avg_sq with the param's shape and dtype.
         return {
             "step": torch.tensor(0.0, dtype=torch.float32),
             "exp_avg": torch.zeros(local_p.shape, dtype=local_p.dtype, device="cpu"),
@@ -284,6 +351,9 @@ class AdamKernel(OptimKernel):
         }
 
     def normalize_state(self, state: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # Converts a non-tensor 'step' entry (int/float from checkpoints) into a float32
+        # scalar tensor, in place.
         # Checkpoints may store step as int/float instead of tensor
         if "step" in state and not isinstance(state["step"], torch.Tensor):
             state["step"] = torch.tensor(float(state["step"]), dtype=torch.float32)
@@ -295,6 +365,12 @@ class AdamKernel(OptimKernel):
         states: dict[str, list[torch.Tensor]],
         group: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC]
+        # Calls torch's functional adam with foreach=True on the given lists, using lr,
+        # betas, weight_decay from group and eps/amsgrad/maximize/decoupled_weight_decay
+        # with defaults. Mutates params and states in place.
+        # KNOWN ISSUE: passes an empty max_exp_avg_sqs list, so amsgrad=True in the
+        # group would fail inside torch.
         beta1, beta2 = group["betas"]
         _adam_fn(
             params,
@@ -322,6 +398,13 @@ class AdamKernel(OptimKernel):
 
 
 class PerLayerOptimWrapper:
+    # [CLASS DOC]
+    # Replacement for optimizer.step when optimizer states are offloaded. Groups
+    # trainable params by non-root FSDP2 submodules (plus a residual group), keeps all
+    # states on pinned CPU memory, and on step pipelines: prefetch layers on an H2D
+    # stream (prefetch_layers ahead), compute on the current stream, copy results back
+    # on a D2H stream, then frees device memory. Uses only param_groups[0]
+    # hyperparameters, so all groups must agree.
     """Accelerate offloaded optimizer step by streaming states per-layer to device.
 
     When optimizer states are offloaded to CPU, the default CPU optimizer step is
@@ -348,6 +431,14 @@ class PerLayerOptimWrapper:
         prefetch_layers: int = 1,
         kernel: OptimKernel | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores the optimizer and kernel (default AdamKernel), resolves device (int ->
+        # 'cuda:N', otherwise torch.device), then builds layer groups, validates
+        # hyperparameters, initialises CPU states, pins them and creates streams/events.
+        # Raises ValueError on mismatched hyperparameters. Side effects: mutates
+        # optimizer.state, allocates pinned memory and device streams.
+        # KNOWN ISSUE: an integer device_id is always mapped to a CUDA device, ignoring
+        # non-CUDA platforms.
         self.optimizer = optimizer
         self.device = (
             torch.device(f"cuda:{device_id}")
@@ -367,6 +458,9 @@ class PerLayerOptimWrapper:
     # ------------------------------------------------------------------
 
     def _validate_hyperparams(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If there are multiple param groups, raises ValueError when any kernel
+        # hyperparameter present in both a group and group 0 differs.
         """Assert all param_groups share identical hyperparameters.
 
         PerLayerOptimWrapper processes params by layer (not by group),
@@ -385,6 +479,11 @@ class PerLayerOptimWrapper:
                     )
 
     def _build_layer_groups(self, model: nn.Module) -> list[list[Parameter]]:
+        # [FUNCTION DOC]
+        # HELPER: Walks named modules, collecting every non-root FSDPModule; for each,
+        # gathers its requires_grad params not yet assigned (deduplicated by id) as one
+        # group; remaining trainable params form a final residual group. Returns the
+        # list of groups in module order.
         """Group params by FSDP2-wrapped sub-modules (excluding root).
 
         After apply_fsdp2, each transformer layer and embedding becomes an
@@ -418,6 +517,10 @@ class PerLayerOptimWrapper:
         return groups
 
     def _init_states(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For each trainable param, creates kernel initial state on CPU if
+        # empty; otherwise moves existing state tensors (local shards) to CPU and
+        # normalises them.
         """Initialize optimizer states on CPU for all trainable params.
 
         IMPORTANT: States must be created on CPU regardless of current param device.
@@ -443,6 +546,9 @@ class PerLayerOptimWrapper:
                     self.kernel.normalize_state(state)
 
     def _pin_states(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Replaces each CPU, unpinned state tensor with a pinned copy so non-
+        # blocking transfers are truly async.
         """Pin optimizer state tensors in memory for async H2D/D2H transfers.
 
         Without pinning, .to(non_blocking=True) on CPU tensors is synchronous,
@@ -458,6 +564,9 @@ class PerLayerOptimWrapper:
                             state[key] = tensor.pin_memory()
 
     def refresh_states(self) -> None:
+        # [FUNCTION DOC]
+        # Public: after an external state load (load_state_dict/DCP), moves state
+        # tensors back to CPU, normalises them and re-pins. Mutates optimizer.state.
         """Re-apply state invariants after checkpoint load.
 
         ``load_state_dict`` / DCP ``set_state_dict`` replace optimizer state
@@ -479,6 +588,9 @@ class PerLayerOptimWrapper:
         self._pin_states()
 
     def _init_streams_and_events(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Creates dedicated H2D and D2H streams on the device and one compute-
+        # end and one H2D-end event per layer group.
         """Pre-allocate streams and events for pipeline synchronization."""
         num_groups = len(self._layer_param_groups)
         self._h2d_stream = current_platform.Stream(device=self.device)
@@ -491,10 +603,18 @@ class PerLayerOptimWrapper:
     # ------------------------------------------------------------------
 
     def _to_device(self, t: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Returns t unchanged if already on the target device, else a non-
+        # blocking copy to it.
         """Move tensor to device if not already there (non-blocking)."""
         return t if t.device == self.device else t.to(self.device, non_blocking=True)
 
     def _prefetch_layer(self, layer_idx: int) -> dict[int, ParamTransferState]:
+        # [FUNCTION DOC]
+        # HELPER: For each param in a layer group that has a grad, builds a
+        # ParamTransferState with device copies of the local param, grad and every state
+        # tensor (copies only those not already on the device). Returns a dict keyed by
+        # id(param). Must be called under the H2D stream.
         """H2D: copy layer's optimizer states (and params/grads if on CPU) to device.
 
         Auto-detects tensor device: skips H2D for tensors already on device.
@@ -527,6 +647,10 @@ class PerLayerOptimWrapper:
         return result
 
     def _compute_for_layer(self, layer_states: dict[int, ParamTransferState]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Collects device params, grads and per-key states from the layer's
+        # transfer states and runs kernel.compute with param_groups[0]. No-op if the
+        # layer has no grads.
         """Run optimizer computation on device tensors for one layer."""
         group = self.optimizer.param_groups[0]
         params: list[torch.Tensor] = []
@@ -546,6 +670,9 @@ class PerLayerOptimWrapper:
         self.kernel.compute(params, grads, collected, group)
 
     def _offload_layer(self, layer_states: dict[int, ParamTransferState]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Non-blocking copies of updated params (only those originally off-
+        # device) and all states back into their pinned CPU tensors.
         """D2H: copy updated param data + optimizer states back to CPU.
 
         Only copies back tensors that were originally on CPU.
@@ -562,6 +689,10 @@ class PerLayerOptimWrapper:
         layer_states: dict[int, ParamTransferState],
         *streams: torch.cuda.Stream,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls record_stream on every device tensor of the layer for each given
+        # stream so the caching allocator does not reuse memory still in use by those
+        # streams.
         """Mark device tensors as used by each *stream* for allocator safety.
 
         Device tensors are allocated on ``_h2d_stream`` but consumed on
@@ -583,6 +714,13 @@ class PerLayerOptimWrapper:
 
     @torch.no_grad()
     def step(self) -> None:
+        # [FUNCTION DOC]
+        # Runs the pipelined optimizer step under no_grad: prefetches the first
+        # prefetch_layers+1 groups, then for each group waits for its H2D event,
+        # computes, records a compute event, prefetches the next group, offloads the
+        # current one on the D2H stream after its compute event, records streams and
+        # drops device references. Finally synchronises the D2H stream and empties the
+        # device cache. Returns None; mutates params and optimizer state.
         """Per-layer optimizer step with async prefetch pipeline."""
         h2d_stream = self._h2d_stream
         d2h_stream = self._d2h_stream

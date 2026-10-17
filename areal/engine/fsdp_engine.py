@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# FSDP2-based training engine (FSDPEngine) implementing the TrainEngine API for HF
+# models with N-D parallelism (DP + Ulysses SP + TP), optional LoRA, CPU offload, tree
+# training, multimodal (VLM) inputs, and weight sync to rollout engines via NCCL/XCCL
+# broadcast or disk. Also defines role-specific subclasses: PPO actor/critic, SFT LM,
+# reward model and DPO engines, each delegating algorithm logic to areal.trainer
+# helpers.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -141,6 +148,10 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass
 class FSDPTrainContext:
+    # [CLASS DOC]
+    # Dataclass carried through the forward/backward pipeline per micro-batch:
+    # model_inputs (after Ulysses slicing), mb_input (original micro-batch), pad_length
+    # (packing padding), ulysses_pad_size, and trie_node (tree training root or None).
     """Context passed through FSDP forward/backward pipeline.
 
     Attributes
@@ -164,6 +175,9 @@ class FSDPTrainContext:
     trie_node: TrieNode | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns a shallow dict of the fields without recursing (avoids RecursionError
+        # on TrieNode).
         """Shallow dict conversion (avoids ``dataclasses.asdict`` which would
         recurse into TrieNode and hit ``RecursionError``).
         """
@@ -172,6 +186,10 @@ class FSDPTrainContext:
 
 @dataclasses.dataclass
 class _PendingWeightUpdateBucket:
+    # [CLASS DOC]
+    # HELPER: Dataclass for an in-flight async broadcast bucket during weight sync:
+    # communication work handles, the rollout engine's update future, the named tensors
+    # kept alive until completion, and the optional side stream used.
     handles: list[Any]
     fut: Future[None]
     named_tensors: list[tuple[str, torch.Tensor]]
@@ -182,10 +200,15 @@ _MULTIMODAL_FORWARD_KEYS = ("image_grid_thw", "pixel_values", "video_grid_thw")
 
 
 def _is_multimodal_payload_key(key: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if the key is a multimodal key per areal.utils.data or one of
+    # image_grid_thw, pixel_values, video_grid_thw.
     return is_multi_modal_key(key) or key in _MULTIMODAL_FORWARD_KEYS
 
 
 def _drop_multimodal_payloads(data: dict[str, Any]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Removes all multimodal payload keys from the dict in place.
     for key in list(data.keys()):
         if _is_multimodal_payload_key(key):
             data.pop(key, None)
@@ -195,6 +218,12 @@ def _prepare_multimodal_forward_inputs(
     mb: dict[str, Any],
     padded_mb: dict[str, Any],
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Moves multimodal data to the forward micro-batch only. Pops
+    # multi_modal_input from mb (or from padded_mb if absent in mb, and removes the
+    # duplicate otherwise), concatenates each of
+    # image_grid_thw/pixel_values/video_grid_thw across items along dim 0 into
+    # padded_mb, then drops all multimodal keys from mb. Mutates both dicts.
     """Keep multimodal tensors only in the forward micro-batch.
 
     ``mb`` is used by loss and bookkeeping callbacks, while ``padded_mb`` is
@@ -218,7 +247,19 @@ def _prepare_multimodal_forward_inputs(
 
 
 class FSDPEngine(TrainEngine):
+    # [CLASS DOC]
+    # TrainEngine backed by PyTorch FSDP2. Lifecycle: construct with TrainEngineConfig
+    # (loads HF config), create_process_group (dist init, device mesh and groups),
+    # initialize (build model, patches, sharding, optimizer), then train/eval/forward,
+    # weight updates to a connected rollout engine, save/load, offload/onload and
+    # destroy. Key state: model, optimizer, lr_scheduler, tokenizer/processor,
+    # parallel_helper and dp/sp/mp groups, rank info, weight-update groups, offload
+    # flags and an optional per-layer optimizer wrapper.
     def __init__(self, config: TrainEngineConfig):
+        # [FUNCTION DOC]
+        # Stores config, loads the HF AutoConfig from config.path (trust_remote_code),
+        # flags vision models, and declares/initialises all state fields (no process
+        # groups or model yet). Side effect: reads the model config from disk/hub.
         self.config = config
         self.optimizer_config = config.optimizer
 
@@ -282,6 +323,11 @@ class FSDPEngine(TrainEngine):
         lora_alpha: int = 16,
         **kwargs,
     ) -> FSDPEngine:
+        # [FUNCTION DOC]
+        # Convenience constructor: builds a TrainEngineConfig with path,
+        # experiment/trial names, backend string 'fsdp:d<dp>t<tp>', dtype, an
+        # OptimizerConfig only if learning_rate is given (else inference-only), LoRA
+        # settings and extra kwargs, and returns cls(config).
         """Construct an FSDPEngine directly without assembling a TrainEngineConfig.
 
         Parameters
@@ -319,6 +365,14 @@ class FSDPEngine(TrainEngine):
         return cls(config)
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
+        # [FUNCTION DOC]
+        # Patches default PG timeouts, initialises the default process group if needed
+        # (marking it owned), creates a gloo CPU group, resolves the parallel strategy
+        # (argument, else parsed from config.backend, else default), converts it to FSDP
+        # form, builds the ParallelHelper and world mesh, and sets dp/sp groups, the
+        # sp_tp model-parallel group, rank, world size, dp_head (first rank of mp group)
+        # and dp_rank. Creates the per-rank logger and warms up communicators. Side
+        # effects: collectives, logging.
         patch_dist_group_timeout(DIST_GROUP_DEFAULT_TIMEOUT)
 
         backend = current_platform.communication_backend
@@ -373,6 +427,17 @@ class FSDPEngine(TrainEngine):
         warmup_process_groups(self.dp_group, self.sp_group, self.mp_group)
 
     def initialize(self, addr: str | None, ft_spec: FinetuneSpec, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Builds the trainable model. Asserts addr is None and ft_spec given;
+        # RuntimeError on torch < 2.4. Sets torch_memory_saver to preload mode if
+        # enabled. Creates the device model, raises ValueError for tree training with sp
+        # > 1, applies the Ulysses and tree-attention monkey patches, applies LoRA if
+        # configured. For memory-efficient LLM loading or LoRA, rank 0 loads pretrained
+        # weights (logging missing/unexpected keys) and takes the full state dict while
+        # others use empty. Parallelizes with TP+FSDP2 (with CPU offload policy if
+        # offload_params), broadcasts the full state if needed, creates optimizer and LR
+        # scheduler, and if per_layer_optim_step is set (adam only, else ValueError)
+        # wraps the optimizer in PerLayerOptimWrapper. Marks initialised.
         # Initialize distributed enviroments and load model.
         assert addr is None, "FSDPEngine does not support remote initialization."
         assert ft_spec is not None, "FSDPEngine requires FinetuneSpec to initialize."
@@ -486,26 +551,41 @@ class FSDPEngine(TrainEngine):
 
     @property
     def data_parallel_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Property: the DP process group.
         return self.dp_group
 
     @property
     def data_parallel_rank(self) -> int:
+        # [FUNCTION DOC]
+        # Property: this rank's index in the DP group.
         return self.dp_rank
 
     @property
     def data_parallel_world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: DP size.
         return self.parallel_helper.dp_size
 
     @property
     def context_and_model_parallel_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Property: the combined SP+TP group.
         return self.mp_group
 
     @property
     def cpu_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Property: the gloo CPU group; asserts the engine is initialised.
         assert self._initialized
         return self._cpu_group
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Marks uninitialised, deletes optimizer, model and per-layer wrapper, runs GC
+        # and empties the device cache. If this engine owns the global group, barriers
+        # on the CPU group (failures logged and ignored), destroys all process groups
+        # and clears ownership so repeated calls are safe.
         self._initialized = False
         if hasattr(self, "optimizer"):
             del self.optimizer
@@ -545,20 +625,33 @@ class FSDPEngine(TrainEngine):
 
     @property
     def initialized(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: whether initialize completed.
         return self._initialized
 
     def current_data_parallel_head(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the global rank of this rank's DP head.
         return self.dp_head
 
     def is_data_parallel_head(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns True if this rank is its DP head (first rank of its SP+TP group).
         return self.rank == self.dp_head
 
     def train(self, mode: bool = True):
+        # [FUNCTION DOC]
+        # Sets the model to train (or eval when mode=False) mode and returns self.
         assert self.model is not None
         self.model.train(mode=mode)
         return self
 
     def connect_engine(self, engine: InferenceEngine, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Connects a rollout InferenceEngine (warning if replacing a different one),
+        # creates a DistRolloutCoordinator, initialises the XCCL weight-update groups
+        # once when meta.type is 'xccl', then synchronises the device and barriers on
+        # the CPU group.
         if self.rollout_engine is not None and self.rollout_engine != engine:
             self.logger.warning(
                 f"Connected rollout engine changed from {self.rollout_engine} to {engine}."
@@ -584,6 +677,10 @@ class FSDPEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Requires a connected rollout engine (RuntimeError otherwise) and delegates to
+        # the coordinator's rollout_batch with the given data, workflow and grouping
+        # options; returns the list of trajectory dicts.
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.rollout_batch(
             data,
@@ -605,6 +702,10 @@ class FSDPEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Requires a connected rollout engine and delegates to the coordinator's
+        # prepare_batch (dataloader-driven async rollout with acceptance filter,
+        # grouping, dynamic batch size, reward normalisation). Returns trajectories.
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
             dataloader,
@@ -618,6 +719,10 @@ class FSDPEngine(TrainEngine):
         )
 
     def update_weights(self, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Requires a connected rollout engine; within the offload-aware context
+        # dispatches to distributed (xccl, asserting groups are initialised) or disk
+        # weight update; raises ValueError for other types.
         self._check_rollout_engine_connected()
         with self._offload_aware_context():
             if meta.type == "xccl":
@@ -629,12 +734,21 @@ class FSDPEngine(TrainEngine):
                 raise ValueError(f"Unknown weight update type {meta.type}")
 
     def set_version(self, version: int):
+        # [FUNCTION DOC]
+        # Sets the model version counter.
         self._version = version
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the model version counter.
         return self._version
 
     def save(self, meta: SaveLoadMeta):
+        # [FUNCTION DOC]
+        # Within the offload-aware context saves weights as HF (with
+        # tokenizer/processor) or DCP (optionally with optimizer); for HF format with
+        # with_optim also saves the optimizer separately. Raises ValueError on unknown
+        # formats.
         with self._offload_aware_context():
             if meta.weight_format == "hf":
                 self._save_model_to_hf(meta.path, meta.tokenizer, meta.processor)
@@ -647,6 +761,10 @@ class FSDPEngine(TrainEngine):
                 self._save_optimizer_state(meta.path)
 
     def load(self, meta: SaveLoadMeta):
+        # [FUNCTION DOC]
+        # Within the offload-aware context loads HF weights or a DCP checkpoint
+        # (optionally with optimizer); for HF with with_optim also loads the separately
+        # saved optimizer state. Raises ValueError on unknown formats.
         with self._offload_aware_context():
             if meta.weight_format == "hf":
                 self._load_model_from_hf(meta.path)
@@ -665,6 +783,10 @@ class FSDPEngine(TrainEngine):
 
     @contextmanager
     def _offload_aware_context(self):
+        # [FUNCTION DOC]
+        # HELPER: Reentrant context manager. When the engine is offloaded, the outermost
+        # entry onloads and the outermost exit offloads again (depth counter); otherwise
+        # it just yields.
         """Temporarily onload parameters for offload-unsafe operations.
 
         Reentrant: nested calls increment depth; only the outermost
@@ -685,15 +807,27 @@ class FSDPEngine(TrainEngine):
                 self.offload()
 
     def optimizer_zero_grad(self):
+        # [FUNCTION DOC]
+        # Zeros optimizer gradients; asserts an optimizer exists.
         assert self.optimizer is not None
         self.optimizer.zero_grad()
 
     def set_lr(self, lr: float) -> None:
+        # [FUNCTION DOC]
+        # Sets lr on every optimizer param group (asserts optimizer exists). Note the LR
+        # scheduler may overwrite it on its next step.
         assert self.optimizer is not None
         for param_group in self.optimizer.param_groups:
             param_group["lr"] = lr
 
     def optimizer_step(self):
+        # [FUNCTION DOC]
+        # Clips gradients with fsdp2_clip_grad_norm over the dp_sp (FSDP) and tp groups
+        # using optimizer_config.gradient_clipping. If the norm is non-finite, zeros
+        # grads and skips the update; otherwise steps via the per-layer wrapper or the
+        # plain optimizer (traced). Does not step the LR scheduler. Returns dict with
+        # update_successful (1.0/0.0), grad_norm and current lr. Asserts optimizer,
+        # config and scheduler exist.
         assert self.optimizer is not None
         assert self.optimizer_config is not None
         assert self.lr_scheduler is not None
@@ -727,6 +861,8 @@ class FSDPEngine(TrainEngine):
         )
 
     def lr_scheduler_step(self):
+        # [FUNCTION DOC]
+        # Advances the LR scheduler one step; asserts it exists.
         assert self.lr_scheduler is not None
         self.lr_scheduler.step()
 
@@ -738,6 +874,13 @@ class FSDPEngine(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Iterates micro-batches: prepares model inputs and FSDPTrainContext, adds tree-
+        # attention kwargs (prefixed 'tree_') when tree training is on, runs the model
+        # forward, squeezes the batch dim of logits, removes the tree kwargs, calls
+        # process_output_fn(logits, ctx dict), and runs backward on the returned loss
+        # unless forward_only or the loss is None. Returns None; gradients accumulate
+        # across micro-batches.
         for mb_item in mb_list:
             inputs, ctx = self._prepare_mb_inputs(mb_item)
 
@@ -777,6 +920,12 @@ class FSDPEngine(TrainEngine):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # One training step: ensures ready (onload, set Ulysses group), zeros grads,
+        # concatenates list inputs, splits into micro-batches on device, computes the
+        # global loss weight over DP, runs forward/backward with per-micro-batch loss
+        # computation (loss multiplied by dp_size to undo FSDP gradient averaging), then
+        # optimizer_step. Returns the optimizer stats plus num_micro_batches.
         self._ensure_ready()
         self.optimizer_zero_grad()
 
@@ -794,6 +943,9 @@ class FSDPEngine(TrainEngine):
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
         ) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Rebuilds the context and returns the scaled loss from
+            # _compute_logprobs_and_loss with loss_multiplier = dp_size.
             ctx = FSDPTrainContext(**ctx_dict)
             return self._compute_logprobs_and_loss(
                 logits,
@@ -818,6 +970,10 @@ class FSDPEngine(TrainEngine):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> torch.Tensor | None:
+        # [FUNCTION DOC]
+        # No-grad evaluation: same micro-batching and loss-weight computation as
+        # train_batch but forward only, collecting each micro-batch loss and returning
+        # their sum all-reduced over DP (aggregate_eval_losses).
         self._ensure_ready()
 
         input_batched, _ = self._normalize_batch_input(input_)
@@ -836,6 +992,9 @@ class FSDPEngine(TrainEngine):
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
         ) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Computes the micro-batch loss, appends a detached copy to the
+            # outer list and returns it.
             ctx = FSDPTrainContext(**ctx_dict)
             loss = self._compute_logprobs_and_loss(
                 logits,
@@ -859,6 +1018,14 @@ class FSDPEngine(TrainEngine):
         output_seqlens: list[int] | None = None,
         aggregate_fn: Callable[[list[torch.Tensor]], torch.Tensor] = torch.cat,
     ) -> torch.Tensor | list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # No-grad inference returning per-token outputs (logprobs, values, or tree
+        # results). For list input, infers output_seqlens from each item's
+        # attention_mask length (ValueError if a given output_seqlens disagrees);
+        # otherwise defaults to the packed sequence lengths. Micro-batches, runs forward
+        # collecting _compute_forward_result outputs, then merges tree results or
+        # reorders/pads outputs into a [batch, max_len] tensor. For list input, splits
+        # the result back per trajectory.
         self._ensure_ready()
 
         input_batched, meta = self._normalize_batch_input(input_)
@@ -887,6 +1054,9 @@ class FSDPEngine(TrainEngine):
         outputs: list[torch.Tensor] = []
 
         def process_output(logits: torch.Tensor, ctx_dict: dict[str, Any]) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Computes the forward result for the micro-batch and appends it to
+            # the outer list; returns None so no backward happens.
             ctx = FSDPTrainContext(**ctx_dict)
             result = self._compute_forward_result(logits, ctx)
             outputs.append(result)
@@ -907,6 +1077,10 @@ class FSDPEngine(TrainEngine):
         return split_batch(result, meta)
 
     def get_lora_adapter_info(self) -> dict[str, list[int]]:
+        # [FUNCTION DOC]
+        # Returns {param name without the 'base_model.model.' prefix: shape list} for
+        # trainable LoRA parameters, or {} when LoRA is disabled or there is no model.
+        # Shapes are local (possibly sharded) shapes.
         """Return adapter parameter names and shapes (for generating synthetic checkpoints)."""
         import re
 
@@ -920,12 +1094,19 @@ class FSDPEngine(TrainEngine):
         return result
 
     def export_stats(self) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Within the offload-aware context exports all stats_tracker statistics reduced
+        # over the DP group; returns a dict of floats.
         with self._offload_aware_context():
             return stats_tracker.export_all(
                 reduce_group=self.data_parallel_group,
             )
 
     def offload(self) -> None:
+        # [FUNCTION DOC]
+        # Offloads device memory with torch_memory_saver.pause after clearing caches,
+        # then synchronises, barriers on the CPU group, logs device stats and sets
+        # is_offload. Raises RuntimeError if TMS is not enabled.
         """Offload model memory to CPU using torch_memory_saver.
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/fsdp_utils/actor.py
@@ -948,6 +1129,9 @@ class FSDPEngine(TrainEngine):
         self.is_offload = True
 
     def onload(self) -> None:
+        # [FUNCTION DOC]
+        # Resumes memory with torch_memory_saver.resume, synchronises, barriers on the
+        # CPU group, logs device stats and clears is_offload.
         """Onload model memory from CPU back to GPU using torch_memory_saver.
 
         Ref: https://github.com/THUDM/slime/blob/main/slime/backends/fsdp_utils/actor.py
@@ -962,6 +1146,9 @@ class FSDPEngine(TrainEngine):
         self.is_offload = False
 
     def clear_batches(self, shard_ids: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Drops the given shard ids from this worker's RTensor fetch buffer; no-op when
+        # none are passed (non-DP-head ranks).
         """Drain this worker's client-side RTensor fetch buffer.
 
         Called via RPC by ``TrainController.clear_batches`` at step end so
@@ -976,20 +1163,30 @@ class FSDPEngine(TrainEngine):
             clear_fetch_buffer(shard_ids)
 
     def fetch_buffer_stats(self) -> dict[str, int]:
+        # [FUNCTION DOC]
+        # Returns local RTensor fetch-buffer statistics.
         """Expose local fetch-buffer stats for post-step drain verification."""
         from areal.infra.rpc.rtensor import fetch_buffer_stats
 
         return fetch_buffer_stats()
 
     def get_device_stats(self) -> DeviceRuntimeInfo:
+        # [FUNCTION DOC]
+        # Returns current device memory/runtime info.
         return DeviceRuntimeInfo.get_current()
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Flushes the perf tracer for the given step (force to write regardless of
+        # schedule).
         perf_tracer.save(step=step, force=force)
 
     def config_perf_tracer(
         self, config: PerfTracerConfig, rank: int, role: str
     ) -> None:
+        # [FUNCTION DOC]
+        # Configures the global perf tracer with config, rank and role unless already
+        # configured.
         if perf_tracer.is_configured():
             return
         perf_tracer.configure(config, rank=rank, role=role)
@@ -997,11 +1194,20 @@ class FSDPEngine(TrainEngine):
     def _make_parallel_strategy(
         self, parallel_strategy: ParallelStrategy
     ) -> FSDPParallelStrategy:
+        # [FUNCTION DOC]
+        # HELPER: Converts a generic ParallelStrategy into an FSDPParallelStrategy with
+        # the same fields.
         return FSDPParallelStrategy(
             **dataclasses.asdict(parallel_strategy),
         )
 
     def _create_llm_actor_or_critic(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds a text model in optimizer_dtype storage with the configured
+        # attention implementation: AutoModelForTokenClassification with one label for
+        # critics, else AutoModelForCausalLM. Uses from_config (random/empty weights)
+        # for init_from_scratch or memory-efficient loading, otherwise from_pretrained.
+        # Returns the model.
         # Storage dtype = optimizer_dtype. FSDP2 MixedPrecisionPolicy
         # (configured in parallelize_model) will cast to self.config.dtype
         # in forward/backward.
@@ -1034,6 +1240,15 @@ class FSDPEngine(TrainEngine):
         return model
 
     def _create_device_model(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets device and NUMA affinity from LOCAL_RANK (KeyError if unset),
+        # records self.device, chooses the loading device (meta on non-zero ranks / cpu
+        # on rank 0 for memory-efficient LLM loading, cpu for memory-efficient VLM, else
+        # the accelerator). For VLMs raises ValueError if compute dtype is float16 or
+        # init_from_scratch is set, loads processor and tokenizer and the
+        # AutoModelForImageTextToText; for LLMs loads the tokenizer and creates
+        # actor/critic. Optionally disables dropout, enables non-reentrant gradient
+        # checkpointing and HF kernels, logs timing and stores self.model.
         current_platform.set_device(int(os.environ["LOCAL_RANK"]))
         current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
         if current_platform.device_type == "cpu":
@@ -1114,6 +1329,13 @@ class FSDPEngine(TrainEngine):
         self.model = model
 
     def _apply_peft_wrapper(self):
+        # [FUNCTION DOC]
+        # HELPER: Wraps the model with a PEFT LoRA adapter (causal-LM task, rank/alpha
+        # from config, 'all-linear' targets unless specific modules are given, no bias),
+        # enabling input grads and keeping adapter dtype unchanged. Rank 0 prints
+        # trainable parameters. Raises NotImplementedError for non-'lora' peft types.
+        # KNOWN ISSUE: task type is always CAUSAL_LM, even for critic (token-
+        # classification) models.
         config = self.config
         if not config.target_modules or config.target_modules == ["all-linear"]:
             target_modules = "all-linear"
@@ -1148,6 +1370,13 @@ class FSDPEngine(TrainEngine):
             self.model.print_trainable_parameters()
 
     def _create_optimizer(self, ft_spec: FinetuneSpec) -> None:
+        # [FUNCTION DOC]
+        # HELPER: No-op without an optimizer config. Asserts type is adam, adam_bf16 or
+        # sgd, logging warnings for risky combinations (SGD, adam_bf16 without bf16
+        # storage, adam with bf16 storage). Creates AdamW (fused unless VLM with TP),
+        # AnyPrecisionAdamW with bf16 states, or SGD. Builds the LR scheduler (cosine
+        # with min ratio, linear or constant, all with warmup computed from the finetune
+        # spec; ValueError otherwise) and logs timing.
         if self.optimizer_config is None:
             return
         assert self.model is not None
@@ -1248,6 +1477,9 @@ class FSDPEngine(TrainEngine):
         self.logger.info(f"Create optimizer time: {time.perf_counter() - tik}")
 
     def _check_rollout_engine_connected(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError unless both rollout engine and coordinator are
+        # set.
         """Validate that rollout engine has been connected via connect_engine()."""
         if self.rollout_engine is None or self.rollout_coordinator is None:
             raise RuntimeError(
@@ -1256,6 +1488,9 @@ class FSDPEngine(TrainEngine):
             )
 
     def _ensure_ready(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Onloads if offloaded and, when SP > 1, sets the global Ulysses SP
+        # group.
         if self.is_offload:
             self.onload()
 
@@ -1266,6 +1501,9 @@ class FSDPEngine(TrainEngine):
     def _normalize_batch_input(
         input_: list[dict[str, Any]] | dict[str, Any],
     ) -> tuple[dict[str, Any], Any | None]:
+        # [FUNCTION DOC]
+        # HELPER: Static. For list input returns concat_batch's (batched dict, split
+        # meta); for a dict returns (dict, None).
         """Normalize list/dict batch input to a single batched dict.
 
         Returns ``(batched_input, meta)`` where ``meta`` is non-None only when
@@ -1279,6 +1517,13 @@ class FSDPEngine(TrainEngine):
     def _get_model_name_parameters(
         self, meta: WeightUpdateMeta
     ) -> Iterator[tuple[str, nn.Parameter]]:
+        # [FUNCTION DOC]
+        # HELPER: Yields (name, param) pairs renamed to the rollout engine's naming.
+        # Qwen-VL: for SGLang strips the first 'language_model.' and drops a leading
+        # 'model.' for visual params; for vLLM strips the first 'model.' and remaps
+        # language_model.* to language_model.model.* and lm_head.* to
+        # language_model.lm_head.*. Gemma3 VLM uses the vLLM-like scheme. Other models
+        # yield names unchanged.
         name_params_iterator = self.model.named_parameters()
         if self.is_vision_model and is_qwen_vl_model(self.model_config.model_type):
             for name, value in name_params_iterator:
@@ -1316,10 +1561,15 @@ class FSDPEngine(TrainEngine):
             yield from name_params_iterator
 
     def _compute_dtype(self) -> torch.dtype:
+        # [FUNCTION DOC]
+        # HELPER: Returns the torch dtype named by config.dtype.
         """Resolve config.dtype to torch.dtype (canonicalized in TrainEngineConfig)."""
         return getattr(torch, self.config.dtype)
 
     def _cast_to_compute_dtype(self, tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Casts floating-point tensors whose dtype differs from the compute
+        # dtype to it (e.g. fp32 master to bf16); returns others unchanged.
         """Cast fp32 master storage to compute dtype for export / rollout sync.
 
         When optimizer_dtype=float32 (the fp32 master weights default), the
@@ -1334,6 +1584,11 @@ class FSDPEngine(TrainEngine):
         return tensor
 
     def _get_full_tensor(self, param: nn.Parameter) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Returns the unsharded tensor for a parameter: full_tensor() for device
+        # DTensors, rebuilding a DTensor from the local shard for CPU-offloaded DTensors
+        # (gathers onto the shard's device), or moves plain CPU tensors to the
+        # accelerator. Collective for DTensors.
         """Get full tensor from a parameter, handling DTensor and CPU offloaded tensors."""
         tensor = param.data
         if isinstance(tensor, DTensor):
@@ -1359,6 +1614,16 @@ class FSDPEngine(TrainEngine):
         named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
         stream: torch.cuda.Stream | None = None,
     ) -> _PendingWeightUpdateBucket | None:
+        # [FUNCTION DOC]
+        # HELPER: Rank-0 only. Sends one bucket of (name, full tensor) pairs to the
+        # rollout engine. Returns None for an empty bucket. Builds ParamSpecs (name,
+        # shape, dtype string) and, for LoRA, attaches the PEFT config to meta. With
+        # multiple per-PP groups, for each group asks the rollout engine to receive
+        # (meta copy with that group name), broadcasts every tensor synchronously from
+        # rank 0 and waits for the engine, returning an already-completed bucket. With a
+        # single group, asks the engine to receive, then issues async broadcasts (on the
+        # given side stream after it waits on the current stream, if provided) and
+        # returns a pending bucket with handles, future and tensors.
         # Early exit when chunk size is relatively small
         if not named_tensors:
             return None
@@ -1444,6 +1709,9 @@ class FSDPEngine(TrainEngine):
     def _wait_pending_weight_update_bucket(
         self, pending_bucket: _PendingWeightUpdateBucket | None
     ):
+        # [FUNCTION DOC]
+        # HELPER: No-op for None; otherwise waits on all broadcast handles, then the
+        # rollout engine's future, and clears the bucket's tensor list to free memory.
         if pending_bucket is None:
             return
 
@@ -1458,12 +1726,23 @@ class FSDPEngine(TrainEngine):
         meta: WeightUpdateMeta,
         named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
     ):
+        # [FUNCTION DOC]
+        # HELPER: Synchronous variant: sends a bucket and waits for it to complete.
         pending_bucket = self._update_bucket_weights_from_distributed_async(
             meta, named_tensors
         )
         self._wait_pending_weight_update_bucket(pending_bucket)
 
     def _init_weight_update_from_distributed(self, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # HELPER: Sets TORCHELASTIC_USE_AGENT_STORE=False so a new TCP store can be
+        # created. If the inference allocation has PP > 1, delegates to per-PP group
+        # creation. Otherwise records group name 'update_weight_group', fills meta with
+        # this host's IP and a free port (on all ranks), and on rank 0 asks the rollout
+        # engine to join, creates a custom process group of size gen_world_size + 1
+        # (trainer rank 0) via TCP rendezvous, stores it, and waits for the engine.
+        # Asserts meta.type is 'xccl' and gen_allocation exists. Side effects: env
+        # mutation, network, logging.
         assert meta.type == "xccl"
         gen_pp_size = meta.gen_allocation.parallel.pp_size if meta.gen_allocation else 1
 
@@ -1528,6 +1807,13 @@ class FSDPEngine(TrainEngine):
     def _init_per_pp_weight_update_groups(
         self, meta: WeightUpdateMeta, gen_pp_size: int
     ):
+        # [FUNCTION DOC]
+        # HELPER: On rank 0, for each inference PP stage creates group
+        # 'update_weight_group_<pp>' of size (gen_world_size / pp) + 1 with its own
+        # host/free port, asking the rollout engine to join each before rendezvous and
+        # waiting on it; remembers stage 0's address/port and sets weight_update_group
+        # to the first group. Other ranks only record group names and empty
+        # address/port. Asserts gen_allocation exists.
         """Create one NCCL weight-update group per inference PP stage.
 
         The group name carries a PP-rank suffix (e.g. ``update_weight_group_0``)
@@ -1594,6 +1880,16 @@ class FSDPEngine(TrainEngine):
 
     @trace_perf("fsdp_engine.update_weights_from_distributed", category="comm")
     def _update_weights_from_distributed(self, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # HELPER: Broadcast-based weight sync (traced). Refreshes meta's NCCL
+        # address/port/group name, rank 0 pauses generation, all ranks barrier. Iterates
+        # (renamed) parameters, LoRA-trainable ones only when LoRA is on; every rank
+        # gathers the full tensor (collective), but only rank 0 casts it to compute
+        # dtype and accumulates it into a bucket up to weight_chunked_mem_mb, sending
+        # full buckets asynchronously on a CUDA side stream while keeping at most one
+        # bucket in flight; the remainder is sent synchronously and any pending bucket
+        # is drained in a finally block. Then barrier, rank 0 resumes generation, device
+        # sync and a final barrier.
         """Broadcast parameters with single-pending-bucket pipelining."""
 
         # Reset weight weight meta with local info
@@ -1693,6 +1989,13 @@ class FSDPEngine(TrainEngine):
 
     @trace_perf("fsdp_engine.update_weights_from_disk", category="io")
     def _update_weights_from_disk(self, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # HELPER: Disk-based weight sync (traced). Rank 0 pauses generation and asks the
+        # rollout engine to load from meta.path (asynchronously); all ranks save the HF
+        # model to meta.path (asserts it is set). Rank 0 then (re)publishes a
+        # name_resolve key for this experiment/trial/version with the current timestamp
+        # (TTL 120 s) so the engine can see the save finished, waits for the engine and
+        # resumes generation. Ends with device sync and CPU barrier.
         fut = Future()
 
         if dist.get_rank() == 0:
@@ -1729,6 +2032,9 @@ class FSDPEngine(TrainEngine):
         tokenizer: PreTrainedTokenizerFast | None,
         processor: ProcessorMixin | None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError if no model; creates the directory and saves
+        # either the LoRA adapter only or the full model with tokenizer/processor.
         """Save model in HuggingFace format."""
         if self.model is None:
             raise RuntimeError("Model not initialized")
@@ -1740,6 +2046,12 @@ class FSDPEngine(TrainEngine):
             self._save_full_model_to_hf(path, tokenizer, processor)
 
     def _save_lora_to_hf(self, path: str):
+        # [FUNCTION DOC]
+        # HELPER: Gathers each trainable LoRA parameter individually (full_tensor
+        # collective for DTensors); rank 0 renames keys to PEFT-standard (drops the
+        # '.default' adapter segment), casts floats to compute dtype on CPU, writes
+        # adapter_model.safetensors and the adapter config. Ends with a CPU-group
+        # barrier.
         """Save only LoRA adapter weights without gathering full model state.
 
         Iterates adapter parameters and unshards them individually to avoid
@@ -1790,6 +2102,11 @@ class FSDPEngine(TrainEngine):
         tokenizer: PreTrainedTokenizerFast | None,
         processor: ProcessorMixin | None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Gathers the full model state dict offloaded to CPU (collective), rank
+        # 0 casts float tensors to compute dtype and saves the model with
+        # save_pretrained plus the HF config, tokenizer and processor if given. Ends
+        # with a CPU-group barrier.
         """Save full model weights."""
         # FSDP2 checkpoint saving
         # Get full state dict with FSDP2
@@ -1818,6 +2135,9 @@ class FSDPEngine(TrainEngine):
         dist.barrier(group=self.cpu_group)
 
     def _load_model_from_hf(self, path: str):
+        # [FUNCTION DOC]
+        # HELPER: Rank 0 reads the full state dict from the path or hub repo; all ranks
+        # then load/broadcast it into the sharded model via fsdp2_load_full_state_dict.
         """Load model from HuggingFace format."""
         if dist.get_rank() == 0:
             full_state = get_state_dict_from_repo_id_or_path(path)
@@ -1836,6 +2156,10 @@ class FSDPEngine(TrainEngine):
         path: str,
         with_optim: bool,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError if no model; creates the directory and saves a
+        # DCPState (model plus optimizer when with_optim) under key 'dcp' with
+        # torch.distributed.checkpoint.save (collective, sharded files).
         """Save model in PyTorch Distributed Checkpoint (DCP) format."""
         if self.model is None:
             raise RuntimeError("Model not initialized")
@@ -1847,6 +2171,9 @@ class FSDPEngine(TrainEngine):
         dcp.save(state_dict, checkpoint_id=path)
 
     def _load_from_dcp(self, path: str, with_optim: bool):
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError if no model; loads a DCPState (model plus optional
+        # optimizer) from the DCP checkpoint at path, in place.
         """Load model from Distributed Checkpoint (DCP) format."""
         if self.model is None:
             raise RuntimeError("Model not initialized")
@@ -1859,6 +2186,10 @@ class FSDPEngine(TrainEngine):
         )
 
     def _save_optimizer_state(self, path: str):
+        # [FUNCTION DOC]
+        # HELPER: Each rank saves its local optimizer state dict with torch.save to
+        # optim_world_size_<W>_rank_<R>.pt in path, then barriers. Asserts optimizer and
+        # distributed init.
         assert self.optimizer is not None
         assert dist.is_initialized()
         rank = dist.get_rank()
@@ -1870,6 +2201,10 @@ class FSDPEngine(TrainEngine):
         dist.barrier(group=self.cpu_group)
 
     def _load_optimizer_state(self, path: str):
+        # [FUNCTION DOC]
+        # HELPER: Each rank loads its optim_world_size_<W>_rank_<R>.pt shard
+        # (weights_only=False, so pickle execution is possible) into the optimizer, then
+        # barriers. Requires the same world size as when saved.
         assert self.optimizer is not None
         assert dist.is_initialized()
         rank = dist.get_rank()
@@ -1881,6 +2216,21 @@ class FSDPEngine(TrainEngine):
         dist.barrier(group=self.cpu_group)
 
     def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
+        # [FUNCTION DOC]
+        # HELPER: Turns a padded batch dict (requires attention_mask and input_ids;
+        # shallow-copied) into a MicroBatchList on CPU. Tree training: builds packed
+        # trie micro-batches synchronised over DP (size aligned to tp*sp) and returns
+        # early. Otherwise computes position ids: for Qwen-VL casts input_ids to int64,
+        # concatenates image/video grid sizes from multi_modal_input and calls the
+        # model's 3-D (mRoPE) position-id routine (requires mm_token_type_ids),
+        # permuting dims; other models get standard position ids. Splits by mb_spec,
+        # packs each micro-batch, pads (to maximum optionally), logs token counts, adds
+        # a batch dim, and for Qwen-VL restores the [3, 1, seq] position layout. For
+        # each micro-batch and its padded twin sets integer max_length_q/k/max_seqlen,
+        # cu_seq_lens_q/k, use_cache=False, attention_mask None (Qwen3 MoE/VL/3.5) or an
+        # empty full/sliding dict, and moves multimodal payloads into the padded
+        # (forward) batch only. Finally drops multimodal payloads from the list's data.
+        # Returns the MicroBatchList.
         assert "attention_mask" in input_ and "input_ids" in input_
         input_ = input_.copy()
 
@@ -1997,6 +2347,14 @@ class FSDPEngine(TrainEngine):
     def _prepare_mb_inputs(
         self, mb_item: MicroBatchItem
     ) -> tuple[dict[str, Any], FSDPTrainContext]:
+        # [FUNCTION DOC]
+        # HELPER: Builds model inputs and an FSDPTrainContext for one micro-batch. With
+        # Ulysses SP > 1: pads (VLM, no slicing since vision is handled separately) or
+        # pads and slices (LLM) input_ids/position_ids to the SP size, makes position
+        # ids contiguous and builds inputs via ulysses_prepare_inputs (which adds rolled
+        # labels). Otherwise copies the padded micro-batch and pops trie_node. Always
+        # removes turn_ids. Returns (inputs, ctx with original micro-batch, padding
+        # length, Ulysses pad size and trie node).
         """Prepare micro-batch inputs with Ulysses sequence parallel handling.
 
         This method handles Ulysses SP padding and slicing, returning both
@@ -2055,6 +2413,9 @@ class FSDPEngine(TrainEngine):
         return inputs, ctx
 
     def _sp_all_gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Differentiable all-gather over the SP group, concatenated along the
+        # last dim.
         gathered = dist_F.all_gather(tensor, group=self.sp_group)
         return torch.cat(gathered, dim=-1)
 
@@ -2063,6 +2424,11 @@ class FSDPEngine(TrainEngine):
         logits: torch.Tensor,
         ulysses_pad_size: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Returns per-token min and max logits over the vocab (detached,
+        # float32), all-gathered across SP and trimmed of Ulysses padding when SP > 1.
+        # KNOWN ISSUE: with TP the logits are vocab-sharded, so these are per-shard
+        # extremes, not global ones.
         vocab_min_logits = logits.detach().min(-1).values.float()
         vocab_max_logits = logits.detach().max(-1).values.float()
         if self.parallel_helper.sp_size > 1:
@@ -2079,6 +2445,11 @@ class FSDPEngine(TrainEngine):
         inputs: dict[str, Any],
         ulysses_pad_size: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Uses rolled_input_ids (Ulysses) or input_ids rolled left by one as
+        # labels (squeezing a leading batch dim), computes temperature-scaled token
+        # logprobs and entropy (TP-aware, chunked), then gathers across SP and trims
+        # Ulysses padding. Returns (logprobs, entropy).
         # Try to get rolled_input_ids (if Ulysses SP is enabled)
         labels = inputs.get(
             "rolled_input_ids",
@@ -2110,6 +2481,8 @@ class FSDPEngine(TrainEngine):
         inputs: dict[str, Any],
         ulysses_pad_size: int = 0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Same as _compute_logprobs_entropy but returns only logprobs.
         # Try to get rolled_input_ids (if Ulysses SP is enabled)
         labels = inputs.get(
             "rolled_input_ids",
@@ -2138,6 +2511,9 @@ class FSDPEngine(TrainEngine):
         values: torch.Tensor,
         ulysses_pad_size: int = 0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Gathers critic values across SP and trims Ulysses padding when SP > 1;
+        # returns values.
         if self.parallel_helper.sp_size > 1:
             values = self._sp_all_gather(values)
             if ulysses_pad_size > 0:
@@ -2153,6 +2529,16 @@ class FSDPEngine(TrainEngine):
         total_loss_weight: torch.Tensor,
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Computes the scaled micro-batch loss. If the micro-batch's loss weight
+        # is 0 returns zero loss connected to logits. Raises NotImplementedError for
+        # critic + tree training. Actor: with tree training returns zero loss for empty
+        # tries, else unpacks vocab stats and logprobs/entropy from the packed tree;
+        # without it computes logprobs/entropy and vocab min/max and trims packing
+        # padding; calls loss_fn(logprobs, entropy, mb_input, vocab_min_logits=...,
+        # vocab_max_logits=...). Critic: computes values (trimmed) and calls
+        # loss_fn(values, mb_input). Returns loss * local_weight / total_loss_weight *
+        # loss_multiplier.
         """Compute logprobs/entropy and return scaled loss."""
         local_weight = loss_weight_fn(ctx.mb_input)
         if local_weight == 0:
@@ -2221,6 +2607,11 @@ class FSDPEngine(TrainEngine):
         logits: torch.Tensor,
         ctx: FSDPTrainContext,
     ) -> torch.Tensor | dict[int, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Forward output for one micro-batch: for actors, tree-unpacked per-
+        # sequence logprobs dict (tree training) or logprobs trimmed of padding; for
+        # critics, values trimmed of padding. Raises NotImplementedError for critic +
+        # tree training.
         """Compute forward output (logprobs or values)."""
         if self.config.is_critic and self.enable_tree_training:
             raise NotImplementedError(
@@ -2255,9 +2646,15 @@ class FSDPEngine(TrainEngine):
 
 
 class FSDPPPOActor(FSDPEngine):
+    # [CLASS DOC]
+    # FSDPEngine specialised as a PPO actor; delegates logp, advantage and PPO update
+    # logic to an areal PPOActor helper bound to this engine, and adds a plain-list SFT
+    # training entry.
     """PPO Actor implementation using FSDP backend."""
 
     def __init__(self, config: PPOActorConfig):
+        # [FUNCTION DOC]
+        # Initialises the engine and creates the PPOActor helper.
         from areal.trainer.ppo.actor import PPOActor
 
         super().__init__(config)
@@ -2265,16 +2662,27 @@ class FSDPPPOActor(FSDPEngine):
 
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # No-grad; forwards to PPOActor.compute_logp.
         return self.actor.compute_logp(*args, **kwargs)
 
     @torch.no_grad()
     def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # No-grad; forwards to PPOActor.compute_advantages.
         return self.actor.compute_advantages(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Forwards to PPOActor.ppo_update (one or more PPO minibatch updates).
         self.actor.ppo_update(*args, **kwargs)
 
     def sft_train_batch(self, data: list) -> dict:
+        # [FUNCTION DOC]
+        # Converts plain-list items (input_ids, attention_mask, loss_mask, cu_seqlens)
+        # into tensors with a batch dim and runs train_batch with a summed next-token
+        # NLL loss masked by loss_mask shifted left, weighted by the number of target
+        # tokens. Returns train stats.
         import torch
 
         # Convert plain-list inputs (sent without tensors to avoid RPC partitioning)
@@ -2297,6 +2705,9 @@ class FSDPPPOActor(FSDPEngine):
             )
 
         def sft_loss_fn(logprobs, entropy, mb_input, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns the negative sum of logprobs[:-1] weighted by
+            # loss_mask[1:] (all tokens if no mask).
             # logprobs[i] = log P(token[i+1] | context), so apply loss_mask shifted left
             loss_mask = mb_input.get("loss_mask", None)
             if loss_mask is not None:
@@ -2309,6 +2720,9 @@ class FSDPPPOActor(FSDPEngine):
             return -logprobs[:-1].sum()
 
         def sft_loss_weight_fn(input_data):
+            # [FUNCTION DOC]
+            # HELPER: Returns the count of target tokens (sum of loss_mask[1:]) or
+            # sequence length minus one when there is no mask.
             loss_mask = input_data.get("loss_mask", None)
             if loss_mask is not None:
                 if loss_mask.ndim == 2:
@@ -2324,6 +2738,9 @@ class FSDPPPOActor(FSDPEngine):
 
     @classmethod
     def as_controller(cls, config: PPOActorConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Class method returning a PPOActorControllerV2 when config._version is 'v2',
+        # else a PPOActorController, both wrapping this engine class with the scheduler.
         if config._version == "v2":
             from areal.trainer.ppo.actor import PPOActorControllerV2
 
@@ -2339,9 +2756,13 @@ class FSDPPPOActor(FSDPEngine):
 
 
 class FSDPPPOCritic(FSDPEngine):
+    # [CLASS DOC]
+    # FSDPEngine specialised as a PPO critic, delegating to an areal PPOCritic helper.
     """PPO Critic implementation using FSDP backend."""
 
     def __init__(self, config: PPOCriticConfig):
+        # [FUNCTION DOC]
+        # Initialises the engine and creates the PPOCritic helper.
         from areal.trainer.ppo.critic import PPOCritic
 
         super().__init__(config)
@@ -2349,13 +2770,19 @@ class FSDPPPOCritic(FSDPEngine):
 
     @torch.no_grad()
     def compute_values(self, *args, **kwargs) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # No-grad; forwards to PPOCritic.compute_values.
         return self.critic.compute_values(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Forwards to PPOCritic.ppo_update.
         self.critic.ppo_update(*args, **kwargs)
 
     @classmethod
     def as_controller(cls, config: PPOCriticConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Returns PPOCriticControllerV2 for v2 configs, else PPOCriticController.
         if config._version == "v2":
             from areal.trainer.ppo.critic import PPOCriticControllerV2
 
@@ -2371,22 +2798,32 @@ class FSDPPPOCritic(FSDPEngine):
 
 
 class FSDPLMEngine(FSDPEngine):
+    # [CLASS DOC]
+    # FSDPEngine for supervised LM fine-tuning, delegating to an areal LMEngine helper.
     """Language model engine for SFT using FSDP backend."""
 
     def __init__(self, config: TrainEngineConfig):
+        # [FUNCTION DOC]
+        # Initialises the engine and creates the LMEngine helper.
         from areal.trainer.sft.lm_engine import LMEngine
 
         super().__init__(config)
         self.lm_engine = LMEngine(self)
 
     def train_lm(self, data):
+        # [FUNCTION DOC]
+        # Forwards to LMEngine.train_lm and returns its stats.
         return self.lm_engine.train_lm(data)
 
     def evaluate_lm(self, data):
+        # [FUNCTION DOC]
+        # Forwards to LMEngine.evaluate_lm.
         return self.lm_engine.evaluate_lm(data)
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Returns LMControllerV2 for v2 configs, else LMController.
         if config._version == "v2":
             from areal.trainer.sft.lm_engine import LMControllerV2
 
@@ -2402,9 +2839,15 @@ class FSDPLMEngine(FSDPEngine):
 
 
 class FSDPRWEngine(FSDPEngine):
+    # [CLASS DOC]
+    # FSDPEngine for reward-model training on paired data, delegating to an areal
+    # RWEngine helper; forces micro-batch granularity 2 so pairs stay together.
     """Reward model engine using FSDP backend."""
 
     def __init__(self, config: TrainEngineConfig):
+        # [FUNCTION DOC]
+        # Initialises the engine and RWEngine helper; if mb_spec.granularity != 2, logs
+        # a warning and replaces config with a deep copy whose granularity is 2.
         from copy import deepcopy
 
         from areal.trainer.rw.rw_engine import RWEngine
@@ -2418,13 +2861,19 @@ class FSDPRWEngine(FSDPEngine):
             self.config.mb_spec.granularity = 2
 
     def train_rw(self, data):
+        # [FUNCTION DOC]
+        # Forwards to RWEngine.train_rw.
         return self.rw_engine.train_rw(data)
 
     def evaluate_rw(self, data):
+        # [FUNCTION DOC]
+        # Forwards to RWEngine.evaluate_rw.
         return self.rw_engine.evaluate_rw(data)
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Returns RWControllerV2 for v2 configs, else RWController.
         if config._version == "v2":
             from areal.trainer.rw.rw_engine import RWControllerV2
 
@@ -2436,9 +2885,15 @@ class FSDPRWEngine(FSDPEngine):
 
 
 class FSDPDPOEngine(FSDPEngine):
+    # [CLASS DOC]
+    # FSDPEngine for DPO training, delegating to an areal DPOEngine helper; forces
+    # micro-batch granularity 2 so chosen/rejected pairs stay together.
     """DPO training engine using FSDP backend."""
 
     def __init__(self, config: DPOEngineConfig):
+        # [FUNCTION DOC]
+        # Initialises the engine and DPOEngine helper; if granularity != 2, warns and
+        # deep-copies config with granularity 2.
         from copy import deepcopy
 
         from areal.trainer.dpo.dpo_engine import DPOEngine
@@ -2452,12 +2907,18 @@ class FSDPDPOEngine(FSDPEngine):
             self.config.mb_spec.granularity = 2
 
     def train_dpo(self, data):
+        # [FUNCTION DOC]
+        # Forwards to DPOEngine.train_dpo.
         return self.dpo_engine.train_dpo(data)
 
     def evaluate_dpo(self, data):
+        # [FUNCTION DOC]
+        # Forwards to DPOEngine.evaluate_dpo.
         return self.dpo_engine.evaluate_dpo(data)
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # Forwards to DPOEngine.compute_logp (reference/policy logprobs per sample).
         return self.dpo_engine.compute_logp(data)
 
     @classmethod
@@ -2466,6 +2927,8 @@ class FSDPDPOEngine(FSDPEngine):
         config: DPOEngineConfig,
         scheduler: Scheduler,
     ):
+        # [FUNCTION DOC]
+        # Returns DPOControllerV2 for v2 configs, else DPOController.
         if config._version == "v2":
             from areal.trainer.dpo.dpo_engine import DPOControllerV2
 

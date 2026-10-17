@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# SGLang scheduler plugin enabling AWEX colocated weight updates. On import it rejects
+# PYTORCH_CUDA_ALLOC_CONF with expandable_segments (RuntimeError) since that disables
+# SGLang's memory saver. register_awex_plugin monkey-patches Scheduler.__init__ (inside
+# the scheduler child process) to bind an AwexSchedulerPlugin, which adds awex_* RPC
+# methods, starts a background thread that gates per-version updates via the MetaServer
+# (env AWEX_META_SERVER_ADDR), and replaces the scheduler event loops so queued updates
+# are applied on the main thread while the engine is paused. Can also be run as a module
+# to launch an SGLang server with the patched scheduler entry point.
+# KNOWN ISSUE: the module docstring says the background thread fetches and queues IPC
+# data, but it now only queues version markers; the awex reader collects IPC handles
+# itself.
 # SPDX-License-Identifier: Apache-2.0
 
 """AWEX SGLang scheduler plugin for colocated weight transfer.
@@ -34,6 +46,9 @@ from typing import Any
 
 
 def assert_alloc_conf_supports_memory_saver(conf: str) -> None:
+    # [FUNCTION DOC]
+    # Raises RuntimeError if the allocator config string contains
+    # expandable_segments:true (case/space-insensitive); otherwise returns None.
     """Reject allocator configs that silently disable SGLang's memory saver.
 
     torch_memory_saver disables itself when it sees expandable_segments, so
@@ -64,6 +79,9 @@ SUPPORTED_SGLANG_VERSIONS = ("0.5.9", "0.5.10.post1")
 
 
 def assert_supported_sglang_version() -> None:
+    # [FUNCTION DOC]
+    # Raises RuntimeError unless the installed sglang version is exactly one of
+    # SUPPORTED_SGLANG_VERSIONS.
     """Refuse to patch a SGLang build whose internals were not verified.
 
     This plugin reaches into scheduler internals: it wraps Scheduler.__init__,
@@ -83,6 +101,9 @@ def assert_supported_sglang_version() -> None:
 
 
 def _float_env(name: str, default: float) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Returns float(env[name]) or default when unset/empty; logs a warning and
+    # returns default on parse failure.
     value = os.environ.get(name, "")
     if not value:
         return default
@@ -94,6 +115,11 @@ def _float_env(name: str, default: float) -> float:
 
 
 class AwexSchedulerPlugin:
+    # [CLASS DOC]
+    # Per-scheduler plugin object. Holds the scheduler, a lazily created
+    # AwexColocateReader, a background thread, a thread-safe queue of version markers,
+    # the last applied version, and the paused-loop poll interval (env
+    # AWEX_PAUSED_POLL_INTERVAL_S, default 0.01 s, clamped >= 0).
     """Binds awex weight-receive to a SGLang Scheduler instance.
 
     Architecture: background thread handles MetaServer I/O (CPU only),
@@ -101,6 +127,9 @@ class AwexSchedulerPlugin:
     """
 
     def __init__(self, scheduler: Any) -> None:
+        # [FUNCTION DOC]
+        # Initialises state as described for the class. No I/O beyond reading the env
+        # var.
         self._scheduler = scheduler
         self._receiver = None
         self._bg_thread: threading.Thread | None = None
@@ -111,6 +140,10 @@ class AwexSchedulerPlugin:
         )
 
     def bind(self) -> None:
+        # [FUNCTION DOC]
+        # Attaches the awex_* methods and process_awex_queue onto the scheduler instance
+        # as attributes, logs, and if AWEX_META_SERVER_ADDR is set, starts the
+        # background worker and patches the event loops.
         methods = [
             "awex_init_receiver",
             "awex_receive_weights",
@@ -132,6 +165,9 @@ class AwexSchedulerPlugin:
             self._patch_event_loop()
 
     def _require_receiver(self):
+        # [FUNCTION DOC]
+        # HELPER: Lazily constructs and returns the AwexColocateReader for the
+        # scheduler.
         if self._receiver is None:
             from areal.engine.awex.colocate_reader import AwexColocateReader
 
@@ -139,26 +175,46 @@ class AwexSchedulerPlugin:
         return self._receiver
 
     def awex_init_receiver(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC]
+        # Forwards keyword arguments to the reader's initialize.
         self._require_receiver().initialize(**kwargs)
 
     def awex_receive_weights(self, version: int = 0) -> None:
+        # [FUNCTION DOC]
+        # Runs the reader's update_weights for the given version.
         self._require_receiver().update_weights(version)
 
     def awex_release_memory(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Forwards to the reader's release_memory with tags.
         self._require_receiver().release_memory(tags)
 
     def awex_resume_memory(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Forwards to the reader's resume_memory with tags.
         self._require_receiver().resume_memory(tags)
 
     def awex_get_weight_metadata(self) -> list:
+        # [FUNCTION DOC]
+        # Returns the reader's inference parameters metadata.
         return self._require_receiver().get_weight_metadata()
 
     def awex_get_parallelism(self) -> dict:
+        # [FUNCTION DOC]
+        # Returns the reader's parallelism dict.
         return self._require_receiver().get_parallelism()
 
     # ── Main loop hook: process queued weight updates ─────────────────
 
     def process_awex_queue(self) -> None:
+        # [FUNCTION DOC]
+        # Main-loop hook; must be called by all TP ranks together. Checks whether the
+        # local queue is non-empty and, with TP > 1, all-reduces MIN over the TP CPU
+        # group so it proceeds only when every rank has an item. Then pops the version
+        # marker, waits for the writer's offload signal, resumes SGLang 'weights'
+        # memory, runs the reader's update_weights (logging and re-raising exceptions),
+        # signals finished, and records the version as applied. Side effects:
+        # collectives, GPU memory changes, MetaServer I/O, logging.
         """Called from scheduler main loop. Processes pending weight updates.
 
         This is a TP-collective operation: ALL TP ranks must call it together
@@ -256,6 +312,16 @@ class AwexSchedulerPlugin:
     # ── Patch scheduler event loop to call process_awex_queue ─────────
 
     def _patch_event_loop(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Replaces scheduler.event_loop_overlap and event_loop_normal with
+        # versions that, whenever the engine is paused, call process_awex_queue and
+        # sleep the poll interval instead of running batches; otherwise they replicate
+        # SGLang's normal/overlap scheduling logic. If the scheduler has
+        # log_decode_stats hooks, wraps them to record the decode counter at their last
+        # call so decode metrics skipped by the patched loop can be re-emitted.
+        # KNOWN ISSUE: the replicated loops copy SGLang internals and must be kept in
+        # sync with the supported versions; the saved original loop references are
+        # unused.
         """Inject process_awex_queue into scheduler's event loops.
 
         SGLang uses event_loop_overlap by default. Patch both for safety.
@@ -274,12 +340,18 @@ class AwexSchedulerPlugin:
             )
 
             def _tracked_log_decode_stats(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Records forward_ct_decode on the scheduler, then calls the
+                # original log_decode_stats.
                 scheduler._areal_awex_last_decode_stats_ct = getattr(
                     scheduler, "forward_ct_decode", None
                 )
                 return _orig_log_decode_stats(*args, **kwargs)
 
             def _tracked_log_decode_stats_every_iteration(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Records forward_ct_decode, then calls the original per-
+                # iteration decode stats logger.
                 scheduler._areal_awex_last_decode_stats_every_iter_ct = getattr(
                     scheduler, "forward_ct_decode", None
                 )
@@ -296,6 +368,12 @@ class AwexSchedulerPlugin:
             )
 
         def _maybe_restore_decode_metrics(stage, batch, result):
+            # [FUNCTION DOC]
+            # HELPER: After processing a DECODE batch result, when hooks exist,
+            # AREAL_AWEX_FORCE_SGLANG_METRICS is '1' (default) and scheduler metrics are
+            # enabled: calls log_decode_stats if the decode counter hits
+            # decode_log_interval and it was not already logged for this counter, and
+            # calls the per-iteration logger if not already called for this counter.
             if not _decode_hooks_available:
                 return
             if os.environ.get("AREAL_AWEX_FORCE_SGLANG_METRICS", "1") != "1":
@@ -343,6 +421,13 @@ class AwexSchedulerPlugin:
         _orig_overlap = scheduler.event_loop_overlap
 
         def _patched_overlap():
+            # [FUNCTION DOC]
+            # HELPER: Overlap event loop (never returns): receive and process requests
+            # (logging control requests and every 500 loops), handle pause by processing
+            # the awex queue, else get the next batch, run it, queue its result and
+            # process the previous batch's result (overlapped unless disabled for this
+            # batch), self-check when idle, launch sampling for generation models, and
+            # track last_batch.
             """Patched overlap loop that checks awex queue when paused."""
             from collections import deque
 
@@ -351,6 +436,9 @@ class AwexSchedulerPlugin:
             _paused_reported = False
 
             def pop_and_process():
+                # [FUNCTION DOC]
+                # HELPER: Pops the oldest (batch, result) from the scheduler's result
+                # queue, processes it and restores decode metrics.
                 tmp_batch, tmp_result = scheduler.result_queue.popleft()
                 scheduler.process_batch_result(tmp_batch, tmp_result)
                 _maybe_restore_decode_metrics(
@@ -432,6 +520,10 @@ class AwexSchedulerPlugin:
         _orig_normal = scheduler.event_loop_normal
 
         def _patched_normal():
+            # [FUNCTION DOC]
+            # HELPER: Non-overlap event loop (never returns): receive/process requests,
+            # process the awex queue while paused, otherwise run the next batch
+            # synchronously and process its result, or self-check when idle.
             logger.info(
                 f"[AWEX] _patched_normal STARTING (gpu_id={getattr(scheduler, 'gpu_id', '?')})",
             )
@@ -462,6 +554,9 @@ class AwexSchedulerPlugin:
     # ── Background thread: MetaServer I/O only (no CUDA ops) ─────────
 
     def _start_background_worker(self, meta_server_addr: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Starts a daemon thread running _background_worker with the MetaServer
+        # address and logs it.
         self._bg_thread = threading.Thread(
             target=self._background_worker,
             args=(meta_server_addr,),
@@ -475,6 +570,17 @@ class AwexSchedulerPlugin:
         )
 
     def _background_worker(self, meta_server_addr: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Thread body. Sets the CUDA device to the scheduler's gpu_id,
+        # initialises the receiver (logs and exits the thread on failure), reads the
+        # writer's starting version from MetaServer key
+        # awex_writer_version_<ip>_<physical gpu>. Then loops: wait until that version's
+        # IPC weights key exists, enqueue a version marker, busy-wait (0.1 s) until the
+        # main loop applied it, increment the version. On exceptions logs, retries with
+        # exponential backoff (capped at 30 s) up to AWEX_READER_MAX_RETRIES (default
+        # 1000) consecutive failures, then gives up.
+        # KNOWN ISSUE: if process_awex_queue raises on the main thread, _version never
+        # advances and this thread spins forever in the wait loop.
         """Initialize the reader, then gate weight-update triggers to the main loop.
 
         This thread does NOT perform any CUDA memory writes. It only:
@@ -574,6 +680,15 @@ class AwexSchedulerPlugin:
                 time.sleep(min(2**retries, 30))
 
     def _init_receiver_from_meta_server(self, meta_server_addr: str):
+        # [FUNCTION DOC]
+        # HELPER: Connects a MetaServerClient (up to 60 attempts, 5 s apart;
+        # RuntimeError if all fail), waits for awex_train_info, sets infer world size
+        # equal to train world size, computes transfer_rank = SLURM_NODEID * (world /
+        # SLURM_NNODES) + gpu_id, and initialises the receiver with that rank and the
+        # physical GPU id.
+        # KNOWN ISSUE: the transfer rank formula assumes equal GPUs per node and SLURM
+        # env vars; outside SLURM multi-node runs all nodes would compute colliding
+        # ranks.
         """Connect to MetaServer, get train info, initialize colocate receiver."""
         from awex.meta.meta_server import MetaServerClient
 
@@ -658,6 +773,9 @@ class AwexSchedulerPlugin:
 
 @dataclass
 class ModelWorkerTask:
+    # [CLASS DOC]
+    # Dataclass describing a callable plus kwargs to run inside the model worker
+    # (backport of SGLang PR #13595).
     """Task for execute_task_in_model_worker (PR #13595 backport for SGLang 0.5.9)."""
 
     task_func: Callable
@@ -665,6 +783,10 @@ class ModelWorkerTask:
 
 
 def register_awex_plugin() -> None:
+    # [FUNCTION DOC]
+    # Checks the SGLang version, then wraps Scheduler.__init__ so every new scheduler
+    # binds an AwexSchedulerPlugin and gets execute_task_in_model_worker. Must run in
+    # the scheduler child process. Side effect: global monkey-patch, logging.
     """Patch Scheduler.__init__ to inject awex plugin after construction.
 
     Must be called INSIDE the scheduler child process (not the parent),
@@ -678,6 +800,9 @@ def register_awex_plugin() -> None:
     _orig_init = Scheduler.__init__
 
     def _patched_init(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Calls the original __init__, binds the plugin and patches the task
+        # executor.
         _orig_init(self, *args, **kwargs)
         AwexSchedulerPlugin(self).bind()
         _patch_execute_task_in_model_worker(self)
@@ -687,9 +812,16 @@ def register_awex_plugin() -> None:
 
 
 def _patch_execute_task_in_model_worker(scheduler) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Attaches execute_task_in_model_worker to the scheduler and, if it has a
+    # request dispatcher, registers it as the handler for ModelWorkerTask.
     """Add execute_task_in_model_worker to Scheduler (backport from PR #13595)."""
 
     def execute_task_in_model_worker(task_spec: ModelWorkerTask):
+        # [FUNCTION DOC]
+        # HELPER: Calls task_spec.task_func with its kwargs plus model_context (tp
+        # rank/size, server args, scheduler), the model and the model runner; returns
+        # its result.
         model_context = dict(
             tp_rank=scheduler.tp_rank,
             tp_size=scheduler.tp_size,
@@ -712,6 +844,10 @@ def _patch_execute_task_in_model_worker(scheduler) -> None:
 
 
 def awex_run_scheduler_process(*args, **kwargs):
+    # [FUNCTION DOC]
+    # Scheduler process entry point: registers the plugin if AWEX_META_SERVER_ADDR is
+    # set (else logs and skips), then delegates to SGLang's run_scheduler_process with
+    # all arguments and returns its result.
     """Scheduler process entry point that registers awex plugin.
 
     Memory management (pause/resume weights, KV cache, CUDA graphs) is handled

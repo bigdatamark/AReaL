@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Training-side AWEX colocated weight transfer adapter for MegatronEngine. Converts
+# Megatron params to HF names/layouts via awex converters, shares them with the
+# colocated SGLang process on the same GPU through CUDA IPC handles exchanged on an awex
+# MetaServer, and manually offloads/reloads model weights, grad buffers and optimizer
+# states to make room. Also exposes helpers for physical GPU id resolution and the
+# shared AWEX timeout (env AWEX_COLOCATE_TIMEOUT_S).
 # SPDX-License-Identifier: Apache-2.0
 
 # Licensed under the Apache License, Version 2.0
@@ -37,6 +44,11 @@ logger = getLogger("AwexColocate")
 
 
 def resolve_physical_gpu_id(relative_gpu_id: int) -> int:
+    # [FUNCTION DOC]
+    # Maps a process-relative CUDA device index to the physical GPU id by indexing the
+    # integer list in CUDA_VISIBLE_DEVICES. Returns the relative id unchanged when the
+    # variable is empty, contains non-integers (e.g. UUIDs) or the index is out of
+    # range.
     """Map a CUDA-masked relative device index to its physical GPU id.
 
     CUDA IPC keys must be unique per node, so both sides of a colocated
@@ -57,6 +69,9 @@ def resolve_physical_gpu_id(relative_gpu_id: int) -> int:
 
 
 def awex_colocate_timeout_s(default: float = 1800.0) -> float:
+    # [FUNCTION DOC]
+    # Returns the float timeout from env AWEX_COLOCATE_TIMEOUT_S, or default (1800 s)
+    # when unset/blank; logs a warning and returns default if it is not a valid float.
     value = os.environ.get("AWEX_COLOCATE_TIMEOUT_S", "").strip()
     if not value:
         return default
@@ -72,6 +87,13 @@ def awex_colocate_timeout_s(default: float = 1800.0) -> float:
 
 
 class AwexMegatronAdapter:
+    # [CLASS DOC]
+    # Per-rank adapter owned by a MegatronEngine. Tracks the MetaServer client/address,
+    # transfer rank, awex rank info and weight converter, IP and physical GPU id,
+    # inference world size and engine count, a logical train rank (infer_world_size +
+    # train global rank), released memory tags ('optimizer', 'weights') and CPU copies
+    # of offloaded non-DDP weights. Initialisation is two-phase:
+    # init_colocate_weight_update (connect) then _lazy_initialize on the first transfer.
     """Training-side adapter for AWEX colocated weight transfer.
 
     Uses CUDA IPC (share_memory + ForkingPickler serialization) for zero-copy
@@ -80,6 +102,11 @@ class AwexMegatronAdapter:
     """
 
     def __init__(self, engine: MegatronEngine):
+        # [FUNCTION DOC]
+        # Stores the engine and initialises all bookkeeping to empty/None. No I/O.
+        # KNOWN ISSUE: _timeout_s and _physical_gpu_id are not initialised here, so
+        # using the adapter before init_colocate_weight_update / _lazy_initialize raises
+        # AttributeError.
         self._engine = engine
         self._offloaded_weights: dict[str, torch.Tensor] = {}
         self._released_tags: set[str] = set()
@@ -101,6 +128,13 @@ class AwexMegatronAdapter:
         transfer_rank: int = 0,
         timeout_s: float | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Resolves the MetaServer address from the argument, then env
+        # AWEX_META_SERVER_ADDR, else starts a MetaServer in-process and exports its
+        # address to that env var. Connects a MetaServerClient, stores transfer_rank and
+        # the timeout (argument or env default). Global rank 0 publishes awex_train_info
+        # with the train world size. pair_name is unused. Side effects: may start a
+        # server, network I/O, env mutation, logging.
         """Initialize MetaServer connection. NCCL group creation is deferred
         to the first weight update (lazy init) to allow SGLang to start first.
         """
@@ -138,6 +172,16 @@ class AwexMegatronAdapter:
         )
 
     def _lazy_initialize(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: One-time setup on first transfer (no-op afterwards). Gets awex mcore
+        # rank info, local IP and physical GPU id; wraps the engine in a minimal shim
+        # object expected by awex's McoreParamMetaResolver; blocks for infer_conf from
+        # MetaServer; computes training parameter metadata and (rank 0) publishes
+        # training_params_meta; computes the logical train rank; registers (ip, physical
+        # gpu, logical rank) in the training_device_rank_entries set; blocks for
+        # num_infer_engines; and builds the awex train weights converter for the model
+        # architecture with infer_conf plus the PP stage layer map and the Megatron
+        # transformer config.
         """Perform deferred initialization: metadata exchange and weight converter setup.
 
         In colocate mode, train side does NOT join any NCCL group.
@@ -161,7 +205,15 @@ class AwexMegatronAdapter:
         from awex.meta.train_meta_resolver import McoreParamMetaResolver
 
         class _EngineShim:
+            # [CLASS DOC]
+            # HELPER: Minimal engine-like object exposing model (as a list), hf_config,
+            # engine_name 'mcore', debug/colocate flags off, empty config and meta
+            # server address, and no-op memory release/resume, as required by the awex
+            # meta resolver.
             def __init__(self, engine):
+                # [FUNCTION DOC]
+                # HELPER: Copies model (wrapped in a list if needed) and hf_config from
+                # the engine and sets fixed defaults.
                 self.model = engine.model
                 if not isinstance(self.model, (list, tuple)):
                     self.model = [self.model]
@@ -173,9 +225,13 @@ class AwexMegatronAdapter:
                 self.meta_server_addr = ""
 
             def release_memory_occupation(self, tags=None):
+                # [FUNCTION DOC]
+                # HELPER: No-op.
                 pass
 
             def resume_memory_occupation(self, tags=None):
+                # [FUNCTION DOC]
+                # HELPER: No-op.
                 pass
 
         shim = _EngineShim(self._engine)
@@ -242,6 +298,10 @@ class AwexMegatronAdapter:
         )
 
     def _release_grad_memory(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For each Megatron DDP chunk, records each dense/expert grad buffer's
+        # storage size in grad_data_size and resizes the storage to 0; if anything was
+        # freed, synchronises CUDA, runs GC and empties the cache. Logs the count.
         """Release gradient buffers to free GPU memory before weight conversion.
 
         Mirrors the AWEX reference release_grad_memory().
@@ -271,6 +331,19 @@ class AwexMegatronAdapter:
 
     @torch.no_grad()
     def execute_colocate_weight_update(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # Publishes one weight version under no_grad. Steps: collect stale CUDA IPC
+        # blocks; offload optimizer states and grad buffers; resume weights if
+        # offloaded; lazily initialise; convert params to HF; group tensors by
+        # shape/dtype; release converted tensors that do not alias live module
+        # params/buffers; offload weights; add the logical rank to
+        # all_training_offloaded_weights; share_memory the groups and CUDA-IPC serialise
+        # (groups, metadata, names); put awex_writer_version_<ip>_<gpu> and
+        # training_serialized_weights_<ip>_<gpu>_<version>; wait (timeout) for
+        # weights_update_finished_<...>, deleting it and the weights key afterwards
+        # (logs and re-raises on failure); in all cases release group tensors, sync, GC,
+        # ipc_collect and empty cache; finally put write_finished_<...>. Returns None.
+        # Side effects: heavy GPU memory movement, MetaServer I/O, logging.
         """Send weights to colocated inference via CUDA IPC through MetaServer.
 
         Flow (mirrors AWEX nccl_writer._write_weights_in_colocate_mode):
@@ -447,6 +520,11 @@ class AwexMegatronAdapter:
         logger.info("Colocate weight update completed: version=%d", version)
 
     def finish_colocate_weight_update(self, training_world_size: int) -> None:
+        # [FUNCTION DOC]
+        # Waits until the MetaServer set finished_weights_update_engines has
+        # num_infer_engines entries, barriers on the engine's CPU group, then rank 0
+        # deletes that set and all_training_offloaded_weights. training_world_size is
+        # unused.
         """Wait for all inference engines to finish weight update, then clean up.
 
         Mirrors AWEX _finish_weights_update().
@@ -473,6 +551,13 @@ class AwexMegatronAdapter:
 
     @torch.no_grad()
     def _convert_parameters(self) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Under no_grad, iterates model chunks (vp stage = chunk index), gets
+        # Megatron parameters via awex, and converts each detached param into one or
+        # more (hf_name, tensor) pairs. If word embeddings are tied and this is the last
+        # PP stage, aliases lm_head.weight to model.embed_tokens.weight when only the
+        # latter is present. Returns the dict of HF name to tensor (some may alias live
+        # storage).
         """Convert Megatron parameters to HF format for IPC transfer."""
         from awex.converter.mcore_converter import get_mcore_model_parameters
 
@@ -503,6 +588,10 @@ class AwexMegatronAdapter:
     # ── Memory management (manual offload) ────────────────────────────────
 
     def release_memory(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Offloads the requested tags (default optimizer and weights) that are not
+        # already released, marks them released, then syncs CUDA, runs GC and empties
+        # the cache. No-op if nothing new to release.
         tags = tags or ["optimizer", "weights"]
         tags_to_release = [t for t in tags if t not in self._released_tags]
         if not tags_to_release:
@@ -522,6 +611,10 @@ class AwexMegatronAdapter:
         logger.info("release_memory done: tags=%s", tags_to_release)
 
     def resume_memory(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Reloads the requested released tags (default both): weights first (without
+        # grads), then optimizer states; unmarks them and syncs CUDA. No-op if none
+        # released.
         tags = tags or ["optimizer", "weights"]
         tags_to_resume = [t for t in tags if t in self._released_tags]
         if not tags_to_resume:
@@ -539,6 +632,13 @@ class AwexMegatronAdapter:
         logger.info("resume_memory done: tags=%s", tags_to_resume)
 
     def _offload_model_weights(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For DDP chunks, per dense/expert buffer, uses the buffer's native
+        # offload_to_cpu if available; otherwise copies param_data into a lazily created
+        # pinned CPU tensor (cpu_data), records param_data_size, and frees param and
+        # grad storage (recording grad_data_size). For non-DDP chunks moves each CUDA
+        # param's data to CPU in _offloaded_weights and replaces it with an empty CPU
+        # tensor. Syncs CUDA and logs the count.
         from megatron.core.distributed import DistributedDataParallel as DDP
 
         model = self._engine.model
@@ -582,6 +682,14 @@ class AwexMegatronAdapter:
         logger.info("Offloaded %d weight buffers to CPU", count)
 
     def _reload_model_weights(self, load_grad: bool = False) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Inverse of _offload_model_weights: for DDP buffers uses
+        # reload_from_cpu if available, else re-allocates param storage to the recorded
+        # size and copies cpu_data back (and, if load_grad, re-allocates and zeroes grad
+        # storage); for non-DDP chunks moves saved CPU tensors back to the engine
+        # device. Clears the saved dict, syncs and logs.
+        # KNOWN ISSUE: assumes param_data_size exists whenever storage is empty; a
+        # buffer whose storage was emptied elsewhere would raise AttributeError.
         from megatron.core.distributed import DistributedDataParallel as DDP
 
         model = self._engine.model
@@ -618,6 +726,10 @@ class AwexMegatronAdapter:
         logger.info("Reloaded model weights to GPU (load_grad=%s)", load_grad)
 
     def ensure_grad_buffers(self) -> None:
+        # [FUNCTION DOC]
+        # Re-allocates and zeroes any DDP grad buffer whose storage was freed (has
+        # grad_data_size and empty storage), so backward can run. Syncs and logs if any
+        # were allocated.
         """Allocate grad buffers if they were freed during offload.
 
         Called before forward_backward (training) to ensure grad storage
@@ -648,6 +760,9 @@ class AwexMegatronAdapter:
             logger.info("Allocated %d grad buffers for training", count)
 
     def _get_inner_optimizers(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns [] if no optimizer, else chained_optimizers, optimizers, or a
+        # single-element list of the engine's optimizer.
         optimizer = self._engine.optimizer
         if optimizer is None:
             return []
@@ -660,6 +775,13 @@ class AwexMegatronAdapter:
         return inner_optimizers
 
     def _offload_optimizer_states(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If env AWEX_OPT_OFFLOAD_VIA_HDO is '1' and the optimizer has
+        # offload_to_cpu, delegates to it. Otherwise, for each inner optimizer, moves
+        # fp32 main parameter shards (shard_fp32_from_float16_groups) and Adam
+        # exp_avg/exp_avg_sq tensors to CPU by swapping references (non-blocking). Then
+        # purges Transformer Engine's global _dummy_wgrads cache if importable, syncs
+        # CUDA and logs the count.
         optimizer = self._engine.optimizer
         if optimizer is None:
             return
@@ -726,6 +848,10 @@ class AwexMegatronAdapter:
         logger.info("Offloaded %d optimizer state tensors to CPU", count)
 
     def _reload_optimizer_states(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Inverse of _offload_optimizer_states: uses restore_from_cpu under
+        # AWEX_OPT_OFFLOAD_VIA_HDO=1, else moves fp32 main shards and Adam states back
+        # to the engine device. Syncs and logs.
         optimizer = self._engine.optimizer
         if optimizer is None:
             return
@@ -773,6 +899,9 @@ class AwexMegatronAdapter:
 
 
 def _get_tf_config(models):
+    # [FUNCTION DOC]
+    # HELPER: Returns the first non-None transformer_config or config attribute found on
+    # the model chunk(s), or None.
     if not isinstance(models, (list, tuple)):
         models = [models]
     for model in models:

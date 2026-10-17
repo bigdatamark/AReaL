@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Gradient-norm computation and clipping for FSDP2 (optionally with TP/PP), adapted from
+# Megatron-LM. At import time picks multi-tensor kernels from Transformer Engine, else
+# Apex amp_C, else the local pure-PyTorch fallbacks (emitting a warning).
 # SPDX-License-Identifier: Apache-2.0
 
 from collections import defaultdict
@@ -52,14 +56,25 @@ except ImportError:
 
 
 def to_local_if_dtensor(tensor: Tensor | DTensor) -> Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns the local shard of a DTensor, or the tensor unchanged if it is a
+    # plain Tensor.
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 def device_mesh_has_dim(mesh: DeviceMesh, dim_name: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if the device mesh has named dimensions and dim_name is among
+    # them.
     return mesh.mesh_dim_names is not None and dim_name in mesh.mesh_dim_names
 
 
 def is_param_not_tensor_parallel_duplicate(param, tensor_parallel_rank: int):
+    # [FUNCTION DOC]
+    # HELPER: Decides whether a parameter's gradient should count toward the norm on
+    # this TP rank, to avoid double counting replicated params. TP rank 0 always counts;
+    # on other ranks, only DTensors with a 'tp' mesh dim whose tp placement is not
+    # Replicate count. Returns bool.
     if tensor_parallel_rank == 0:
         return True
 
@@ -77,6 +92,9 @@ def is_param_not_tensor_parallel_duplicate(param, tensor_parallel_rank: int):
 
 
 def get_main_grads_for_grad_norm(params, tensor_parallel_rank: int) -> list[Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the list of non-None .grad tensors of params that are not TP
+    # duplicates on this rank.
     return [
         param.grad
         for param in params
@@ -93,6 +111,19 @@ def get_grad_norm_fp32(
     norm_type: float = 2.0,
     offload_params: bool = False,
 ) -> float:
+    # [FUNCTION DOC]
+    # Computes the global gradient norm as a Python float. Converts DTensor grads to
+    # local shards; for inf-norm takes the max abs value and all-reduces MAX over the DP
+    # and model-parallel groups; for p-norms sums the p-th powers (fused multi-tensor L2
+    # kernel for p=2 on GPU, per-tensor torch.norm otherwise, a CPU loop with .item()
+    # when offload_params), all-reduces SUM over the groups, and takes the p-th root.
+    # Ranks with no grads still join the all-reduces with zero contribution to avoid
+    # hangs. Inputs: grads_for_norm (tensor or list), data_parallel_group,
+    # model_parallel_group (either may be None), norm_type, offload_params. Side
+    # effects: collectives and GPU-CPU syncs.
+    # KNOWN ISSUE: the data-parallel group is tested by truthiness while the model-
+    # parallel group uses 'is not None'; behavior is the same for real groups but
+    # inconsistent.
     if isinstance(grads_for_norm, Tensor):
         grads_for_norm = [grads_for_norm]
 
@@ -183,6 +214,12 @@ def clip_grad_by_total_norm_fp32(
     total_norm: float,
     offload_params: bool = False,
 ) -> None:
+    # [FUNCTION DOC]
+    # Scales all parameter gradients in place by max_norm / (total_norm + 1e-6) when
+    # that coefficient is < 1; otherwise does nothing. Groups local grads by dtype; on
+    # GPU uses the selected fused scale kernel for fp32 grads and the local fallback for
+    # other dtypes (e.g. bf16 lm_head); with offload_params uses the local fallback on
+    # CPU. Returns None.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
     if clip_coeff >= 1.0:
         return
@@ -244,6 +281,13 @@ def fsdp2_clip_grad_norm(
     norm_type: float = 2.0,
     offload_params: bool = False,
 ) -> float:
+    # [FUNCTION DOC]
+    # Public entry point: validates norm_type (ValueError unless positive or inf),
+    # determines the TP rank, gathers non-duplicate grads, computes the norm over the
+    # FSDP and TP groups, then if pp_group is given combines across pipeline stages (MAX
+    # for inf, sum of p-th powers then root otherwise), and clips the parameters' grads
+    # in place if any parameters were given. Returns the total (pre-clip) grad norm as
+    # float. Side effects: collectives, GPU-CPU syncs, in-place grad mutation.
     if norm_type <= 0 and norm_type != float("inf"):
         raise ValueError(
             f"Invalid norm_type {norm_type}. Must be a positive float or inf."

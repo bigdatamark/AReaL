@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Megatron-Core based training engine (MegatronEngine) implementing the TrainEngine API
+# with TP/PP/VPP/CP/EP parallelism via Megatron's parallel state. Models are built from
+# HF checkpoints through mbridge or megatron-bridge, optionally with Megatron-Bridge
+# LoRA, FP8, chunked-logits (AReaL LM head) and tree training. Provides Megatron
+# pipeline-scheduled train/eval/forward, distributed-optimizer training, HF/DCP-style
+# checkpointing, weight sync to rollout engines (XCCL broadcast via registry or bridge
+# conversion, disk, or AWEX colocated CUDA IPC), offload/onload, plus PPO actor/critic,
+# SFT, reward-model and DPO subclasses. Module-level helpers handle GLU name
+# normalisation and padded/chunked LM-head layouts.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -157,6 +167,10 @@ _EXPERT_NUM_RE = re.compile(r"\.(weight|bias)\d+$")
 
 
 def _normalize_glu_param_name(name: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Canonicalises a parameter name by removing the layer index ('.layers.N.'
+    # -> '.layers.') and trailing expert numbers on weight/bias (weightN -> weight), so
+    # GLU detection matches across PP ranks and grouped experts.
     name = _LAYER_IDX_RE.sub(".layers.", name)
     name = _EXPERT_NUM_RE.sub(r".\1", name)
     return name
@@ -166,6 +180,9 @@ def _float16_wrapper_fp32_output(
     enable_chunked_logits: bool,
     model_dtype: torch.dtype,
 ) -> bool | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns False (disable Megatron Float16Module's fp32 output cast) when
+    # chunked logits are enabled with a half-precision model, else None (keep default).
     if enable_chunked_logits and model_dtype in (
         torch.float16,
         torch.bfloat16,
@@ -181,6 +198,9 @@ def _reuse_chunked_logits_storage(
     enable_chunked_logits: bool,
     entropy_requires_grad: bool,
 ) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True when chunked logits are on and entropy gradients are not required
+    # (storage reuse makes entropy non-differentiable).
     # Storage reuse makes entropy non-differentiable, so only enable it when
     # entropy gradients are disabled.
     return enable_chunked_logits and not entropy_requires_grad
@@ -194,6 +214,9 @@ def _warn_if_areal_lm_head_entropy_is_nondifferentiable(
     enable_chunked_logits: bool,
     entropy_requires_grad: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: On global rank 0, for actor models with chunked logits and entropy
+    # gradients disabled, logs a warning that entropy will not contribute gradients.
     if (
         global_rank != 0
         or is_critic
@@ -214,6 +237,9 @@ def _validate_areal_lm_head_compatibility(
     enable_tree_training: bool,
     npu_available: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: When chunked logits are enabled, raises NotImplementedError on NPU or with
+    # tree training; otherwise no-op.
     if not enable_chunked_logits:
         return
     if npu_available:
@@ -226,6 +252,9 @@ def _map_chunked_lm_head_output(
     output: ChunkedLMHeadOutput,
     fn: Callable[[torch.Tensor], torch.Tensor],
 ) -> ChunkedLMHeadOutput:
+    # [FUNCTION DOC]
+    # HELPER: Applies fn to every tensor field of a ChunkedLMHeadOutput and returns a
+    # new one.
     return ChunkedLMHeadOutput(*(fn(tensor) for tensor in output))
 
 
@@ -234,6 +263,12 @@ def _padded_lm_head_labels(
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: From packed 1-D input_ids and cu_seqlens, builds a [batch, max_seqlen]
+    # zero-padded id matrix, shifts each row left by one (next-token labels; last
+    # position wraps to a pad/first token), and returns it transposed to [max_seqlen,
+    # batch] contiguous to match Megatron's [S, B] layout. Raises ValueError for non-1-D
+    # input.
     """Build next-token labels matching Megatron's padded ``[S, B, H]`` layout."""
     if input_ids.ndim != 1:
         raise ValueError(
@@ -258,6 +293,11 @@ def _repack_padded_lm_head_output(
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Takes a flattened [max_seqlen*batch, ...] tensor in [S, B] order, reshapes
+    # and transposes to [B, S, ...] and selects only valid positions, returning values
+    # in packed sequence order. Raises ValueError if the first dim does not equal
+    # batch*max_seqlen.
     """Restore flattened padded LM Head values to packed sequence order."""
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     batch_size = seq_lens.numel()
@@ -278,6 +318,9 @@ def _mbridge_precision_args(
     enable_fp32_lm_head: bool,
     cross_entropy_loss_fusion: bool,
 ) -> dict[str, bool]:
+    # [FUNCTION DOC]
+    # HELPER: Returns extra mbridge args: enable_fp32_lm_head when requested and chunked
+    # logits are off, and cross_entropy_loss_fusion when requested.
     args = {}
     if not enable_chunked_logits and enable_fp32_lm_head:
         args["enable_fp32_lm_head"] = True
@@ -287,9 +330,15 @@ def _mbridge_precision_args(
 
 
 class _MegatronModelList(list):
+    # [CLASS DOC]
+    # List subclass holding Megatron model chunks (one per virtual pipeline stage) that
+    # also offers module-like forward/named_parameters/parameters.
     """List wrapper that exposes module-like helpers for Megatron model chunks."""
 
     def forward(self, *args, **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Calls the single chunk with the arguments; raises RuntimeError if there is
+        # more than one chunk.
         if len(self) == 1:
             return self[0](*args, **kwargs)
         raise RuntimeError(
@@ -297,16 +346,34 @@ class _MegatronModelList(list):
         )
 
     def named_parameters(self, *args, **kwargs) -> Iterator[tuple[str, nn.Parameter]]:
+        # [FUNCTION DOC]
+        # Yields named parameters of every chunk in order (names may repeat across
+        # chunks).
         for module in self:
             yield from module.named_parameters(*args, **kwargs)
 
     def parameters(self, *args, **kwargs) -> Iterator[nn.Parameter]:
+        # [FUNCTION DOC]
+        # Yields parameters of every chunk.
         for _, parameter in self.named_parameters(*args, **kwargs):
             yield parameter
 
 
 class MegatronEngine(TrainEngine):
+    # [CLASS DOC]
+    # TrainEngine on Megatron-Core. Lifecycle: construct (config only),
+    # create_process_group (dist + Megatron model parallel init), initialize (bridge,
+    # configs, model build, HF weight load, optimizer), then training/inference, weight
+    # updates, save/load, offload and destroy. Key state: hf/tf configs, model chunk
+    # list, bridge and LoRA wrapper, optimizer and OptimizerParamScheduler,
+    # checkpointer, rollout engine/coordinator, weight-update group info, offload depth,
+    # AWEX adapter, FP8 and packing-mode flags.
     def __init__(self, config: TrainEngineConfig):
+        # [FUNCTION DOC]
+        # Stores config sub-objects and initialises all state; reads DTE (delta
+        # transfer) runtime config from env; validates chunked-LM-head compatibility
+        # (NotImplementedError on NPU or tree training); derives FP8 flags and the
+        # bridge type. No model or groups are created.
         self.config = config
         self.hf_config: PretrainedConfig
         self.tf_config: TransformerConfig
@@ -361,6 +428,15 @@ class MegatronEngine(TrainEngine):
         self.processor = None
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
+        # [FUNCTION DOC]
+        # Converts the parallel strategy to Megatron form. If torch.distributed is not
+        # initialised, initialises it (without device_id), initialises Megatron model
+        # parallelism (TP, PP, optional VPP, CP, EP, ETP; order tp-cp-ep-dp-pp), seeds
+        # Megatron's CUDA RNG and marks the global group as owned. Creates the per-rank
+        # logger, the context+model-parallel group and its CPU twin, a gloo CPU group,
+        # and warms up communicators.
+        # KNOWN ISSUE: the Megatron RNG is seeded with self.seed before initialize()
+        # reads the real seed, so it always uses the default 0.
         if parallel_strategy is None:
             parallel_strategy = ParallelStrategy()
         self.parallel_strategy = self._make_parallel_strategy(parallel_strategy)
@@ -409,6 +485,12 @@ class MegatronEngine(TrainEngine):
         )
 
     def _apply_megatron_bridge_lora(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Requires a built model and the megatron-bridge backend. Expands empty
+        # or 'all-linear' targets to linear_qkv/linear_proj/linear_fc1/linear_fc2, wraps
+        # the model chunks with Megatron-Bridge LoRA (rank, alpha, no dropout) in
+        # training mode, marks adapter params to save, and logs trainable parameter
+        # counts.
         assert self.model is not None, "Model must be initialized before applying LoRA."
         assert self.bridge_cls == "megatron-bridge"
 
@@ -445,6 +527,22 @@ class MegatronEngine(TrainEngine):
         )
 
     def initialize(self, addr: str | None, ft_spec: FinetuneSpec, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Builds the model. Reads the global seed (default 42 with a warning), asserts
+        # addr is None, normalises adam_bf16 config, sets TMS preload mode, sets
+        # device/NUMA from LOCAL_RANK and rank/world size from RANK/WORLD_SIZE, computes
+        # the PP head flag and per-PP weight-update group name, creates a distributed
+        # lock. Raises NotImplementedError for LoRA without megatron-bridge, VLM with CP
+        # > 1, or padded-seq models with CP > 1. Loads the tokenizer, builds the bridge,
+        # HF and Transformer configs and pipeline layer splits (deterministic mode pre-
+        # build if enabled), resolves vision/packing mode, loads the processor for VLMs,
+        # applies FP8 config and validates it, warns when bridge-delegated weight sync
+        # will fall back. Creates the Megatron model chunks on device, applies LoRA,
+        # loads HF weights, clears stale FP8 high-precision init values, detects GLU fc1
+        # names, logs parameter count, optionally disables dropout, configures
+        # deterministic mode, VPP stages, grad-reduce/param-gather overlap hooks and
+        # grad finalisation, marks duplicated params and creates the optimizer.
+        # KNOWN ISSUE: the addr assertion message mentions FSDPEngine.
         try:
             self.seed = get_seed()
         except ValueError:
@@ -667,6 +765,12 @@ class MegatronEngine(TrainEngine):
         self._initialized = True
 
     def _build_glu_fc1_names(self) -> set[str]:
+        # [FUNCTION DOC]
+        # HELPER: Scans every module having both linear_fc1 and linear_fc2; if fc1's
+        # output dim equals twice fc2's input dim (TP-local shapes; uses weight or
+        # weight0 for grouped experts) the MLP is gated, and fc1's direct weight/bias
+        # (including numbered expert variants) names are added in normalised form.
+        # Returns the set.
         """Detect which `linear_fc1` parameters belong to GLU MLPs.
 
         Compares weight shapes: if ``fc1.weight.shape[0] == 2 * fc2.weight.shape[1]``
@@ -714,6 +818,14 @@ class MegatronEngine(TrainEngine):
         return glu_fc1_names
 
     def _build_hf_mcore_bridge(self):
+        # [FUNCTION DOC]
+        # HELPER: Creates the HF<->Megatron bridge. mbridge: AutoBridge from the HF path
+        # with engine dtype, recompute args when gradient checkpointing, MoE overrides
+        # (dispatcher, fusions, shared expert overlap, router bias rate, optional router
+        # dtype, z-loss, DeepEP) filtered to fields the TransformerConfig class accepts,
+        # and precision args (warning for unsupported ones). megatron-bridge:
+        # AutoBridge.from_hf_pretrained (NotImplementedError with tree training).
+        # Otherwise None. Stores and returns self.bridge.
         if self.bridge_cls == "mbridge":
             self.bridge = mbridge.AutoBridge.from_pretrained(
                 self.config.path, trust_remote_code=True
@@ -799,59 +911,87 @@ class MegatronEngine(TrainEngine):
 
     @property
     def initialized(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: whether initialize completed.
         return self._initialized
 
     @property
     def data_parallel_rank(self) -> int:
+        # [FUNCTION DOC]
+        # Property: Megatron DP rank (asserts groups initialised).
         assert self.process_group_initialized
         return mpu.get_data_parallel_rank()
 
     @property
     def data_parallel_world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: Megatron DP world size.
         assert self.process_group_initialized
         return mpu.get_data_parallel_world_size()
 
     @property
     def data_parallel_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Property: Megatron DP group.
         assert self.process_group_initialized
         return mpu.get_data_parallel_group()
 
     def current_data_parallel_head(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the first global rank of this rank's context+model parallel group.
         """Get the rank of the head of the current data parallel group."""
         assert self.process_group_initialized
         ranks = dist.get_process_group_ranks(self.context_and_model_parallel_group)
         return ranks[0]
 
     def is_data_parallel_head(self) -> bool:
+        # [FUNCTION DOC]
+        # True if this rank is the first rank of its context+model parallel group.
         assert self.process_group_initialized
         ranks = dist.get_process_group_ranks(self.context_and_model_parallel_group)
         return ranks[0] == self.rank
 
     @property
     def pipeline_parallel_rank(self) -> int:
+        # [FUNCTION DOC]
+        # Property: Megatron PP rank.
         assert self.process_group_initialized
         return mpu.get_pipeline_model_parallel_rank()
 
     def is_pipeline_parallel_head(self) -> bool:
+        # [FUNCTION DOC]
+        # True if this rank has DP (with CP) rank 0 and TP rank 0, i.e. it represents
+        # its PP stage.
         assert self.process_group_initialized
         return self.is_pp_head
 
     @property
     def context_and_model_parallel_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Property: group spanning CP, TP and PP ranks of the same DP replica.
         assert self.process_group_initialized
         return self._context_and_model_parallel_group
 
     @property
     def cpu_model_parallel_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Property: gloo twin of the context+model parallel group.
         assert self.process_group_initialized
         return self._cpu_model_parallel_group
 
     @property
     def cpu_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Property: global gloo CPU group.
         assert self.process_group_initialized
         return self._cpu_group
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Marks uninitialised, closes the checkpointer (drains async saves), drops
+        # optimizer and model, GC and empty cache. If owning the global group: best-
+        # effort CPU barrier, destroys Megatron model parallel state and all process
+        # groups, and clears ownership.
         self._initialized = False
         self.process_group_initialized = False
         # Drain any pending async checkpoint saves before tearing down process
@@ -889,12 +1029,20 @@ class MegatronEngine(TrainEngine):
             self.own_global_group = False
 
     def train(self, mode: bool = True):
+        # [FUNCTION DOC]
+        # Sets every model chunk to train/eval mode and returns self.
         assert self.model is not None
         for model in self.model:
             model.train(mode=mode)
         return self
 
     def connect_engine(self, engine: InferenceEngine, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Connects a rollout engine (warning if replacing), creates the
+        # DistRolloutCoordinator, then for 'xccl' meta initialises the weight-update
+        # NCCL groups once, or for 'awex' creates (if needed) an AwexMegatronAdapter and
+        # initialises it with the MetaServer address from meta.nccl_master_address and
+        # this rank as transfer rank. Ends with device sync and a CPU-group barrier.
         if self.rollout_engine is not None and self.rollout_engine != engine:
             self.logger.warning(
                 f"Connected rollout engine changed from {self.rollout_engine} to {engine}."
@@ -931,6 +1079,9 @@ class MegatronEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Requires a connected rollout engine (RuntimeError otherwise) and delegates to
+        # the coordinator's rollout_batch; returns trajectory dicts.
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.rollout_batch(
             data,
@@ -952,6 +1103,10 @@ class MegatronEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Requires a connected rollout engine and delegates to the coordinator's
+        # prepare_batch (dataloader-driven rollout with filtering, grouping, dynamic
+        # batch size, reward normalisation).
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
             dataloader,
@@ -965,6 +1120,14 @@ class MegatronEngine(TrainEngine):
         )
 
     def update_weights(self, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Requires a connected rollout engine. For 'awex': runs the adapter's colocated
+        # IPC transfer for meta.version (default 0), barriers, waits for all inference
+        # engines to finish, then rank 0 onloads the rollout KV cache and resumes
+        # generation, and a final barrier; the offload flag is deliberately left
+        # unchanged. Otherwise, inside the offload-aware context, dispatches 'xccl'
+        # (asserting groups exist) to distributed update or 'disk' to disk update;
+        # ValueError for unknown types.
         self._check_rollout_engine_connected()
         if meta.type == "awex":
             # Colocate mode flow (mirrors the AWEX reference integration):
@@ -1001,12 +1164,23 @@ class MegatronEngine(TrainEngine):
                 raise ValueError(f"Unknown weight update type {meta.type}")
 
     def set_version(self, version: int):
+        # [FUNCTION DOC]
+        # Sets the model version counter.
         self._version = version
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the model version counter.
         return self._version
 
     def save(self, meta: SaveLoadMeta):
+        # [FUNCTION DOC]
+        # If an AWEX adapter exists, first frees grad buffers and empties the cache.
+        # Within the offload-aware context: HF format saves weights (ValueError if
+        # with_optim) with tokenizer/processor/base model path; DCP format uses the
+        # Megatron checkpointer with optional optimizer (NotImplementedError if no
+        # checkpointer, e.g. LoRA without distributed optimizer); ValueError for unknown
+        # formats.
         if self._awex_adapter is not None:
             # Post-ppo_update the fp32 grad buffers (~2x param bytes) are
             # dead weight until the next train_batch (which rebuilds them via
@@ -1041,6 +1215,10 @@ class MegatronEngine(TrainEngine):
                 raise ValueError(f"Unknown weight format {meta.weight_format}. ")
 
     def load(self, meta: SaveLoadMeta):
+        # [FUNCTION DOC]
+        # Within the offload-aware context: HF format loads weights (ValueError if
+        # with_optim); DCP loads via the checkpointer with optional optimizer
+        # (NotImplementedError if none); ValueError otherwise.
         with self._offload_aware_context():
             if meta.weight_format == "hf":
                 if meta.with_optim:
@@ -1063,6 +1241,10 @@ class MegatronEngine(TrainEngine):
 
     @contextmanager
     def _offload_aware_context(self):
+        # [FUNCTION DOC]
+        # HELPER: Reentrant context manager that onloads on the outermost entry and re-
+        # offloads on the outermost exit when the engine is offloaded; otherwise just
+        # yields.
         """Temporarily onload parameters for offload-unsafe operations.
 
         Reentrant: nested calls increment depth; only the outermost
@@ -1083,12 +1265,21 @@ class MegatronEngine(TrainEngine):
                 self.offload()
 
     def optimizer_zero_grad(self):
+        # [FUNCTION DOC]
+        # Zeros optimizer grads and every model chunk's DDP grad buffer. Asserts an
+        # optimizer exists.
         assert self.optimizer is not None, "Optimizer is not initialized."
         self.optimizer.zero_grad()
         for model in self.model:
             model.zero_grad_buffer()
 
     def optimizer_step(self):
+        # [FUNCTION DOC]
+        # If delta transfer (DTE) is enabled, stores each param group's current lr as
+        # _areal_last_step_lr. Steps the Megatron optimizer (which handles grad
+        # clipping, loss-scale and skipping on overflow internally) and returns
+        # update_successful, grad_norm (NaN if None) and the current lr of group 0. Does
+        # not step the LR scheduler.
         if self._dte_runtime_config.enabled:
             # The LR scheduler advances before the subsequent weight update.
             # Preserve the LR consumed by this optimizer step for AdamW
@@ -1106,6 +1297,8 @@ class MegatronEngine(TrainEngine):
         )
 
     def lr_scheduler_step(self):
+        # [FUNCTION DOC]
+        # Advances the OptimizerParamScheduler by one increment; asserts it exists.
         assert self.lr_scheduler is not None, "LR Scheduler is not initialized."
         self.lr_scheduler.step(1)
 
@@ -1119,9 +1312,34 @@ class MegatronEngine(TrainEngine):
         forward_only: bool = False,
         gather_cp_output: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Runs Megatron's pipeline schedule (get_forward_backward_func) over the micro-
+        # batch list, with one data iterator per VPP chunk when there are several,
+        # num_microbatches = len(mb_list), forward_only as given. The nested
+        # forward_step produces model outputs and a loss callback built from
+        # process_output_fn. gather_cp_output=True gathers CP-local outputs back to full
+        # length (used by forward_batch); training keeps CP-local outputs and lets the
+        # loss use CP-local labels. Ensures the engine is ready first.
         self._ensure_ready()
 
         def forward_step(batch_iter, model):
+            # [FUNCTION DOC]
+            # HELPER: Megatron forward-step callback. Pulls the next MicroBatchItem;
+            # with tree training adds dense tree-attention kwargs (and copies trie_node
+            # into the original micro-batch). Decides CP-local mode and whether to use
+            # the chunked LM head (enabled, actor, no tree training, last pipeline
+            # stage), raising NotImplementedError for chunked LM head with vision inputs
+            # (except padded text-only models). Runs packed_context_parallel_forward
+            # (returns hidden states when chunked). For the chunked LM head builds next-
+            # token labels (padded BSHD layout, CP-split packed layout, or
+            # [S,B]-transposed), computes chunked logprobs/entropy with the output layer
+            # weight (shared embedding if tied, muP scaling), and for non-CP-local
+            # outputs repacks padded output, reassembles CP shards and unpads. Removes
+            # tree kwargs. On the last stage returns (output, partial loss callback)
+            # where the callback input is the original micro-batch augmented with CP
+            # metadata (_cp_local_labels, _cp_padded_cu_seqlens, _cp_padding_length,
+            # _cp_old_cu_seqlens) when CP-local, or unpadded logits otherwise; non-last
+            # stages return the raw output tensor with the callback.
             mb_input: MicroBatchItem = next(batch_iter)
 
             cu_seqlens = mb_input.padded_mb.get("cu_seqlens", None)
@@ -1268,6 +1486,10 @@ class MegatronEngine(TrainEngine):
                 del mb_input.padded_mb[key]
 
             def _process_output(input_, output_):
+                # [FUNCTION DOC]
+                # HELPER: Loss callback for Megatron: calls process_output_fn(output,
+                # inputs); when it returns None substitutes a dummy loss of 1.0 on the
+                # output's device. Returns (loss, {}).
                 loss = process_output_fn(output_, input_)
                 if loss is None:
                     device = (
@@ -1334,6 +1556,14 @@ class MegatronEngine(TrainEngine):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # One training step: ensures ready, re-allocates AWEX-freed grad buffers if
+        # applicable, zeros grads, concatenates list input, builds micro-batches on
+        # device, computes the total loss weight over the DP+CP group, and runs
+        # forward/backward with loss multiplier = DP size * optimizer loss scale *
+        # number of micro-batches (cancelling Megatron's per-microbatch averaging and
+        # DDP averaging). Then optimizer_step; returns its stats plus num_micro_batches.
+        # Side effect: GPU-CPU sync for the loss scale.
         self._ensure_ready()
         if self._awex_adapter is not None:
             self._awex_adapter.ensure_grad_buffers()
@@ -1371,6 +1601,9 @@ class MegatronEngine(TrainEngine):
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]
         ) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Returns the scaled micro-batch loss via _compute_logprobs_and_loss
+            # with the step's loss multiplier.
             return self._compute_logprobs_and_loss(
                 output,
                 inputs,
@@ -1398,6 +1631,10 @@ class MegatronEngine(TrainEngine):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> torch.Tensor | None:
+        # [FUNCTION DOC]
+        # No-grad evaluation with the same micro-batching and DP+CP loss weight;
+        # collects per-micro-batch losses and, on the last pipeline stage, returns their
+        # sum all-reduced over DP+CP; returns None on other stages.
         self._ensure_ready()
 
         input_batched, _ = self._normalize_batch_input(input_)
@@ -1418,6 +1655,9 @@ class MegatronEngine(TrainEngine):
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]
         ) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Computes the micro-batch loss (no multiplier), stores a detached
+            # copy and returns it.
             loss = self._compute_logprobs_and_loss(
                 output, inputs, loss_fn, loss_weight_fn, total_loss_weight
             )
@@ -1440,6 +1680,13 @@ class MegatronEngine(TrainEngine):
         output_seqlens: list[int] | None = None,
         aggregate_fn: Callable[[list[torch.Tensor]], torch.Tensor] = torch.cat,
     ) -> torch.Tensor | list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # No-grad inference. Determines output sequence lengths (from list inputs'
+        # attention_mask shapes, validating a given list, or from packed lengths),
+        # builds micro-batches, runs forward with CP outputs gathered, then on the last
+        # pipeline stage merges tree results or reorders/pads outputs; broadcasts the
+        # result from the last PP rank to the whole PP group and splits it per
+        # trajectory for list input.
         self._ensure_ready()
 
         input_batched, meta = self._normalize_batch_input(input_)
@@ -1468,6 +1715,9 @@ class MegatronEngine(TrainEngine):
         outputs: list[torch.Tensor] = []
 
         def process_output(output: torch.Tensor, inputs: dict[str, Any]) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Computes the forward result for a micro-batch, appends it to the
+            # outer list and returns None.
             result = self._compute_forward_result(output, inputs)
             outputs.append(result)
             return None
@@ -1495,6 +1745,10 @@ class MegatronEngine(TrainEngine):
         return split_batch(res, meta)
 
     def export_stats(self) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Exports stats_tracker data reduced over DP (keys synced over DP+CP when CP >
+        # 1) within the offload-aware context; with PP > 1, broadcasts the last stage's
+        # dict over the PP group and merges it in. Returns the dict.
         key_sync_group = None
         if self.parallel_strategy.context_parallel_size > 1:
             key_sync_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -1515,6 +1769,9 @@ class MegatronEngine(TrainEngine):
         return data
 
     def init_awex_adapter(self, meta_server_addr: str | None = None) -> None:
+        # [FUNCTION DOC]
+        # Creates the AwexMegatronAdapter if absent (so offload uses its tag-based
+        # memory release) and eagerly publishes awex_train_info.
         """Create awex adapter early for selective memory management.
 
         Must be called before offload() in colocate mode so that offload uses
@@ -1530,6 +1787,10 @@ class MegatronEngine(TrainEngine):
         self._eager_publish_awex_train_info(meta_server_addr)
 
     def _eager_publish_awex_train_info(self, meta_server_addr: str | None) -> None:
+        # [FUNCTION DOC]
+        # HELPER: On rank 0 (or without dist), if a MetaServer address is given or in
+        # AWEX_META_SERVER_ADDR, connects and puts awex_train_info with the world size.
+        # Failures are logged as warnings.
         addr = meta_server_addr or os.environ.get("AWEX_META_SERVER_ADDR", "")
         if not addr or (dist.is_initialized() and dist.get_rank() != 0):
             return
@@ -1549,6 +1810,12 @@ class MegatronEngine(TrainEngine):
             self.logger.warning("[AWEX] eager publish awex_train_info failed: %s", e)
 
     def offload(self) -> None:
+        # [FUNCTION DOC]
+        # With an AWEX adapter: clears memory, releases optimizer and weights through
+        # the adapter, syncs, barriers and sets is_offload. Otherwise requires
+        # torch_memory_saver (RuntimeError if disabled): optionally frees DDP grad
+        # buffers first (no CPU backup), clears memory, pauses TMS, syncs, barriers,
+        # logs device stats and sets is_offload.
         """Offload model memory to CPU.
 
         In colocate mode (awex adapter active): manual tag-based offload via
@@ -1594,6 +1861,11 @@ class MegatronEngine(TrainEngine):
         self.is_offload = True
 
     def onload(self) -> None:
+        # [FUNCTION DOC]
+        # With an AWEX adapter: resumes optimizer and weights via the adapter, clears
+        # memory, syncs, barriers. Otherwise resumes TMS, restores grad buffers if they
+        # were discarded, clears memory, syncs and barriers. Logs device stats and
+        # clears is_offload.
         """Onload model memory from CPU back to GPU.
 
         Uses awex adapter (selective, tag-based) when available, otherwise
@@ -1628,6 +1900,9 @@ class MegatronEngine(TrainEngine):
         self.is_offload = False
 
     def clear_batches(self, shard_ids: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Drops the given shard ids from the local RTensor fetch buffer; no-op without
+        # ids.
         """Drain this worker's client-side RTensor fetch buffer.
 
         Called via RPC by ``TrainController.clear_batches`` at step end so
@@ -1642,12 +1917,19 @@ class MegatronEngine(TrainEngine):
             clear_fetch_buffer(shard_ids)
 
     def fetch_buffer_stats(self) -> dict[str, int]:
+        # [FUNCTION DOC]
+        # Returns local RTensor fetch-buffer statistics.
         """Expose local fetch-buffer stats for post-step drain verification."""
         from areal.infra.rpc.rtensor import fetch_buffer_stats
 
         return fetch_buffer_stats()
 
     def _normalize_adam_bf16_config(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: When optimizer type is 'adam_bf16', rewrites the (shared) config in
+        # place to 'adam' with Megatron's precision-aware optimizer and bf16
+        # exp_avg/exp_avg_sq, and forces engine dtype to bfloat16 (warning if it was
+        # different). Logs the conversion.
         if self.optimizer_config is None or self.optimizer_config.type != "adam_bf16":
             return
 
@@ -1671,6 +1953,11 @@ class MegatronEngine(TrainEngine):
             self.config.dtype = "bfloat16"
 
     def _check_and_apply_fp8_config(self):
+        # [FUNCTION DOC]
+        # HELPER: If FP8 is enabled, copies each FP8 config field onto the
+        # TransformerConfig: 'mode' -> fp8, a few fields keep their names, all others
+        # get an 'fp8_' prefix; unknown target fields are warned about. Logs
+        # mode/recipe/param.
         if not self.enable_fp8:
             return
         fp8_config = self.fp8_config
@@ -1705,6 +1992,9 @@ class MegatronEngine(TrainEngine):
         # fp8_param_gather is passed from make_mcore_model()
 
     def _validate_fp8_consistency(self):
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError if FP8 training is enabled but the HF
+        # quantization_config is missing or its quant_method is not 'fp8'.
         """Validate that FP8 configuration is consistent.
 
         If either training uses FP8, quantization_config must exist
@@ -1727,12 +2017,19 @@ class MegatronEngine(TrainEngine):
             )
 
     def get_device_stats(self) -> DeviceRuntimeInfo:
+        # [FUNCTION DOC]
+        # Returns current device memory/runtime info.
         return DeviceRuntimeInfo.get_current()
 
     def start_memory_profile(self, max_entries: int = 100000) -> None:
+        # [FUNCTION DOC]
+        # Starts CUDA memory history recording with up to max_entries entries.
         torch.cuda.memory._record_memory_history(max_entries=max_entries)
 
     def stop_memory_profile(self, snapshot_dir: str) -> None:
+        # [FUNCTION DOC]
+        # Dumps a CUDA memory snapshot to snapshot_dir as
+        # snapshot_rank<R>_p<pp>d<dp>c<cp>t<tp>.pickle and stops recording.
         pp = mpu.get_pipeline_model_parallel_rank()
         dp = mpu.get_data_parallel_rank()
         cp = mpu.get_context_parallel_rank()
@@ -1743,11 +2040,15 @@ class MegatronEngine(TrainEngine):
         torch.cuda.memory._record_memory_history(enabled=None)
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Flushes the perf tracer for the step (force to write regardless of schedule).
         perf_tracer.save(step=step, force=force)
 
     def config_perf_tracer(
         self, config: PerfTracerConfig, rank: int, role: str
     ) -> None:
+        # [FUNCTION DOC]
+        # Configures the global perf tracer unless already configured.
         if perf_tracer.is_configured():
             return
         perf_tracer.configure(config, rank=rank, role=role)
@@ -1755,6 +2056,9 @@ class MegatronEngine(TrainEngine):
     def _make_parallel_strategy(
         self, parallel_strategy: ParallelStrategy
     ) -> MegatronParallelStrategy:
+        # [FUNCTION DOC]
+        # HELPER: Builds a MegatronParallelStrategy from the generic one, enabling
+        # sequence parallel when TP > 1 and setting VPP size from the Megatron config.
         base_strategy = dataclasses.asdict(parallel_strategy)
         vpp_size = self.mcore_config.virtual_pipeline_parallel_size
         return MegatronParallelStrategy(
@@ -1764,6 +2068,12 @@ class MegatronEngine(TrainEngine):
         )
 
     def _init_context_and_model_parallel_group(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Using a Megatron RankGenerator with order tp-cp-ep-dp-pp (ep=1),
+        # creates one NCCL group per DP replica over its tp-cp-pp ranks and keeps the
+        # one for this rank's DP index. When config.offload is set also creates gloo
+        # mirrors of these groups (used when the accelerator is handed to rollout). All
+        # ranks must call it (group creation is collective).
         # Initialize context and model parallel groups, which are only used in AReaL
         # for data distribution
         rank_generator = mpu.RankGenerator(
@@ -1800,6 +2110,16 @@ class MegatronEngine(TrainEngine):
                     self._cpu_model_parallel_group = cpu_group
 
     def _create_optimizer(self, ft_spec: FinetuneSpec) -> None:
+        # [FUNCTION DOC]
+        # HELPER: No-op without optimizer config. Asserts a model exists and type is
+        # adam or sgd (warning for sgd). Validates total steps > 0 and warmup < total
+        # (ValueError). Builds a Megatron OptimizerConfig (lr, min lr = ratio*lr, weight
+        # decay, bf16/fp16 flags, Adam betas/eps, distributed optimizer unless LoRA,
+        # gradient clipping, FP8 recipe, precision-aware settings and main/state dtypes)
+        # and gets the Megatron optimizer. Creates an OptimizerParamScheduler with init
+        # lr 0, warmup steps, decay ending at total steps with the configured style, and
+        # constant weight decay. Creates a MegatronCheckpointManager unless LoRA is
+        # used.
         if self.optimizer_config is None:
             return
         assert self.model is not None and len(self.model) > 0
@@ -1906,6 +2226,8 @@ class MegatronEngine(TrainEngine):
             )
 
     def _check_rollout_engine_connected(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError unless rollout engine and coordinator are set.
         """Validate that rollout engine has been connected via connect_engine()."""
         if self.rollout_engine is None or self.rollout_coordinator is None:
             raise RuntimeError(
@@ -1917,11 +2239,17 @@ class MegatronEngine(TrainEngine):
     def _normalize_batch_input(
         input_: list[dict[str, Any]] | dict[str, Any],
     ) -> tuple[dict[str, Any], Any | None]:
+        # [FUNCTION DOC]
+        # HELPER: Static. Concatenates list input into one batch and returns (batch,
+        # split meta), or (dict, None) for dict input.
         if isinstance(input_, list):
             return concat_batch(input_)
         return input_, None
 
     def _ensure_ready(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Onloads if offloaded; raises RuntimeError if the model is not
+        # initialised.
         if self.is_offload:
             self.onload()
 
@@ -1933,6 +2261,14 @@ class MegatronEngine(TrainEngine):
         meta: WeightUpdateMeta,
         converted_named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: PP-head only. For a non-empty bucket of HF-named tensors: acquires the
+        # distributed engine lock, builds ParamSpecs, attaches a vLLM-style LoRA config
+        # to meta when LoRA is on, asks the rollout engine to receive, async-broadcasts
+        # every tensor from rank 0 of this stage's weight-update group and waits, waits
+        # for the engine, clears the bucket and releases the lock.
+        # KNOWN ISSUE: the lock is not released if any step raises (no try/finally),
+        # which can deadlock other PP stages.
         # Early exit when chunk size is relatively small
         if not converted_named_tensors:
             return
@@ -1978,6 +2314,12 @@ class MegatronEngine(TrainEngine):
 
     @property
     def _duplicated_param_names(self) -> set[str]:
+        # [FUNCTION DOC]
+        # Property (cached): names of parameters whose owning module has parallel_mode
+        # 'duplicated' (replicated rather than TP-sharded).
+        # KNOWN ISSUE: per _mark_duplicated_params' own note, Megatron's TELinear sets
+        # parallel_mode to None for duplicated modules, so this set may be empty in
+        # practice.
         """Parameter names whose parent module has parallel_mode='duplicated'.
 
         These params are replicated (not TP-sharded) but TE incorrectly marks
@@ -1996,6 +2338,11 @@ class MegatronEngine(TrainEngine):
         return self._cached_duplicated_param_names
 
     def _mark_duplicated_params(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: One-time fix-up: for each non-expert module with tp_size == 1, flags
+        # its direct parameters that are marked tensor_model_parallel as _is_duplicated
+        # and clears tensor_model_parallel, so grad-norm/clipping does not double count
+        # them.
         """Fix TP metadata for params whose parent module is duplicated.
 
         These params are replicated (not TP-sharded), but TE can mark them with
@@ -2033,6 +2380,11 @@ class MegatronEngine(TrainEngine):
         name: str,
         param: nn.Parameter | torch.Tensor,
     ) -> tuple[nn.Parameter | torch.Tensor, int]:
+        # [FUNCTION DOC]
+        # HELPER: Prepares one Megatron parameter for export: all-gathers TP shards
+        # (handling GLU fc1 interleave, duplicated params, FP8 direct
+        # conversion/quantization), strips vocab padding, and returns (param, size in
+        # bytes; FP8 blockwise counts one byte per element). Collective across TP.
         """Collect and prepare a parameter for conversion.
 
         This method handles:
@@ -2073,6 +2425,12 @@ class MegatronEngine(TrainEngine):
         buffer_size: int,
         weight_chunked_mem_size: int,
     ) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Collects a non-expert param (all TP ranks participate). Non-PP-head
+        # ranks return the unchanged buffer size. On PP heads, flushes the bucket if
+        # adding the param would exceed the chunk limit, converts it to HF tensors
+        # (model type with '_lora' suffix under LoRA) and appends them. Returns the new
+        # buffer size.
         param, param_size = self._collect_param(name, param)
 
         if not self.is_pipeline_parallel_head():
@@ -2105,6 +2463,12 @@ class MegatronEngine(TrainEngine):
         meta: WeightUpdateMeta,
         named_tensors: list[tuple[str, nn.Parameter | torch.Tensor]],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For a non-empty bucket of expert params: all-gathers name lists across
+        # the expert-parallel group (RuntimeError if counts mismatch) and async all-
+        # gathers each tensor, clears the bucket, and on PP heads converts all ranks'
+        # expert tensors to HF and sends them via
+        # _update_bucket_weights_from_distributed.
         """Gather a bucket of MoE expert weights and broadcast them.
 
         This function handles the distributed update for a bucket of Mixture-of-Experts
@@ -2182,6 +2546,10 @@ class MegatronEngine(TrainEngine):
         buffer_size: int,
         weight_chunked_mem_size: int,
     ) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Collects an expert param; flushes the expert bucket if (buffer + size)
+        # * EP size would exceed the chunk limit; appends the param and returns the new
+        # buffer size.
         param, param_size = self._collect_param(name, param)
 
         if (
@@ -2195,6 +2563,17 @@ class MegatronEngine(TrainEngine):
         return buffer_size
 
     def _init_weight_update_from_distributed(self, meta: WeightUpdateMeta) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sets TORCHELASTIC_USE_AGENT_STORE=False. For SGLang inference with PP
+        # > 1, requires train PP == inference PP (ValueError on every rank otherwise)
+        # and each training PP head creates, under the engine lock, the group
+        # update_weight_group_<pp_rank> with the rollout engine's workers of the
+        # matching stage (size per-stage world + 1, trainer rank 0), with its own
+        # host/free port. Otherwise (inference PP == 1 or vLLM) each training PP head
+        # creates the same-named group spanning all inference workers (size gen world +
+        # 1). Non-head ranks set empty address and port 0. Asserts meta.type is 'xccl'
+        # and gen_allocation exists on heads. Side effects: env mutation, rendezvous
+        # networking, rollout-engine RPC, logging.
         assert meta.type == "xccl"
         gen_pp_size = meta.gen_allocation.parallel.pp_size if meta.gen_allocation else 1
         gen_backend = meta.gen_allocation.backend if meta.gen_allocation else None
@@ -2332,6 +2711,12 @@ class MegatronEngine(TrainEngine):
 
     @trace_perf("megatron_engine.update_weights_from_distributed", category="comm")
     def _update_weights_from_distributed(self, meta: WeightUpdateMeta) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Broadcast weight sync (traced). Fills meta with this stage's
+        # address/port/group name, rank 0 pauses generation, barrier; uses bridge export
+        # when megatron-bridge is configured for it and there is no quantization or
+        # LoRA, else the registry path; rank 0 resumes generation; device sync and
+        # barrier.
         # Reset weight weight meta with local info
         meta.nccl_master_address = self.weight_update_master_addr
         meta.nccl_master_port = self.weight_update_master_port
@@ -2365,6 +2750,13 @@ class MegatronEngine(TrainEngine):
         dist.barrier(group=self.cpu_group)
 
     def _update_weights_via_registry(self, meta: WeightUpdateMeta) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Two passes over this PP stage's named parameters (global layer/expert
+        # indices). Pass 1: non-expert params (or, under LoRA, only trainable adapter
+        # params including experts) are TP-gathered, converted to HF and bucket-
+        # broadcast by PP heads up to weight_chunked_mem_mb; leftovers flushed (warning
+        # if LoRA produced nothing). Barrier. Pass 2 (non-LoRA): expert params are
+        # gathered across EP, converted and broadcast in buckets. Barrier.
         """Hand-rolled conversion path via convert_to_hf registry.
 
         Used for FP8, LoRA, and models with a converter entry. Iterates this PP
@@ -2426,6 +2818,11 @@ class MegatronEngine(TrainEngine):
         dist.barrier(group=self.cpu_group)
 
     def _update_weights_via_bridge(self, meta: WeightUpdateMeta) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Iterates megatron-bridge's export_hf_weights over the model (all ranks
+        # participate in its collectives); PP heads bucket the contiguous HF tensors by
+        # byte size and broadcast each full bucket and the remainder. Ends with a CPU
+        # barrier.
         """Delegate live weight sync to megatron-bridge.export_hf_weights.
 
         Streams (hf_name, hf_tensor) directly from the bridge, which handles
@@ -2460,6 +2857,14 @@ class MegatronEngine(TrainEngine):
 
     @trace_perf("megatron_engine.update_weights_from_disk", category="io")
     def _update_weights_from_disk(self, meta: WeightUpdateMeta) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Disk weight sync (traced). Rank 0 pauses generation and starts the
+        # rollout engine's disk update; all ranks save the HF model to meta.path; rank 0
+        # publishes a name_resolve key (experiment, trial, version -> timestamp, TTL 120
+        # s), waits for the engine and resumes generation. Device sync and barrier.
+        # KNOWN ISSUE: unlike the FSDP engine it neither asserts meta.path nor deletes a
+        # pre-existing name_resolve key, so a repeated version could make
+        # name_resolve.add fail.
         fut = Future()
 
         if dist.get_rank() == 0:
@@ -2491,6 +2896,15 @@ class MegatronEngine(TrainEngine):
         processor: Any | None = None,
         base_model_path: str | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Saves weights as HF safetensors to path (created). megatron-bridge:
+        # ValueError for critics; saves only the LoRA adapter (with base model
+        # reference) or the full model (non-strict when the MTP head was dropped).
+        # mbridge: uses mbridge save_weights (initialising its safetensor IO if needed)
+        # or AReaL's fast multi-threaded saver (3 GB shards, FP8 direct convert), plus
+        # the critic value head. Rank 0 saves tokenizer/processor and, if MTP was
+        # dropped, scrubs MTP counts from config.json and rebuilds the safetensors
+        # index. Device sync and barrier.
         assert self.model is not None, "Model is not initialized."
         os.makedirs(path, exist_ok=True)
 
@@ -2558,6 +2972,10 @@ class MegatronEngine(TrainEngine):
 
     @property
     def _mtp_head_dropped(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: True for megatron-bridge models with enable_mtp off whose (text) HF
+        # config declares MTP layers (mtp_num_hidden_layers or
+        # num_nextn_predict_layers).
         """True when the model declares an MTP head but enable_mtp left it unbuilt."""
         if self.bridge_cls != "megatron-bridge" or self.mcore_config.enable_mtp:
             return False
@@ -2568,6 +2986,10 @@ class MegatronEngine(TrainEngine):
         )
 
     def _scrub_mtp_from_saved_config(self, path: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If path/config.json exists, recursively sets any non-zero
+        # mtp_num_hidden_layers / num_nextn_predict_layers to 0 and rewrites the file
+        # (sorted, indented) when changed, logging it.
         """Zero MTP layer counts in an exported config.json so it matches the
         MTP-stripped weights (the head is dropped when enable_mtp=False)."""
         cfg_path = os.path.join(path, "config.json")
@@ -2577,6 +2999,9 @@ class MegatronEngine(TrainEngine):
             cfg = json.load(f)
 
         def _walk(node: Any) -> bool:
+            # [FUNCTION DOC]
+            # HELPER: Recursively walks dicts/lists zeroing MTP count keys; returns
+            # whether anything changed.
             changed = False
             if isinstance(node, dict):
                 for key, value in node.items():
@@ -2603,6 +3028,11 @@ class MegatronEngine(TrainEngine):
             )
 
     def _rebuild_index_from_saved_shards(self, path: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If model.safetensors.index.json exists, reads each .safetensors file's
+        # header (8-byte little-endian length + JSON) to rebuild weight_map and
+        # total_size from actual contents, rewrites the index and logs removed ghost
+        # entries.
         """Rewrite model.safetensors.index.json from the shard files' actual
         contents. megatron-bridge's strict=False save marks each shard's full
         expected key set as saved, leaving ghost entries for the dropped mtp.*
@@ -2640,6 +3070,10 @@ class MegatronEngine(TrainEngine):
             )
 
     def _load_model_from_hf(self, path: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Loads HF weights into the Megatron model: megatron-bridge path
+        # (ValueError for critics) runs load_hf_weights with CPU as the default factory
+        # device; otherwise AReaL's fast mbridge loader (critic and FP8 aware).
         assert self.model is not None, "Model is not initialized."
 
         if self.bridge_cls == "megatron-bridge":
@@ -2669,6 +3103,17 @@ class MegatronEngine(TrainEngine):
             )
 
     def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
+        # [FUNCTION DOC]
+        # HELPER: Splits a padded batch (requires attention_mask and input_ids) into
+        # micro-batches. Tree training (asserts CP == 1): builds packed trie micro-
+        # batches synced over DP, warning if fewer than 2*PP micro-batches. Otherwise
+        # adds position ids for non-VLMs, splits with at least 2*PP micro-batches (count
+        # divisible by PP) synced over the DP group, packs each, and prepares the
+        # sequence layout for the packing mode (alignment to TP, or 2*TP*CP with CP,
+        # lcm'd with the vectorised alignment for FP8; optional pad-to-maximum). Logs
+        # sizes, converts micro-batches to plain dicts with integer max_seqlen, and for
+        # VLMs moves vision tensors to the padded (forward) side and filters multimodal
+        # payloads out of the list's data. Returns the MicroBatchList.
         assert "attention_mask" in input_ and "input_ids" in input_
         # Parallel sizes
         pp_size = self.parallel_strategy.pipeline_parallel_size
@@ -2781,6 +3226,20 @@ class MegatronEngine(TrainEngine):
         total_loss_weight: torch.Tensor,
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Computes the scaled micro-batch loss on the last pipeline stage. Zero-
+        # weight micro-batches return a zero loss connected to the output. Critic + tree
+        # training raises NotImplementedError. Actor: tree training unpacks vocab
+        # min/max and logprobs/entropy from the packed trie (empty tries give zero loss;
+        # mean/norm stats are None); chunked LM-head outputs already carry logprobs,
+        # entropy and vocab min/max/mean/norm; otherwise computes vocab stats from
+        # detached logits first (the fused path may reuse logits storage) and then TP-
+        # aware logprobs/entropy against CP-local labels or input_ids rolled left. When
+        # CP metadata is present, reassembles CP shards for all six tensors, unpads them
+        # and strips the _cp_ keys from inputs. Calls loss_fn(logprobs, entropy, inputs,
+        # vocab_min/max/mean/norm_logits=...). Critic: loss_fn(values, inputs) with the
+        # last dim squeezed. Returns loss * local_weight / total_loss_weight *
+        # loss_multiplier.
         local_weight = loss_weight_fn(inputs)
         if local_weight == 0:
             connected_output = (
@@ -2942,6 +3401,11 @@ class MegatronEngine(TrainEngine):
         output: torch.Tensor | ChunkedLMHeadOutput,
         inputs: dict[str, Any],
     ) -> torch.Tensor | dict[int, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Returns per-token logprobs for actors (directly from chunked LM-head
+        # output, tree-unpacked per-sequence dict for tree training, or TP-aware
+        # temperature-scaled logprobs against left-rolled ids) or squeezed values for
+        # critics. Raises NotImplementedError for critic + tree training.
         if self.config.is_critic and self.enable_tree_training:
             raise NotImplementedError(
                 "Tree training with critic model is not supported yet."
@@ -2983,9 +3447,13 @@ class MegatronEngine(TrainEngine):
 
 
 class MegatronPPOActor(MegatronEngine):
+    # [CLASS DOC]
+    # MegatronEngine specialised as a PPO actor, delegating to an areal PPOActor helper.
     """PPO Actor implementation using Megatron backend."""
 
     def __init__(self, config: PPOActorConfig):
+        # [FUNCTION DOC]
+        # Initialises the engine and creates the PPOActor helper.
         from areal.trainer.ppo.actor import PPOActor
 
         super().__init__(config)
@@ -2993,17 +3461,26 @@ class MegatronPPOActor(MegatronEngine):
 
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # No-grad; forwards to PPOActor.compute_logp.
         return self.actor.compute_logp(*args, **kwargs)
 
     @torch.no_grad()
     def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # No-grad; forwards to PPOActor.compute_advantages.
         return self.actor.compute_advantages(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Forwards to PPOActor.ppo_update.
         self.actor.ppo_update(*args, **kwargs)
 
     @classmethod
     def as_controller(cls, config: PPOActorConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Returns PPOActorControllerV2 for v2 configs, else PPOActorController, wrapping
+        # this engine class with the scheduler.
         if config._version == "v2":
             from areal.trainer.ppo.actor import PPOActorControllerV2
 
@@ -3019,9 +3496,14 @@ class MegatronPPOActor(MegatronEngine):
 
 
 class MegatronPPOCritic(MegatronEngine):
+    # [CLASS DOC]
+    # MegatronEngine specialised as a PPO critic, delegating to an areal PPOCritic
+    # helper.
     """PPO Critic implementation using Megatron backend."""
 
     def __init__(self, config: PPOCriticConfig):
+        # [FUNCTION DOC]
+        # Initialises the engine and creates the PPOCritic helper.
         from areal.trainer.ppo.critic import PPOCritic
 
         super().__init__(config)
@@ -3029,13 +3511,19 @@ class MegatronPPOCritic(MegatronEngine):
 
     @torch.no_grad()
     def compute_values(self, *args, **kwargs) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # No-grad; forwards to PPOCritic.compute_values.
         return self.critic.compute_values(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Forwards to PPOCritic.ppo_update.
         self.critic.ppo_update(*args, **kwargs)
 
     @classmethod
     def as_controller(cls, config: PPOCriticConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Returns PPOCriticControllerV2 for v2 configs, else PPOCriticController.
         if config._version == "v2":
             from areal.trainer.ppo.critic import PPOCriticControllerV2
 
@@ -3051,22 +3539,32 @@ class MegatronPPOCritic(MegatronEngine):
 
 
 class MegatronLMEngine(MegatronEngine):
+    # [CLASS DOC]
+    # MegatronEngine for SFT language modelling, delegating to an areal LMEngine helper.
     """Language model engine for SFT using Megatron backend."""
 
     def __init__(self, config: TrainEngineConfig):
+        # [FUNCTION DOC]
+        # Initialises the engine and creates the LMEngine helper.
         from areal.trainer.sft.lm_engine import LMEngine
 
         super().__init__(config)
         self.lm_engine = LMEngine(self)
 
     def train_lm(self, data):
+        # [FUNCTION DOC]
+        # Forwards to LMEngine.train_lm.
         return self.lm_engine.train_lm(data)
 
     def evaluate_lm(self, data):
+        # [FUNCTION DOC]
+        # Forwards to LMEngine.evaluate_lm.
         return self.lm_engine.evaluate_lm(data)
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Returns LMControllerV2 for v2 configs, else LMController.
         if config._version == "v2":
             from areal.trainer.sft.lm_engine import LMControllerV2
 
@@ -3082,9 +3580,15 @@ class MegatronLMEngine(MegatronEngine):
 
 
 class MegatronRWEngine(MegatronEngine):
+    # [CLASS DOC]
+    # MegatronEngine for reward-model training, delegating to an areal RWEngine helper
+    # and forcing micro-batch granularity 2.
     """Reward model engine using Megatron backend."""
 
     def __init__(self, config: TrainEngineConfig):
+        # [FUNCTION DOC]
+        # Initialises the engine and RWEngine helper; if granularity != 2, warns and
+        # deep-copies config with granularity 2.
         from copy import deepcopy
 
         from areal.trainer.rw.rw_engine import RWEngine
@@ -3098,13 +3602,19 @@ class MegatronRWEngine(MegatronEngine):
             self.config.mb_spec.granularity = 2
 
     def train_rw(self, data):
+        # [FUNCTION DOC]
+        # Forwards to RWEngine.train_rw.
         return self.rw_engine.train_rw(data)
 
     def evaluate_rw(self, data):
+        # [FUNCTION DOC]
+        # Forwards to RWEngine.evaluate_rw.
         return self.rw_engine.evaluate_rw(data)
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Returns RWControllerV2 for v2 configs, else RWController.
         if config._version == "v2":
             from areal.trainer.rw.rw_engine import RWControllerV2
 
@@ -3116,9 +3626,15 @@ class MegatronRWEngine(MegatronEngine):
 
 
 class MegatronDPOEngine(MegatronEngine):
+    # [CLASS DOC]
+    # MegatronEngine for DPO training, delegating to an areal DPOEngine helper and
+    # forcing micro-batch granularity 2.
     """DPO training engine using Megatron backend."""
 
     def __init__(self, config: DPOEngineConfig):
+        # [FUNCTION DOC]
+        # Initialises the engine and DPOEngine helper; if granularity != 2, warns and
+        # deep-copies config with granularity 2.
         from copy import deepcopy
 
         from areal.trainer.dpo.dpo_engine import DPOEngine
@@ -3132,12 +3648,18 @@ class MegatronDPOEngine(MegatronEngine):
             self.config.mb_spec.granularity = 2
 
     def train_dpo(self, data):
+        # [FUNCTION DOC]
+        # Forwards to DPOEngine.train_dpo.
         return self.dpo_engine.train_dpo(data)
 
     def evaluate_dpo(self, data):
+        # [FUNCTION DOC]
+        # Forwards to DPOEngine.evaluate_dpo.
         return self.dpo_engine.evaluate_dpo(data)
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # Forwards to DPOEngine.compute_logp.
         return self.dpo_engine.compute_logp(data)
 
     @classmethod
@@ -3146,6 +3668,8 @@ class MegatronDPOEngine(MegatronEngine):
         config: DPOEngineConfig,
         scheduler: Scheduler,
     ):
+        # [FUNCTION DOC]
+        # Returns DPOControllerV2 for v2 configs, else DPOController.
         if config._version == "v2":
             from areal.trainer.dpo.dpo_engine import DPOControllerV2
 
