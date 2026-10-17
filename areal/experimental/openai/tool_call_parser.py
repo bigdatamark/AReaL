@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tool-call extraction for the experimental ArealOpenAI client: turns raw model output
+# text into OpenAI tool-call objects (chat-completions or Responses API flavor), the
+# visible text (reasoning plus remaining content) and an adjusted finish reason.
+# Supports a custom Qwen3-Coder XML parser, then SGLang's parsers, then vLLM's parsers
+# (with an SGLang-to-vLLM parser-name map), whichever backend is installed.
 # SPDX-License-Identifier: Apache-2.0
 
 import json
@@ -49,6 +55,13 @@ _SGLANG_TO_VLLM_TOOL_PARSER: dict[str, str] = {
 def _detect_think_and_return_ori_think(
     text: str, think_start_token: str, think_end_token: str
 ) -> tuple[str, str]:
+    # [FUNCTION DOC]
+    # HELPER: Splits text into (reasoning, normal). If think_start_token is absent
+    # returns empty reasoning and the text. Otherwise removes all start tokens; if the
+    # end token is missing, the whole remainder is treated as truncated reasoning
+    # (returned with the start token prefixed) and normal text is empty; else splits at
+    # the first end token and returns reasoning wrapped in start/end tokens and the text
+    # after it. Copied from SGLang.
     """
     return think text(with <think> and </think>) and normal text
     """
@@ -74,6 +87,10 @@ def _detect_think_and_return_ori_think(
 
 
 def _iter_tool_definitions(tools: list[Any]) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # HELPER: Normalizes a tool list to function definition dicts: takes the nested
+    # "function" dict (chat format) or the tool itself when its type is "function"
+    # (Responses flat format); non-dict entries and others are skipped.
     """Return OpenAI chat/responses tool definitions in a common shape."""
     tool_defs: list[dict[str, Any]] = []
     for tool in tools:
@@ -87,6 +104,9 @@ def _iter_tool_definitions(tools: list[Any]) -> list[dict[str, Any]]:
 
 
 def _tool_argument_schemas(tools: list[Any]) -> dict[str, dict[str, dict[str, Any]]]:
+    # [FUNCTION DOC]
+    # HELPER: Returns a map of tool name to its JSON-schema "properties" (only dict-
+    # valued properties kept), for tools that have a string name and dict parameters.
     schemas: dict[str, dict[str, dict[str, Any]]] = {}
     for tool_def in _iter_tool_definitions(tools):
         name = tool_def.get("name")
@@ -104,6 +124,9 @@ def _tool_argument_schemas(tools: list[Any]) -> dict[str, dict[str, dict[str, An
 
 
 def _clean_qwen3_coder_parameter(raw_value: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Strips at most one leading and one trailing newline from a raw parameter
+    # value.
     if raw_value.startswith("\n"):
         raw_value = raw_value[1:]
     if raw_value.endswith("\n"):
@@ -115,6 +138,12 @@ def _coerce_qwen3_coder_parameter(
     value: str,
     schema: dict[str, Any] | None,
 ) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Converts a string parameter value according to its JSON schema type (for a
+    # union type list the first non-"null" type is used): "boolean" maps true/false
+    # case-insensitively, "integer" to int, "number" to float, "array"/"object" via JSON
+    # parsing. Returns the original string when there is no schema, the type is other,
+    # or conversion fails (including a boolean that is neither true nor false).
     if not schema:
         return value
 
@@ -147,6 +176,11 @@ def _build_tool_call(
     arguments: str,
     use_responses: bool,
 ) -> ChatCompletionMessageFunctionToolCall | ResponseFunctionToolCall:
+    # [FUNCTION DOC]
+    # HELPER: Builds a tool-call object with random IDs: a Responses-API function call
+    # (id "fc-..." and call_id "call_...", status completed) when use_responses, else a
+    # chat-completion function tool call (id "call_...") with the given name and JSON
+    # arguments string.
     if use_responses:
         return ResponseFunctionToolCall(
             type="function_call",
@@ -173,6 +207,19 @@ def _process_tool_calls_qwen3_coder_xml(
     str,
     str,
 ]:
+    # [FUNCTION DOC]
+    # HELPER: Custom parser for Qwen3-Coder style tool calls (tool_call blocks
+    # containing function=NAME blocks containing parameter=NAME tags), because SGLang
+    # may return empty arguments for this format. Splits off think-tagged reasoning,
+    # then for each tool_call block and each function in it collects parameters
+    # (newline-trimmed and schema-coerced from the matching tool definition) into a JSON
+    # arguments string. Aborts entirely (returns None, original text, unchanged finish
+    # reason) if parameter open/close tags are unbalanced or a value contains a
+    # parameter tag. Functions with no parsed arguments are skipped; a block whose
+    # functions all yield calls is removed from the content. Returns (None, text,
+    # finish_reason) if no calls were found; otherwise the call list, reasoning plus
+    # content with the consumed blocks removed and the "<|im_end|>" token stripped, and
+    # finish_reason changed from "stop" to "tool_calls".
     """Parse Qwen3-Coder XML tool calls with ``<parameter=...>`` tags.
 
     SGLang's qwen3_coder parser recognizes the tool name in this format but
@@ -266,6 +313,19 @@ def _process_tool_calls_sglang(
     str,
     str,
 ]:
+    # [FUNCTION DOC]
+    # HELPER: SGLang-backed parsing. Imports SGLang (raises ModuleNotFoundError if
+    # absent, which the caller relies on). Converts tools to SGLang Tool objects (flat
+    # Responses format or nested chat format), builds a FunctionCallParser for
+    # tool_call_parser and a ReasoningParser for reasoning_parser, and splits reasoning
+    # using that parser's think tokens. If a tool call is detected: changes
+    # finish_reason "stop" to "tool_calls", parses non-streamingly and returns tool-call
+    # objects (Responses or chat flavor with random IDs) plus reasoning and remaining
+    # content. On parse exception logs an ERROR with traceback and returns (None,
+    # original text, the possibly-updated finish_reason). With no tool call returns
+    # (None, text, finish_reason).
+    # KNOWN ISSUE: on a parse exception the returned finish_reason may already have been
+    # changed to "tool_calls" even though no calls are returned.
     from sglang.srt.entrypoints.openai.protocol import Function as SglFunction
     from sglang.srt.entrypoints.openai.protocol import Tool as SglTool
     from sglang.srt.function_call.function_call_parser import FunctionCallParser
@@ -350,6 +410,17 @@ def _process_tool_calls_vllm(
     str,
     str,
 ]:
+    # [FUNCTION DOC]
+    # HELPER: vLLM-backed parsing. Imports vLLM parser managers (ModuleNotFoundError if
+    # absent). If a tokenizer and reasoning_parser name are given, instantiates vLLM's
+    # reasoning parser to get start/end tokens and splits reasoning (warning and no
+    # split on failure); otherwise no reasoning split. Maps the SGLang parser name to a
+    # vLLM name, warns and returns (None, text, finish_reason) if the parser is unknown
+    # or no tokenizer was given. Runs the vLLM tool parser's extraction on the content
+    # with a minimal request object; on exception logs an ERROR with traceback and
+    # returns no calls. If calls were found, changes "stop" to "tool_calls" and returns
+    # tool-call objects (Responses or chat flavor with new random IDs) and reasoning
+    # plus the parser's remaining content.
     from vllm.reasoning import ReasoningParserManager
     from vllm.tool_parsers import ToolParserManager
 
@@ -462,6 +533,15 @@ def process_tool_calls(
     str,
     str,
 ]:
+    # [FUNCTION DOC]
+    # Public entry point. Inputs: text (raw model output), tools (OpenAI tool
+    # definitions), tool_call_parser and reasoning_parser names (SGLang naming),
+    # finish_reason, use_responses (produce Responses-API objects instead of chat ones),
+    # tokenizer (needed only for vLLM). For "qwen3_coder" first tries the custom XML
+    # parser and returns its result if it found calls. Then tries SGLang, then vLLM,
+    # each skipped if its package is missing. If neither is installed logs a WARNING and
+    # returns (None, text, finish_reason). Returns a tuple of (tool calls or None,
+    # output text, finish reason).
     """Process tool calls in the response"""
     if tool_call_parser == "qwen3_coder":
         tool_calls, output_text, finish_reason = _process_tool_calls_qwen3_coder_xml(

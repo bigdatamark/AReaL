@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Launcher-side wrapper for SGLang inference servers in SPMD mode. Run as a process (by
+# the local/Slurm/Ray launchers) that starts one or more SGLang server subprocesses on
+# the GPUs visible to it, waits until they serve requests, publishes their addresses
+# through name_resolve, then monitors them and exits if any dies.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -36,6 +41,11 @@ logger = logging.getLogger("SGLangWrapper")
 def launch_server_cmd(
     command: list[str], custom_env: dict[str, str] | None = None
 ) -> subprocess.Popen:
+    # [FUNCTION DOC]
+    # Starts command (argument list) as a subprocess inheriting stdout and merging
+    # stderr into it. The environment is a copy of the current one with a fresh unique
+    # Triton cache directory (avoids cache directory races between servers) plus
+    # custom_env overrides. Logs the command and returns the Popen handle.
     """
     Launch inference server in a new process and return its process handle.
 
@@ -63,6 +73,15 @@ def launch_server_cmd(
 
 
 def wait_for_server(base_url: str, timeout: int | None = None) -> None:
+    # [FUNCTION DOC]
+    # Polls GET base_url/v1/models (dummy bearer header) until it returns 200, then
+    # sleeps 5s more and returns. Connection errors sleep 1s and retry; non-200
+    # responses retry immediately. Raises TimeoutError if timeout (seconds) has elapsed
+    # when a non-200 response is seen.
+    # KNOWN ISSUE: the timeout is only checked after non-200 responses, not after
+    # connection errors, and requests have no per-request timeout, so with an
+    # unreachable server this can wait forever; non-200 responses are retried in a tight
+    # loop.
     """Wait for the server to be ready by polling the /v1/models endpoint.
 
     Args:
@@ -87,6 +106,10 @@ def wait_for_server(base_url: str, timeout: int | None = None) -> None:
 
 
 class SGLangServerWrapper:
+    # [CLASS DOC]
+    # Launches and supervises the SGLang servers for one launcher process. Holds
+    # experiment/trial names, the SGLang config, parsed allocation mode, node GPU count,
+    # optional CPUs per GPU (stored but unused) and the list of server Popen handles.
     def __init__(
         self,
         experiment_name: str,
@@ -96,6 +119,8 @@ class SGLangServerWrapper:
         n_gpus_per_node: int,
         cpu_per_gpu: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores the arguments and initializes an empty server process list.
         self.experiment_name = experiment_name
         self.trial_name = trial_name
         self.config = sglang_config
@@ -105,6 +130,10 @@ class SGLangServerWrapper:
         self.cpu_per_gpu = cpu_per_gpu
 
     def _monitor_server_processes(self, server_addresses):
+        # [FUNCTION DOC]
+        # HELPER: Polls each server process every second; when any has exited, logs its
+        # address and return code and terminates the current process with exit code 1.
+        # Never returns normally.
         """Monitor server processes and exit if any dies."""
         while True:
             all_alive = True
@@ -123,6 +152,19 @@ class SGLangServerWrapper:
             time.sleep(1)
 
     def run(self):
+        # [FUNCTION DOC]
+        # Computes per-server GPU count (gen instance size). If it exceeds GPUs per node
+        # it must be a multiple (ValueError otherwise) and multi-node info (node rank,
+        # master addr/port) is read from the AREAL_SGLANG_MULTI_NODE_* env vars.
+        # Determines how many servers this process runs from the visible-device env var
+        # (visible count divided by GPUs per server) or servers per node, and an index
+        # offset from the smallest visible device ID. For each local server index: picks
+        # a disjoint port sub-range of 10000-32767 per index and finds a free server
+        # port and distributed-init port in it, sets dist init address (shared master
+        # for cross-node, else localhost), uses a base GPU id relative to the visible
+        # devices, offsets the random seed by the server index, and builds the SGLang
+        # command line. Launches all servers concurrently in a thread pool (each waits
+        # until healthy) and then monitors them forever.
         gpus_per_server = self.allocation_mode.gen_instance_size
         cross_nodes = False
         if gpus_per_server > self.n_gpus_per_node:
@@ -203,6 +245,12 @@ class SGLangServerWrapper:
         self._monitor_server_processes(server_addresses)
 
     def launch_one_server(self, cmd, host_ip, server_port, node_rank):
+        # [FUNCTION DOC]
+        # Launches one server. If AWEX_META_SERVER_ADDR is set, passes it in the env and
+        # swaps the SGLang launch module for the awex SGLang plugin module. Starts the
+        # process, waits until it serves requests (no timeout), and on node rank 0
+        # registers "host:port" under the trial's generation-servers name_resolve key.
+        # Logs and returns the Popen handle.
         custom_env = None
         awex_meta_addr = os.environ.get("AWEX_META_SERVER_ADDR")
         if awex_meta_addr:
@@ -223,6 +271,13 @@ class SGLangServerWrapper:
 
 
 def launch_sglang_server(argv):
+    # [FUNCTION DOC]
+    # Entry logic: parses CLI args, structures sglang, cluster, name_resolve and rollout
+    # config sections, reconfigures name_resolve, emits the deprecation FutureWarning
+    # about the allocation-mode parser, parses the allocation mode and asserts its
+    # generation backend is sglang, enables returning routed experts in SGLang if the
+    # rollout config requests it, then constructs a SGLangServerWrapper (CPU count from
+    # the rollout scheduling spec) and runs it (blocking).
     config, _ = parse_cli_args(argv)
     config.sglang = to_structured_cfg(config.sglang, SGLangConfig)
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
@@ -264,6 +319,9 @@ def launch_sglang_server(argv):
 
 
 def main(argv):
+    # [FUNCTION DOC]
+    # Process entry: runs launch_sglang_server; on any exception logs the traceback and
+    # exits with code 1; always finally kills this process's child tree gracefully.
     try:
         launch_sglang_server(argv)
     except Exception:

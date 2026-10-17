@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Ray-based SPMD launcher. Runs experiment components as Ray remote tasks inside
+# placement groups: per-node SGLang server tasks or per-server vLLM tasks (via the
+# server launcher modules), and one trainer task per GPU with torch.distributed env vars
+# injected (instead of torchrun). Monitors task futures, cleans up and supports recovery
+# by re-running with the same placement groups (kept in a module-global launcher).
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
@@ -52,6 +58,12 @@ RECOVER_TIME_INTERVAL = 10  # seconds
 
 
 def run_func(file_path, function_name, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Executed inside a Ray task: loads the Python file at file_path as a module (name
+    # derived from the path, registered in sys.modules), executes it, looks up
+    # function_name and calls it with args/kwargs, returning its result. Raises
+    # FileNotFoundError if no module spec can be built and ValueError if the function is
+    # missing.
     # Convert the file path to a module name
     module_name = file_path.replace("/", "_").replace(".", "_")
 
@@ -79,7 +91,13 @@ def run_func(file_path, function_name, *args, **kwargs):
 
 
 class RayLauncher:
+    # [CLASS DOC]
+    # Tracks Ray task futures by job name ("<job>:<index>") and placement groups by job
+    # name for one experiment trial.
     def __init__(self, experiment_name: str, trial_name: str, fileroot: str):
+        # [FUNCTION DOC]
+        # Stores experiment/trial names and fileroot; initializes empty job-future and
+        # placement-group maps.
         self.experiment_name = experiment_name
         self.trial_name = trial_name
         self.fileroot = fileroot
@@ -90,6 +108,8 @@ class RayLauncher:
 
     @property
     def run_name(self):
+        # [FUNCTION DOC]
+        # Property: "<experiment_name>_<trial_name>".
         return f"{self.experiment_name}_{self.trial_name}"
 
     def submit(
@@ -108,6 +128,12 @@ class RayLauncher:
             dict[str, str] | None
         ) = None,  # keyword arguments to pass to the function
     ):
+        # [FUNCTION DOC]
+        # Submits one Ray task running run_func(file_path, func_name, args...,
+        # kwargs...) with the given CPUs, GPUs (as the "NPU" custom resource on NPU
+        # platforms), memory (MB converted to bytes), runtime env vars, and optionally
+        # pinned to a placement group bundle (capturing child tasks). Records and
+        # returns the future under job_name.
         if kwargs is None:
             kwargs = {}
         runtime_env = RuntimeEnv(
@@ -157,6 +183,16 @@ class RayLauncher:
         env_vars: dict | None = None,
         env_hook: Callable[[PlacementGroup], list[dict]] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Submits count tasks spread evenly over nodes. Validates count divisible by
+        # nodes and list_args/list_kwargs lengths (ValueError). Creates (or, in recover
+        # runs, reuses) a PACK placement group with one bundle per node holding the per-
+        # node CPU/GPU(or NPU)/memory totals, waiting up to 30s for it (logs cluster
+        # resources and re-raises on timeout). If env_hook is given it is called with
+        # the placement group to produce per-task extra env vars. Each task i goes to
+        # bundle i // tasks_per_node with merged env vars (warning if the device-
+        # visibility var is preset) and per-task args/kwargs. Returns the list of
+        # futures.
         """Submit an array of jobs to Ray with ray placement groups.
 
         Note: Here we use `ray.remote` instead of `ray job submit` since `ray job submit`
@@ -262,6 +298,10 @@ class RayLauncher:
         return futures
 
     def stop(self, job_name: str, force: bool = False):
+        # [FUNCTION DOC]
+        # Cancels the task future for job_name (force kills the worker if force,
+        # otherwise raises KeyboardInterrupt in the task), removes it and logs INFO;
+        # logs ERROR and keeps it on cancel failure; warns if unknown.
         """Stop a job by name."""
         if job_name in self.jobs:
             future = self.jobs[job_name]
@@ -276,6 +316,9 @@ class RayLauncher:
             logger.warning(f"Job {job_name} not found in running jobs.")
 
     def stop_all(self, force: bool = False, pattern: str | None = None):
+        # [FUNCTION DOC]
+        # Stops all jobs, or only those whose name matches the regex pattern, then
+        # removes any remaining matched entries from the map. Logs INFO.
         """Stop all jobs with pattern matched."""
         job_names = list(self.jobs.keys())
         if pattern:
@@ -296,6 +339,13 @@ class RayLauncher:
     def wait(
         self, check_status=(JobState.FAILED,), remove_status=(JobState.COMPLETED,)
     ):
+        # [FUNCTION DOC]
+        # Polls every 5s until no jobs remain. Each round tries to get every future with
+        # a 0.1s timeout: a returned value marks the job COMPLETED (logs result), a task
+        # error marks it FAILED (logs error), timeouts are skipped. Raises JobException
+        # (worker type from the name prefix, host "ray") for the first job whose state
+        # is in check_status, and removes jobs whose state is in remove_status. Asserts
+        # statuses are only COMPLETED or FAILED.
         """Check every RAY_WAIT_CHECK_TIME_INTERVAL seconds for the status of all jobs.
         If a ray job returns, its status changes to JobState.COMPLETED.
         If a ray job failed, its status changes to JobState.FAILED.
@@ -341,12 +391,39 @@ class RayLauncher:
 
 
 def main():
+    # [FUNCTION DOC]
+    # CLI entry: connects to the Ray cluster, parses CLI args and runs ray_main with
+    # run_id 0.
     ray.init()
     config, _ = parse_cli_args(sys.argv[1:])
     ray_main(config, run_id=0)
 
 
 def ray_main(config, run_id: int = 0):
+    # [FUNCTION DOC]
+    # Runs an SPMD experiment on Ray. Structures recover/cluster config, determines
+    # recover state, warns about the deprecated allocation parser, validates config,
+    # resets the trial's name_resolve subtree, creates or reuses the global RayLauncher
+    # (asserting run_id 0 on creation), parses the allocation mode and scheduling specs,
+    # and saves metadata on fresh runs. SGLang: launches one llm_server task per
+    # generation node (all node GPUs, CPUs and memory scaled by GPUs per node, seed
+    # offset per node), with a multi-node env hook (node rank, master address/port per
+    # server group) when a server spans nodes, then waits for dp_size addresses (on
+    # failure stops all non-forcefully, runs the post-exit hook, re-raises). vLLM:
+    # launches one task per server with tp GPUs and per-server seeds, then waits
+    # similarly (stop forcefully on failure). Trainer (unless server-only): launches one
+    # 1-GPU task per GPU on the remaining nodes using sys.argv[1] as entry file and the
+    # rest as args, with an env hook providing RANK, WORLD_SIZE, LOCAL_RANK=0,
+    # MASTER_ADDR/PORT from the placement group, plus server addresses, NCCL and
+    # deterministic-Megatron flags, offload vars and AREAL_SPMD_MODE=1. Waits treating
+    # COMPLETED or FAILED as terminal; on interrupt/JobException/timeout stops
+    # llm_server tasks gracefully and trainer tasks forcefully, runs the post-exit hook,
+    # and recursively retries after 10s if the job FAILED and recovery is enabled with
+    # retries left; otherwise re-raises.
+    # KNOWN ISSUE: a normally completed job also raises JobException (reason COMPLETED),
+    # so even successful runs end with an exception. For vLLM the node count is world
+    # size integer-divided by GPUs per node and can be 0 for small allocations, causing
+    # a modulo-by-zero in submit_array.
     config.recover = to_structured_cfg(config.recover, RecoverConfig)
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
     is_recover_run = check_if_recover(config.recover, run_id)
@@ -430,6 +507,11 @@ def ray_main(config, run_id: int = 0):
         def sglang_env_hook(
             n_tasks: int, task_group_size: int, placement_group: PlacementGroup
         ) -> list[dict]:
+            # [FUNCTION DOC]
+            # HELPER: For multi-node SGLang servers, gets a master IP/port from the
+            # placement group for each group of task_group_size consecutive tasks and
+            # returns, per task, env vars with its node rank within the group and its
+            # group's master address/port.
             master_addrs = []
             master_ports = []
             for i in range(0, n_tasks, task_group_size):
@@ -560,6 +642,11 @@ def ray_main(config, run_id: int = 0):
         # We amend environment variable similar to torchrun to ensure correct initialization of
         # torch distributed.
         def torch_env_hook(n_tasks: int, placement_group: PlacementGroup) -> list[dict]:
+            # [FUNCTION DOC]
+            # HELPER: Gets a master IP/port from the placement group and returns per-
+            # task env vars RANK, WORLD_SIZE (n_tasks), LOCAL_RANK "0" (Ray isolates
+            # GPUs), MASTER_ADDR and MASTER_PORT for torch.distributed initialization;
+            # logs the address.
             host_ip, port = get_placement_group_master_ip_and_port(placement_group)
             logger.info(
                 f"Amend torch distributed env vars: MASTER_ADDR={host_ip}, PORT={port}"

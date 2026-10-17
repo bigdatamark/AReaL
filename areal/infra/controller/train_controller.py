@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Single-controller for distributed training workers. The TrainController creates one
+# training-engine worker per GPU rank through a Scheduler, sets torch.distributed env
+# vars, initializes engines remotely, and exposes a TrainEngine-like API whose calls fan
+# out over RPC: tensor-like inputs (lists of trajectory dicts containing torch tensors
+# or RTensors) are partitioned across data-parallel groups by balanced token count and
+# sent only to DP-head workers, other inputs are replicated, and results are merged back
+# into the original order. Also bridges to a RolloutController for weight sync and batch
+# preparation, and clears distributed RTensor batches.
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -34,6 +43,9 @@ logger = logging.getLogger("TrainController")
 
 
 def _find_in_structure(obj: Any, type_: type) -> Any | None:
+    # [FUNCTION DOC]
+    # HELPER: Depth-first search through nested dicts, lists and tuples; returns the
+    # first object that is an instance of type_, or None.
     """Find first instance of type_ in a nested structure."""
     if isinstance(obj, type_):
         return obj
@@ -51,6 +63,8 @@ def _find_in_structure(obj: Any, type_: type) -> Any | None:
 
 
 def _is_tensor_like(obj: Any) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if obj (possibly nested) contains a torch Tensor or an RTensor.
     """Check if obj contains tensors or rtensors."""
     return (
         _find_in_structure(obj, torch.Tensor) is not None
@@ -59,6 +73,12 @@ def _is_tensor_like(obj: Any) -> bool:
 
 
 def _item_weight(d: dict[str, Any]) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Token weight of one trajectory dict for load balancing: sum of the
+    # attention_mask if it is a local tensor (forces a GPU-CPU sync if on GPU), element
+    # count of a remote attention_mask's local data, otherwise the element count of the
+    # first RTensor value or of the first local tensor with at least 2 dims; defaults to
+    # 1.
     attn_mask = d.get("attention_mask")
     if isinstance(attn_mask, torch.Tensor):
         return int(attn_mask.sum().item())
@@ -78,6 +98,13 @@ def _dispatch_tensors(
     dp_size: int,
     group_size: int = 1,
 ) -> tuple[list[list[dict[str, Any]]], list[list[int]]]:
+    # [FUNCTION DOC]
+    # HELPER: Partitions item_list across dp_size groups. Items are bundled into atomic
+    # consecutive groups of group_size (never split; e.g. chosen/rejected pairs), group
+    # weights are summed token weights, and a balanced greedy partition into dp_size
+    # bins is computed. Returns (per-DP lists of items, per-DP lists of original item
+    # indices). Raises ValueError if the item count is not divisible by group_size;
+    # asserts every shard is a multiple of group_size.
     """Partition trajectories across DP groups by balanced token count.
 
     Args:
@@ -125,6 +152,11 @@ def _dispatch_tensors(
 def _pad_eval_batch(
     args: tuple[Any, ...], dp_size: int, group_size: int = 1
 ) -> tuple[Any, ...]:
+    # [FUNCTION DOC]
+    # HELPER: For evaluation dispatch, finds the first positional argument that is a
+    # non-empty tensor-like list and pads it with dummy items (built from the first
+    # item, with zero masks) up to a multiple of dp_size times group_size, logging at
+    # INFO. Returns the args as a new tuple; other args are unchanged.
     """Pad the first tensor-like arg to a multiple of ``dp_size * group_size``.
 
     Called before dispatch for explicit evaluation controller paths so that
@@ -154,6 +186,11 @@ def _pad_eval_batch(
 def _merge_tensors(
     results: list[Any], group_indices: list[list[int]]
 ) -> list[Any] | None:
+    # [FUNCTION DOC]
+    # HELPER: Merges per-DP results back to original order. Returns None if every group
+    # result is None. A non-list group result is broadcast to every index of that group.
+    # Asserts each group result length matches its index list, and places each item at
+    # its original index. Returns the reordered list.
     """Flatten per-DP-group results and reorder to original trajectory order."""
     if all(r is None for r in results):
         return None
@@ -172,6 +209,13 @@ def _merge_tensors(
 
 
 class TrainController:
+    # [CLASS DOC]
+    # Controller presenting a TrainEngine-like interface over remote workers. State:
+    # engine class, TrainEngineConfig, scheduler, parsed train allocation (parallel
+    # strategy), worker list, per-worker DP-head flags (only DP heads receive data;
+    # other ranks get it by in-engine broadcast), worker role, whether this controller
+    # created its own local process group, master address/port for torch.distributed,
+    # and the connected RolloutController (None until connect_engine).
     """Controller for managing distributed training across multiple workers.
 
     This class orchestrates the lifecycle of training workers, handles data
@@ -192,6 +236,10 @@ class TrainController:
         config: TrainEngineConfig,
         scheduler: Scheduler,
     ):
+        # [FUNCTION DOC]
+        # Stores engine class, config and scheduler, parses config.backend into a
+        # ModelAllocation, and initializes empty worker lists, default role "default",
+        # no own process group and no rollout. No I/O.
         self.train_engine = train_engine
         self.config = config
         self.scheduler = scheduler
@@ -210,6 +258,13 @@ class TrainController:
         self.rollout: RolloutController = None
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
+        # [FUNCTION DOC]
+        # If torch.distributed is not initialized in the controller process, creates a
+        # single-process gloo group (rank 0, world size 1) on a free localhost TCP port
+        # and records that it owns it. parallel_strategy is ignored. Real worker process
+        # groups are created in initialize.
+        # KNOWN ISSUE: the docstring calls this a dummy placeholder, but it does
+        # initialize a local gloo process group.
         """Placeholder method for process group creation.
 
         This is a dummy method maintained for API compatibility. The actual
@@ -233,22 +288,32 @@ class TrainController:
 
     @property
     def parallel_strategy(self) -> ParallelStrategy:
+        # [FUNCTION DOC]
+        # Property: the parallel strategy from the parsed backend allocation.
         """Parallel strategy derived from the parsed backend allocation."""
         return self.train_alloc.parallel
 
     @property
     def data_parallel_rank(self) -> int:
+        # [FUNCTION DOC]
+        # Property: always 0 (the controller acts as a single DP rank).
         return 0
 
     @property
     def data_parallel_world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: always 1.
         return 1
 
     def is_data_parallel_head(self) -> bool:
+        # [FUNCTION DOC]
+        # Always True (the controller is its own DP head).
         return True
 
     @property
     def cpu_group(self):
+        # [FUNCTION DOC]
+        # Property: always None (no CPU process group on the controller).
         return None
 
     def initialize(
@@ -257,6 +322,14 @@ class TrainController:
         ft_spec: FinetuneSpec,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Creates and initializes the training fleet. Inputs: role (worker role name),
+        # ft_spec (FinetuneSpec), kwargs forwarded to each engine's initialize. Builds a
+        # Job with world_size replicas using the configured scheduling specs and
+        # strategy, creates and fetches workers, takes MASTER_ADDR from rank 0's IP and
+        # MASTER_PORT from its second engine port (or second worker port if none),
+        # creates engines (with env vars) and initializes them synchronously, then
+        # queries which workers are DP heads. Logs progress.
         """Initialize environments for distributed training and load models.
 
         Parameters
@@ -323,6 +396,8 @@ class TrainController:
         logger.info("TrainController initialization complete")
 
     def _engine_name(self, rank: int) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the engine name "<role>/<rank>".
         """Generate engine name for a worker rank.
 
         Engine names follow the "role/index" format (e.g., "actor/0", "ref/1").
@@ -330,10 +405,16 @@ class TrainController:
         return f"{self._worker_role}/{rank}"
 
     async def _async_create_engines(self, engine: str):
+        # [FUNCTION DOC]
+        # HELPER: For every worker concurrently, sets RANK, WORLD_SIZE, MASTER_ADDR,
+        # MASTER_PORT and LOCAL_RANK=0 (one GPU per process) env vars and then creates
+        # the engine (by import path string) with the config.
         """Create engine instances on all workers. Sets distributed env vars before creation."""
         logger.info("Creating engines on workers...")
 
         async def _setup_worker(worker: Worker, rank: int):
+            # [FUNCTION DOC]
+            # HELPER: Sets the distributed env for one worker and creates its engine.
             env = {
                 "RANK": str(rank),
                 "WORLD_SIZE": str(len(self.workers)),
@@ -356,6 +437,10 @@ class TrainController:
         logger.info("Engines created on all workers!")
 
     async def _async_initialize_engines(self, ft_spec: FinetuneSpec, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Two phases over all workers concurrently: create_process_group with
+        # the parallel strategy, then initialize with ft_spec and kwargs (model load,
+        # optimizer setup).
         """Initialize engines: create process groups, then load models and setup optimizers."""
         logger.info("Calling engine initialization...")
         # Phase 1: Create process groups for distributed training
@@ -384,10 +469,15 @@ class TrainController:
         logger.info("All engines are initialized!")
 
     def _identify_dp_heads(self):
+        # [FUNCTION DOC]
+        # HELPER: Queries is_data_parallel_head on every engine and stores the boolean
+        # list in workers_is_dp_head.
         """Query workers to identify DP heads. Stores result in self.workers_is_dp_head."""
         logger.info("Identifying DP head workers...")
 
         async def _get_dp_head():
+            # [FUNCTION DOC]
+            # HELPER: Async gather of the is_data_parallel_head calls.
             tasks = [
                 self.scheduler.async_call_engine(
                     worker_id=worker.id,
@@ -401,6 +491,12 @@ class TrainController:
         self.workers_is_dp_head = run_async_task(_get_dp_head)
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Tears down: if workers exist, calls destroy on every engine concurrently
+        # (exceptions collected and logged as warnings per rank; other errors logged),
+        # then deletes workers in reverse rank order (so rank 0, the TCPStore owner,
+        # dies last), clears worker lists, and destroys the controller's own local
+        # process group if it created one.
         """Destroy the controller and release GPU memory of models.
 
         Cleans up all resources including workers, engines, and internal state.
@@ -426,6 +522,9 @@ class TrainController:
             try:
 
                 async def _destroy_all_engines():
+                    # [FUNCTION DOC]
+                    # HELPER: Concurrently calls destroy on every engine, returning
+                    # results or exceptions.
                     tasks = [
                         self.scheduler.async_call_engine(
                             worker_id=worker.id,
@@ -475,6 +574,11 @@ class TrainController:
         rpc_meta: dict[str, Any] | None = None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Synchronous generic RPC: prepares DP dispatch of args/kwargs (popping
+        # an optional group_size kwarg), calls method on all workers with optional
+        # rpc_meta, and collects results (merged list for tensor dispatch, first DP
+        # head's result otherwise).
         """Dispatch method call to workers via the appropriate path."""
         dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
         results = run_async_task(
@@ -489,6 +593,8 @@ class TrainController:
         rpc_meta: dict[str, Any] | None = None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Async counterpart of _custom_function_call.
         """Async version of _custom_function_call."""
         dp_args, dp_kwargs, group_indices = self._prepare_dispatch(*args, **kwargs)
         results = await self._call_workers(
@@ -503,6 +609,10 @@ class TrainController:
         *,
         group_size: int,
     ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        # [FUNCTION DOC]
+        # HELPER: Pads the first tensor-like positional arg to a multiple of dp_size
+        # times group_size (eval path) and returns (padded args, a shallow copy of
+        # kwargs).
         """Pad eval batches for explicit algorithm-level evaluation dispatch."""
         kwargs = dict(kwargs)
         args = _pad_eval_batch(
@@ -513,6 +623,11 @@ class TrainController:
     def _prepare_dispatch(
         self, *args, **kwargs
     ) -> tuple[list[list[Any]], dict[str, list[Any]], list[list[int]] | None]:
+        # [FUNCTION DOC]
+        # HELPER: Pops group_size (default 1) from kwargs; if any arg or kwarg is
+        # tensor-like, partitions inputs across DP groups, otherwise replicates them.
+        # Returns (per-arg lists of DP slices, per-kwarg lists of DP slices, group
+        # indices or None).
         """Route to tensor or scalar dispatch based on input type.
 
         Returns (dp_split_args, dp_split_kwargs, group_indices).
@@ -526,11 +641,20 @@ class TrainController:
     def _partition_inputs(
         self, group_size: int, /, *args, **kwargs
     ) -> tuple[list[list[Any]], dict[str, list[Any]], list[list[int]]]:
+        # [FUNCTION DOC]
+        # HELPER: Splits tensor-like args/kwargs across DP groups. The first tensor-like
+        # value determines the partition (via balanced token dispatch); later tensor-
+        # like values are split with the same indices (so they must be aligned lists);
+        # non-tensor values are replicated dp_size times. Asserts at least one value was
+        # tensor-like. Returns (dp args, dp kwargs, group indices).
         """Partition tensor args across DP groups; replicate others."""
         dp_size = self.parallel_strategy.dp_size
         group_indices: list[list[int]] | None = None
 
         def _split(item: Any) -> list[Any]:
+            # [FUNCTION DOC]
+            # HELPER: Splits one value per the rules above, recording group indices on
+            # first use.
             nonlocal group_indices
             if _is_tensor_like(item):
                 if group_indices is None:
@@ -549,6 +673,9 @@ class TrainController:
     def _replicate_inputs(
         self, *args, **kwargs
     ) -> tuple[list[list[Any]], dict[str, list[Any]], None]:
+        # [FUNCTION DOC]
+        # HELPER: Replicates every arg and kwarg dp_size times; returns group indices
+        # None.
         """Replicate all args to every DP group."""
         dp_size = self.parallel_strategy.dp_size
         dp_args = [[a] * dp_size for a in args]
@@ -562,6 +689,10 @@ class TrainController:
         dp_split_kwargs: dict[str, list[Any]],
         rpc_meta: dict[str, Any] | None = None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Calls method on every worker concurrently. DP-head workers receive the
+        # next DP slice of each arg/kwarg in order; non-head workers receive no data
+        # args. Passes rpc_meta through. Returns the list of per-worker results.
         """Send dispatched inputs to workers. DP heads get slices, others empty."""
         tasks = []
         dp_idx = 0
@@ -591,6 +722,9 @@ class TrainController:
     def _collect_results(
         self, results: list[Any], group_indices: list[list[int]] | None
     ) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: Keeps only DP-head results; returns them merged into original order if
+        # group_indices is given, else the first DP head's result.
         """Filter to DP heads, then reorder (tensor) or merge (scalar)."""
         results = [r for idx, r in enumerate(results) if self.workers_is_dp_head[idx]]
         if group_indices is not None:
@@ -598,6 +732,11 @@ class TrainController:
         return results[0]
 
     def connect_engine(self, rollout: RolloutController, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Connects a RolloutController for weight updates: warns if replacing a
+        # different one, stores it, and sends each training engine a RolloutCallback
+        # pointing at the rollout controller's callback address, together with meta, via
+        # a connect_engine RPC.
         if self.rollout is not None and self.rollout != rollout:
             logger.warning(
                 f"Connected rollout controller changed from {self.rollout} to {rollout}."
@@ -610,6 +749,10 @@ class TrainController:
         self._custom_function_call("connect_engine", engine=engine, meta=meta)
 
     def export_stats(self):
+        # [FUNCTION DOC]
+        # Returns the controller-local stats tracker export updated with the stats from
+        # the first DP head (workers are assumed to have already all-reduced their
+        # stats).
         """Export training statistics from all workers.
 
         Collects statistics from all workers. The statistics are assumed to be
@@ -633,6 +776,9 @@ class TrainController:
     # specific training scenarios (PPO, SFT, etc.) where the appropriate
     # loss functions and data processing are handled.
     def train(self, mode: bool = True):
+        # [FUNCTION DOC]
+        # RPC: sets training mode (mode True) or eval mode on all engines; returns self
+        # for chaining.
         """Set the engine to training mode.
 
         Parameters
@@ -649,6 +795,8 @@ class TrainController:
         return self
 
     def eval(self):
+        # [FUNCTION DOC]
+        # Equivalent to train(False); returns self.
         """Set the engine to evaluation mode.
 
         This is a convenience method that calls `self.train(False)`.
@@ -661,6 +809,8 @@ class TrainController:
         return self.train(False)
 
     def set_version(self, version: int):
+        # [FUNCTION DOC]
+        # RPC: sets the weight version on all engines.
         """Set the current weight version in the training engine.
 
         Parameters
@@ -671,6 +821,8 @@ class TrainController:
         self._custom_function_call("set_version", version)
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # RPC: returns the weight version reported by the first DP head.
         """Get the current weight version in the training engine.
 
         Returns
@@ -681,6 +833,12 @@ class TrainController:
         return self._custom_function_call("get_version")
 
     def get_lora_adapter_info(self) -> dict[str, list[int]]:
+        # [FUNCTION DOC]
+        # RPC: fetches LoRA adapter info. Returns results[0] if the RPC result is
+        # truthy, else an empty dict.
+        # KNOWN ISSUE: a non-tensor RPC already returns the first DP head's result (a
+        # dict), so indexing it with 0 looks up key 0 in that dict and will likely raise
+        # KeyError.
         """Get LoRA adapter parameter names and shapes from worker rank 0."""
         results = self._custom_function_call("get_lora_adapter_info")
         if results:
@@ -688,6 +846,8 @@ class TrainController:
         return {}
 
     def save(self, meta: SaveLoadMeta):
+        # [FUNCTION DOC]
+        # RPC: saves model/optimizer state according to meta on all engines.
         """Save model weights and optimizer states for later use.
 
         Parameters
@@ -698,6 +858,8 @@ class TrainController:
         self._custom_function_call("save", meta)
 
     def load(self, meta: SaveLoadMeta):
+        # [FUNCTION DOC]
+        # RPC: loads model/optimizer state according to meta on all engines.
         """Load model weights and optimizer states from a file.
 
         Parameters
@@ -708,12 +870,17 @@ class TrainController:
         self._custom_function_call("load", meta)
 
     def init_awex_adapter(self, meta_server_addr: str | None = None):
+        # [FUNCTION DOC]
+        # RPC: creates the awex weight-sync adapter on all engines with an optional
+        # meta-server address.
         """Create awex adapter early for selective memory management."""
         self._custom_function_call(
             "init_awex_adapter", meta_server_addr=meta_server_addr
         )
 
     def step_lr_scheduler(self):
+        # [FUNCTION DOC]
+        # RPC: steps the learning-rate scheduler on all engines.
         """Step the learning rate scheduler.
 
         Since PPO uses minibatch updates, this method should be called periodically
@@ -723,28 +890,49 @@ class TrainController:
         self._custom_function_call("step_lr_scheduler")
 
     def update_weights(self, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Requires a connected rollout controller (RuntimeError otherwise), then RPC
+        # update_weights with meta on all engines, which push weights to the inference
+        # side.
         self._check_rollout_engine_connected()
         self._custom_function_call("update_weights", meta=meta)
 
     def offload(self) -> None:
+        # [FUNCTION DOC]
+        # RPC: offloads model parameters to CPU on all engines.
         """Offload model parameters to CPU across all train workers."""
         self._custom_function_call("offload")
 
     def onload(self) -> None:
+        # [FUNCTION DOC]
+        # RPC: onloads model parameters back to GPU on all engines.
         """Onload model parameters to GPU across all train workers."""
         self._custom_function_call("onload")
 
     def get_device_stats(self):
+        # [FUNCTION DOC]
+        # RPC: returns device memory stats from the first DP head.
         return self._custom_function_call("get_device_stats")
 
     def start_memory_profile(self, max_entries: int = 100000):
+        # [FUNCTION DOC]
+        # RPC: starts CUDA memory history recording on all engines with max_entries;
+        # returns the first DP head's result.
         return self._custom_function_call("start_memory_profile", max_entries)
 
     def stop_memory_profile(self, snapshot_dir: str):
+        # [FUNCTION DOC]
+        # RPC: stops memory profiling and dumps snapshots into snapshot_dir; returns the
+        # first DP head's result.
         return self._custom_function_call("stop_memory_profile", snapshot_dir)
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
+        # [FUNCTION DOC]
+        # Configures the performance tracer on every worker concurrently with its rank,
+        # role and config (called on all workers, not only DP heads).
         async def _call():
+            # [FUNCTION DOC]
+            # HELPER: Async gather of per-worker config_perf_tracer calls.
             tasks = [
                 self.scheduler.async_call_engine(
                     worker_id=worker.id,
@@ -761,6 +949,8 @@ class TrainController:
         run_async_task(_call)
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # RPC: asks engines to save perf traces for an optional step, optionally forced.
         self._custom_function_call("save_perf_tracer", step=step, force=force)
 
     def prepare_batch(
@@ -774,6 +964,11 @@ class TrainController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Delegates to the connected RolloutController's prepare_batch with the same
+        # arguments and returns its trajectories.
+        # KNOWN ISSUE: does not check that a rollout controller is connected, so it
+        # raises AttributeError on None instead of the clearer RuntimeError.
         return self.rollout.prepare_batch(
             dataloader=dataloader,
             workflow=workflow,
@@ -795,6 +990,9 @@ class TrainController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Delegates to the connected RolloutController's rollout_batch and returns its
+        # trajectories (no connection check either).
         return self.rollout.rollout_batch(
             data=data,
             workflow=workflow,
@@ -806,6 +1004,8 @@ class TrainController:
         )
 
     def _check_rollout_engine_connected(self):
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError if no rollout controller is connected.
         """Validate that rollout engine has been connected via connect_engine()."""
         if self.rollout is None:
             raise RuntimeError(
@@ -814,6 +1014,10 @@ class TrainController:
             )
 
     async def _async_clear_batches(self, *targets: dict[str, RTensor]):
+        # [FUNCTION DOC]
+        # HELPER: Groups the shard IDs referenced by the given RTensor batch dicts by
+        # storage node and concurrently sends a clear request to each node; exceptions
+        # are swallowed. No-op if there are no shards.
         """Extract shard IDs and clear tensors on each worker.
 
         HTTP DELETEs to each storage node's ``/data/clear`` — this evicts
@@ -832,6 +1036,13 @@ class TrainController:
         )
 
     def clear_batches(self, *targets: dict[str, RTensor]):
+        # [FUNCTION DOC]
+        # Frees distributed batch shards. First clears storage on each storage node;
+        # then, if any shard IDs exist, sends the flat list of IDs (not tensor-like, so
+        # replicated) to every DP head with broadcast disabled so each drains its local
+        # fetch buffer. Finally, best-effort, queries fetch_buffer_stats from DP head 0
+        # and logs a WARNING if entries remain (possible leak) or DEBUG if clean; an RPC
+        # failure there is only logged at DEBUG.
         """Clear distributed batch shards from workers to free memory.
 
         Two fan-outs — see areal-project/AReaL#1209:

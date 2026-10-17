@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Controller (orchestrator) of the distributed data service. It asks the scheduler for
+# RPC guard workers, then through each guard's HTTP API allocates ports and forks one
+# DataWorker per guard plus a Router and a Gateway on guard 0, waits for their health
+# endpoints, registers workers with the router, and afterwards registers/unregisters
+# datasets through the gateway, clears worker batch caches and tears everything down.
+# Initialization is pipelined in a background thread so callers can continue once
+# workers exist.
 # SPDX-License-Identifier: Apache-2.0
 
 """DataController — orchestrator for the distributed data loading service.
@@ -33,6 +41,14 @@ logger = logging.getLogger("DataController")
 
 
 class DataController:
+    # [CLASS DOC]
+    # Data service controller. Class constants: guard role suffix "-data", admin API key
+    # from env AREAL_ADMIN_KEY (default "areal-data-admin", read at import time), and a
+    # 30s timeout for worker creation. State: config, scheduler, guard workers, worker
+    # role, gateway/router/worker HTTP addresses, created scheduler roles, forked
+    # services as (guard address, role, index) tuples, admin key, registered datasets
+    # keyed by dataset API key, and pipelined-init state (init future, lock, workers-
+    # ready and shutdown-requested events).
     """Controller for the distributed data loading service.
 
     API follows ``TrainController`` / ``RolloutControllerV2`` patterns:
@@ -47,6 +63,8 @@ class DataController:
         config: DataServiceConfig,
         scheduler: Scheduler,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores config and scheduler and initializes all state to empty values. No I/O.
         self.config = config
         self.scheduler = scheduler
 
@@ -82,6 +100,14 @@ class DataController:
         wait: bool = False,
         **kwargs: Any,
     ) -> concurrent.futures.Future | None:
+        # [FUNCTION DOC]
+        # Starts initialization for role with num_dataset_workers workers in the
+        # "ctrl_init" executor thread. Raises RuntimeError if an initialization future
+        # is still pending. Blocks until guard workers have been created (TimeoutError
+        # after 30s), re-raising any early failure. If wait is True, blocks until full
+        # initialization finishes (up to setup_timeout) and returns None; otherwise
+        # returns the Future (later public calls wait for it). Extra kwargs are
+        # forwarded to the async initializer, which ignores them.
         from areal.infra.utils.concurrent import get_executor
 
         if self._init_future is not None:
@@ -110,6 +136,9 @@ class DataController:
         return self._init_future
 
     def _guarded_bg_initialize(self, *args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Runs _bg_initialize and, on any failure, sets the workers-ready event
+        # before re-raising so initialize does not hang.
         """Ensure _workers_ready is signaled even if _bg_initialize fails."""
         try:
             self._bg_initialize(*args, **kwargs)
@@ -122,6 +151,9 @@ class DataController:
         num_dataset_workers: int,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Runs _async_initialize synchronously in this thread and logs an INFO
+        # line on completion unless shutdown was requested.
         from areal.infra.utils.concurrent import run_async_task
 
         run_async_task(self._async_initialize, num_dataset_workers, **kwargs)
@@ -130,6 +162,9 @@ class DataController:
         logger.info("DataController initialized with %d workers", num_dataset_workers)
 
     def _ensure_initialized(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If an init future is pending, waits (under the init lock) for its
+        # result with setup_timeout, propagating its exception, then clears it.
         if self._init_future is None:
             return
         with self._init_lock:
@@ -144,6 +179,21 @@ class DataController:
         num_dataset_workers: int,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Full async bring-up. Validates scheduling_spec and its cmd (ValueError
+        # if missing). Rewrites the guard command to use the current Python interpreter
+        # (the part after "-m" as module, or the whole cmd as a script). Creates
+        # num_dataset_workers guard workers under role "<role>-data" and records the
+        # role, sets workers-ready, and stops early if shutdown was requested. Wave 1:
+        # concurrently forks a data worker on each guard (rank, world size, dataloader
+        # workers, seed) and a router on guard 0, recording their URLs. Wave 2:
+        # concurrently forks the gateway on guard 0 (with router address and forward
+        # timeout equal to setup_timeout) and registers every worker with the router via
+        # authenticated POSTs (first error re-raised). On any exception logs an ERROR,
+        # kills forked services in reverse order, deletes created scheduler roles
+        # (errors ignored), clears addresses/workers and re-raises.
+        # KNOWN ISSUE: splitting the command on the first "-m" substring can mis-parse
+        # commands where "-m" occurs inside another token or path.
         cfg = self.config
         spec = cfg.scheduling_spec
         if spec is None:
@@ -246,7 +296,14 @@ class DataController:
 
                 # Wave 2: Fork Gateway + Register workers with Router
                 async def _register_workers() -> None:
+                    # [FUNCTION DOC]
+                    # HELPER: Concurrently registers every worker URL with the router;
+                    # raises the first registration error after all finish.
                     async def _register_one(worker_addr: str) -> None:
+                        # [FUNCTION DOC]
+                        # HELPER: POSTs one worker address to the router's /register
+                        # endpoint with the admin bearer key and a 5s timeout; raises on
+                        # HTTP error; logs INFO.
                         async with session.post(
                             f"{self._router_addr}/register",
                             json={"worker_addr": worker_addr},
@@ -325,6 +382,14 @@ class DataController:
         drop_last: bool = True,
         max_length: int | None = None,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Waits for initialization, then POSTs the dataset description (ID, path, loader
+        # type, split, tokenizer path, max length, shuffle, drop_last, kwargs) to the
+        # gateway's /v1/datasets/register with the admin key and setup_timeout. Stores
+        # the returned dataset API key with dataset ID, total samples and drop_last,
+        # logs INFO, and returns a dict with api_key, dataset_id, dataset_size,
+        # total_samples (same value) and num_workers. Raises RuntimeError on gateway
+        # HTTP/client errors and KeyError if the response lacks fields.
         """Register a dataset with the service.
 
         POST /v1/datasets/register on Gateway.
@@ -375,6 +440,9 @@ class DataController:
         }
 
     def unregister_dataset(self, dataset_id: str) -> None:
+        # [FUNCTION DOC]
+        # Waits for initialization, POSTs to the gateway's /v1/datasets/unregister (30s
+        # timeout), removes local entries with that dataset ID and logs INFO.
         """Unregister a dataset from the service."""
         self._ensure_initialized()
         from areal.infra.utils.concurrent import run_async_task
@@ -398,6 +466,9 @@ class DataController:
     # -- Batch cleanup -----------------------------------------------------
 
     def clear_batches(self) -> None:
+        # [FUNCTION DOC]
+        # Waits for initialization; if workers exist, synchronously sends a DELETE
+        # /data/clear to every data worker to drop cached batches.
         """Clear batch caches and tensor stores on all data workers.
 
         Called by trainers after each training step, alongside
@@ -412,7 +483,12 @@ class DataController:
         run_async_task(self._async_clear_batches)
 
     async def _async_clear_batches(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Concurrently sends DELETE /data/clear (10s timeout) to every worker;
+        # failures are logged at DEBUG and ignored.
         async def _clear_one(session: aiohttp.ClientSession, addr: str) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Clears one worker, swallowing errors.
             try:
                 async with session.delete(
                     f"{addr}/data/clear",
@@ -431,6 +507,12 @@ class DataController:
     # -- Destroy -----------------------------------------------------------
 
     def destroy(self) -> None:
+        # [FUNCTION DOC]
+        # Shuts the service down: flags shutdown and cancels any pending init future (a
+        # running one is not interrupted), sends a best-effort /v1/shutdown to the
+        # gateway, kills forked services in reverse creation order, deletes scheduler
+        # workers for created roles (failures logged at DEBUG), and clears all
+        # addresses, workers and dataset records.
         """Shutdown service: unload all datasets, kill services, delete workers."""
         self._shutdown_requested.set()
         future = self._init_future
@@ -487,6 +569,12 @@ class DataController:
         raw_cmd: list[str],
         health_path: str = "/health",
     ) -> tuple[str, int]:
+        # [FUNCTION DOC]
+        # HELPER: Asks a guard to allocate one port (POST /alloc_ports), appends "--host
+        # HOST --port PORT" to raw_cmd, asks the guard to fork it under
+        # role/worker_index (POST /fork), records the forked service, waits for its
+        # health_path to return 200, and returns (host, port). Raises on HTTP errors or
+        # health timeout.
         async with session.post(
             f"{guard_addr}/alloc_ports",
             json={"count": 1},
@@ -524,6 +612,10 @@ class DataController:
         name: str,
         timeout: float | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Polls url with GET every 0.1s (2s per request) until it returns 200
+        # (logs INFO) or until timeout (default setup_timeout) elapses, then raises
+        # TimeoutError. Request errors are ignored while polling.
         timeout_val = timeout or self.config.setup_timeout
         deadline = time.monotonic() + timeout_val
         while time.monotonic() < deadline:
@@ -544,12 +636,18 @@ class DataController:
     async def _async_kill_forked_services(
         self, services: list[tuple[str, str, int]]
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Concurrently asks each owning guard to kill its forked service (POST
+        # /kill_forked_worker, 5s timeout); logs INFO on success, WARNING on non-200,
+        # ERROR on exception. Never raises.
         async def _kill_one(
             session: aiohttp.ClientSession,
             guard_addr: str,
             role: str,
             worker_index: int,
         ) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Kills one forked service as described, swallowing errors.
             try:
                 async with session.post(
                     f"{guard_addr}/kill_forked_worker",
@@ -587,6 +685,9 @@ class DataController:
         api_key: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Synchronous wrapper around _async_gateway_post with the default 60s
+        # timeout.
         from areal.infra.utils.concurrent import run_async_task
 
         return run_async_task(self._async_gateway_post, endpoint, api_key, payload)
@@ -598,6 +699,10 @@ class DataController:
         payload: dict[str, Any],
         timeout: float = 60,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: POSTs JSON payload to the gateway endpoint with a bearer api_key and
+        # total timeout. Returns the JSON response; raises RuntimeError for HTTP status
+        # 400 or above (including the body text) or for client errors.
         url = f"{self._gateway_addr}{endpoint}"
         try:
             async with aiohttp.ClientSession(

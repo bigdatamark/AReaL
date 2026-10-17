@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# CLI entrypoint for the data service gateway process (run as a module).
 # SPDX-License-Identifier: Apache-2.0
 
 """CLI entrypoint: python -m areal.infra.data_service.gateway"""
@@ -8,6 +10,12 @@ import argparse
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses CLI args (host default 0.0.0.0, port 8090, admin API key, router address,
+    # router timeout 2s, forward timeout 60s; unknown args ignored), builds a
+    # GatewayConfig, silences noisy HTTP loggers, creates the FastAPI gateway app and
+    # serves it with uvicorn (blocking, warning log level, no access log). Imports
+    # app/config/uvicorn lazily inside the function. No return value.
     parser = argparse.ArgumentParser(description="AReaL Data Service Gateway")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8090)

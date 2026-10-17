@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# FastAPI application for the data service gateway: the single public entry point. Admin
+# endpoints (bearer admin key) register/unregister datasets by broadcasting to all
+# workers known to the router and mint per-dataset API keys; consumer endpoints (bearer
+# dataset key) fetch samples from a router-chosen worker, and broadcast epoch resets and
+# state save/load. All outbound HTTP uses aiohttp without proxy env vars.
 # SPDX-License-Identifier: Apache-2.0
 
 """Data Service Gateway — thin HTTP proxy with auth, routing, and forwarding."""
@@ -21,6 +27,10 @@ logger = logging.getLogger("DataGateway")
 
 
 async def _query_router(router_addr: str, admin_key: str, timeout: float) -> str:
+    # [FUNCTION DOC]
+    # HELPER: POSTs an empty JSON body to the router's /route with the admin bearer key
+    # and timeout; returns the chosen "worker_addr". Raises HTTPException 502 on a
+    # non-200 response (network errors propagate as aiohttp exceptions).
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=timeout), trust_env=False
     ) as session:
@@ -39,6 +49,9 @@ async def _query_router(router_addr: str, admin_key: str, timeout: float) -> str
 async def _get_all_worker_addrs(
     router_addr: str, admin_key: str, timeout: float
 ) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: GETs the router's /workers with the admin key and timeout; returns the
+    # list of worker "addr" values. Raises HTTPException 502 on non-200.
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=timeout), trust_env=False
     ) as session:
@@ -56,11 +69,18 @@ async def _get_all_worker_addrs(
 async def _broadcast_to_workers(
     worker_addrs: list[str], endpoint: str, payload: dict, timeout: float
 ) -> list[dict]:
+    # [FUNCTION DOC]
+    # HELPER: Concurrently POSTs payload to endpoint on every worker address within one
+    # session with a total timeout. Never raises: each entry is a dict with addr, HTTP
+    # status and parsed JSON data (or {"raw": text} if not JSON), or status 500 with an
+    # error string on exceptions. Returns the list in input order.
     async with aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=timeout), trust_env=False
     ) as session:
 
         async def _send_post(addr: str) -> dict:
+            # [FUNCTION DOC]
+            # HELPER: Sends the POST to one worker and wraps the outcome as described.
             try:
                 async with session.post(f"{addr}{endpoint}", json=payload) as resp:
                     try:
@@ -76,17 +96,26 @@ async def _broadcast_to_workers(
 
 
 def create_gateway_app(config: GatewayConfig) -> FastAPI:
+    # [FUNCTION DOC]
+    # Builds the gateway FastAPI app for config with an in-memory DatasetKeyRegistry and
+    # the route handlers below. Returns the app (not started).
     app = FastAPI(title="AReaL Data Gateway")
     registry = DatasetKeyRegistry(config.admin_api_key)
 
     # Helper: resolve dataset key to dataset_id, raise if invalid
     def _resolve_dataset_key(token: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Maps a dataset bearer token to its dataset ID; raises HTTPException
+        # 401 if unknown.
         dataset_id = registry.resolve(token)
         if dataset_id is None:
             raise HTTPException(status_code=401, detail="Invalid dataset API key")
         return dataset_id
 
     def _check_broadcast_results(results: list[dict], operation: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Raises HTTPException 502 listing addresses and errors if any broadcast
+        # result has a non-200 status.
         failed = [r for r in results if r["status"] != 200]
         if failed:
             details = ", ".join(
@@ -103,11 +132,22 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     # ===== Health =====
     @app.get("/health")
     async def health():
+        # [FUNCTION DOC]
+        # GET /health: returns status ok and the configured router address. No auth.
         return {"status": "ok", "router_addr": config.router_addr}
 
     # ===== Admin: Register Dataset =====
     @app.post("/v1/datasets/register")
     async def register_dataset(request: Request):
+        # [FUNCTION DOC]
+        # POST /v1/datasets/register (admin). Reads the JSON body
+        # (WorkerLoadDatasetRequest fields); dataset_id defaults to "<split>-<last path
+        # component>". Gets all workers from the router (503 if none), broadcasts
+        # /datasets/load. If any worker fails, broadcasts /datasets/unload to the
+        # successful ones as rollback and raises 502 with details (noting rollback
+        # failures). On success revokes any old key for the dataset, generates a new key
+        # and returns api_key, dataset_id, dataset_size (sum of per-worker reported
+        # sizes) and num_workers.
         require_admin_key(request, config.admin_api_key)
         body = await request.json()
 
@@ -179,6 +219,10 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     # ===== Admin: Unregister Dataset =====
     @app.post("/v1/datasets/unregister")
     async def unregister_dataset(request: Request):
+        # [FUNCTION DOC]
+        # POST /v1/datasets/unregister (admin). Requires dataset_id (400 otherwise),
+        # broadcasts /datasets/unload to all workers (502 if any fail), revokes the key
+        # and returns status ok.
         require_admin_key(request, config.admin_api_key)
         body = await request.json()
         dataset_id = body.get("dataset_id")
@@ -203,6 +247,10 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     # ===== Admin: Shutdown =====
     @app.post("/v1/shutdown")
     async def shutdown(request: Request):
+        # [FUNCTION DOC]
+        # POST /v1/shutdown (admin). Best effort: for every registered dataset
+        # broadcasts /datasets/unload to all workers and revokes its key; any error is
+        # logged as a WARNING. Always returns status ok. Does not stop any process.
         require_admin_key(request, config.admin_api_key)
         try:
             worker_addrs = await _get_all_worker_addrs(
@@ -226,6 +274,9 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     # ===== Admin: Workers =====
     @app.get("/v1/workers")
     async def list_workers(request: Request):
+        # [FUNCTION DOC]
+        # GET /v1/workers (admin): returns the router's worker addresses as a list of
+        # {"addr": ...}.
         require_admin_key(request, config.admin_api_key)
         worker_addrs = await _get_all_worker_addrs(
             config.router_addr,
@@ -237,6 +288,11 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     # ===== Consumer: Fetch Samples by Index =====
     @app.post("/v1/samples/fetch")
     async def fetch_samples(request: Request):
+        # [FUNCTION DOC]
+        # POST /v1/samples/fetch (dataset key). Resolves the dataset, asks the router
+        # for one worker and forwards {"dataset_id", "indices"} to that worker's
+        # /v1/samples/fetch, returning its JSON. Raises 502 if the worker returns
+        # non-200.
         token = extract_bearer_token(request)
         dataset_id = _resolve_dataset_key(token)
         body = await request.json()
@@ -265,6 +321,10 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     # ===== Consumer: Epoch Advance =====
     @app.post("/v1/epochs/advance")
     async def epoch_advance(request: Request):
+        # [FUNCTION DOC]
+        # POST /v1/epochs/advance (dataset key). Broadcasts /epoch/reset with the
+        # dataset ID and body "epoch" (default 0) to all workers (503 if none, 502 if
+        # any fail). Returns status ok and the number of workers reset.
         token = extract_bearer_token(request)
         dataset_id = _resolve_dataset_key(token)
         body = await request.json()
@@ -292,6 +352,10 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     # ===== Consumer: State Save =====
     @app.post("/v1/state/save")
     async def state_save(request: Request):
+        # [FUNCTION DOC]
+        # POST /v1/state/save (dataset key). Broadcasts /state/save with the dataset ID
+        # and body "path" (default empty) to all workers; 502 on any failure. Returns
+        # status ok and the path.
         token = extract_bearer_token(request)
         dataset_id = _resolve_dataset_key(token)
         body = await request.json()
@@ -314,6 +378,9 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     # ===== Consumer: State Load =====
     @app.post("/v1/state/load")
     async def state_load(request: Request):
+        # [FUNCTION DOC]
+        # POST /v1/state/load (dataset key). Broadcasts /state/load with the dataset ID
+        # and path to all workers; 502 on any failure. Returns status ok.
         token = extract_bearer_token(request)
         dataset_id = _resolve_dataset_key(token)
         body = await request.json()
@@ -336,6 +403,10 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
     # ===== Consumer: Status =====
     @app.get("/v1/status")
     async def status(request: Request):
+        # [FUNCTION DOC]
+        # GET /v1/status (dataset key). Tries to return a router-chosen worker's /health
+        # JSON augmented with dataset_id; on any failure or non-200 falls back to
+        # {"status": "ok", "dataset_id": ...}.
         token = extract_bearer_token(request)
         dataset_id = _resolve_dataset_key(token)
 

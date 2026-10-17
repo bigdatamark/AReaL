@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Re-export shim: exposes the generic RPC guard app pieces (GuardState, create_app,
+# run_server, parser/state helpers, forked-child cleanup) under the data service
+# namespace. No logic of its own.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations

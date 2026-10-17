@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Experimental multi-turn RL rollout workflow built on the ArealOpenAI client: the model
+# answers, and if the reward is zero it is asked to reflect and retry, with a per-turn
+# reward discount.
 # SPDX-License-Identifier: Apache-2.0
 
 from copy import deepcopy
@@ -15,6 +19,10 @@ logger = logging.getLogger("MultiTurnV2Workflow")
 
 
 class MultiTurnWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow that runs up to max_turns chat completions per episode, appending
+    # a fixed reflection user message after each wrong answer. Always uses n_samples=1
+    # (grouping is left to a wrapping grouped workflow).
     def __init__(
         self,
         reward_fn,
@@ -23,6 +31,14 @@ class MultiTurnWorkflow(RolloutWorkflow):
         max_turns: int,
         turn_discount: float,
     ):
+        # [FUNCTION DOC]
+        # Inputs: reward_fn (callable taking prompt string, completion string, input
+        # token ids, output token ids and the data fields as kwargs, returning a
+        # number), gconfig (generation hyperparameters; copied with tokenizer stop/pad
+        # token IDs and n_samples forced to 1), tokenizer, max_turns (int),
+        # turn_discount (float multiplied into the reward per extra turn). Wraps
+        # reward_fn in AsyncRewardWrapper and builds the reflection message list. No
+        # I/O.
         self.reward_fn = reward_fn
         # Enforce n_samples=1; grouping is handled by GroupedRolloutWorkflow
         self.gconfig = gconfig.new_with_stop_and_pad_token_ids(tokenizer).new(
@@ -44,6 +60,21 @@ class MultiTurnWorkflow(RolloutWorkflow):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict
     ) -> tuple[dict, Any]:
+        # [FUNCTION DOC]
+        # Runs one episode. Inputs: engine (InferenceEngine), data (dict with "messages"
+        # plus any reward kwargs). Creates an ArealOpenAI client, deep-copies the
+        # messages, then loops while reward is 0 and fewer than max_turns turns:
+        # requests a chat completion (stored, using gconfig sampling settings), fetches
+        # the stored interaction for token ids, computes the reward on the chat-
+        # templated prompt and completion text, increments the turn count, and if still
+        # wrong and turns remain appends the assistant answer plus the reflection
+        # message and multiplies the discount by turn_discount. The final reward is
+        # reward times discount (float), logged as stats (reward, num_turns) under the
+        # workflow stat scope, assigned to the last completion, and the client's
+        # exported interactions are returned.
+        # KNOWN ISSUE: the return annotation says a tuple but the function returns the
+        # exported interactions dict. If max_turns is 0 the loop never runs and the last
+        # completion variable is undefined (NameError).
         client = ArealOpenAI(engine=engine, tokenizer=self.tokenizer)
         messages = deepcopy(data["messages"])
         # Run multi-turn rollout until correct

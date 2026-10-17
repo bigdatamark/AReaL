@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Local (single-node) SPMD launcher. Starts AReaL experiment processes as local
+# subprocesses: optional LLM inference servers (SGLang or vLLM) via their launcher
+# modules and a torchrun trainer, assigning GPUs round-robin through the platform's
+# device-visibility env var, teeing output to per-job log files, monitoring process
+# states with psutil, and restarting the whole run for recovery. Also defines the
+# psutil-status to JobState mapping.
 # SPDX-License-Identifier: Apache-2.0
 
 import getpass
@@ -72,6 +79,10 @@ for job_state, process_statuses in JOB_STATE_TO_PROCESS_STATUS.items():
 
 
 def terminate_process_and_children(pid: int, signal: str | int | None = None):
+    # [FUNCTION DOC]
+    # Recursively sends signal (default SIGKILL; a name string like "SIGTERM" is
+    # resolved) to all descendants of pid (depth-first) and then to pid itself. Silently
+    # ignores processes that no longer exist.
     if signal is None:
         signal = signal_module.SIGKILL
     if isinstance(signal, str):
@@ -87,7 +98,17 @@ def terminate_process_and_children(pid: int, signal: str | int | None = None):
 
 
 class LocalLauncher:
+    # [CLASS DOC]
+    # Manages local subprocess "jobs" keyed "<job_name>/<index>". State:
+    # experiment/trial names, fileroot for logs, the Popen map, per-name job counters,
+    # last observed job states, a round-robin GPU counter and the list of visible device
+    # IDs (from the platform device-control env var, or all detected devices).
     def __init__(self, experiment_name: str, trial_name: str, fileroot: str):
+        # [FUNCTION DOC]
+        # Stores names and fileroot, initializes job maps, and reads the visible device
+        # list. Raises RuntimeError if the list is empty.
+        # KNOWN ISSUE: splitting an empty env var value yields one empty string, so the
+        # "no GPU" check never fires in that case.
         self.experiment_name = experiment_name
         self.trial_name = trial_name
         self.fileroot = fileroot
@@ -110,14 +131,22 @@ class LocalLauncher:
 
     @property
     def run_name(self):
+        # [FUNCTION DOC]
+        # Property: "<experiment_name>_<trial_name>".
         return f"{self.experiment_name}_{self.trial_name}"
 
     def log_path_of(self, job_name: str) -> str:
+        # [FUNCTION DOC]
+        # Returns "<fileroot>/logs/<user>/<experiment>/<trial>/<job_name>.log", creating
+        # the directory (side effect).
         log_path = f"{self.fileroot}/logs/{getpass.getuser()}/{self.experiment_name}/{self.trial_name}"
         os.makedirs(log_path, exist_ok=True)
         return os.path.join(log_path, f"{job_name}.log")
 
     def __del__(self):
+        # [FUNCTION DOC]
+        # Destructor: blocks waiting for all jobs (may raise from wait during garbage
+        # collection).
         self.wait()
 
     def submit_array(
@@ -128,6 +157,14 @@ class LocalLauncher:
         gpu: int = 0,
         env_vars: dict | None = None,
     ):
+        # [FUNCTION DOC]
+        # Starts count processes for job_name. cmd is one string (repeated) or a list of
+        # per-process commands. If gpu > 0, each process gets gpu devices chosen round-
+        # robin from the visible devices (wrapping, so devices can be oversubscribed)
+        # via the device-control env var. Builds the command with env vars and stdbuf,
+        # appends a shell pipe that tees output into the job log, logs it, starts it
+        # with a shell, and records it under "<job_name>/<offset+i>". Mutates the
+        # env_vars dict passed in.
         if env_vars is None:
             env_vars = {}
         if not isinstance(cmd, list):
@@ -160,9 +197,17 @@ class LocalLauncher:
         gpu: int = 0,
         env_vars: dict | None = None,
     ):
+        # [FUNCTION DOC]
+        # Starts a single process for job_name (submit_array with count 1).
         self.submit_array(job_name=job_name, cmd=cmd, gpu=gpu, env_vars=env_vars)
 
     def stop(self, job_name, signal=None):
+        # [FUNCTION DOC]
+        # Kills every job whose key starts with job_name (asserts at least one) with the
+        # given signal (default SIGKILL) including children, waits for each, and removes
+        # them from the job map.
+        # KNOWN ISSUE: prefix matching means stopping "trainer" would also stop a job
+        # named e.g. "trainer2".
         assert any(k.startswith(job_name) for k in self._jobs)
         keys = [k for k, p in self._jobs.items() if k.startswith(job_name)]
         procs = [p for k, p in self._jobs.items() if k.startswith(job_name)]
@@ -179,17 +224,27 @@ class LocalLauncher:
             del p
 
     def stop_all(self, signal=None):
+        # [FUNCTION DOC]
+        # Stops all job names ever submitted with signal (despite the comment, the
+        # signal is passed through).
+        # KNOWN ISSUE: names whose jobs were already stopped trigger the assertion in
+        # stop, since counters are not cleared by stop.
         # signal argument is ignored in local stop_all
         for name in self._job_counter:
             self.stop(name, signal=signal)
 
     def find(self, job_name):
+        # [FUNCTION DOC]
+        # Returns a JobInfo: RUNNING on localhost if job_name is a known key, else
+        # NOT_FOUND (does not inspect the process).
         if job_name in self._jobs:
             return JobInfo(name=job_name, state=JobState.RUNNING, host="localhost")
         else:
             return JobInfo(name=job_name, state=JobState.NOT_FOUND)
 
     def find_all(self, job_name_regex=".*"):
+        # [FUNCTION DOC]
+        # Returns JobInfo for every known job key fully matching the regex.
         rs = []
         for name in self._jobs:
             if re.fullmatch(job_name_regex, name):
@@ -207,6 +262,15 @@ class LocalLauncher:
         remove_status: tuple[JobState, ...] = (JobState.COMPLETED,),
         update=False,
     ):
+        # [FUNCTION DOC]
+        # Polls every 2s until all jobs are removed. Each round maps each process's
+        # psutil status to a JobState (unknown statuses become NOT_FOUND), raises
+        # JobException (worker type = name prefix) if any state is in check_status, and
+        # removes jobs whose state is in remove_status (also deleting them from the map
+        # and decrementing counters if update). Raises TimeoutError past the optional
+        # timeout. Logs progress.
+        # KNOWN ISSUE: psutil raises NoSuchProcess if a process has been fully reaped,
+        # which is not handled.
         deadline = None if timeout is None else time.time() + timeout
         logger.info(
             "Waiting for %d local running processes, pids: %s",
@@ -261,11 +325,36 @@ class LocalLauncher:
 
 
 def main():
+    # [FUNCTION DOC]
+    # CLI entry: parses CLI args into a config and runs local_main with run_id 0.
     config, _ = parse_cli_args(sys.argv[1:])
     local_main(config, run_id=0)
 
 
 def local_main(config, run_id: int = 0):
+    # [FUNCTION DOC]
+    # Runs an SPMD experiment locally. Structures the recover and cluster config
+    # sections, determines whether this is a recover run, emits a FutureWarning about
+    # the deprecated allocation-mode parser, validates the config, creates a
+    # LocalLauncher, resets the trial's name-resolve subtree, and parses the allocation
+    # mode. Saves experiment metadata on fresh runs. If the generation backend is sglang
+    # or vllm, launches one llm_server job running the matching server module with the
+    # same CLI args plus a seed override, with GPUs equal to gen pp times tp times dp
+    # and thread/env vars from the rollout scheduling spec, then waits for dp_size
+    # server addresses via name resolve (on timeout or interrupt stops all with SIGINT,
+    # runs the post-exit hook and re-raises). Unless the allocation is server-only,
+    # launches a torchrun trainer on one node with train world-size processes/GPUs, a
+    # free master port, and env vars: server addresses, NCCL tweaks for SGLang weight
+    # sync, deterministic TransformerEngine flag for deterministic Megatron, offload
+    # (TMS) vars if enable_offload, actor spec env/thread vars, and AREAL_SPMD_MODE=1.
+    # Then waits treating any exit (including completion) as an event; on interrupt,
+    # JobException or timeout stops all with SIGTERM, runs the post-exit hook, and if
+    # recovery is enabled ("on"/"auto") and retries remain for a
+    # failed/missing/completed job, sleeps 10s and recursively relaunches with run_id+1;
+    # otherwise re-raises.
+    # KNOWN ISSUE: because completion is treated like failure, a successful run with
+    # recovery enabled is relaunched until retries are exhausted, and finally raises a
+    # JobException.
     config.recover = to_structured_cfg(config.recover, RecoverConfig)
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
     is_recover_run = check_if_recover(config.recover, run_id)

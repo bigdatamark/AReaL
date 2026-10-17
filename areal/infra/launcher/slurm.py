@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Slurm-based SPMD launcher. Generates sbatch scripts (from templates in the Slurm
+# utilities) that run one srun step per task, optionally inside Apptainer containers,
+# submits them as job arrays (LLM servers per node, torchrun trainers per node), tracks
+# job states via squeue queries, and supports recovery by recursively relaunching on
+# failure.
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
@@ -51,9 +57,17 @@ RECOVER_TIME_INTERVAL = 10  # seconds
 
 
 class SlurmLauncher:
+    # [CLASS DOC]
+    # Manages Slurm job arrays for one experiment trial. Holds names, fileroot (for logs
+    # and sbatch scripts), container type ("apptainer" or "none"), a map from Slurm job
+    # ID to JobInfo, and a job-name list.
+    # KNOWN ISSUE: job_names is never appended to, so the duplicate-submission assertion
+    # in submit_array can never trigger.
     def __init__(
         self, experiment_name: str, trial_name: str, fileroot: str, container_type: str
     ):
+        # [FUNCTION DOC]
+        # Stores names, fileroot and container type; initializes empty job maps.
         self.experiment_name = experiment_name
         self.trial_name = trial_name
         self.fileroot = fileroot
@@ -65,24 +79,38 @@ class SlurmLauncher:
 
     @property
     def run_name(self) -> str:
+        # [FUNCTION DOC]
+        # Property: "<experiment_name>_<trial_name>".
         """Returns the run name of this launcher."""
         return f"{self.experiment_name}_{self.trial_name}"
 
     def slurm_name(self, job_name: str) -> str:
+        # [FUNCTION DOC]
+        # Returns the Slurm job name "<experiment>_<trial>:<job_name>".
         """Returns the slurm name of a job."""
         return f"{self.experiment_name}_{self.trial_name}:{job_name}"
 
     def log_path_of(self, job_name: str) -> str:
+        # [FUNCTION DOC]
+        # Returns the log file path
+        # "<fileroot>/logs/<user>/<experiment>/<trial>/<job_name>.log", creating the
+        # directory.
         log_path = f"{self.fileroot}/logs/{getpass.getuser()}/{self.experiment_name}/{self.trial_name}"
         os.makedirs(log_path, exist_ok=True)
         return os.path.join(log_path, f"{job_name}.log")
 
     def sbatch_path_of(self, job_name: str) -> str:
+        # [FUNCTION DOC]
+        # Returns the sbatch script path in the same log directory with a ".sh" suffix,
+        # creating the directory.
         sbatch_path = f"{self.fileroot}/logs/{getpass.getuser()}/{self.experiment_name}/{self.trial_name}"
         os.makedirs(sbatch_path, exist_ok=True)
         return os.path.join(sbatch_path, f"{job_name}.sh")
 
     def submit(self, job_name, cmd, **kwargs):
+        # [FUNCTION DOC]
+        # Submits a single-task array (count 1); other submit_array parameters must be
+        # passed as kwargs.
         """Submits and launch a job with SBATCH.
 
         Args:
@@ -91,6 +119,9 @@ class SlurmLauncher:
         return self.submit_array(job_name, cmd, count=1, **kwargs)
 
     def find_job_id(self, job_name: str):
+        # [FUNCTION DOC]
+        # Returns the Slurm job ID whose tracked JobInfo name equals the Slurm name of
+        # job_name, or None.
         job_name = self.slurm_name(job_name)
         for job_id, job_info in self.jobs.items():
             if job_info.name == job_name:
@@ -113,6 +144,24 @@ class SlurmLauncher:
         nodelist: str | None = None,
         exclude: str | None = None,
     ):
+        # [FUNCTION DOC]
+        # Builds and submits one sbatch job array. Inputs: job_name, cmd (one string or
+        # one per task; must have count entries), count tasks over nodes nodes (count
+        # divisible by nodes; GPUs per node divisible by tasks per node),
+        # n_gpus_per_node, cpus_per_task, mem_per_task in MB, container image/mounts,
+        # extra srun args, env_vars (one dict for all or a list per task; must not set
+        # the device-visibility var, ValueError), optional nodelist/exclude. Computes
+        # memory per CPU and per node (plus 10 GB slack), writes #SBATCH options (name,
+        # append-mode output to the log, no requeue, exact node count, tasks per node,
+        # GPU gres, CPUs, memory), and per task an srun command pinned to its node with
+        # its GPU share, either wrapping the command in an Apptainer exec with env flags
+        # or passing env via an export flag. Writes the script, runs sbatch, parses the
+        # job ID, records a PENDING JobInfo and refreshes states. On sbatch failure or
+        # unparsable output logs and returns None without raising.
+        # KNOWN ISSUE: in the "none" container branch the export flag is appended to
+        # srun_additional_args cumulatively, so each later task inherits all previous
+        # tasks' export flags and the accumulated string is also passed to the sbatch
+        # template.
         """Submits and launch a job array with SBATCH.
         Note that a job array has one (unique) slurm name, and one (unique) slurm id.
 
@@ -272,6 +321,9 @@ class SlurmLauncher:
         self._update_all()
 
     def stop(self, job_name, force=False):
+        # [FUNCTION DOC]
+        # Cancels the job array for job_name with SIGKILL if force else SIGTERM; no-op
+        # if it is not tracked.
         """Stops a running job.
 
         Raises exception if there is no such job, but passes if the job
@@ -288,11 +340,15 @@ class SlurmLauncher:
         return cancel_jobs(slurm_ids=[job_id], signal=signal)
 
     def stop_all(self, force=False):
+        # [FUNCTION DOC]
+        # Cancels all tracked jobs with SIGKILL if force else SIGTERM.
         """Stops all running jobs."""
         signal = "SIGKILL" if force else "SIGTERM"
         return cancel_jobs(slurm_ids=list(self.jobs.keys()), signal=signal)
 
     def find(self, job_name) -> JobInfo | None:
+        # [FUNCTION DOC]
+        # Refreshes states and returns the JobInfo for job_name, or None if not tracked.
         """Gets the status of a job of this job.
 
         Args:
@@ -307,6 +363,9 @@ class SlurmLauncher:
         return self.jobs[job_id] if job_id else None
 
     def find_all(self, job_name_regex=".*") -> list[JobInfo]:
+        # [FUNCTION DOC]
+        # Refreshes states and returns JobInfos whose short job name (after the last
+        # colon) fully matches the regex.
         """Finds jobs.
 
         Args:
@@ -327,6 +386,8 @@ class SlurmLauncher:
         self,
         status: list[JobState],
     ) -> list[JobInfo]:
+        # [FUNCTION DOC]
+        # HELPER: Refreshes states and returns JobInfos whose state is in status.
         """Finds jobs with the given status.
 
         Args:
@@ -349,6 +410,14 @@ class SlurmLauncher:
         remove_status: tuple[JobState, ...] = (JobState.COMPLETED,),
         update=False,
     ):
+        # [FUNCTION DOC]
+        # Polls every 5s until no jobs are left: raises TimeoutError past the optional
+        # timeout, refreshes states, raises JobException (worker type = Slurm name, with
+        # host and state) for any job whose state is in check_status, and drops jobs in
+        # remove_status from the wait list (and from tracking if update). Logs progress.
+        # KNOWN ISSUE: the wait list is rebuilt from all tracked jobs every iteration,
+        # so with update False jobs removed for remove_status reappear and the loop
+        # never finishes unless a check_status state occurs.
         """Waits until all jobs submitted via this client instance finish."""
         # begin wait
         deadline = None if timeout is None else time.time() + timeout
@@ -391,6 +460,9 @@ class SlurmLauncher:
             time.sleep(SLURM_WAIT_CHECK_TIME_INTERVAL)
 
     def _update_all(self):
+        # [FUNCTION DOC]
+        # HELPER: Queries Slurm for all tracked job IDs and replaces their JobInfo
+        # entries; logs a WARNING if the squeue call fails.
         """Updates the status of all jobs."""
         try:
             slurm_infos = query_jobs(slurm_ids=list(self.jobs.keys()))
@@ -404,11 +476,34 @@ class SlurmLauncher:
 
 
 def main():
+    # [FUNCTION DOC]
+    # CLI entry: parses CLI args and runs slurm_main with run_id 0.
     config, _ = parse_cli_args(sys.argv[1:])
     slurm_main(config, run_id=0)
 
 
 def slurm_main(config, run_id: int = 0):
+    # [FUNCTION DOC]
+    # Runs an SPMD experiment on Slurm. Structures cluster/recover config, checks
+    # recover state, warns about the deprecated allocation parser, validates config,
+    # creates a SlurmLauncher using the actor spec's container type, resets the trial's
+    # name_resolve subtree, parses the allocation mode and saves metadata on fresh runs.
+    # For sglang/vllm generation backends: builds one server command per generation node
+    # (python module launcher with the same CLI args and a per-node seed offset) and
+    # per-node env (thread vars, rollout env, device-visibility for vLLM, multi-node
+    # rank/master address/port shell references for cross-node servers), submits the
+    # llm_server array using rollout spec resources, image, mounts and srun args, and
+    # waits for dp_size server addresses (on failure cancels all with SIGKILL, runs
+    # post-exit hook, re-raises). Unless server-only, submits a trainer array with one
+    # torchrun per remaining node (node rank, head node IP and port from the sbatch
+    # script, optional extra bash commands) and env vars: server addresses, NCCL tweaks
+    # for SGLang, deterministic Megatron flag, offload vars, actor env/thread vars and
+    # AREAL_SPMD_MODE=1. Waits treating cancelled/failed/not-found/completed as
+    # terminal; on interrupt/JobException/timeout cancels all with SIGKILL, runs the
+    # post-exit hook and recursively relaunches after 10s if the job FAILED or is
+    # NOT_FOUND and recovery is enabled with retries left; otherwise re-raises.
+    # KNOWN ISSUE: successful completion also surfaces as a JobException (reason
+    # COMPLETED) that is re-raised.
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
     config.recover = to_structured_cfg(config.recover, RecoverConfig)
     is_recover_run = check_if_recover(config.recover, run_id)
@@ -491,6 +586,14 @@ def slurm_main(config, run_id: int = 0):
         }
 
         def _build_llm_server_plan(backend: str, spec: dict):
+            # [FUNCTION DOC]
+            # HELPER: Builds the LLM server launch plan for backend: per-node commands,
+            # per-node env dicts, node count (generation world size divided by GPUs per
+            # node) and server count (gen dp size). Raises NotImplementedError for
+            # unknown backends.
+            # KNOWN ISSUE: the spec parameter is immediately overwritten (callers pass
+            # the random seed for it), and a generation world size smaller than one node
+            # yields 0 nodes and a division by zero.
             # Returns: cmds, env_vars_list, n_nodes, n_servers
 
             if backend not in backend_spec:
@@ -586,6 +689,13 @@ def slurm_main(config, run_id: int = 0):
         nproc_per_node: int,
         additional_bash_cmds: list[str] | None = None,
     ) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Returns one command per trainer node: a bash -c string running
+        # optional extra bash commands followed by torchrun with total node count,
+        # nproc_per_node, the node rank, master address/port taken from the sbatch
+        # script's head_node_ip and trainer_port shell variables, and the original CLI
+        # args (double quotes escaped). Logs the first command, or warns if there are no
+        # trainer nodes.
         extra_args = " ".join(sys.argv[1:])
         trainer_cmds = []
         for i in range(trainer_n_nodes):

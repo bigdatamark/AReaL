@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Package areal.infra.launcher: launchers for running AReaL experiments on different
+# backends (local processes, Ray, Slurm) plus wrappers/launch functions for SGLang and
+# vLLM inference servers. Re-exports the launcher classes, their *_main entry functions
+# and the server wrappers.
 # SPDX-License-Identifier: Apache-2.0
 
 """Launcher modules for different cluster backends."""

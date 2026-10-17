@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# FastAPI application for the data service router: keeps an in-memory list of registered
+# data worker URLs, polls their /health in the background, and hands out healthy workers
+# round-robin. All endpoints except /health require the admin bearer key. FastAPI and
+# pydantic are imported dynamically via importlib.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -22,6 +27,9 @@ logger = logging.getLogger("DataRouter")
 
 
 def _extract_bearer_token(request: Request) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the token from an "Authorization: Bearer ..." header (case-
+    # insensitive prefix); raises HTTPException 401 otherwise.
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
@@ -32,6 +40,9 @@ def _extract_bearer_token(request: Request) -> str:
 
 
 def _require_admin_key(request: Request, admin_key: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Extracts the bearer token and compares it to admin_key in constant time;
+    # raises HTTPException 403 if different. Returns the token.
     token = _extract_bearer_token(request)
     if not hmac.compare_digest(token, admin_key):
         raise HTTPException(status_code=403, detail="Invalid admin API key.")
@@ -39,26 +50,41 @@ def _require_admin_key(request: Request, admin_key: str) -> str:
 
 
 class RegisterWorkerRequest(BaseModel):
+    # [CLASS DOC]
+    # Pydantic body for /register: worker_addr (base URL of a data worker).
     worker_addr: str
 
 
 class UnregisterWorkerRequest(BaseModel):
+    # [CLASS DOC]
+    # Pydantic body for /unregister: worker_addr.
     worker_addr: str
 
 
 def create_router_app(config: RouterConfig) -> FastAPI:
+    # [FUNCTION DOC]
+    # Builds the router app for config. Closure state: registered worker list (insertion
+    # order), per-worker health flags, a round-robin counter and an asyncio lock. A
+    # lifespan context starts the background health poller on startup and cancels it on
+    # shutdown. Returns the FastAPI app (health map also exposed on app.state).
     registered_workers: list[str] = []
     worker_healthy: dict[str, bool] = {}
     rr_idx: int = 0
     lock = asyncio.Lock()
 
     async def _poll_workers() -> None:
+        # [FUNCTION DOC]
+        # HELPER: Forever loop: concurrently GETs /health on every registered worker
+        # (per-request timeout worker_health_timeout), marks each healthy iff status is
+        # 200 (False on error), then sleeps poll_interval.
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=config.worker_health_timeout),
             trust_env=False,
         ) as session:
 
             async def _check_health(addr: str) -> None:
+                # [FUNCTION DOC]
+                # HELPER: Health check for one worker updating its flag.
                 try:
                     async with session.get(f"{addr}/health") as resp:
                         worker_healthy[addr] = resp.status == 200
@@ -73,6 +99,9 @@ def create_router_app(config: RouterConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # [FUNCTION DOC]
+        # HELPER: Lifespan context: logs startup, runs the poll task while the app is
+        # alive, then cancels and awaits it and logs shutdown.
         logger.info("DataRouter starting")
         poll_task = asyncio.create_task(_poll_workers())
         yield
@@ -88,6 +117,9 @@ def create_router_app(config: RouterConfig) -> FastAPI:
 
     @app.get("/health")
     async def health():
+        # [FUNCTION DOC]
+        # GET /health (no auth): returns status ok, number of registered workers and
+        # number currently healthy.
         return {
             "status": "ok",
             "workers": len(registered_workers),
@@ -96,6 +128,9 @@ def create_router_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/register")
     async def register(body: RegisterWorkerRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /register (admin): adds the worker under the lock if new, marking it
+        # healthy immediately, and logs INFO. Idempotent; returns status ok.
         _require_admin_key(request, config.admin_api_key)
         async with lock:
             if body.worker_addr not in registered_workers:
@@ -110,6 +145,9 @@ def create_router_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/unregister")
     async def unregister(body: UnregisterWorkerRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /unregister (admin): removes the worker and its health flag if present,
+        # logs INFO; returns status ok.
         _require_admin_key(request, config.admin_api_key)
         async with lock:
             if body.worker_addr in registered_workers:
@@ -120,6 +158,10 @@ def create_router_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/route")
     async def route(request: Request):
+        # [FUNCTION DOC]
+        # POST /route (admin): under the lock, picks the next healthy worker round-robin
+        # (counter modulo the number of healthy workers, so the order shifts when health
+        # changes) and returns {"worker_addr": ...}. Raises 503 if none are healthy.
         nonlocal rr_idx
         _require_admin_key(request, config.admin_api_key)
         async with lock:
@@ -137,6 +179,9 @@ def create_router_app(config: RouterConfig) -> FastAPI:
 
     @app.get("/workers")
     async def list_workers(request: Request):
+        # [FUNCTION DOC]
+        # GET /workers (admin): returns every registered worker with its addr and
+        # healthy flag.
         _require_admin_key(request, config.admin_api_key)
         return {
             "workers": [

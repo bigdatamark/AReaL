@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# CLI entrypoint for the data service router process.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -7,6 +9,11 @@ import importlib
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses CLI args (host 0.0.0.0, port 8091, admin API key, worker poll interval 5s,
+    # worker health timeout 3s; unknown args ignored), dynamically imports the router
+    # app/config and logging modules, builds a RouterConfig, silences HTTP loggers and
+    # serves the router app with uvicorn (blocking). No return value.
     parser = argparse.ArgumentParser(description="AReaL Data Service Router")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8091)

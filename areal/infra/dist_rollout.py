@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# SPMD (non-controller) rollout coordination for training processes: data-parallel head
+# ranks generate rollouts through a local InferenceEngine client, trajectories are all-
+# gathered and load-balanced across the data-parallel group by sequence length, and then
+# broadcast to the context/model-parallel ranks of each DP group, with device syncs and
+# CPU barriers around collectives.
 # SPDX-License-Identifier: Apache-2.0
 
 from collections.abc import Callable
@@ -20,6 +26,10 @@ from areal.utils.seqpack import get_allocate_fn
 
 @dataclass
 class RedistributedData:
+    # [CLASS DOC]
+    # Result of redistribution: all_data (every gathered trajectory, unpadded), data
+    # (the trajectories assigned to this rank), rank (this rank within the group) and
+    # group_indices (per-rank lists of indices into all_data).
     all_data: list[dict[str, Any]]
     data: list[dict[str, Any]]
     rank: int
@@ -31,6 +41,14 @@ def redistribute_trajectories(
     group=None,
     packing_algorithm: str = "ffd",
 ) -> RedistributedData:
+    # [FUNCTION DOC]
+    # Collective over group (default process group); every rank must call it. All-
+    # gathers the local trajectory dict lists, flattens them in rank order, computes
+    # each trajectory's token count from the attention mask sum (one GPU-CPU sync per
+    # trajectory), strips padding from each trajectory, and allocates indices to ranks
+    # using the chosen packing algorithm ("ffd" or "kk") with effectively unlimited
+    # capacity and at least world-size groups for balance. Returns a RedistributedData
+    # with this rank's assigned trajectories (not concatenated).
     """Redistribute a list of trajectory dicts across a process group.
 
     Each trajectory dict should contain tensors with shape [batch_size, seqlen, *],
@@ -95,7 +113,13 @@ def redistribute_trajectories(
 
 
 class DistRolloutCoordinator:
+    # [CLASS DOC]
+    # Coordinates a rollout InferenceEngine and a TrainEngine inside SPMD training
+    # processes so that only DP heads generate data and every rank ends up with its
+    # share of the batch.
     def __init__(self, rollout_engine: InferenceEngine, train_engine: TrainEngine):
+        # [FUNCTION DOC]
+        # Stores the rollout (inference) engine and the train engine. No I/O.
         self.rollout_engine = rollout_engine
         self.train_engine = train_engine
 
@@ -103,6 +127,13 @@ class DistRolloutCoordinator:
         self,
         trajectories: list[dict[str, Any]] | None,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # HELPER: Collective. On DP heads (trajectories not None), redistributes
+        # trajectories across the train engine's data-parallel group using the packing
+        # algorithm from train_engine.config.mb_spec (default "ffd"); other ranks start
+        # with None. Then device-synchronizes and barriers on the CPU group, broadcasts
+        # the batch from the current DP head to the context-and-model-parallel group,
+        # and synchronizes/barriers again. Returns the local list of trajectories.
         """Broadcast and redistribute trajectories across distributed workers.
 
         This helper encapsulates:
@@ -158,6 +189,13 @@ class DistRolloutCoordinator:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Synchronous rollout: on DP heads calls the rollout engine's rollout_batch with
+        # the given workflow settings and moves results to the current device; then
+        # redistributes/broadcasts so all ranks return their batch. Collective; all
+        # ranks must call it.
+        # KNOWN ISSUE: the docstring mentions a connect_engine requirement and a
+        # RuntimeError, but this method performs no such check.
         """Generate rollout batch with distributed coordination (synchronous).
 
         This method orchestrates distributed rollout generation:
@@ -218,6 +256,13 @@ class DistRolloutCoordinator:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Asynchronous (staleness-controlled) rollout: on DP heads calls the rollout
+        # engine's prepare_batch with the dataloader, workflow, should_accept_fn,
+        # group_size, dynamic_bs and normalization flags, moves results to the device,
+        # then redistributes/broadcasts. Returns the local batch. Collective.
+        # KNOWN ISSUE: same as rollout_batch, the documented connect_engine check and
+        # RuntimeError are not implemented here.
         """Prepare async rollout batch with distributed coordination.
 
         Similar to rollout_batch but uses prepare_batch for async training,

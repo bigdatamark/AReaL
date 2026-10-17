@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Single-controller for rollout (inference) workers. The RolloutController asks a
+# Scheduler to create inference workers, instantiates a remote InferenceEngine on each,
+# launches/attaches inference servers, and dispatches rollout tasks to workers round-
+# robin through a BatchTaskDispatcher with global staleness control. Workers report
+# finished trajectories back through a Flask HTTP callback server run by the controller.
+# It also coordinates weight updates, pause/resume, offload/onload, versioning, and
+# optional proxy workers plus a proxy gateway for agent (OpenAI-compatible) workflows.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -54,6 +62,13 @@ logger = logging.getLogger("RolloutController")
 # type annotation, which disallows workflow object or types
 @dataclass
 class _RemoteRolloutTaskInput:
+    # [CLASS DOC]
+    # HELPER: Serializable description of one rollout task sent to a remote worker:
+    # task_id, data sample, workflow as an import path string (or None),
+    # workflow_kwargs, should_accept_fn as an import path string (or None), is_eval
+    # flag, group_size (samples per prompt), proxy_addr (proxy worker address for agent
+    # workflows), reward_normalization and drop_incomplete_group flags. Unlike the local
+    # task input, workflow objects/types are not allowed.
     task_id: int
     data: dict[str, Any]
     workflow: str | None
@@ -68,17 +83,32 @@ class _RemoteRolloutTaskInput:
 
 @dataclass
 class _RemoteRolloutResult:
+    # [CLASS DOC]
+    # HELPER: Result of a remote rollout task: task_id and the trajectory dict (possibly
+    # empty/None if rejected).
     task_id: int
     trajectory: dict[str, Any]
 
 
 class RolloutController:
+    # [CLASS DOC]
+    # Controller managing a pool of remote inference engine workers. Holds the engine
+    # class, config, scheduler, parsed rollout allocation (tp/pp/dp), worker and server-
+    # info lists, round-robin index, a lock-protected model version, a task-ID
+    # generator, staleness manager and dispatcher (created in initialize), callback HTTP
+    # server state (Flask app, server thread, host/port, a dedicated asyncio loop for
+    # resolving futures), a map of pending task IDs to asyncio Futures, proxy worker
+    # state and proxy gateway state.
     def __init__(
         self,
         inf_engine: type[InferenceEngine],
         config: InferenceEngineConfig,
         scheduler: Scheduler,
     ):
+        # [FUNCTION DOC]
+        # Stores inf_engine (engine class to run on workers), config
+        # (InferenceEngineConfig) and scheduler; parses config.backend into a
+        # ModelAllocation; initializes all bookkeeping fields to empty/None. No I/O.
         self.inf_engine = inf_engine
         self.config = config
         self.scheduler = scheduler
@@ -137,6 +167,10 @@ class RolloutController:
 
     @property
     def _proxy_role(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Property returning "proxy-" plus the worker role, so several
+        # controllers can fork proxies into one scheduler. Raises RuntimeError if
+        # initialize has not set the role.
         """Generate a unique proxy role name based on the worker role.
 
         This avoids collisions when multiple controllers (e.g., rollout and
@@ -149,10 +183,14 @@ class RolloutController:
         return f"proxy-{self._worker_role}"
 
     def _proxy_engine_name(self, rank: int) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the proxy engine name "<proxy role>/<rank>".
         """Generate engine name for a proxy worker rank."""
         return f"{self._proxy_role}/{rank}"
 
     def _engine_name(self, rank: int) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the engine name "<role>/<rank>".
         """Generate engine name for a worker rank.
 
         Engine names follow the "role/index" format (e.g., "rollout/0", "rollout/1").
@@ -167,6 +205,20 @@ class RolloutController:
         *args,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Brings up the rollout fleet. Inputs: role (scheduler role name), server_args
+        # (dict passed to launch_server), server_infos (existing servers to connect to
+        # instead of launching, e.g. for evaluation), plus extra args/kwargs forwarded
+        # to each engine's initialize. Computes instance size as tp times pp and
+        # dp_size; builds one SchedulingSpec per dp replica from the first configured
+        # spec, scaling cpu and mem by instance size and setting gpu to instance size if
+        # GPUs are requested; creates a Job with the configured scheduling strategy.
+        # Runs _async_initialize synchronously. Then creates a StalenessManager (max
+        # concurrent rollouts defaults to consumer batch size; max staleness from
+        # max_head_offpolicyness) with self as version provider, a BatchTaskDispatcher
+        # (queue size defaults to 16 times max concurrency, task factory
+        # _create_submit_callback, optional tracing and deterministic order),
+        # initializes the dispatcher, and starts the callback server.
         # Get scheduling config from kwargs or use defaults
         # Schedule inference engines in the granularity of instance sizes,
         # usually TP x PP.
@@ -238,6 +290,21 @@ class RolloutController:
         *args,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Async part of initialize. Creates workers through the scheduler and
+        # fetches them; creates the engine (by class import path) on each worker
+        # concurrently; forces train_data_parallel_size=1 in kwargs when absent/None so
+        # workers do not apply their own staleness scaling. Then three modes: (1)
+        # server_infos given: asserts one per worker and initializes each engine with
+        # its server address; (2) colocation strategy: computes slots per node from
+        # scheduler n_gpus_per_node (default 8) divided by GPUs per server, launches a
+        # server on each worker with an explicit base_gpu_id and an
+        # _awex_gpus_per_server hint, stores returned server infos and initializes
+        # engines with those addresses; (3) separation: collectively launches servers on
+        # all workers, stores infos, and initializes engines without an address (workers
+        # discover it via name resolution). Logs progress at INFO.
+        # KNOWN ISSUE: server_args is typed as a dict but may be None from initialize;
+        # the colocation path would fail unpacking None.
         # Create workers via scheduler
         logger.info("Creating workers via scheduler...")
         worker_ids = self.scheduler.create_workers(job=job)
@@ -370,6 +437,11 @@ class RolloutController:
         logger.info("All engines are initialized...")
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Tears down: destroys the dispatcher, stops the callback server, calls destroy
+        # on all engines (60s timeout), deletes rollout workers via the scheduler
+        # (errors logged), deletes proxy workers if started, stops the proxy gateway,
+        # and clears pending futures (without resolving them).
         # Stop background threads and shutdown the async task runner
         if self._dispatcher is not None:
             self._dispatcher.destroy()
@@ -404,6 +476,10 @@ class RolloutController:
             self._pending_futures.clear()
 
     def start_proxy(self) -> None:
+        # [FUNCTION DOC]
+        # Starts proxy workers (once; warns and returns if already started). Raises
+        # RuntimeError if no server infos exist (initialize not called). Runs
+        # _async_start_proxy synchronously and marks proxies started.
         """Initialize proxy workers for AgentWorkflow support.
 
         Creates proxy workers colocated with rollout workers. Each proxy worker
@@ -424,6 +500,12 @@ class RolloutController:
         self._proxy_started = True
 
     async def _async_start_proxy(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Forks one proxy worker per rollout worker (role from _proxy_role,
+        # running the proxy rollout server module), fetches them, creates the inference
+        # engine on each, initializes each engine against the corresponding rollout
+        # server address (matching by rank), records proxy addresses from the workers,
+        # and logs.
         """Async implementation of proxy worker initialization."""
         command = "areal.experimental.openai.proxy.proxy_rollout_server"
         worker_ids = self.scheduler.fork_workers(
@@ -471,6 +553,9 @@ class RolloutController:
         logger.info(f"Proxy servers initialized. Addresses: {self.proxy_addrs}")
 
     def get_proxy_addr(self, rank: int) -> str:
+        # [FUNCTION DOC]
+        # Returns the proxy HTTP address for a rollout worker rank. Raises RuntimeError
+        # if proxies are not started and IndexError if rank is out of range.
         """Get the proxy server address for a given rollout worker rank.
 
         Parameters
@@ -494,6 +579,15 @@ class RolloutController:
         return self.proxy_addrs[rank]
 
     def start_proxy_gateway(self) -> None:
+        # [FUNCTION DOC]
+        # Starts an in-process FastAPI proxy gateway that routes external OpenAI-style
+        # requests to proxy workers. Requires started proxies (RuntimeError otherwise);
+        # warns and returns if already running. Builds the app with the proxy addresses
+        # and the agent config admin key (default "areal-admin-key" if no agent config),
+        # picks a free port and the host IP, serves it with uvicorn on 0.0.0.0 in a
+        # daemon thread, polls up to 10s for the server to report started (RuntimeError
+        # on timeout), logs, then tells every rollout engine the gateway address via a
+        # collective set_proxy_gateway_addr RPC.
         """Start the proxy gateway for external access.
 
         Creates a FastAPI server that routes requests to backend proxy
@@ -525,6 +619,10 @@ class RolloutController:
         self._proxy_gateway_app = app
 
         def serve():
+            # [FUNCTION DOC]
+            # HELPER: Thread target that builds and runs a uvicorn server for the
+            # gateway app (warning log level, no access log), storing the server object
+            # on the controller; logs an ERROR if it crashes.
             import uvicorn
 
             try:
@@ -577,12 +675,18 @@ class RolloutController:
 
     @property
     def proxy_gateway_addr(self) -> str:
+        # [FUNCTION DOC]
+        # Property: the gateway URL "http://host:port". Raises RuntimeError if not
+        # started.
         """Single URL for external users."""
         if self._proxy_gateway_host is None:
             raise RuntimeError("Proxy gateway not started")
         return f"http://{format_hostport(self._proxy_gateway_host, self._proxy_gateway_port)}"
 
     def _stop_proxy_gateway(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If the gateway is running, asks uvicorn to exit, joins its thread up
+        # to 30s (warning if still alive) and resets all gateway fields to None.
         """Stop the proxy gateway server if running."""
         if self._proxy_gateway_host is None:
             return
@@ -603,6 +707,18 @@ class RolloutController:
         self._proxy_gateway_host = None
 
     def _start_callback_server(self):
+        # [FUNCTION DOC]
+        # HELPER: Starts the callback HTTP server (warns and returns if already
+        # running). Creates a Flask app whose POST routes mirror RolloutCallback:
+        # init_weights_group, update_weights_xccl, update_weights_disk,
+        # pause_generation, continue_generation (each deserializes the payload and runs
+        # the matching async controller method to completion on the callback thread's
+        # event loop), onload/offload (sync), and rollout_complete (resolves the pending
+        # future for a task ID; 500 with the error on failure). Any unhandled exception
+        # returns 500 JSON and is logged. Binds a single-threaded werkzeug server on the
+        # host IP and a free port, silences access logs and sets the werkzeug logger to
+        # WARNING, then runs serve_forever in a daemon thread and blocks until that
+        # thread's event loop exists.
         """Start Flask HTTP server to receive callbacks from RolloutCallback."""
         if self._callback_server is not None:
             logger.warning("Callback server already running")
@@ -613,6 +729,9 @@ class RolloutController:
 
         @app.route("/callback/init_weights_group", methods=["POST"])
         def init_weights_group():
+            # [FUNCTION DOC]
+            # HELPER: Route handler; deserializes "meta" and runs
+            # init_weights_update_group on the callback loop. Returns status ok JSON.
             payload = request.get_json() or {}
             meta = deserialize_value(payload.get("meta"))
             self._callback_loop.run_until_complete(self.init_weights_update_group(meta))
@@ -620,6 +739,10 @@ class RolloutController:
 
         @app.route("/callback/update_weights_xccl", methods=["POST"])
         def update_weights():
+            # [FUNCTION DOC]
+            # HELPER: Route handler; deserializes "meta" and "param_specs" and runs
+            # update_weights_from_distributed on the callback loop. Returns status ok
+            # JSON.
             payload = request.get_json() or {}
             meta = deserialize_value(payload.get("meta"))
             param_specs = deserialize_value(payload.get("param_specs"))
@@ -630,6 +753,9 @@ class RolloutController:
 
         @app.route("/callback/update_weights_disk", methods=["POST"])
         def update_weights_disk():
+            # [FUNCTION DOC]
+            # HELPER: Route handler; deserializes "meta" and runs
+            # update_weights_from_disk on the callback loop. Returns status ok JSON.
             payload = request.get_json() or {}
             meta = deserialize_value(payload.get("meta"))
             self._callback_loop.run_until_complete(self.update_weights_from_disk(meta))
@@ -637,16 +763,25 @@ class RolloutController:
 
         @app.route("/callback/pause_generation", methods=["POST"])
         def pause_generation():
+            # [FUNCTION DOC]
+            # HELPER: Route handler; runs pause_generation on the callback loop. Returns
+            # status ok JSON.
             self._callback_loop.run_until_complete(self.pause_generation())
             return jsonify({"status": "ok"})
 
         @app.route("/callback/continue_generation", methods=["POST"])
         def continue_generation():
+            # [FUNCTION DOC]
+            # HELPER: Route handler; runs continue_generation on the callback loop.
+            # Returns status ok JSON.
             self._callback_loop.run_until_complete(self.continue_generation())
             return jsonify({"status": "ok"})
 
         @app.route("/callback/onload", methods=["POST"])
         def onload():
+            # [FUNCTION DOC]
+            # HELPER: Route handler; calls onload with optional "tags" from the payload.
+            # Returns status ok JSON.
             payload = request.get_json() or {}
             tags = payload.get("tags")
             self.onload(tags=tags)
@@ -654,6 +789,9 @@ class RolloutController:
 
         @app.route("/callback/offload", methods=["POST"])
         def offload():
+            # [FUNCTION DOC]
+            # HELPER: Route handler; calls offload with optional "tags" from the
+            # payload. Returns status ok JSON.
             payload = request.get_json() or {}
             tags = payload.get("tags")
             self.offload(tags=tags)
@@ -661,6 +799,9 @@ class RolloutController:
 
         @app.route("/callback/rollout_complete", methods=["POST"])
         def rollout_complete():
+            # [FUNCTION DOC]
+            # HELPER: Route handler; resolves the pending future for payload "task_id".
+            # Returns status ok, or an error JSON with HTTP 500 on exception.
             payload = request.get_json() or {}
             task_id = payload.get("task_id")
             try:
@@ -671,6 +812,9 @@ class RolloutController:
 
         @app.errorhandler(Exception)
         def handle_error(e):
+            # [FUNCTION DOC]
+            # HELPER: Flask error handler: logs an ERROR and returns the exception text
+            # as JSON with HTTP 500.
             logger.error(f"Callback handler error: {e}")
             return jsonify({"error": str(e)}), 500
 
@@ -694,6 +838,10 @@ class RolloutController:
         werkzeug_logger.setLevel(stdlib_logging.WARNING)
 
         def serve_forever():
+            # [FUNCTION DOC]
+            # HELPER: Callback server thread body: creates and installs a new asyncio
+            # loop for this thread, signals readiness, logs the address and serves
+            # requests until shutdown.
             # Create and set event loop for this thread
             self._callback_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._callback_loop)
@@ -712,6 +860,11 @@ class RolloutController:
         self._callback_loop_ready.wait()
 
     def _stop_callback_server(self):
+        # [FUNCTION DOC]
+        # HELPER: If running, shuts down the werkzeug server, closes the callback event
+        # loop and resets all callback-server fields and the readiness event.
+        # KNOWN ISSUE: the loop is closed from a different thread than the one that
+        # created it, without stopping it first.
         """Stop the callback server if running."""
         if self._callback_server is not None:
             logger.info("Stopping callback server...")
@@ -728,12 +881,19 @@ class RolloutController:
 
     @property
     def callback_addr(self) -> str:
+        # [FUNCTION DOC]
+        # Property: callback server address "host:port". Raises RuntimeError if the
+        # server is not started.
         """Return callback server address as 'host:port'."""
         if self._callback_host is None or self._callback_port is None:
             raise RuntimeError("Callback server not started")
         return format_hostport(self._callback_host, self._callback_port)
 
     def _resolve_task_future(self, task_id: int):
+        # [FUNCTION DOC]
+        # HELPER: Pops the pending asyncio future for task_id under the lock and, if
+        # present, sets its result to None thread-safely on the future's own loop.
+        # Unknown IDs are ignored.
         """Resolve a pending future with the task result."""
         with self._futures_lock:
             future = self._pending_futures.pop(task_id, None)
@@ -741,19 +901,29 @@ class RolloutController:
             future.get_loop().call_soon_threadsafe(future.set_result, None)
 
     def _collective_rpc(self, method: str, *args, **kwargs) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Synchronous wrapper calling method with args/kwargs on every rollout
+        # engine; returns the list of per-worker results in rank order.
         return run_async_task(self._collective_rpc_async, method, *args, **kwargs)
 
     async def _collective_rpc_async(self, method: str, *args, **kwargs) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Async collective RPC over rollout workers using the rollout engine
+        # names.
         return await self._generic_collective_rpc_async(
             method, self.workers, self._engine_name, *args, **kwargs
         )
 
     def _proxy_collective_rpc(self, method: str, *args, **kwargs) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Synchronous collective RPC over proxy workers.
         return run_async_task(self._proxy_collective_rpc_async, method, *args, **kwargs)
 
     async def _proxy_collective_rpc_async(
         self, method: str, *args, **kwargs
     ) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Async collective RPC over proxy workers using the proxy engine names.
         return await self._generic_collective_rpc_async(
             method, self.proxy_workers, self._proxy_engine_name, *args, **kwargs
         )
@@ -766,6 +936,10 @@ class RolloutController:
         *args,
         **kwargs,
     ) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Concurrently calls method on each given worker's engine (engine name
+        # derived from rank by engine_name_fn) through the scheduler and gathers the
+        # results in order. Any failure propagates.
         tasks = [
             self.scheduler.async_call_engine(
                 worker_id=worker.id,
@@ -779,6 +953,9 @@ class RolloutController:
         return await asyncio.gather(*tasks)
 
     def _choose_worker(self) -> tuple[Worker, int]:
+        # [FUNCTION DOC]
+        # HELPER: Round-robin worker selection; returns (worker, rank) and advances the
+        # index. Raises RuntimeError if there are no workers. Not thread-safe.
         """Choose a worker for the next request using round-robin scheduling.
 
         Returns
@@ -794,6 +971,13 @@ class RolloutController:
         return worker, rank
 
     def _resolve_workflow_str(self, workflow: WorkflowLike | None) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Converts a workflow spec to an import-path string: None stays None
+        # (online mode), strings are returned unchanged, and classes or instances
+        # (RolloutWorkflow or agent-like) become "module.ClassName".
+        # KNOWN ISSUE: instance workflows are reduced to their class path, so
+        # constructor state of the instance is lost; the worker re-instantiates from
+        # workflow_kwargs.
         """Resolve workflow to a string import path.
 
         Handles RolloutWorkflow, agent workflow instances/classes, string paths,
@@ -826,6 +1010,10 @@ class RolloutController:
     def _resolve_should_accept_fn(
         self, should_accept_fn: Callable[[dict[str, Any]], bool] | str | None
     ):
+        # [FUNCTION DOC]
+        # HELPER: Validates should_accept_fn for remote use: raises RuntimeError if it
+        # is a callable (must be an import path), or if a given string cannot be
+        # imported locally. Returns the string or None.
         if callable(should_accept_fn):
             raise RuntimeError(
                 "If given, `should_accept_fn` must be an importable string path, e.g., 'my_module.filter_func'."
@@ -840,6 +1028,9 @@ class RolloutController:
         return should_accept_fn
 
     def _rollout_stats(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns a one-line text summary of staleness manager counters
+        # (enqueued, running, accepted, rejected).
         stats = self._staleness_manager.get_stats()
         return (
             f"enqueued: {stats.enqueued}, "
@@ -849,7 +1040,23 @@ class RolloutController:
         )
 
     def _create_submit_callback(self, pending_task: _RemoteRolloutTaskInput):
+        # [FUNCTION DOC]
+        # HELPER: Task factory for the dispatcher: returns a zero-argument coroutine
+        # function that executes pending_task on a remote worker.
         async def _submit_then_wait() -> _RemoteRolloutResult | None:
+            # [FUNCTION DOC]
+            # HELPER: Executes one remote rollout. Picks a worker round-robin, registers
+            # an asyncio future for the task ID, fills in the proxy address for that
+            # rank if proxies are running and none was given, and calls the worker
+            # engine's submit RPC with the task fields and the controller's
+            # rollout_complete callback URL (asserting the returned task ID matches).
+            # Waits up to request_timeout for the callback to resolve the future, then
+            # fetches the result via wait_for_task with a 0.1s non-raising timeout. A
+            # non-None trajectory marks the rollout accepted in the staleness manager
+            # and returns a _RemoteRolloutResult; None marks it rejected and returns
+            # None. On timeout or any other exception removes the pending future, marks
+            # rejected, logs an ERROR and returns None. Optional INFO tracing with
+            # stats.
             # Choose worker via round-robin
             worker, rank = self._choose_worker()
             engine_name = self._engine_name(rank)
@@ -936,6 +1143,9 @@ class RolloutController:
         return _submit_then_wait
 
     def get_capacity(self):
+        # [FUNCTION DOC]
+        # Returns the staleness manager's current capacity (how many more rollouts may
+        # be submitted).
         return self.staleness_manager.get_capacity()
 
     def submit(
@@ -951,6 +1161,13 @@ class RolloutController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> int:
+        # [FUNCTION DOC]
+        # Submits one rollout task. Converts workflow to an import path and validates
+        # should_accept_fn (must be an importable string; RuntimeError otherwise),
+        # defaults workflow_kwargs to an empty dict and task_id to the next generated
+        # ID, builds a _RemoteRolloutTaskInput with the remaining flags (is_eval,
+        # group_size, proxy_addr, reward_normalization, drop_incomplete_group) and hands
+        # it to the dispatcher (RuntimeError if not initialized). Returns the task ID.
         workflow_str = self._resolve_workflow_str(workflow)
         should_accept_fn = self._resolve_should_accept_fn(should_accept_fn)
         if workflow_kwargs is None:
@@ -981,6 +1198,10 @@ class RolloutController:
     def wait(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> list[dict[str, Any] | None]:
+        # [FUNCTION DOC]
+        # Blocks until count results are available from the dispatcher (timeout and
+        # raise_timeout passed through). Returns the trajectories (None for rejected
+        # tasks) and optionally logs when tracing.
         # Delegate to dispatcher and extract trajectories
         results = self.dispatcher.wait_results(count, timeout, raise_timeout)
         # Log and trace
@@ -1000,6 +1221,10 @@ class RolloutController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Submits every item of data with the same workflow settings, waits for exactly
+        # that many results and returns only the non-None trajectories. Emits a perf-
+        # tracer instant event and is wrapped in a perf trace span.
         perf_tracer.instant(
             "rollout_controller.rollout_batch",
             category="scheduler",
@@ -1031,6 +1256,16 @@ class RolloutController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Asynchronous batch preparation with staleness control. On the first call
+        # creates and stores a generator that cycles the dataloader forever and yields
+        # one task input per item (new task ID each); the dispatcher's
+        # active_submit_and_wait keeps submitting from it and returns once a batch of
+        # dataloader.batch_size (or dynamic size) results is ready. Returns the non-None
+        # trajectories. Asserts the dataloader has a batch size.
+        # KNOWN ISSUE: the generator is cached on first use, so later calls with a
+        # different dataloader, workflow or kwargs silently keep using the first ones;
+        # should_accept_fn is not validated here unlike submit.
         """Prepare a batch with controlled staleness.
 
         Continuously submits from dataloader and waits for results, ensuring at least
@@ -1044,6 +1279,9 @@ class RolloutController:
             workflow_kwargs = {}
 
         def task_input_generator():
+            # [FUNCTION DOC]
+            # HELPER: Infinite generator over the cycled dataloader yielding a
+            # _RemoteRolloutTaskInput per sample.
             for data in cycle_dataloader(dataloader):
                 for item in data:
                     yield _RemoteRolloutTaskInput(
@@ -1071,11 +1309,20 @@ class RolloutController:
         return [t for t in trajectories if t is not None]
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[Any]:
+        # [FUNCTION DOC]
+        # Computes token log-probabilities on the inference workers. Returns an empty
+        # list for empty input. Otherwise splits data across workers by stride (item i
+        # goes to worker i mod N), calls each worker's compute_logp concurrently and
+        # reassembles results in the original order. Raises RuntimeError if there are no
+        # workers or a worker returns the wrong number of results.
         """Compute token log-probabilities for trajectories via remote workers."""
         if len(data) == 0:
             return []
 
         async def _compute():
+            # [FUNCTION DOC]
+            # HELPER: Async body of compute_logp performing the strided split,
+            # concurrent RPCs and merge.
             indexed_chunks: list[list[int]] = []
             tasks = []
             n_workers = len(self.workers)
@@ -1111,6 +1358,9 @@ class RolloutController:
         return run_async_task(_compute)
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
+        # [FUNCTION DOC]
+        # Sends a single ModelRequest to a round-robin chosen worker's agenerate method
+        # and returns its ModelResponse (bypasses workflows and staleness control).
         """Asynchronously generate a response for the given request.
 
         This method provides direct access to the inference engine's generation capabilities
@@ -1138,6 +1388,9 @@ class RolloutController:
         )
 
     async def init_weights_update_group(self, meta: WeightUpdateMeta) -> None:
+        # [FUNCTION DOC]
+        # Asks every worker engine concurrently to join the weight-update communication
+        # group, passing meta and its own rank as the only xccl group rank.
         tasks = [
             self.scheduler.async_call_engine(
                 worker_id=worker.id,
@@ -1153,25 +1406,42 @@ class RolloutController:
     async def update_weights_from_distributed(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ):
+        # [FUNCTION DOC]
+        # Collective RPC telling every worker to receive weights over the distributed
+        # group for the given param_specs.
         await self._collective_rpc_async(
             "update_weights_from_distributed", meta=meta, param_specs=param_specs
         )
 
     async def update_weights_from_disk(self, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Disables per-worker checkpoint deletion on meta (mutates it), has every worker
+        # reload weights from meta.path, then deletes that directory locally (errors
+        # ignored).
         meta.clear_checkpoint_after_load = False
         await self._collective_rpc_async("update_weights_from_disk", meta=meta)
         shutil.rmtree(meta.path, ignore_errors=True)
 
     async def pause_generation(self):
+        # [FUNCTION DOC]
+        # Async collective pause_generation on all workers.
         await self._collective_rpc_async("pause_generation")
 
     def pause_generation_sync(self):
+        # [FUNCTION DOC]
+        # Synchronous collective pause_generation on all workers with a 120s HTTP
+        # timeout.
         self._collective_rpc("pause_generation", http_timeout=120.0)
 
     async def continue_generation(self):
+        # [FUNCTION DOC]
+        # Async collective continue_generation on all workers.
         await self._collective_rpc_async("continue_generation")
 
     def set_version(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # Under the version lock, stores the new model version and pushes it to all
+        # rollout workers and, if started, proxy workers (60s timeouts).
         with self._version_lock:
             self._version = version
             self._collective_rpc("set_version", version=version, http_timeout=60.0)
@@ -1181,31 +1451,51 @@ class RolloutController:
                 )
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the current model version under the lock (used by the staleness
+        # manager as version provider).
         with self._version_lock:
             return self._version
 
     def pause(self):
+        # [FUNCTION DOC]
+        # Pauses the dispatcher (no new task dispatch), then pauses proxy workers if
+        # started and all rollout workers.
         self.dispatcher.pause()
         if self._proxy_started:
             self._proxy_collective_rpc("pause", http_timeout=60.0)
         self._collective_rpc("pause", http_timeout=60.0)
 
     def resume(self):
+        # [FUNCTION DOC]
+        # Resumes rollout workers, then proxy workers if started, then the dispatcher
+        # (reverse order of pause).
         self._collective_rpc("resume", http_timeout=60.0)
         if self._proxy_started:
             self._proxy_collective_rpc("resume", http_timeout=60.0)
         self.dispatcher.resume()
 
     def offload(self, tags: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Collective offload of inference memory (optional tags) with a 120s timeout.
         self._collective_rpc("offload", tags=tags, http_timeout=120.0)
 
     def abort_all_requests(self):
+        # [FUNCTION DOC]
+        # Collective abort of all in-flight generation requests on workers.
         self._collective_rpc("abort_all_requests", http_timeout=60.0)
 
     def onload(self, tags: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Collective onload (restore memory, optional tags) with a 120s timeout.
         self._collective_rpc("onload", tags=tags, http_timeout=120.0)
 
     def export_stats(self) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Collects stats dicts from all workers and merges them: for each key with a
+        # matching "<key>__count" entry, computes the count-weighted mean across
+        # workers. Returns only averaged keys with positive total count; count keys
+        # themselves and keys without counts are dropped.
         all_raw_stats = self._collective_rpc(method="export_stats", http_timeout=60.0)
         stats = defaultdict(float)
         counts = defaultdict(int)
@@ -1226,7 +1516,12 @@ class RolloutController:
         return final_stats
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
+        # [FUNCTION DOC]
+        # Configures the performance tracer on every worker concurrently, passing each
+        # its rank, the role and config.
         async def _call():
+            # [FUNCTION DOC]
+            # HELPER: Async body issuing the per-worker config_perf_tracer calls.
             tasks = [
                 self.scheduler.async_call_engine(
                     worker_id=worker.id,
@@ -1243,16 +1538,24 @@ class RolloutController:
         run_async_task(_call)
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Collective call asking workers to flush/save perf traces for an optional step,
+        # optionally forced.
         self._collective_rpc("save_perf_tracer", step=step, force=force)
 
     @property
     def staleness_manager(self):
+        # [FUNCTION DOC]
+        # Property: the StalenessManager (None before initialize).
         return self._staleness_manager
 
     @property
     def dispatcher(
         self,
     ) -> BatchTaskDispatcher[_RemoteRolloutTaskInput, _RemoteRolloutResult]:
+        # [FUNCTION DOC]
+        # Property: the BatchTaskDispatcher. Raises RuntimeError if initialize has not
+        # been called.
         """Get the task dispatcher, ensuring initialization has been called."""
         if self._dispatcher is None:
             raise RuntimeError(
@@ -1262,5 +1565,8 @@ class RolloutController:
 
     @property
     def runner(self):
+        # [FUNCTION DOC]
+        # Property kept for backward compatibility: the dispatcher's underlying async
+        # task runner.
         """For backward compatibility. The runner is now owned by the dispatcher."""
         return self.dispatcher.runner

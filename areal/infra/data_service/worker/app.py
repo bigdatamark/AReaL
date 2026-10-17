@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# FastAPI application for a data service worker. Each worker can hold several datasets
+# (keyed by dataset ID); for each it builds the dataset through AReaL's custom dataset
+# registry, a rank-sharded sampler and a StatefulDataLoader (batch size 1, identity
+# collate), and serves raw samples by index, epoch resets and dataloader checkpointing.
+# Uses a global lock for the dataset map plus a per-dataset lock (ordering: global then
+# per-dataset).
 # SPDX-License-Identifier: Apache-2.0
 
 """DataWorker FastAPI app — serves dataset samples over HTTP."""
@@ -34,11 +41,17 @@ logger = logging.getLogger("DataWorker")
 
 
 def _identity_collate(samples: list[Any]) -> list[Any]:
+    # [FUNCTION DOC]
+    # HELPER: Collate function returning the list of samples unchanged.
     return samples
 
 
 @dataclass
 class _DatasetState:
+    # [CLASS DOC]
+    # HELPER: Mutable per-dataset state: dataset_id, raw dataset, its dataloader and
+    # sampler, current epoch, exhausted flag, unloading flag (set while being removed)
+    # and an asyncio lock serializing state operations.
     dataset_id: str
     raw_dataset: Any
     dataloader: Any
@@ -50,6 +63,11 @@ class _DatasetState:
 
 
 def create_worker_app(config: DataWorkerConfig) -> FastAPI:
+    # [FUNCTION DOC]
+    # Builds the worker app for config. Closure state: dataset map, a set of IDs
+    # currently loading, and the global datasets lock. Lifespan seeds random generators
+    # once (seed with key "data_worker_<rank>"), exposes config and datasets on
+    # app.state, and clears datasets on shutdown. Returns the app.
     # --- Concurrency model ---
     # datasets_lock : guards dict mutations (add/remove entries) and the
     #                 _loading_ids reservation set.
@@ -64,6 +82,9 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: Any):
+        # [FUNCTION DOC]
+        # HELPER: Lifespan context performing the startup seeding/state exposure and
+        # shutdown clearing.
         seeding.set_random_seed(config.seed, key=f"data_worker_{config.rank}")
         app.state.config = config
         app.state.datasets = datasets
@@ -75,6 +96,8 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
     app = FastAPI(title="AReaL Data Worker", lifespan=lifespan)
 
     def _require_dataset(dataset_id: str) -> _DatasetState:
+        # [FUNCTION DOC]
+        # HELPER: Returns the state for dataset_id or raises HTTPException 404.
         state = datasets.get(dataset_id)
         if state is None:
             raise HTTPException(
@@ -84,6 +107,9 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
 
     @asynccontextmanager
     async def _locked_active_state(dataset_id: str):
+        # [FUNCTION DOC]
+        # HELPER: Async context manager yielding the dataset state while holding its
+        # lock; raises 404 if unknown and 409 if it is unloading.
         state = _require_dataset(dataset_id)
         async with state.lock:
             if state.unloading:
@@ -95,6 +121,9 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
 
     @app.get("/health")
     async def health():
+        # [FUNCTION DOC]
+        # GET /health: returns status ok, this worker's rank and number of loaded
+        # datasets.
         return {
             "status": "ok",
             "rank": config.rank,
@@ -103,7 +132,20 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
 
     @app.post("/datasets/load")
     async def load_dataset(body: WorkerLoadDatasetRequest):
+        # [FUNCTION DOC]
+        # POST /datasets/load. Phase 1 under the global lock: 409 if the ID is already
+        # loaded or loading, else reserves it. Phase 2 in a worker thread: optionally
+        # loads an HF processor/tokenizer from tokenizer_or_processor_path, builds the
+        # dataset, a sampler sharded by this worker's rank/world size
+        # (DistributedSampler when drop_last, else an eval sampler that keeps all
+        # samples) with the requested shuffle/drop_last, and a StatefulDataLoader; on
+        # failure releases the reservation and re-raises (HTTP 500). Phase 3 under the
+        # lock: stores state with epoch 0. Returns status ok, dataset_size (this rank's
+        # sampler sample count) and steps_per_epoch.
         def _load_sync():
+            # [FUNCTION DOC]
+            # HELPER: Synchronous dataset/sampler/dataloader construction described
+            # above; returns the three objects.
             _tokenizer = None
             _processor = None
             if body.tokenizer_or_processor_path:
@@ -184,12 +226,22 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
 
     @app.post("/v1/samples/fetch")
     async def fetch_samples(body: FetchSamplesRequest):
+        # [FUNCTION DOC]
+        # POST /v1/samples/fetch: under the dataset lock, returns {"samples": [...]}
+        # with each requested index of the raw dataset serialized by the RPC serializer.
+        # KNOWN ISSUE: indices address the full raw dataset, not this worker's shard,
+        # and no bounds check is done (IndexError becomes HTTP 500).
         async with _locked_active_state(body.dataset_id) as state:
             samples = [serialize_value(state.raw_dataset[idx]) for idx in body.indices]
             return {"samples": samples}
 
     @app.post("/datasets/unload")
     async def unload_dataset(body: WorkerUnloadDatasetRequest):
+        # [FUNCTION DOC]
+        # POST /datasets/unload: 409 if the dataset is still loading or already
+        # unloading, 404 if unknown. Waits for in-flight operations by taking the
+        # dataset lock and marks it unloading, then removes it from the map if still the
+        # same object. Returns status ok.
         # Phase 1: look up state under datasets_lock (fast).
         async with datasets_lock:
             if body.dataset_id in _loading_ids:
@@ -222,6 +274,10 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
 
     @app.post("/epoch/reset")
     async def reset_epoch(body: WorkerEpochResetRequest):
+        # [FUNCTION DOC]
+        # POST /epoch/reset: under the dataset lock sets epoch, clears exhausted, and
+        # sets the sampler epoch (reshuffles deterministically). Returns status ok and
+        # the epoch.
         async with _locked_active_state(body.dataset_id) as state:
             state.epoch = body.epoch
             state.exhausted = False
@@ -231,6 +287,10 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
 
     @app.post("/state/save")
     async def save_state(body: WorkerStateSaveRequest):
+        # [FUNCTION DOC]
+        # POST /state/save: under the dataset lock creates the directory body.path and
+        # pickles the dataloader state dict to "worker_<rank>.pkl" inside it. Returns
+        # status ok and the file path.
         async with _locked_active_state(body.dataset_id) as state:
             save_dir = Path(body.path)
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -243,6 +303,12 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
 
     @app.post("/state/load")
     async def load_state(body: WorkerStateLoadRequest):
+        # [FUNCTION DOC]
+        # POST /state/load: under the dataset lock reads "worker_<rank>.pkl" from
+        # body.path (404 if missing), unpickles it into the dataloader state and clears
+        # exhausted. Returns status ok and the path.
+        # KNOWN ISSUE: uses pickle on a caller-supplied path, which executes arbitrary
+        # code if the file is untrusted.
         async with _locked_active_state(body.dataset_id) as state:
             load_path = Path(body.path) / f"worker_{config.rank}.pkl"
             if not load_path.exists():
@@ -260,6 +326,9 @@ def create_worker_app(config: DataWorkerConfig) -> FastAPI:
 
     @app.delete("/data/clear")
     async def clear_data():
+        # [FUNCTION DOC]
+        # DELETE /data/clear: no-op stub that always returns status ok with
+        # tensor_shards 0 (this worker caches nothing).
         return {"status": "ok", "tensor_shards": 0}
 
     return app

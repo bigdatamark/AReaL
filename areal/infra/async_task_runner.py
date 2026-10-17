@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Generic thread-backed async task runner. A background daemon thread runs a uvloop
+# event loop that pulls submitted async functions from a bounded thread-safe input
+# queue, runs them concurrently as asyncio tasks, and pushes timestamped results to a
+# bounded output queue that callers drain synchronously. Supports pause/resume,
+# duplicate task-ID detection and propagation of fatal loop errors. No AReaL-specific
+# logic.
 # SPDX-License-Identifier: Apache-2.0
 
 """Generic asynchronous task runner for executing concurrent async Python functions.
@@ -29,11 +36,18 @@ DEFAULT_POLL_SLEEP_TIME = 0.5  # 500ms
 
 
 class TaskQueueFullError(RuntimeError):
+    # [CLASS DOC]
+    # RuntimeError subclass raised when the input queue (on submit) or output queue
+    # (inside the loop) is full.
     """Raised when an AsyncTaskRunner queue is full."""
 
 
 @dataclass
 class TimedResult(Generic[T]):
+    # [CLASS DOC]
+    # Generic dataclass for a finished task: create_time (monotonic nanoseconds when the
+    # asyncio task was created, not when it was submitted), data (the result, None if
+    # the task failed or was cancelled) and task_id.
     """Wrapper for task results with creation timestamp.
 
     Attributes
@@ -53,6 +67,9 @@ class TimedResult(Generic[T]):
 
 @dataclass
 class _TaskInput(Generic[T]):
+    # [CLASS DOC]
+    # HELPER: Internal dataclass holding a submitted async function, its positional args
+    # tuple, kwargs dict and integer task_id.
     """Internal wrapper for task input with async function and arguments."""
 
     async_fn: Callable[..., Awaitable[T]]
@@ -63,6 +80,9 @@ class _TaskInput(Generic[T]):
 
 @dataclass
 class _Task(Generic[T]):
+    # [CLASS DOC]
+    # HELPER: Internal dataclass for a running task: creation time (monotonic ns), the
+    # asyncio Task and the originating _TaskInput.
     """Internal wrapper for running task with metadata."""
 
     create_time: int  # nanoseconds from time.monotonic_ns()
@@ -71,6 +91,16 @@ class _Task(Generic[T]):
 
 
 class AsyncTaskRunner(Generic[T]):
+    # [CLASS DOC]
+    # Generic runner (result type T). State: configuration (queue size, poll wait/sleep
+    # times, tracing flag), threading Events exiting and paused, bounded input/output
+    # queues, the event loop reference plus a loop-ready Event, an asyncio Event used to
+    # wake the loop when input arrives, a lock-guarded stored thread exception, a lock-
+    # guarded set of active task IDs (submitted but not yet completed), an optional
+    # logger and the thread handle. Lifecycle: construct, initialize, submit/wait (and
+    # pause/resume), destroy.
+    # KNOWN ISSUE: the class docstring examples call submit without the required
+    # keyword-only task_id argument.
     """Generic asynchronous task runner with queue management and pause/resume control.
 
     This class provides a reusable async task executor that runs a background thread
@@ -165,6 +195,10 @@ class AsyncTaskRunner(Generic[T]):
         poll_sleep_time: float = DEFAULT_POLL_SLEEP_TIME,
         enable_tracing: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Stores configuration and creates the Events, the two queues (both with maxsize
+        # max_queue_size), locks, empty active-ID set; logger and thread start as None.
+        # Does not start the thread.
         """Initialize the AsyncTaskRunner.
 
         Parameters
@@ -215,6 +249,11 @@ class AsyncTaskRunner(Generic[T]):
         self.thread: threading.Thread | None = None
 
     def initialize(self, logger=None):
+        # [FUNCTION DOC]
+        # Stores the optional logger, clears exiting and paused, clears the loop-ready
+        # event, starts the daemon background thread running _run_thread, and blocks
+        # until the loop signals ready (or the thread failed). Can be called again after
+        # destroy to restart.
         """Initialize and start the background thread.
 
         This method starts the background thread that runs the asyncio
@@ -240,6 +279,10 @@ class AsyncTaskRunner(Generic[T]):
         self._loop_ready.wait()
 
     def destroy(self, timeout: float = 30.0):
+        # [FUNCTION DOC]
+        # Sets exiting, clears paused, wakes the loop, and joins the thread for up to
+        # timeout seconds (default 30); logs a WARNING if it is still alive. Pending
+        # tasks get cancelled by the loop's cleanup. Queues are not cleared.
         """Shutdown the task runner and wait for thread cleanup.
 
         This method signals the background thread to exit and waits for
@@ -264,6 +307,9 @@ class AsyncTaskRunner(Generic[T]):
                     )
 
     def _check_thread_health(self):
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError (chained from the stored exception) if the
+        # background thread died with an exception; otherwise no-op.
         """Check if the background thread has encountered a fatal error.
 
         Raises
@@ -279,6 +325,12 @@ class AsyncTaskRunner(Generic[T]):
                 ) from self._thread_exception
 
     def _run_thread(self):
+        # [FUNCTION DOC]
+        # HELPER: Background thread body. Creates a new uvloop loop, sets it as the
+        # thread's loop, records it, signals ready, and runs the async main loop to
+        # completion. Any exception is stored for _check_thread_health and logged at
+        # ERROR. Finally always sets exiting and loop-ready (so waiters do not hang),
+        # clears the loop reference and closes the loop.
         """Entry point for the background thread.
 
         Runs the async event loop and handles exceptions.
@@ -308,6 +360,18 @@ class AsyncTaskRunner(Generic[T]):
                 loop.close()
 
     async def _run_async_loop(self):
+        # [FUNCTION DOC]
+        # HELPER: Main coroutine. Creates and sets the wakeup Event. Until exiting: if
+        # paused, sleeps poll_sleep_time and loops (running tasks keep executing but
+        # their results are not collected while paused); otherwise drains the input
+        # queue into new asyncio tasks; if none are running waits for new input; else
+        # waits up to poll_wait_time for the first completion. For each finished task:
+        # gets its result (None plus WARNING if cancelled, None plus ERROR log if it
+        # raised), wraps it in a TimedResult and puts it on the output queue without
+        # blocking, removes its ID from the active set and optionally logs a trace. If
+        # the output queue is full, re-registers the task, logs CRITICAL and raises
+        # TaskQueueFullError, which kills the loop. On exit (finally) clears the wakeup
+        # event, cancels and awaits all unfinished tasks, and clears the active ID set.
         """Main async event loop that processes tasks.
 
         This loop:
@@ -418,6 +482,13 @@ class AsyncTaskRunner(Generic[T]):
         self,
         running_tasks: dict[str, _Task[T]],
     ) -> int:
+        # [FUNCTION DOC]
+        # HELPER: While not paused, pops inputs from the queue without blocking, and for
+        # each creates an asyncio task (named by the string task ID) from calling the
+        # async function with its args, records it in running_tasks (mutated in place)
+        # with the current monotonic time, and optionally traces. Raises ValueError if
+        # the ID is already running (defensive; normally caught in submit). Returns the
+        # number of tasks added.
         tasks_added = 0
         while not self.paused.is_set():
             try:
@@ -455,6 +526,13 @@ class AsyncTaskRunner(Generic[T]):
         return tasks_added
 
     async def _wait_for_new_tasks(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Suspends the loop until input arrives, exiting is set or paused is
+        # set. Sleeps poll_sleep_time if the wakeup event is missing. Uses a check-
+        # clear-recheck of the input queue size around clearing the event to avoid
+        # missing a wakeup set by another thread.
+        # KNOWN ISSUE: pause() does not signal the event, so a loop blocked here only
+        # notices a pause when some later input or destroy wakes it.
         if self._input_event is None:
             await asyncio.sleep(self.poll_sleep_time)
             return
@@ -479,6 +557,12 @@ class AsyncTaskRunner(Generic[T]):
         task_id: int,
         **kwargs,
     ) -> int:
+        # [FUNCTION DOC]
+        # Submits async_fn with positional args and kwargs under a keyword-only task_id.
+        # Checks thread health (RuntimeError if dead), rejects an ID that is already
+        # active with ValueError, records it as active, and enqueues without blocking;
+        # if the input queue is full removes the ID again and raises TaskQueueFullError.
+        # Wakes the loop thread-safely and returns task_id.
         """Submit an async function for execution.
 
         The function will be executed in the background thread's event
@@ -554,6 +638,14 @@ class AsyncTaskRunner(Generic[T]):
     def wait(
         self, count: int, timeout: float | None = None, with_timing: bool = False
     ) -> list[TimedResult[T]] | list[T]:
+        # [FUNCTION DOC]
+        # Blocks the caller until count results are collected from the output queue.
+        # timeout None means 7 days. Polls the output queue in slices of at most
+        # poll_sleep_time, checking thread health (RuntimeError) and exiting
+        # (RuntimeError) each iteration, and raises TimeoutError when the deadline
+        # passes (results already taken are lost to the caller). Returns TimedResult
+        # objects if with_timing is True, else just their data values, in completion
+        # order.
         """Wait for a specified number of task results.
 
         This method blocks until at least `count` results are available
@@ -626,6 +718,9 @@ class AsyncTaskRunner(Generic[T]):
         return [r.data for r in results_to_return]
 
     def pause(self):
+        # [FUNCTION DOC]
+        # Sets the paused flag so no new tasks are started from the input queue; running
+        # tasks continue.
         """Pause submission of new tasks.
 
         After calling pause(), no new tasks will be started from the
@@ -635,6 +730,8 @@ class AsyncTaskRunner(Generic[T]):
         self.paused.set()
 
     def resume(self):
+        # [FUNCTION DOC]
+        # Clears the paused flag and wakes the loop.
         """Resume submission of new tasks.
 
         Allows new tasks to be pulled from the input queue and
@@ -644,6 +741,8 @@ class AsyncTaskRunner(Generic[T]):
         self._signal_new_input()
 
     def get_queue_sizes(self) -> tuple[int, int]:
+        # [FUNCTION DOC]
+        # Returns (input queue size, output queue size) as approximate counts.
         """Get current sizes of input and output queues.
 
         Returns
@@ -654,6 +753,8 @@ class AsyncTaskRunner(Generic[T]):
         return self.input_queue.qsize(), self.output_queue.qsize()
 
     def get_input_queue_size(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the approximate number of tasks waiting in the input queue.
         """Get current size of the input queue.
 
         Returns
@@ -664,6 +765,8 @@ class AsyncTaskRunner(Generic[T]):
         return self.input_queue.qsize()
 
     def get_output_queue_size(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the approximate number of results waiting in the output queue.
         """Get current size of the output queue.
 
         Returns
@@ -674,6 +777,10 @@ class AsyncTaskRunner(Generic[T]):
         return self.output_queue.qsize()
 
     def _signal_new_input(self):
+        # [FUNCTION DOC]
+        # HELPER: Thread-safely sets the loop's wakeup event via the loop's call-soon-
+        # threadsafe mechanism; no-op if the loop or event is not available, and ignores
+        # RuntimeError (closed loop).
         loop = self._loop
         input_event = self._input_event
         if loop is None or input_event is None:

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Train-worker-side proxy that lets training engines trigger inference-side operations
+# (weight-update group setup, weight transfer, pause/resume, memory onload/offload) by
+# POSTing to callback endpoints on the TrainController's HTTP server, which forwards
+# them to the RolloutController.
+# KNOWN ISSUE: the module logger uses the dotted module name instead of a PascalCase
+# logger name as required by the project style.
 # SPDX-License-Identifier: Apache-2.0
 
 from concurrent.futures import Future
@@ -16,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RolloutCallback:
+    # [CLASS DOC]
+    # Dataclass holding controller_addr ("host:port" of the controller callback server)
+    # and request_timeout (seconds per HTTP request, default 600). Methods tied to NCCL
+    # collectives return Futures and must not block, because the train side must start
+    # its own collective concurrently with the inference side.
     """Callback interface for train workers to coordinate with TrainController.
 
     This class acts as a proxy that train engines use to trigger operations on
@@ -32,6 +44,11 @@ class RolloutCallback:
     request_timeout: float = 600.0
 
     def _post(self, endpoint: str, payload: dict[str, Any] | None = None) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Synchronous POST of payload (empty dict if None) as JSON to
+        # http://controller_addr + endpoint with request_timeout. Raises for HTTP error
+        # status; returns the parsed JSON body. On any requests exception logs an ERROR
+        # and re-raises.
         """Make synchronous HTTP POST to controller callback endpoint.
 
         Parameters
@@ -62,6 +79,9 @@ class RolloutCallback:
     def _post_nowait(
         self, endpoint: str, payload: dict[str, Any] | None = None
     ) -> Future[dict]:
+        # [FUNCTION DOC]
+        # HELPER: Submits _post to the shared global thread pool executor and returns
+        # its Future immediately.
         """Make asynchronous HTTP POST to controller callback endpoint.
 
         This method submits the HTTP request to a background thread and returns
@@ -86,11 +106,17 @@ class RolloutCallback:
     def _post_nowait_void(
         self, endpoint: str, payload: dict[str, Any] | None = None
     ) -> Future[None]:
+        # [FUNCTION DOC]
+        # HELPER: Like _post_nowait but returns a new Future that resolves to None on
+        # success or carries the HTTP exception, chained via a done-callback.
         """Make an async POST request and return a Future that resolves to None."""
         http_future = self._post_nowait(endpoint, payload)
         result_future: Future[None] = Future()
 
         def on_done(f: Future[dict]):
+            # [FUNCTION DOC]
+            # HELPER: Done-callback that propagates the HTTP future's outcome (None or
+            # exception) to the result future.
             try:
                 f.result()  # Raise any exception from the HTTP request
                 result_future.set_result(None)
@@ -101,6 +127,10 @@ class RolloutCallback:
         return result_future
 
     def init_weights_update_group(self, meta: WeightUpdateMeta) -> Future[None]:
+        # [FUNCTION DOC]
+        # Non-blocking: POSTs the serialized WeightUpdateMeta to
+        # "/callback/init_weights_group" so the inference side joins the weight-update
+        # process group. Returns a Future[None].
         """Callback to controller to initialize weight update group on inference side.
 
         This method is NON-BLOCKING. It starts the HTTP request in a background
@@ -123,6 +153,10 @@ class RolloutCallback:
     def update_weights_from_distributed(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ) -> Future[None]:
+        # [FUNCTION DOC]
+        # Non-blocking: POSTs serialized meta and param_specs to
+        # "/callback/update_weights_xccl" so the inference side starts receiving
+        # broadcast weights. Returns a Future[None].
         """Callback to controller to receive weights on inference side.
 
         This method is NON-BLOCKING. The train engine calls this to notify the
@@ -149,6 +183,10 @@ class RolloutCallback:
         return self._post_nowait_void("/callback/update_weights_xccl", payload)
 
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
+        # [FUNCTION DOC]
+        # Non-blocking: POSTs serialized meta (containing the checkpoint path) to
+        # "/callback/update_weights_disk" so the inference side reloads weights from
+        # disk. Returns a Future[None].
         """Callback to controller to load weights from disk on inference side.
 
         This method is NON-BLOCKING for consistency, though disk-based updates
@@ -168,6 +206,8 @@ class RolloutCallback:
         return self._post_nowait_void("/callback/update_weights_disk", payload)
 
     def pause_generation(self) -> None:
+        # [FUNCTION DOC]
+        # Blocking POST to "/callback/pause_generation"; returns None.
         """Callback to controller to pause inference generation.
 
         This is synchronous as it must complete before weight updates begin.
@@ -175,6 +215,8 @@ class RolloutCallback:
         self._post("/callback/pause_generation")
 
     def continue_generation(self) -> None:
+        # [FUNCTION DOC]
+        # Blocking POST to "/callback/continue_generation"; returns None.
         """Callback to controller to resume inference generation.
 
         This is synchronous as it should complete before returning control.
@@ -182,11 +224,17 @@ class RolloutCallback:
         self._post("/callback/continue_generation")
 
     def onload(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Blocking POST to "/callback/onload" with optional tags (omitted when
+        # empty/None) to restore inference-side memory.
         """Callback to controller to resume memory occupation on inference side."""
         payload = {"tags": tags} if tags else {}
         self._post("/callback/onload", payload)
 
     def offload(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Blocking POST to "/callback/offload" with optional tags (omitted when
+        # empty/None) to release inference-side memory.
         """Callback to controller to release memory occupation on inference side."""
         payload = {"tags": tags} if tags else {}
         self._post("/callback/offload", payload)
