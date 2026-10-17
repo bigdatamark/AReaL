@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Unit tests for data-proxy pause/resume: the PauseState async flag and the FastAPI
+# endpoints /pause_generation, /continue_generation and the "paused" field of /health.
+# The app is driven in-process through httpx.ASGITransport with mocked tokenizer,
+# OpenAI-style client and InfBridge pause/resume (no real backend calls).
 """Unit tests for data proxy pause/resume (Plan 3c)."""
 
 from __future__ import annotations
@@ -20,6 +25,10 @@ from areal.v2.inference_service.data_proxy.session import SessionStore
 
 @pytest.fixture
 def config():
+    # [FUNCTION DOC]
+    # Fixture: returns a DataProxyConfig on 127.0.0.1:18083 pointing at a fake SGLang
+    # backend "http://mock-sglang:30000" with tokenizer "mock-tokenizer", 10s request
+    # timeout, 5 resubmit retries and a 0.01s resubmit wait (fast tests). No I/O.
     return DataProxyConfig(
         host="127.0.0.1",
         port=18083,
@@ -33,6 +42,11 @@ def config():
 
 @pytest.fixture
 def mock_tokenizer():
+    # [FUNCTION DOC]
+    # Fixture: returns a MagicMock tokenizer: async tokenize -> [101, 102, 103],
+    # decode_token -> "tok_<id>", decode_tokens -> "hello world", async
+    # apply_chat_template -> [100, 200, 300], eos_token_id 2 and pad_token_id 0 (also on
+    # the inner _tok mock).
     tok = MagicMock()
     tok.tokenize = AsyncMock(return_value=[101, 102, 103])
     tok.decode_token = MagicMock(side_effect=lambda tid: f"tok_{tid}")
@@ -48,6 +62,9 @@ def mock_tokenizer():
 
 @pytest.fixture
 def mock_areal_client():
+    # [FUNCTION DOC]
+    # Fixture: returns a MagicMock ArealOpenAI-like client whose chat.completions.create
+    # is an AsyncMock delegating to the nested _mock_create.
     """Mock ArealOpenAI client that returns a valid ChatCompletion."""
     from openai.types.chat import ChatCompletion, ChatCompletionMessage
     from openai.types.chat.chat_completion import Choice
@@ -56,6 +73,13 @@ def mock_areal_client():
     mock_client = MagicMock()
 
     async def _mock_create(*, areal_cache=None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake create(); builds a fixed ChatCompletion (id "chatcmpl-mock", one
+        # "stop" choice with content "mocked response", usage 3/5/8). If areal_cache (a
+        # dict) is given, also builds an InteractionWithTokenLogpReward with a cached
+        # input_ids [100, 200, 300] and output_tokens [1234, 5678] tensors and the
+        # completion, stored in areal_cache under the completion id (mutates the passed
+        # dict). Extra kwargs ignored. Returns the completion.
         import torch
 
         completion = ChatCompletion(
@@ -98,6 +122,14 @@ def mock_areal_client():
 
 @pytest_asyncio.fixture
 async def app_client(config, mock_tokenizer, mock_areal_client):
+    # [FUNCTION DOC]
+    # Async fixture: creates the data proxy app via create_app(config), a fresh
+    # PauseState and a real InfBridge (SGLangBridgeBackend, settings from config) whose
+    # pause/resume are replaced by AsyncMocks that flip the shared PauseState to
+    # True/False. Injects tokenizer, inf_bridge, areal_client, pause_state, config, a
+    # new SessionStore and version 0 into app.state, then yields (httpx AsyncClient on
+    # base "http://test", app, pause_state); app exceptions become 500 responses instead
+    # of raising. Closes the client afterwards.
     """Create an ASGI test client with all app.state attributes injected."""
     from areal.v2.inference_service.inf_bridge import InfBridge
     from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
@@ -118,9 +150,13 @@ async def app_client(config, mock_tokenizer, mock_areal_client):
     # side_effect must be an async function (not a lambda returning a coroutine)
     # so that AsyncMock awaits the state change before the endpoint returns.
     async def _mock_pause():
+        # [FUNCTION DOC]
+        # HELPER: Pause side effect; awaits _set_paused(pause_state, True).
         await _set_paused(pause_state, True)
 
     async def _mock_resume():
+        # [FUNCTION DOC]
+        # HELPER: Resume side effect; awaits _set_paused(pause_state, False).
         await _set_paused(pause_state, False)
 
     inf_bridge.pause = AsyncMock(side_effect=_mock_pause)
@@ -140,6 +176,8 @@ async def app_client(config, mock_tokenizer, mock_areal_client):
 
 
 async def _set_paused(pause_state: PauseState, value: bool) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Awaits pause_state.set_paused(value). Used by the mocked pause/resume.
     """Helper to set pause state in async mock side effects."""
     await pause_state.set_paused(value)
 
@@ -150,21 +188,29 @@ async def _set_paused(pause_state: PauseState, value: bool) -> None:
 
 
 class TestPauseState:
+    # [CLASS DOC]
+    # Unit tests for PauseState flag transitions (no app involved).
     """Test PauseState flag transitions."""
 
     @pytest.mark.asyncio
     async def test_default_not_paused(self):
+        # [FUNCTION DOC]
+        # Asserts a new PauseState reports not paused.
         state = PauseState()
         assert not await state.is_paused()
 
     @pytest.mark.asyncio
     async def test_set_paused_true(self):
+        # [FUNCTION DOC]
+        # Asserts set_paused(True) makes is_paused() True.
         state = PauseState()
         await state.set_paused(True)
         assert await state.is_paused()
 
     @pytest.mark.asyncio
     async def test_set_paused_false(self):
+        # [FUNCTION DOC]
+        # Asserts pausing then unpausing returns is_paused() to False.
         state = PauseState()
         await state.set_paused(True)
         assert await state.is_paused()
@@ -173,6 +219,8 @@ class TestPauseState:
 
     @pytest.mark.asyncio
     async def test_multiple_transitions(self):
+        # [FUNCTION DOC]
+        # Asserts three consecutive pause/unpause cycles each report the expected state.
         state = PauseState()
         for _ in range(3):
             await state.set_paused(True)
@@ -187,10 +235,15 @@ class TestPauseState:
 
 
 class TestPauseResumeEndpoints:
+    # [CLASS DOC]
+    # Endpoint tests for /pause_generation, /continue_generation and /health's paused
+    # flag.
     """Test POST /pause_generation and POST /continue_generation endpoints."""
 
     @pytest.mark.asyncio
     async def test_health_includes_paused_false(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts GET /health returns 200 with "paused" present and False.
         client, app, pause_state = app_client
         resp = await client.get("/health")
         assert resp.status_code == 200
@@ -200,6 +253,9 @@ class TestPauseResumeEndpoints:
 
     @pytest.mark.asyncio
     async def test_pause_endpoint(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts POST /pause_generation returns 200 {"status": "ok", "paused": True}
+        # and that inf_bridge.pause was awaited exactly once.
         client, app, pause_state = app_client
 
         resp = await client.post("/pause_generation")
@@ -213,6 +269,9 @@ class TestPauseResumeEndpoints:
 
     @pytest.mark.asyncio
     async def test_resume_endpoint(self, app_client):
+        # [FUNCTION DOC]
+        # Pre-pauses the state, then asserts POST /continue_generation returns 200 with
+        # status "ok" and paused False, and inf_bridge.resume was called once.
         client, app, pause_state = app_client
 
         # First pause
@@ -229,6 +288,8 @@ class TestPauseResumeEndpoints:
 
     @pytest.mark.asyncio
     async def test_health_paused_true_after_pause(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts /health reports paused True after POST /pause_generation.
         client, app, pause_state = app_client
 
         await client.post("/pause_generation")

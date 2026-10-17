@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Pytest conftest for the v2 inference_service tests. On Python < 3.12 it pre-registers
+# empty namespace ModuleType stubs for "areal", "areal.experimental", "areal.v2" and
+# "areal.v2.inference_service" in sys.modules (with __path__ set to the real source
+# dirs) so submodules can be imported without executing areal/__init__.py, which uses
+# 3.12-only syntax. Runs at import time (global sys.modules mutation).
+# KNOWN ISSUE: the inline comment says the repo root is "4 levels up", but the code
+# joins three ".." components from this directory (which is correct for
+# tests/v2/inference_service).
 """Pre-import hook for Python < 3.12 compatibility.
 
 The top-level ``areal/__init__.py`` imports from modules that use PEP 695 syntax
@@ -29,6 +38,12 @@ _STUB_PACKAGES = [
 
 
 def _ensure_namespace_stubs():
+    # [FUNCTION DOC]
+    # HELPER: For each (name, path) in _STUB_PACKAGES not already imported, creates a
+    # bare module with __path__ [path] and __package__ name and inserts it into
+    # sys.modules. Then, for every dotted name, sets the child module as an attribute on
+    # its parent module so attribute traversal (e.g. by unittest.mock.patch) works.
+    # Returns None.
     """Insert namespace-style modules for ``areal`` ancestors with real paths."""
     for name, path in _STUB_PACKAGES:
         if name not in sys.modules:

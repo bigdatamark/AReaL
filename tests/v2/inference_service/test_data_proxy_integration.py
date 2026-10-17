@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# GPU integration tests for the data proxy FastAPI app against real SGLang (and vLLM)
+# servers launched as module-scoped subprocesses. The app is wired manually (ASGI
+# lifespan is not run by httpx.ASGITransport) with a real TokenizerProxy, InfBridge and
+# ArealOpenAI client, and exercised in-process for session lifecycle, streaming and
+# non-streaming chat, auth, pause/resume blocking, and abort/resubmit during generation.
+# Tests skip without a GPU.
 """Integration tests for data proxy with a real SGLang server.
 
 Requires GPU and a model. Run with:
@@ -34,14 +41,22 @@ SERVER_STARTUP_TIMEOUT = 180  # seconds
 
 
 def _get_test_model_path() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the Qwen3-0.6B path via tests.utils.get_model_path (local or
+    # download).
     return get_model_path(LOCAL_MODEL_PATH, HF_MODEL_ID)
 
 
 def _has_gpu() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True iff CUDA is available with at least one device.
     return torch.cuda.is_available() and torch.cuda.device_count() > 0
 
 
 def _check_server_health(base_url: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: GETs {base_url}/health (10s timeout); True on 200, False on non-200 or any
+    # httpx.HTTPError.
     try:
         resp = httpx.get(f"{base_url}/health", timeout=10)
         return resp.status_code == 200
@@ -56,6 +71,14 @@ def _check_server_health(base_url: str) -> bool:
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC]
+    # Module fixture: skips without a GPU; launches an SGLang server (skip tokenizer
+    # init, mem fraction 0.3, tp 1, GPU 0) on the host IP with free HTTP and dist ports,
+    # polls health each second up to SERVER_STARTUP_TIMEOUT (kill + fail on timeout),
+    # yields {host, port, base_url}, then kills the process tree.
+    # KNOWN ISSUE: the docstring says it yields a tuple, but it yields a dict; the
+    # post-loop elapsed-time check can also fail a server that became healthy right at
+    # the deadline.
     """Launch an SGLang server and yield its ``(host, port, base_url)``."""
     if not _has_gpu():
         pytest.skip("GPU required for SGLang server")
@@ -99,6 +122,11 @@ def sglang_server():
 
 @pytest.fixture(scope="module")
 def vllm_server():
+    # [FUNCTION DOC]
+    # Module fixture: skips without a GPU; launches a vLLM server via
+    # integration_utils.launch_vllm_server, yields its info dict (host, port, base_url)
+    # and kills the process tree afterwards.
+    # KNOWN ISSUE: the docstring says it yields a tuple, but it yields a dict.
     """Launch a vLLM server and yield its ``(host, port, base_url)``."""
     if not _has_gpu():
         pytest.skip("GPU required for vLLM server")
@@ -116,6 +144,8 @@ def vllm_server():
 
 @pytest.fixture(scope="module")
 def model_path() -> str:
+    # [FUNCTION DOC]
+    # Module fixture: returns the test model path.
     return _get_test_model_path()
 
 
@@ -125,6 +155,12 @@ def model_path() -> str:
 
 
 def _create_data_proxy_app_with_sessions(sglang_server, model_path):
+    # [FUNCTION DOC]
+    # HELPER: Builds a data proxy app for the SGLang server (port 0, 60s timeout) and
+    # wires app.state by hand: TokenizerProxy(model_path), a fresh PauseState, an
+    # InfBridge with SGLangBridgeBackend, an ArealOpenAI client over that bridge and the
+    # raw tokenizer, the config, a new SessionStore and version 0. Returns (app, session
+    # store).
     """Create a fully-wired data proxy app with session support."""
     from areal.experimental.openai.client import ArealOpenAI
     from areal.v2.inference_service.data_proxy.app import create_app
@@ -170,6 +206,9 @@ def _create_data_proxy_app_with_sessions(sglang_server, model_path):
 
 
 def _create_data_proxy_app_vllm(vllm_server, model_path):
+    # [FUNCTION DOC]
+    # HELPER: Same as _create_data_proxy_app_with_sessions but with backend_type "vllm"
+    # and a VLLMBridgeBackend pointed at the vLLM server. Returns (app, session store).
     """Create a data proxy app backed by vLLM with session support."""
     from areal.experimental.openai.client import ArealOpenAI
     from areal.v2.inference_service.data_proxy.app import create_app
@@ -219,10 +258,18 @@ ADMIN_KEY = "areal-admin-key"
 @pytest.mark.sglang
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestChatCompletionsIntegration:
+    # [CLASS DOC]
+    # Session-based /chat/completions tests against real SGLang.
     """Test the full /chat/completions endpoint with a real SGLang backend."""
 
     @pytest.mark.asyncio
     async def test_non_streaming_chat_completion(self, sglang_server, model_path):
+        # [FUNCTION DOC]
+        # Starts a session with the admin key (201), sends a greedy non-streaming chat
+        # with the session key, validates the OpenAI structure and usage totals, then
+        # set_reward 0.0 and asserts interaction_count 1 and ready_transition True.
+        # KNOWN ISSUE: the docstring says set_reward(finish=True) but no finish flag is
+        # sent; the test relies on the default behaviour finishing the trajectory.
         """Full lifecycle: start_session → POST /chat/completions → set_reward(finish=True)."""
         app, store = _create_data_proxy_app_with_sessions(sglang_server, model_path)
 
@@ -295,6 +342,11 @@ class TestChatCompletionsIntegration:
 
     @pytest.mark.asyncio
     async def test_streaming_chat_completion(self, sglang_server, model_path):
+        # [FUNCTION DOC]
+        # Starts a session and sends a streaming chat; asserts an SSE response whose
+        # parsed chunks (up to [DONE]) number >= 2, start with an assistant role delta,
+        # end with finish_reason stop/length, include content, and share one id; then
+        # set_reward 0.0 (200).
         """Streaming: start_session → POST /chat/completions stream=True → SSE chunks."""
         app, store = _create_data_proxy_app_with_sessions(sglang_server, model_path)
 
@@ -372,6 +424,10 @@ class TestChatCompletionsIntegration:
 
     @pytest.mark.asyncio
     async def test_multi_turn_chat_completion(self, sglang_server, model_path):
+        # [FUNCTION DOC]
+        # Two sequential greedy chats in one session (second includes the first answer
+        # as history); asserts both succeed with distinct ids, and set_reward reports
+        # interaction_count 2 and ready_transition True.
         """Multi-turn: two sequential chat completions in the same session."""
         app, store = _create_data_proxy_app_with_sessions(sglang_server, model_path)
 
@@ -447,6 +503,10 @@ class TestChatCompletionsIntegration:
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_set_reward_and_export(self, sglang_server, model_path):
+        # [FUNCTION DOC]
+        # Skipped (pending traj schema migration). Start session, chat, set_reward 1.0
+        # (asserts message "success", one interaction, ready), then export the session
+        # and assert one interaction with tensor_dict, reward 1.0 and interaction_id.
         """Full lifecycle: start → chat → set_reward(finish=True) → export_trajectories."""
         app, store = _create_data_proxy_app_with_sessions(sglang_server, model_path)
 
@@ -516,6 +576,10 @@ class TestChatCompletionsIntegration:
 
     @pytest.mark.asyncio
     async def test_auth_rejection(self, sglang_server, model_path):
+        # [FUNCTION DOC]
+        # Asserts start_session without auth is 401, with a wrong admin key is 403, and
+        # that a chat with an unknown bearer key is still served (200) in standalone
+        # mode.
         """Verify that invalid API keys are rejected."""
         app, store = _create_data_proxy_app_with_sessions(sglang_server, model_path)
 
@@ -563,6 +627,8 @@ class TestChatCompletionsIntegration:
 @pytest.mark.sglang
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestPauseResumeIntegration:
+    # [CLASS DOC]
+    # Pause/continue endpoint and blocking behaviour with a real SGLang backend.
     """Test /pause_generation and /continue_generation with real SGLang backend.
 
     These tests verify that:
@@ -573,6 +639,10 @@ class TestPauseResumeIntegration:
 
     @pytest.mark.asyncio
     async def test_pause_continue_endpoints_respond(self, sglang_server, model_path):
+        # [FUNCTION DOC]
+        # Asserts /health paused flips False -> True after /pause_generation (status ok)
+        # and back to False after /continue_generation; these call the real SGLang pause
+        # endpoints.
         """Verify /pause_generation and /continue_generation return correct JSON."""
         app, store = _create_data_proxy_app_with_sessions(sglang_server, model_path)
 
@@ -611,6 +681,10 @@ class TestPauseResumeIntegration:
     async def test_chat_completions_blocked_while_paused(
         self, sglang_server, model_path
     ):
+        # [FUNCTION DOC]
+        # Starts a session, sets the PauseState directly, fires a chat as a background
+        # task, waits 1s and asserts it has not completed; then unpauses and asserts it
+        # completes (within 30s) with a valid assistant completion.
         """While PauseState is set, /chat/completions blocks until resumed."""
         import asyncio
 
@@ -670,6 +744,9 @@ class TestPauseResumeIntegration:
     async def test_chat_completions_after_pause_continue_cycle(
         self, sglang_server, model_path
     ):
+        # [FUNCTION DOC]
+        # Starts a session, calls /pause_generation then /continue_generation, and
+        # asserts a following chat completes normally.
         """Full cycle: pause → continue → /chat/completions works normally."""
         app, store = _create_data_proxy_app_with_sessions(sglang_server, model_path)
 
@@ -714,6 +791,9 @@ class TestPauseResumeIntegration:
     async def test_streaming_chat_completions_blocked_while_paused(
         self, sglang_server, model_path
     ):
+        # [FUNCTION DOC]
+        # Like the blocked-while-paused test but streaming: after unpausing, asserts an
+        # SSE response with >= 2 chunks ending in finish_reason stop/length.
         """While paused, streaming /chat/completions blocks until resumed."""
         import asyncio
 
@@ -788,6 +868,9 @@ class TestPauseResumeIntegration:
 @pytest.mark.sglang
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestConcurrentPauseDuringGeneration:
+    # [CLASS DOC]
+    # Abort/resubmit tests: pause the real SGLang server mid-generation and verify the
+    # InfBridge transparently resumes and completes the request.
     """Test the real abort/resubmit cycle by pausing SGLang mid-generation.
 
     These tests fire a long-running /chat/completions request
@@ -802,6 +885,10 @@ class TestConcurrentPauseDuringGeneration:
     async def test_pause_during_chat_completions_then_resume(
         self, sglang_server, model_path
     ):
+        # [FUNCTION DOC]
+        # Starts a session, concurrently runs a 256-token sampled chat and a task that
+        # pauses after 0.5s and continues 1s later; asserts the chat returns a valid
+        # completion (non-empty content, finish stop/length, completion_tokens > 0).
         """Pause SGLang while /chat/completions is in-flight, resume, verify.
 
         Flow:
@@ -828,6 +915,9 @@ class TestConcurrentPauseDuringGeneration:
             session_api_key = resp.json()["sessions"][0]["session_api_key"]
 
             async def do_chat():
+                # [FUNCTION DOC]
+                # HELPER: Posts the long "ocean poem" chat request with the session key
+                # (120s timeout) and returns the response.
                 return await client.post(
                     "/chat/completions",
                     json={
@@ -846,6 +936,9 @@ class TestConcurrentPauseDuringGeneration:
                 )
 
             async def pause_then_resume():
+                # [FUNCTION DOC]
+                # HELPER: Sleeps 0.5s, POSTs /pause_generation, sleeps 1s, POSTs
+                # /continue_generation.
                 await asyncio.sleep(0.5)
                 await client.post("/pause_generation")
                 await asyncio.sleep(1.0)
@@ -874,6 +967,10 @@ class TestConcurrentPauseDuringGeneration:
     async def test_pause_during_streaming_chat_then_resume(
         self, sglang_server, model_path
     ):
+        # [FUNCTION DOC]
+        # Streaming variant of the concurrent pause test; asserts an SSE response with
+        # >= 2 chunks, role delta first, finish_reason last and at least one content
+        # chunk.
         """Pause SGLang while streaming /chat/completions, resume, verify SSE.
 
         Streaming response starts only after resubmit_backend.generate() returns,
@@ -899,6 +996,9 @@ class TestConcurrentPauseDuringGeneration:
             session_api_key = resp.json()["sessions"][0]["session_api_key"]
 
             async def do_stream_chat():
+                # [FUNCTION DOC]
+                # HELPER: Posts the long streaming "quantum mechanics" chat request and
+                # returns the response.
                 return await client.post(
                     "/chat/completions",
                     json={
@@ -918,6 +1018,9 @@ class TestConcurrentPauseDuringGeneration:
                 )
 
             async def pause_then_resume():
+                # [FUNCTION DOC]
+                # HELPER: Sleeps 0.5s, POSTs /pause_generation, sleeps 1s, POSTs
+                # /continue_generation.
                 await asyncio.sleep(0.5)
                 await client.post("/pause_generation")
                 await asyncio.sleep(1.0)
@@ -967,9 +1070,15 @@ class TestConcurrentPauseDuringGeneration:
 @pytest.mark.vllm
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestChatCompletionsVLLM:
+    # [CLASS DOC]
+    # Session chat tests against a real vLLM backend.
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_non_streaming_chat_completion_vllm(self, vllm_server, model_path):
+        # [FUNCTION DOC]
+        # Skipped (pending traj schema migration). vLLM lifecycle: start session, greedy
+        # chat (validates structure/usage), set_reward 1.0 (one interaction, ready),
+        # export the session and assert one interaction with reward 1.0.
         """Full lifecycle: start → chat → set_reward → end → export via vLLM."""
         app, _store = _create_data_proxy_app_vllm(vllm_server, model_path)
 
@@ -1035,6 +1144,10 @@ class TestChatCompletionsVLLM:
 
     @pytest.mark.asyncio
     async def test_streaming_chat_completion_vllm(self, vllm_server, model_path):
+        # [FUNCTION DOC]
+        # Starts a session and streams a greedy chat via vLLM; asserts >= 2 SSE chunks
+        # with role first and finish_reason last, then set_reward 0.0 reports
+        # ready_transition True.
         """Streaming /chat/completions through vLLM backend."""
         app, _store = _create_data_proxy_app_vllm(vllm_server, model_path)
 
@@ -1093,8 +1206,14 @@ class TestChatCompletionsVLLM:
 @pytest.mark.vllm
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestPauseResumeVLLM:
+    # [CLASS DOC]
+    # Pause/continue endpoint checks with a real vLLM backend.
     @pytest.mark.asyncio
     async def test_pause_continue_endpoints_respond_vllm(self, vllm_server, model_path):
+        # [FUNCTION DOC]
+        # Asserts /health paused flag toggles False -> True -> False across
+        # /pause_generation and /continue_generation, each returning 200 with the
+        # matching paused value.
         """Verify /pause_generation and /continue_generation work with vLLM."""
         app, _store = _create_data_proxy_app_vllm(vllm_server, model_path)
 

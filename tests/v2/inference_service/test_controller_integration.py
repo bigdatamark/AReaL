@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Slow GPU integration tests for RolloutControllerV2 against real inference servers. A
+# module-scoped pre-launched SGLang server backs the lifecycle/version/pause/rollout
+# tests; parametrized "full init" fixtures (SGLang and vLLM, selectable via -m markers)
+# let the controller launch the server itself through a LocalScheduler and RPC guard,
+# covering health, chat via the gateway, RTensor localization, online/inline agent
+# workflows with reward discounting, and VLM image chat with Qwen3-VL-2B. Network I/O,
+# subprocesses and GPU use throughout; tests skip without a GPU.
 """Integration tests for RolloutControllerV2 with real inference servers.
 
 Requires GPU and a model. Marked @pytest.mark.slow to exclude from default CI.
@@ -47,6 +55,10 @@ SERVER_STARTUP_TIMEOUT = 180  # seconds
 
 
 def _ignore_closed_handler_runtime_error(callable_obj, *args, **kwargs) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Calls callable_obj(*args, **kwargs) and swallows RuntimeError only when
+    # its message contains one of the known teardown-noise tokens (set_version(, or
+    # pause/continue_generation/offload/onload "failed on ALL"); other errors re-raise.
     """Best-effort cleanup for flaky control-plane teardown calls.
 
     Some controller cleanup paths can raise after the gateway handler closes even
@@ -72,6 +84,10 @@ def _post_gateway_control_to_all_workers(
     gateway_controller,
     endpoint_template: str,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: For every worker id in the controller's private _worker_ids, synchronously
+    # POSTs {} to the gateway at endpoint_template formatted with worker_id, using the
+    # admin bearer key and a 10s timeout; asserts each response is 200.
     for worker_id in gateway_controller._worker_ids.values():
         resp = httpx.post(
             f"{gateway_controller.proxy_gateway_addr}{endpoint_template.format(worker_id=worker_id)}",
@@ -85,6 +101,11 @@ def _post_gateway_control_to_all_workers(
 
 
 def _resume_with_gateway_fallback(gateway_controller) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Calls controller.resume(); if it raises RuntimeError "continue_generation
+    # failed on ALL", falls back to posting /continue_generation/{worker_id} through the
+    # gateway for every worker and resumes the private workflow executor if present.
+    # Other errors re-raise.
     try:
         gateway_controller.resume()
     except RuntimeError as exc:
@@ -107,6 +128,11 @@ def _export_trajectory_with_retry(
     timeout: float = 30.0,
     wait_timeout: float = 20.0,
 ) -> dict[str, object]:
+    # [FUNCTION DOC]
+    # HELPER: Polls POST {gateway_url}/export_trajectories (session_ids [session_id],
+    # given discount, style "individual", admin bearer key, per-request timeout) every
+    # 0.2s until it returns 200 or wait_timeout seconds pass. Returns the JSON body on
+    # success; otherwise calls pytest.fail with the last status and body.
     deadline = time.time() + wait_timeout
     last_response = None
     while time.time() < deadline:
@@ -131,6 +157,9 @@ def _export_trajectory_with_retry(
 
 
 def _make_solid_color_png_b64(width: int, height: int, color: tuple) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns base64 (UTF-8 str) of a solid-color RGB PNG of the given size and
+    # color.
     img = Image.new("RGB", (width, height), color=color)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -140,6 +169,14 @@ def _make_solid_color_png_b64(width: int, height: int, color: tuple) -> str:
 def _do_vlm_chat_session(
     ctrl, task_id: str, messages: list, *, max_tokens: int = 64
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Through the controller's gateway, starts a session for task_id with the
+    # hard-coded admin key "test-admin" (expects 201), sends a greedy non-streaming chat
+    # completion with the given messages and max_completion_tokens (expects 200, one
+    # choice, non-empty content, completion_tokens > 0), then finishes it with
+    # set_reward 0.0 and finish True (expects 200). Returns the completion JSON.
+    # KNOWN ISSUE: the docstring says "end_session" but the session is finished via
+    # /rl/set_reward with finish=True.
     """start_session → chat/completions → end_session."""
     gw = ctrl._gateway_addr
     admin = "test-admin"
@@ -184,6 +221,9 @@ def _do_vlm_chat_session(
 
 
 class _FakeDataLoader:
+    # [CLASS DOC]
+    # HELPER: Minimal dataloader stub: iterating yields the whole item list once as a
+    # single batch; exposes batch_size.
     """Minimal dataloader stub for prepare_batch tests.
 
     Yields one batch of dicts per iteration with a `.batch_size` attribute,
@@ -191,16 +231,26 @@ class _FakeDataLoader:
     """
 
     def __init__(self, items: list[dict], batch_size: int = 1) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Stores items and batch_size (default 1).
         self._items = items
         self.batch_size = batch_size
 
     def __iter__(self):
+        # [FUNCTION DOC]
+        # HELPER: Yields the stored item list once.
         yield self._items
 
 
 def _server_args_for_backend(
     backend: str, model_path: str, *, mem: float = 0.15
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a launch-args dict for backend "sglang" (SGLangConfig with
+    # skip_tokenizer_init and mem_fraction_static=mem, tp 1, base GPU 0) or "vllm"
+    # (vLLMConfig with gpu_memory_utilization=mem, tp/pp 1) via the config class's
+    # build_args, so all dataclass defaults are included. mem defaults to 0.15. Raises
+    # ValueError for other backends.
     """Return backend-specific ``server_args`` for full-init fixtures.
 
     Mirrors the production path in ``rl_trainer.py``: build the backend's
@@ -244,6 +294,14 @@ def _server_args_for_backend(
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC]
+    # Module fixture: skips without a GPU; launches an SGLang server subprocess for the
+    # test model on the host IP with two free ports (HTTP and dist init), polling health
+    # once per second up to SERVER_STARTUP_TIMEOUT; on timeout kills it and fails.
+    # Yields a dict with host, port, base_url and process, then kills the process tree.
+    # KNOWN ISSUE: timeout is re-checked after the loop by elapsed time, so a server
+    # that becomes healthy right at the deadline (health checks can take up to 30s) is
+    # treated as a failure.
     """Launch an SGLang server and yield its (host, port, base_url)."""
     if not has_gpu():
         pytest.skip("GPU required for SGLang server")
@@ -288,11 +346,17 @@ def sglang_server():
 
 @pytest.fixture(scope="module")
 def model_path() -> str:
+    # [FUNCTION DOC]
+    # Module fixture: returns the test model path (may download).
     """Return the test model path."""
     return get_test_model_path()
 
 
 def _make_local_scheduler(tmp_path_factory: pytest.TempPathFactory, name: str):
+    # [FUNCTION DOC]
+    # HELPER: Skips without a GPU; creates a module-lifetime temp dir with fileroot and
+    # name_resolve subdirs and returns a LocalScheduler on GPU 0 using
+    # EXPR_NAME/TRIAL_NAME and those paths.
     """Create a LocalScheduler with a module-lifetime temp root."""
     if not has_gpu():
         pytest.skip("GPU required for LocalScheduler")
@@ -321,6 +385,12 @@ def _make_gateway_controller_config(
     online_mode: bool = False,
     set_reward_finish_timeout: float = 0.0,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Returns an InferenceEngineConfig for the pre-launched-server controller:
+    # backend sglang:d1, tokenizer and model = model_path, an _OnlineAgent AgentConfig
+    # in "online" or "inline" mode with the given set_reward_finish_timeout, a CPU-only
+    # guard SchedulingSpec, consumer batch 8, offpolicyness 1024, 180s setup timeout and
+    # admin key "test-admin".
     from areal.api.cli_args import (
         AgentConfig,
         InferenceEngineConfig,
@@ -352,6 +422,9 @@ def _make_gateway_controller_config(
 
 
 def _make_server_info(sglang_server: dict[str, object]):
+    # [FUNCTION DOC]
+    # HELPER: Wraps the sglang_server fixture dict into a LocalInfServerInfo (process,
+    # host, port).
     from areal.api.io_struct import LocalInfServerInfo
 
     return LocalInfServerInfo(
@@ -363,6 +436,11 @@ def _make_server_info(sglang_server: dict[str, object]):
 
 @pytest.fixture(scope="module")
 def gateway_controller(sglang_server, model_path, tmp_path_factory):
+    # [FUNCTION DOC]
+    # Module fixture: skips without a GPU; builds a RolloutControllerV2 on a
+    # LocalScheduler, initializes it with role "rollout" against the pre-launched SGLang
+    # server (waiting for readiness), yields it, then destroys it and deletes all
+    # scheduler workers.
     """Create and initialize a RolloutControllerV2, yield it, then destroy."""
     if not has_gpu():
         pytest.skip("GPU required")
@@ -400,6 +478,11 @@ _backend_params = [
 
 @pytest.fixture(scope="module", params=_backend_params)
 def gateway_controller_full_init(request, model_path, tmp_path_factory):
+    # [FUNCTION DOC]
+    # Module fixture parametrized over sglang/vllm: builds a controller whose config
+    # requests 1 GPU for the guard and lets initialize() launch the inference server
+    # using _server_args_for_backend (300s setup timeout). Yields it; destroys and
+    # deletes workers on teardown.
     """Controller that launches an inference server via the full init path.
 
     Parametrized to test both SGLang and vLLM backends.
@@ -446,6 +529,8 @@ def gateway_controller_full_init(request, model_path, tmp_path_factory):
 
 @pytest.fixture(scope="module", params=_backend_params)
 def gateway_controller_full_init_online(request, model_path, tmp_path_factory):
+    # [FUNCTION DOC]
+    # Like gateway_controller_full_init but with the _OnlineAgent in "online" mode.
     """Full-init controller with online mode enabled.
 
     Parametrized to test both SGLang and vLLM backends.
@@ -502,6 +587,9 @@ def gateway_controller_full_init_online(request, model_path, tmp_path_factory):
 def gateway_controller_full_init_with_reward_timeout(
     request, model_path, tmp_path_factory
 ):
+    # [FUNCTION DOC]
+    # Like gateway_controller_full_init but with an "inline" _OnlineAgent and
+    # set_reward_finish_timeout 3.0 (rewards do not immediately finish a trajectory).
     """Full-init controller with reward finish timeout.
 
     Parametrized to test both SGLang and vLLM backends.
@@ -558,11 +646,16 @@ def gateway_controller_full_init_with_reward_timeout(
 
 @pytest.fixture(scope="module")
 def vlm_model_path() -> str:
+    # [FUNCTION DOC]
+    # Module fixture: returns the Qwen3-VL-2B model path (may download).
     return get_vlm_test_model_path()
 
 
 @pytest.fixture(scope="module", params=_backend_params)
 def gateway_controller_full_init_vlm(request, vlm_model_path, tmp_path_factory):
+    # [FUNCTION DOC]
+    # Like gateway_controller_full_init but for the VLM model, with 600s setup timeout
+    # and mem fraction 0.25.
     """Full-init controller for VLM (Qwen3-VL-2B-Instruct).
 
     Parametrized to test both SGLang and vLLM backends.
@@ -616,15 +709,23 @@ def gateway_controller_full_init_vlm(request, vlm_model_path, tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.skipif(not has_gpu(), reason="GPU required")
 class TestControllerLifecycle:
+    # [CLASS DOC]
+    # Lifecycle checks on the pre-launched SGLang controller: services started and
+    # healthy.
     """Verify controller lifecycle: init starts services, properties set, destroy cleans up."""
 
     def test_gateway_services_started(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Asserts gateway and router addresses are non-empty and at least one data proxy
+        # exists.
         """After initialization, gateway services should be running."""
         assert gateway_controller._gateway_addr != ""
         assert gateway_controller._router_addr != ""
         assert len(gateway_controller._data_proxy_addrs) > 0
 
     def test_gateway_health(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Asserts GET gateway /health returns 200 with status "ok".
         """The gateway HTTP service should respond healthy."""
         addr = gateway_controller._gateway_addr
         resp = httpx.get(f"{addr}/health", timeout=10.0)
@@ -632,6 +733,8 @@ class TestControllerLifecycle:
         assert resp.json()["status"] == "ok"
 
     def test_router_health(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Asserts router /health returns 200, status "ok" and at least one worker.
         """The router HTTP service should respond healthy with 1 worker."""
         resp = httpx.get(f"{gateway_controller._router_addr}/health", timeout=10.0)
         assert resp.status_code == 200
@@ -640,6 +743,8 @@ class TestControllerLifecycle:
         assert data["workers"] >= 1
 
     def test_data_proxy_health(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Asserts the first data proxy's /health returns 200 with status "ok".
         """The data proxy HTTP service should respond healthy."""
         dp_addr = gateway_controller._data_proxy_addrs[0]
         resp = httpx.get(f"{dp_addr}/health", timeout=10.0)
@@ -656,13 +761,20 @@ class TestControllerLifecycle:
 @pytest.mark.sglang
 @pytest.mark.skipif(not has_gpu(), reason="GPU required")
 class TestControllerVersioning:
+    # [CLASS DOC]
+    # Version management on the real controller.
     """Verify version management on the controller."""
 
     def test_default_version_is_zero(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Asserts the controller starts at version 0.
         """Controller should start at version 0."""
         assert gateway_controller.get_version() == 0
 
     def test_set_version_updates_local(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Asserts set_version(5) updates get_version(); resets to 0 afterwards,
+        # tolerating known teardown RuntimeErrors.
         """set_version should update the local version."""
         try:
             gateway_controller.set_version(5)
@@ -680,9 +792,14 @@ class TestControllerVersioning:
 @pytest.mark.sglang
 @pytest.mark.skipif(not has_gpu(), reason="GPU required")
 class TestControllerPauseResume:
+    # [CLASS DOC]
+    # Pause/resume broadcast checks against real data proxies.
     """Verify pause/resume broadcasts to workers."""
 
     def test_pause_broadcasts_to_workers(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Calls pause() and asserts the first data proxy's /health reports paused True;
+        # always resumes (with gateway fallback) afterwards.
         """pause() should broadcast pause to all data proxy workers."""
         try:
             gateway_controller.pause()
@@ -694,6 +811,9 @@ class TestControllerPauseResume:
             _resume_with_gateway_fallback(gateway_controller)
 
     def test_resume_broadcasts_to_workers(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Pauses then resumes (with fallback) and asserts the data proxy reports paused
+        # False.
         """resume() should broadcast resume to all data proxy workers."""
         gateway_controller.pause()
         _resume_with_gateway_fallback(gateway_controller)
@@ -703,6 +823,9 @@ class TestControllerPauseResume:
         assert resp.json().get("paused") is False
 
     def test_pause_resume_roundtrip_keeps_services_healthy(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Pauses, waits 0.5s, resumes, waits 0.5s, then asserts gateway and router
+        # /health are 200.
         """After pause → resume, all services should remain healthy."""
         gateway_controller.pause()
         time.sleep(0.5)
@@ -726,9 +849,14 @@ class TestControllerPauseResume:
 @pytest.mark.sglang
 @pytest.mark.skipif(not has_gpu(), reason="GPU required")
 class TestControllerRolloutBatch:
+    # [CLASS DOC]
+    # rollout_batch with the SimpleAgent test workflow.
     """Test rollout_batch through the controller with SimpleAgent workflow."""
 
     def test_rollout_batch_with_simple_agent(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Runs rollout_batch on one arithmetic prompt with the SimpleAgent import path;
+        # asserts a one-element list of dicts whose input_ids is a 2-D RTensor.
         """rollout_batch with SimpleAgent should return list of trajectory dicts."""
         data = [
             {
@@ -763,9 +891,14 @@ class TestControllerRolloutBatch:
 @pytest.mark.sglang
 @pytest.mark.skipif(not has_gpu(), reason="GPU required")
 class TestControllerPrepareBatch:
+    # [CLASS DOC]
+    # prepare_batch with the SimpleAgent test workflow.
     """Test prepare_batch through the controller with SimpleAgent workflow."""
 
     def test_prepare_batch_returns_results(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Runs prepare_batch over a _FakeDataLoader of two prompts; asserts a non-empty
+        # list whose first trajectory has a 2-D RTensor input_ids.
         """prepare_batch should return a list of trajectory dicts."""
         items = [
             {
@@ -804,9 +937,14 @@ class TestControllerPrepareBatch:
 @pytest.mark.sglang
 @pytest.mark.skipif(not has_gpu(), reason="GPU required")
 class TestControllerSubmitWait:
+    # [CLASS DOC]
+    # submit/wait API.
     """Test submit/wait API on the controller."""
 
     def test_submit_wait_roundtrip(self, gateway_controller):
+        # [FUNCTION DOC]
+        # Submits one task with SimpleAgent (asserts an int task id), waits for 1 result
+        # up to 120s, and asserts the single result is None (rejected) or a dict.
         """submit + wait should complete a full roundtrip."""
         data = {
             "messages": [{"role": "user", "content": "Say hello."}],
@@ -836,6 +974,9 @@ class TestControllerSubmitWait:
 @pytest.mark.slow
 @pytest.mark.skipif(not has_gpu(), reason="GPU required")
 class TestControllerFullInitialization:
+    # [CLASS DOC]
+    # Full-init controller tests (controller launches the inference server), for both
+    # backends.
     """Test the full initialization path where the controller launches the server.
 
     Parametrized via ``gateway_controller_full_init`` to cover both SGLang and
@@ -844,6 +985,8 @@ class TestControllerFullInitialization:
     """
 
     def test_server_infos_populated(self, gateway_controller_full_init):
+        # [FUNCTION DOC]
+        # Asserts server_infos is non-empty and the first has a host and positive port.
         """server_infos should be populated after full init."""
         ctrl = gateway_controller_full_init
         assert len(ctrl.server_infos) > 0
@@ -852,6 +995,8 @@ class TestControllerFullInitialization:
         assert info.port > 0
 
     def test_inf_server_health(self, gateway_controller_full_init):
+        # [FUNCTION DOC]
+        # Asserts every private _inf_addrs server answers /health with 200.
         """The inference server launched by the controller should be healthy."""
         ctrl = gateway_controller_full_init
         for addr in ctrl._inf_addrs:
@@ -859,12 +1004,16 @@ class TestControllerFullInitialization:
             assert resp.status_code == 200
 
     def test_gateway_health(self, gateway_controller_full_init):
+        # [FUNCTION DOC]
+        # Asserts the gateway /health returns 200.
         """Gateway should be healthy after full init."""
         ctrl = gateway_controller_full_init
         resp = httpx.get(f"{ctrl._gateway_addr}/health", timeout=10.0)
         assert resp.status_code == 200
 
     def test_data_proxy_health(self, gateway_controller_full_init):
+        # [FUNCTION DOC]
+        # Asserts every data proxy /health returns 200.
         """Data proxies should be healthy after full init."""
         ctrl = gateway_controller_full_init
         for dp_addr in ctrl._data_proxy_addrs:
@@ -872,6 +1021,9 @@ class TestControllerFullInitialization:
             assert resp.status_code == 200
 
     def test_data_proxy_forked_from_inf_workers(self, gateway_controller_full_init):
+        # [FUNCTION DOC]
+        # Asserts at least one service role ends with the controller's _INF_SUFFIX and
+        # at least one "data-proxy" entry exists in the private _forked_services list.
         """Data proxies should have been forked via RPCGuard in full init path."""
         ctrl = gateway_controller_full_init
         # Verify at least one inf role is registered
@@ -886,6 +1038,12 @@ class TestControllerFullInitialization:
         assert len(dp_entries) > 0, "No data-proxy entries in _forked_services"
 
     def test_chat_completion_via_gateway(self, gateway_controller_full_init):
+        # [FUNCTION DOC]
+        # Starts a session (201), sends a greedy non-streaming chat, validates the
+        # OpenAI-style structure (object, id, one assistant choice with non-empty
+        # content, finish_reason stop or length, consistent usage totals), then
+        # set_reward finish=True and asserts interaction_count 1 and ready_transition
+        # True.
         """Full e2e: start_session → /chat/completions → validate → set_reward."""
         ctrl = gateway_controller_full_init
         gw = ctrl._gateway_addr
@@ -952,6 +1110,11 @@ class TestControllerFullInitialization:
         assert resp.json()["ready_transition"] is True
 
     def test_rtensor_localize_on_rollout_result(self, gateway_controller_full_init):
+        # [FUNCTION DOC]
+        # Runs rollout_batch on one prompt; asserts input_ids is a meta-tensor RTensor
+        # whose shard node_addr includes a port, then RTensor.localize fetches real 2-D
+        # tensors (batch >= 1) from the data proxy; attention_mask, if present, is also
+        # materialized.
         """RTensor.localize() should successfully fetch tensors from data proxy."""
         ctrl = gateway_controller_full_init
         data = [
@@ -1000,6 +1163,9 @@ class TestControllerFullInitialization:
             assert not local_traj["attention_mask"].is_meta
 
     def test_rtensor_localize_batch4(self, gateway_controller_full_init):
+        # [FUNCTION DOC]
+        # Runs rollout_batch on 4 prompts; asserts 4 dicts each localizing to a real 2-D
+        # input_ids tensor.
         """RTensor.localize() on a batch of 4 should produce 4 trajectory dicts."""
         ctrl = gateway_controller_full_init
         batch_size = 4
@@ -1041,6 +1207,8 @@ class TestControllerFullInitialization:
 @pytest.mark.slow
 @pytest.mark.skipif(not has_gpu(), reason="GPU required")
 class TestControllerOnlineWorkflow:
+    # [CLASS DOC]
+    # Online/inline agent workflow tests through real gateway services.
     """Test controller-in-the-loop online workflow through real gateway services.
 
     Parametrized via ``gateway_controller_full_init_online`` and
@@ -1051,6 +1219,11 @@ class TestControllerOnlineWorkflow:
     def test_online_workflow_submit_wait_roundtrip(
         self, gateway_controller_full_init_online
     ):
+        # [FUNCTION DOC]
+        # Online mode: submits a task with workflow None (online, 120s timeout), sends a
+        # chat and a set_reward 1.0 with the admin key (HITL session "__hitl__",
+        # trajectory 0), then wait_for_task returns a dict whose localized "rewards"
+        # tensor's first value is 1.0.
         import requests
 
         gateway_url = gateway_controller_full_init_online.proxy_gateway_addr
@@ -1112,6 +1285,12 @@ class TestControllerOnlineWorkflow:
     def test_offline_export_applies_discount_after_multiple_rewards_in_same_trajectory(
         self, gateway_controller_full_init_with_reward_timeout
     ):
+        # [FUNCTION DOC]
+        # Inline mode with a 3s finish timeout: starts a session, does two chats each
+        # followed by set_reward (1.0 then 4.0) and asserts neither reward finishes the
+        # trajectory; then exports with discount 0.5 (with retry) and asserts
+        # interactions are in chat order with discounted rewards 3.0 (1.0 + 0.5 * 4.0)
+        # and 4.0.
         ctrl = gateway_controller_full_init_with_reward_timeout
         gateway_url = ctrl.proxy_gateway_addr
         assert ctrl.config.admin_api_key is not None
@@ -1203,6 +1382,8 @@ class TestControllerOnlineWorkflow:
 @pytest.mark.ci
 @pytest.mark.skipif(not has_gpu(), reason="GPU required")
 class TestControllerVLMImage:
+    # [CLASS DOC]
+    # VLM image chat tests using the full-init VLM controller.
     """VLM image chat tests via real Qwen3-VL-2B-Instruct inference.
 
     Parametrized via ``gateway_controller_full_init_vlm`` to cover both SGLang
@@ -1210,6 +1391,8 @@ class TestControllerVLMImage:
     """
 
     def test_single_image_chat(self, gateway_controller_full_init_vlm):
+        # [FUNCTION DOC]
+        # Sends one 64x64 red PNG data URL plus text through _do_vlm_chat_session.
         img = _make_solid_color_png_b64(64, 64, (255, 0, 0))
         messages = [
             {
@@ -1226,6 +1409,8 @@ class TestControllerVLMImage:
         _do_vlm_chat_session(gateway_controller_full_init_vlm, "vlm-1img", messages)
 
     def test_multiple_images_chat(self, gateway_controller_full_init_vlm):
+        # [FUNCTION DOC]
+        # Sends two 32x32 PNGs (red, blue) plus text, max 128 tokens.
         red = _make_solid_color_png_b64(32, 32, (255, 0, 0))
         blue = _make_solid_color_png_b64(32, 32, (0, 0, 255))
         messages = [
@@ -1252,6 +1437,8 @@ class TestControllerVLMImage:
         )
 
     def test_text_only_on_vlm(self, gateway_controller_full_init_vlm):
+        # [FUNCTION DOC]
+        # Sends a text-only prompt to the VLM, max 32 tokens.
         messages = [{"role": "user", "content": "What is 2+2? Answer briefly."}]
         _do_vlm_chat_session(
             gateway_controller_full_init_vlm,

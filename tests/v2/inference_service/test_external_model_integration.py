@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Integration-style tests (all in-process, no network) for external-model support in the
+# v2 inference service: gateway /export_trajectories routing and an end-to-end flow
+# wiring real gateway, router and data-proxy FastAPI apps together via
+# httpx.ASGITransport, with a mock external OpenAI-compatible server. Gateway-side
+# router/forward helpers are patched in ROUTER_MODULE
+# (areal.v2.inference_service.gateway.app).
 from __future__ import annotations
 
 import json
@@ -32,11 +39,16 @@ ROUTER_MODULE = "areal.v2.inference_service.gateway.app"
 
 
 def admin_headers() -> dict[str, str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns an Authorization bearer header dict for ADMIN_KEY.
     return {"Authorization": f"Bearer {ADMIN_KEY}"}
 
 
 @pytest.fixture
 def router_config() -> RouterConfig:
+    # [FUNCTION DOC]
+    # Fixture: RouterConfig on 127.0.0.1:18081 with ADMIN_KEY, a 999s poll interval
+    # (effectively no health polling) and round_robin routing.
     return RouterConfig(
         host="127.0.0.1",
         port=18081,
@@ -48,6 +60,9 @@ def router_config() -> RouterConfig:
 
 @pytest.fixture
 def gateway_config() -> GatewayConfig:
+    # [FUNCTION DOC]
+    # Fixture: GatewayConfig on 127.0.0.1:18080 with ADMIN_KEY, router at
+    # "http://mock-router:8081", 2s router timeout and 30s forward timeout.
     return GatewayConfig(
         host="127.0.0.1",
         port=18080,
@@ -60,6 +75,9 @@ def gateway_config() -> GatewayConfig:
 
 @pytest_asyncio.fixture
 async def gateway_client(gateway_config: GatewayConfig):
+    # [FUNCTION DOC]
+    # Async fixture: yields an httpx AsyncClient over the gateway app (ASGI,
+    # "http://test").
     app = create_gateway_app(gateway_config)
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
@@ -67,6 +85,9 @@ async def gateway_client(gateway_config: GatewayConfig):
 
 
 class TestGatewayUnifiedExportTrajectories:
+    # [CLASS DOC]
+    # Tests for the gateway's unified /export_trajectories endpoint with router query,
+    # forwarding and session revocation patched as AsyncMocks.
     @pytest.mark.asyncio
     @patch(f"{ROUTER_MODULE}.revoke_session_in_router", new_callable=AsyncMock)
     @patch(f"{ROUTER_MODULE}.forward_request", new_callable=AsyncMock)
@@ -78,6 +99,11 @@ class TestGatewayUnifiedExportTrajectories:
         mock_revoke,
         gateway_client,
     ):
+        # [FUNCTION DOC]
+        # Router returns WORKER_ADDR and forward returns 200 with an interactions dict;
+        # posts session_ids ["ext-1"] with the admin key and asserts 200, one router
+        # query, and that the forwarded URL contains "/export_trajectories". Revocation
+        # is not asserted.
         mock_query_router.return_value = WORKER_ADDR
         mock_forward.return_value = httpx.Response(
             200,
@@ -107,6 +133,10 @@ class TestGatewayUnifiedExportTrajectories:
         mock_revoke,
         gateway_client,
     ):
+        # [FUNCTION DOC]
+        # Posts session_ids ["ses-1"] with group_id, discount and style "sft"; asserts
+        # 200, one router query, exactly one revoke_session_in_router call, and
+        # forwarding to "/export_trajectories".
         mock_query_router.return_value = WORKER_ADDR
         mock_forward.return_value = httpx.Response(200, json={"interactions": []})
 
@@ -137,6 +167,9 @@ class TestGatewayUnifiedExportTrajectories:
         mock_revoke,
         gateway_client,
     ):
+        # [FUNCTION DOC]
+        # Posts without session_ids; asserts 400 with "session_ids is required" in the
+        # error and that no router query, forward or revoke happened.
         resp = await gateway_client.post(
             "/export_trajectories",
             json={"discount": 1.0},
@@ -152,10 +185,29 @@ class TestGatewayUnifiedExportTrajectories:
 
 @pytest.mark.asyncio
 async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_config):
+    # [FUNCTION DOC]
+    # End-to-end external-model flow. Builds a mock external FastAPI app answering
+    # /chat/completions, real router and data-proxy apps (session store with ADMIN_KEY,
+    # version 0) and a gateway app, each behind its own ASGI client. Registers
+    # WORKER_ADDR in the router, then patches the gateway's register_model_in_router,
+    # query_router and forward_request with in-process fakes and replaces
+    # httpx.AsyncClient inside the data proxy module (and app.state.http_client) with
+    # _ExternalClient. Then via the gateway: registers model "ext-1" at
+    # "http://mock-external" (200), sends a chat completion (200, id "chatcmpl-mock"),
+    # sets reward 1.0 (trajectory_ready True), exports session "__hitl__" and asserts
+    # exactly one interaction whose request content is "hello" and whose cached JSON
+    # response content is "Mock response".
+    # KNOWN ISSUE: the initial data_proxy_app.state.http_client = httpx.AsyncClient(...)
+    # is overwritten without ever being closed (resource leak warning); the data-proxy
+    # config is also constructed twice redundantly.
     mock_external_app = FastAPI()
 
     @mock_external_app.post("/chat/completions")
     async def mock_chat(request: Request):
+        # [FUNCTION DOC]
+        # HELPER: Mock external endpoint; reads the JSON body and returns a fixed chat
+        # completion echoing body["model"] (default "mock-model") with content "Mock
+        # response" and usage 10/5/15.
         body = await request.json()
         return JSONResponse(
             {
@@ -250,6 +302,11 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             *,
             client: httpx.AsyncClient | None = None,
         ) -> dict:
+            # [FUNCTION DOC]
+            # HELPER: Fake register_model_in_router; ignores router_addr/admin
+            # key/timeout/client and POSTs model, url, api_key and data_proxy_addrs to
+            # the in-process router's /register_model with admin headers. Raises on HTTP
+            # error; returns the JSON body.
             del router_addr, admin_api_key, timeout, client
             resp = await router_client.post(
                 "/register_model",
@@ -275,6 +332,11 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             model: str | None = None,
             client: httpx.AsyncClient | None = None,
         ) -> str:
+            # [FUNCTION DOC]
+            # HELPER: Fake query_router; builds a payload with model (if given) and
+            # session_id, else api_key, POSTs it to the in-process router's /route,
+            # raises RouterKeyRejectedError on 404/503, raises on other HTTP errors, and
+            # returns the response's worker_addr.
             del router_addr, path, timeout, admin_api_key, client
             payload: dict = {}
             if model is not None:
@@ -301,6 +363,10 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             *,
             client: httpx.AsyncClient | None = None,
         ) -> httpx.Response:
+            # [FUNCTION DOC]
+            # HELPER: Fake forward_request; if upstream_url starts with WORKER_ADDR,
+            # strips that prefix and POSTs body/headers to the in-process data proxy;
+            # otherwise returns a synthetic 500 "unexpected upstream" response.
             del timeout, client
             if upstream_url.startswith(WORKER_ADDR):
                 path = upstream_url.removeprefix(WORKER_ADDR)
@@ -308,16 +374,30 @@ async def test_external_model_flow_end_to_end_gateway_router_data_proxy(router_c
             return httpx.Response(500, json={"error": "unexpected upstream"})
 
         class _ExternalClient:
+            # [CLASS DOC]
+            # HELPER: Stand-in for httpx.AsyncClient inside the data proxy: an async
+            # context manager whose post() asserts the URL is the mock external
+            # /chat/completions and forwards to the in-process external app.
             def __init__(self, *args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Accepts and ignores any constructor arguments.
                 pass
 
             async def __aenter__(self):
+                # [FUNCTION DOC]
+                # HELPER: Returns self on entering the async context.
                 return self
 
             async def __aexit__(self, exc_type, exc, tb):
+                # [FUNCTION DOC]
+                # HELPER: Returns False so exceptions propagate.
                 return False
 
             async def post(self, url, json=None, headers=None):
+                # [FUNCTION DOC]
+                # HELPER: Asserts url == "http://mock-external/chat/completions" and
+                # returns the external app's response to POST /chat/completions with the
+                # given json and headers.
                 assert url == "http://mock-external/chat/completions"
                 return await external_client.post(
                     "/chat/completions",

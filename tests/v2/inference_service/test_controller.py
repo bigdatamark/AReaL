@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Unit tests for RolloutControllerV2 (areal.v2.inference_service.controller): the
+# InferenceEngineConfig fields it relies on, workflow/agent resolution into
+# InferenceServiceWorkflow, public API surface, construction-time validation and local
+# state, stats export, and further behaviours below. Controllers are built with a
+# MagicMock scheduler and are generally not initialize()d; private fields are injected
+# and HTTP/scheduler interactions are mocked.
 """Tests for RolloutControllerV2."""
 
 from __future__ import annotations
@@ -19,6 +26,8 @@ from areal.v2.inference_service.controller.workflow import (
 
 
 def _make_scheduler(n_gpus_per_node: int = 8) -> MagicMock:
+    # [FUNCTION DOC]
+    # HELPER: Returns a MagicMock scheduler with n_gpus_per_node (default 8).
     scheduler = MagicMock()
     scheduler.n_gpus_per_node = n_gpus_per_node
     return scheduler
@@ -30,7 +39,14 @@ def _make_scheduler(n_gpus_per_node: int = 8) -> MagicMock:
 
 
 class TestInferenceEngineConfigForInferenceService:
+    # [CLASS DOC]
+    # Tests for InferenceEngineConfig defaults/overrides used by the inference service.
     def test_defaults(self):
+        # [FUNCTION DOC]
+        # Asserts defaults for backend "sglang:d1": admin key "areal-admin-key", model
+        # "default", consumer_batch_size 1, max_concurrent_rollouts None,
+        # max_head_offpolicyness 0, tracing off, and a default agent config pointing at
+        # the online _OnlineAgent class path.
         cfg = InferenceEngineConfig(backend="sglang:d1")
         assert cfg.admin_api_key == "areal-admin-key"
         assert cfg.model == "default"
@@ -45,6 +61,9 @@ class TestInferenceEngineConfigForInferenceService:
         )
 
     def test_custom_values(self):
+        # [FUNCTION DOC]
+        # Asserts custom admin key, batch size, concurrency, offpolicyness and an
+        # AgentConfig (set_reward_finish_timeout 3.0) are stored as given.
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="custom-key",
@@ -64,6 +83,8 @@ class TestInferenceEngineConfigForInferenceService:
         assert cfg.agent.set_reward_finish_timeout == 3.0
 
     def test_scheduling_fields(self):
+        # [FUNCTION DOC]
+        # Asserts request_timeout 60.0 and setup_timeout 600.0 are stored.
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             request_timeout=60.0,
@@ -73,10 +94,16 @@ class TestInferenceEngineConfigForInferenceService:
         assert cfg.setup_timeout == 600.0
 
     def test_dump_to_file_defaults_to_false(self):
+        # [FUNCTION DOC]
+        # Asserts dump_to_file defaults to False.
         cfg = InferenceEngineConfig(backend="sglang:d1")
         assert cfg.dump_to_file is False
 
     def test_deterministic_sampling_with_offpolicy_head_warns(self):
+        # [FUNCTION DOC]
+        # Patches the cli_args logger; asserts deterministic_sampling with
+        # max_head_offpolicyness 1 logs exactly one warning mentioning
+        # "task-to-weight-version".
         with patch("areal.api.cli_args.logger") as mock_logger:
             InferenceEngineConfig(
                 backend="sglang:d1",
@@ -88,6 +115,8 @@ class TestInferenceEngineConfigForInferenceService:
         assert "task-to-weight-version" in mock_logger.warning.call_args.args[0]
 
     def test_deterministic_sampling_onpolicy_does_not_warn(self):
+        # [FUNCTION DOC]
+        # Asserts deterministic sampling with offpolicyness 0 logs no warning.
         with patch("areal.api.cli_args.logger") as mock_logger:
             InferenceEngineConfig(
                 backend="sglang:d1",
@@ -98,6 +127,8 @@ class TestInferenceEngineConfigForInferenceService:
         mock_logger.warning.assert_not_called()
 
     def test_nondeterministic_sampling_with_offpolicy_head_does_not_warn(self):
+        # [FUNCTION DOC]
+        # Asserts non-deterministic sampling with offpolicyness 1 logs no warning.
         with patch("areal.api.cli_args.logger") as mock_logger:
             InferenceEngineConfig(
                 backend="sglang:d1",
@@ -114,7 +145,14 @@ class TestInferenceEngineConfigForInferenceService:
 
 
 class TestControllerWorkflowResolution:
+    # [CLASS DOC]
+    # Tests for RolloutControllerV2._resolve_workflow and _resolve_should_accept_fn.
     def test_resolve_workflow_with_instance(self):
+        # [FUNCTION DOC]
+        # Asserts _resolve_workflow(12345) raises TypeError mentioning a "callable run()
+        # method".
+        # KNOWN ISSUE: the name says "with_instance" but it actually tests rejection of
+        # a non-callable, non-agent object (an int).
         controller = RolloutControllerV2(
             config=InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key"),
             scheduler=MagicMock(n_gpus_per_node=8),
@@ -123,6 +161,11 @@ class TestControllerWorkflowResolution:
             controller._resolve_workflow(12345)
 
     def test_resolve_workflow_none_creates_online_inference_service_workflow(self):
+        # [FUNCTION DOC]
+        # With an AgentConfig (drop_retry_orphans True) and a gateway address, asserts
+        # _resolve_workflow(None, workflow_kwargs={"timeout": 3.0}) returns an online
+        # InferenceServiceWorkflow bound to this controller with agent None, timeout 3.0
+        # and drop_retry_orphans True.
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
@@ -147,6 +190,9 @@ class TestControllerWorkflowResolution:
         assert resolved.drop_retry_orphans is True
 
     def test_resolve_workflow_agent_class_creates_offline_workflow(self):
+        # [FUNCTION DOC]
+        # Asserts passing an agent class produces an InferenceServiceWorkflow holding an
+        # instance of that class and inheriting drop_retry_orphans True from the config.
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
@@ -160,7 +206,11 @@ class TestControllerWorkflowResolution:
         controller._gateway_addr = "http://test:8080"
 
         class MockAgent:
+            # [CLASS DOC]
+            # HELPER: Minimal agent class whose async run() returns reward 1.0.
             async def run(self, data, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Returns 1.0 regardless of inputs.
                 return 1.0
 
         resolved = controller._resolve_workflow(
@@ -174,6 +224,9 @@ class TestControllerWorkflowResolution:
         assert resolved.drop_retry_orphans is True
 
     def test_resolve_workflow_forwards_reward_normalization(self):
+        # [FUNCTION DOC]
+        # Asserts group_size=2 and reward_normalization=True passed to _resolve_workflow
+        # are forwarded onto the created workflow.
         controller = RolloutControllerV2(
             config=InferenceEngineConfig(
                 backend="sglang:d1",
@@ -184,7 +237,11 @@ class TestControllerWorkflowResolution:
         controller._gateway_addr = "http://test:8080"
 
         class MockAgent:
+            # [CLASS DOC]
+            # HELPER: Minimal agent class whose async run() returns reward 1.0.
             async def run(self, data, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Returns 1.0 regardless of inputs.
                 return 1.0
 
         resolved = controller._resolve_workflow(
@@ -198,13 +255,21 @@ class TestControllerWorkflowResolution:
         assert resolved.reward_normalization is True
 
     def test_resolve_should_accept_fn_none(self):
+        # [FUNCTION DOC]
+        # Asserts the static _resolve_should_accept_fn(None) returns None.
         assert RolloutControllerV2._resolve_should_accept_fn(None) is None
 
     def test_resolve_should_accept_fn_callable(self):
+        # [FUNCTION DOC]
+        # Asserts _resolve_should_accept_fn returns a given callable unchanged.
         fn = lambda x: True  # noqa: E731
         assert RolloutControllerV2._resolve_should_accept_fn(fn) is fn
 
     def test_resolve_workflow_with_agent_class(self):
+        # [FUNCTION DOC]
+        # With serialize_group_samples True, asserts an agent class is wrapped in an
+        # InferenceServiceWorkflow that has an agent, an arun_episode method and
+        # serialize_group_samples True.
         """Test _resolve_workflow wraps agent-like classes in InferenceServiceWorkflow."""
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
@@ -216,7 +281,11 @@ class TestControllerWorkflowResolution:
         controller._gateway_addr = "http://test:8080"
 
         class MockAgent:
+            # [CLASS DOC]
+            # HELPER: Minimal agent class whose async run() returns reward 1.0.
             async def run(self, data, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Returns 1.0 regardless of inputs.
                 return 1.0
 
         resolved = controller._resolve_workflow(
@@ -229,19 +298,29 @@ class TestControllerWorkflowResolution:
         assert resolved.serialize_group_samples is True
 
     def test_resolve_workflow_agent_class_without_gateway_raises(self):
+        # [FUNCTION DOC]
+        # Asserts resolving an agent class without a gateway address raises ValueError
+        # "Gateway address is unavailable".
         controller = RolloutControllerV2(
             config=InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key"),
             scheduler=MagicMock(n_gpus_per_node=8),
         )
 
         class MockAgent:
+            # [CLASS DOC]
+            # HELPER: Minimal agent class whose async run() returns reward 1.0.
             async def run(self, data, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Returns 1.0 regardless of inputs.
                 return 1.0
 
         with pytest.raises(ValueError, match="Gateway address is unavailable"):
             controller._resolve_workflow(MockAgent, workflow_kwargs={})
 
     def test_resolve_workflow_rollout_workflow_instance_raises(self):
+        # [FUNCTION DOC]
+        # Asserts passing an InferenceServiceWorkflow instance raises TypeError (direct
+        # RolloutWorkflow instances not supported).
         controller = RolloutControllerV2(
             config=InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key"),
             scheduler=MagicMock(n_gpus_per_node=8),
@@ -260,6 +339,9 @@ class TestControllerWorkflowResolution:
             controller._resolve_workflow(workflow)
 
     def test_resolve_workflow_rollout_workflow_class_raises(self):
+        # [FUNCTION DOC]
+        # Asserts passing the import path string of a RolloutWorkflow class raises
+        # TypeError (direct RolloutWorkflow classes not supported).
         controller = RolloutControllerV2(
             config=InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key"),
             scheduler=MagicMock(n_gpus_per_node=8),
@@ -281,7 +363,14 @@ class TestControllerWorkflowResolution:
 
 
 class TestRolloutControllerV2APISurface:
+    # [CLASS DOC]
+    # Static API-surface checks on the RolloutControllerV2 class.
     def test_has_all_public_methods(self):
+        # [FUNCTION DOC]
+        # Asserts the class defines each expected public method (initialize, destroy,
+        # submit, wait, rollout_batch, prepare_batch, chat_completion, version,
+        # capacity, pause/resume, stats, generation pause/continue and perf tracer
+        # methods).
         methods = [
             "initialize",
             "destroy",
@@ -305,6 +394,9 @@ class TestRolloutControllerV2APISurface:
             assert hasattr(RolloutControllerV2, m), f"Missing method: {m}"
 
     def test_has_properties(self):
+        # [FUNCTION DOC]
+        # Asserts the class exposes staleness_manager, workflow_executor,
+        # proxy_gateway_addr and worker_ids attributes.
         properties = [
             "staleness_manager",
             "workflow_executor",
@@ -315,6 +407,9 @@ class TestRolloutControllerV2APISurface:
             assert hasattr(RolloutControllerV2, p), f"Missing property: {p}"
 
     def test_not_subclass_of_rollout_controller(self):
+        # [FUNCTION DOC]
+        # Asserts RolloutControllerV2's only base class is object (composition, not
+        # inheritance).
         """RolloutControllerV2 must NOT be a subclass of RolloutController."""
         # Verify it doesn't inherit from any class except object
         bases = RolloutControllerV2.__bases__
@@ -327,13 +422,22 @@ class TestRolloutControllerV2APISurface:
 
 
 class TestRolloutControllerV2Construction:
+    # [CLASS DOC]
+    # Tests for constructor validation and initial local state.
     def test_admin_api_key_none_raises(self):
+        # [FUNCTION DOC]
+        # Sets admin_api_key to "" and asserts construction raises ValueError
+        # "admin_api_key must be set".
+        # KNOWN ISSUE: the name says "none" but the test uses an empty string, not None.
         cfg = InferenceEngineConfig(backend="sglang:d1")
         cfg.admin_api_key = ""
         with pytest.raises(ValueError, match="admin_api_key must be set"):
             RolloutControllerV2(config=cfg, scheduler=MagicMock(n_gpus_per_node=8))
 
     def test_model_empty_raises(self):
+        # [FUNCTION DOC]
+        # Asserts model "" makes construction raise ValueError "model must not be
+        # empty".
         cfg = InferenceEngineConfig(
             backend="sglang:d1", admin_api_key="test-key", model=""
         )
@@ -341,6 +445,9 @@ class TestRolloutControllerV2Construction:
             RolloutControllerV2(config=cfg, scheduler=MagicMock(n_gpus_per_node=8))
 
     def test_constructor(self):
+        # [FUNCTION DOC]
+        # Asserts a fresh controller stores config/scheduler, has no workers or server
+        # infos, version 0, staleness_manager None and empty worker id maps.
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -355,12 +462,18 @@ class TestRolloutControllerV2Construction:
         assert controller.worker_ids == {}
 
     def test_admin_api_key_defaults(self):
+        # [FUNCTION DOC]
+        # Asserts the configured admin key is retained on controller.config.
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
         assert controller.config.admin_api_key == "test-key"
 
     def test_version_management_without_services(self):
+        # [FUNCTION DOC]
+        # Sets the private _version to 42 and asserts get_version() returns 42.
+        # KNOWN ISSUE: the docstring mentions set_version, but only the private field is
+        # set directly; set_version is not exercised.
         """set_version / get_version work even without gateway services."""
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
@@ -371,6 +484,8 @@ class TestRolloutControllerV2Construction:
         assert controller.get_version() == 42
 
     def test_export_stats_returns_dict(self):
+        # [FUNCTION DOC]
+        # Asserts export_stats() returns a dict on a fresh controller.
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -378,6 +493,10 @@ class TestRolloutControllerV2Construction:
         assert isinstance(stats, dict)
 
     def test_export_stats_drains_local_workflow_metrics(self):
+        # [FUNCTION DOC]
+        # Resets the global stats_tracker, records rollout reward 0.75, and asserts the
+        # first export_stats() returns reward and count while the second returns {}
+        # (drained). Resets the global tracker again in a finally block.
         stats_tracker.export_all(reset=True)
         try:
             stats_tracker.get("rollout").scalar(reward=0.75)
@@ -397,6 +516,8 @@ class TestRolloutControllerV2Construction:
             stats_tracker.export_all(reset=True)
 
     def test_proxy_gateway_addr(self):
+        # [FUNCTION DOC]
+        # Asserts proxy_gateway_addr is "" before initialize().
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -404,6 +525,9 @@ class TestRolloutControllerV2Construction:
         assert controller.proxy_gateway_addr == ""
 
     def test_callback_addr_formats_ipv6_hostport(self):
+        # [FUNCTION DOC]
+        # Sets private _callback_host to an IPv6 literal and _callback_port 19000;
+        # asserts callback_addr brackets the host as "[2001:db8::10]:19000".
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -413,6 +537,9 @@ class TestRolloutControllerV2Construction:
         assert controller.callback_addr == "[2001:db8::10]:19000"
 
     def test_workflow_executor_raises_before_init(self):
+        # [FUNCTION DOC]
+        # Asserts accessing workflow_executor before initialize raises RuntimeError
+        # mentioning "initialize".
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -420,6 +547,9 @@ class TestRolloutControllerV2Construction:
             _ = controller.workflow_executor
 
     def test_config_perf_tracer_is_noop(self):
+        # [FUNCTION DOC]
+        # Asserts config_perf_tracer() and save_perf_tracer() can be called without
+        # raising (no-ops).
         cfg = InferenceEngineConfig(backend="sglang:d1", admin_api_key="test-key")
         scheduler = MagicMock(n_gpus_per_node=8)
         controller = RolloutControllerV2(config=cfg, scheduler=scheduler)
@@ -432,6 +562,16 @@ class TestRolloutControllerV2Construction:
     async def test_async_initialize_passes_config_to_data_proxy(
         self, deterministic_sampling
     ):
+        # [FUNCTION DOC]
+        # Parametrized over deterministic_sampling. Builds a config with tokenizer path,
+        # timeout, an AgentConfig (finish timeout 7.5, two message preprocessors, a
+        # prefix matcher) and a guard SchedulingSpec, a scheduler returning one fake
+        # worker, and callback 127.0.0.1:19000. Patches _async_fork_on_guard to return
+        # three (host, port) pairs and runs _async_initialize with one
+        # LocalInfServerInfo. Asserts exactly one fork with role "data-proxy" whose
+        # raw_cmd contains --set-reward-finish-timeout 7.5, --callback-server-addr
+        # http://127.0.0.1:19000, --deterministic-sampling only when enabled, two
+        # --message-preprocessor flags in config order, and the --prefix-matcher path.
         from areal.api.cli_args import SchedulingSpec
         from areal.api.io_struct import LocalInfServerInfo
 
@@ -508,8 +648,16 @@ class TestRolloutControllerV2Construction:
 
 
 class TestOnlineCallbackFlow:
+    # [CLASS DOC]
+    # Tests for the controller's online-mode HTTP callback server
+    # (/callback/online_ready). Each starts a real local callback server via
+    # _start_online_callback_server, posts with the admin bearer key using a real httpx
+    # client, and stops it in finally.
     @pytest.mark.asyncio
     async def test_online_callback_without_waiter_buffers_export_request(self):
+        # [FUNCTION DOC]
+        # Posts a ready callback with no waiter present; asserts 200 and that a later
+        # wait_for_online_trajectory(timeout=1.0) returns the buffered payload.
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
@@ -532,6 +680,11 @@ class TestOnlineCallbackFlow:
 
     @pytest.mark.asyncio
     async def test_online_callback_settles_waiter_once(self):
+        # [FUNCTION DOC]
+        # Starts a waiter task first, posts a ready callback, asserts 200 and that the
+        # waiter resolves to the posted payload.
+        # KNOWN ISSUE: despite the name, it does not verify the waiter is settled only
+        # once.
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
@@ -560,6 +713,9 @@ class TestOnlineCallbackFlow:
 
     @pytest.mark.asyncio
     async def test_online_callback_invalid_payload_keeps_waiter_pending(self):
+        # [FUNCTION DOC]
+        # Starts a waiter, posts a payload missing trajectory_id; asserts HTTP 425 and
+        # that the waiter is still pending, then cancels it (cancellation not awaited).
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
@@ -588,6 +744,11 @@ class TestOnlineCallbackFlow:
 
     @pytest.mark.asyncio
     async def test_cancelled_waiter_buffers_completed_online_result(self):
+        # [FUNCTION DOC]
+        # Starts and cancels a waiter (asserting CancelledError), then posts a ready
+        # callback (200) and asserts a new wait_for_online_trajectory returns the
+        # payload, i.e. results arriving after a cancelled waiter are buffered rather
+        # than lost.
         cfg = InferenceEngineConfig(
             backend="sglang:d1",
             admin_api_key="test-admin-key",
@@ -620,19 +781,40 @@ class TestOnlineCallbackFlow:
 
 
 class TestInferenceServiceWorkflow:
+    # [CLASS DOC]
+    # Tests for InferenceServiceWorkflow (offline agent mode, online mode, group
+    # sampling, export request options and stats).
     async def _run_offline_group(
         self,
         *,
         serialize_group_samples: bool,
         failing_member: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Runs one offline arun_episode for a group of 4 with a MockAgent that
+        # records start order and peak concurrency; when serialize_group_samples is
+        # False all 4 members must be concurrently active (they rendezvous on an Event
+        # with a 1s timeout), and the member whose index equals failing_member raises
+        # RuntimeError. Uses a MagicMock controller (version 3), mocks _start_session
+        # (group "grp-test-42", 4 session/key pairs), _set_last_reward and
+        # _export_interactions, and patches workflow_context and stats_tracker in the
+        # workflow module. Asserts _export_interactions was awaited once with all
+        # session ids, group_id "grp-test-42" and discard_trajectory True iff a member
+        # failed. Returns (result, max_active, start_order, tracker mock, workflow).
         active = 0
         max_active = 0
         start_order: list[int] = []
         all_started = asyncio.Event()
 
         class MockAgent:
+            # [CLASS DOC]
+            # HELPER: Agent whose run() derives its member index from the api_key suffix
+            # and tracks concurrency via closure variables.
             async def run(self, data, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Records start order, increments/decrements the active counter
+                # (updating max_active), waits per the serialization mode, raises for
+                # failing_member, else returns the member index as a float reward.
                 del data
                 nonlocal active, max_active
                 member_index = int(kwargs["api_key"].rsplit("-", 1)[1])
@@ -697,6 +879,11 @@ class TestInferenceServiceWorkflow:
 
     @pytest.mark.asyncio
     async def test_export_interactions_forwards_drop_retry_orphans(self):
+        # [FUNCTION DOC]
+        # Builds a workflow with drop_retry_orphans True and a mocked aiohttp-style
+        # session whose post() returns an async context manager yielding {"traj": {}};
+        # asserts _export_interactions returns {} and the POST JSON has
+        # drop_retry_orphans True.
         workflow = InferenceServiceWorkflow(
             controller=MagicMock(),
             gateway_addr="http://test:8080",
@@ -719,6 +906,9 @@ class TestInferenceServiceWorkflow:
 
     @pytest.mark.asyncio
     async def test_export_interactions_forwards_reward_normalization(self):
+        # [FUNCTION DOC]
+        # Same as above with reward_normalization True; asserts {} is returned and the
+        # POST JSON has reward_normalization True.
         workflow = InferenceServiceWorkflow(
             controller=MagicMock(),
             gateway_addr="http://test:8080",
@@ -742,6 +932,12 @@ class TestInferenceServiceWorkflow:
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_online_mode_waits_on_controller(self):
+        # [FUNCTION DOC]
+        # Skipped (pending traj schema migration). Online mode: controller's
+        # wait_for_online_trajectory returns a session/trajectory id; mocks the HTTP
+        # session, workflow_context, stats_tracker and deserialize_interactions; asserts
+        # arun_episode returns interactions containing "chatcmpl-1", waited once with
+        # timeout 3.0, posted once and deserialized the "interactions" payload.
         mock_interaction = MagicMock(reward=1.0)
         controller = MagicMock()
         controller.wait_for_online_trajectory = AsyncMock(
@@ -798,10 +994,20 @@ class TestInferenceServiceWorkflow:
 
     @pytest.mark.asyncio
     async def test_offline_mode_runs_agent(self):
+        # [FUNCTION DOC]
+        # Offline mode with a single-member group: mocks _start_session,
+        # _set_last_reward and _export_interactions plus workflow_context/stats_tracker;
+        # asserts arun_episode returns the exported interactions, starts the session and
+        # sets the reward once, and exports ["sess-1"] for group "grp-test-1" with
+        # discard_trajectory False.
         controller = MagicMock()
 
         class MockAgent:
+            # [CLASS DOC]
+            # HELPER: Minimal agent whose async run() returns reward 1.0.
             async def run(self, data, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Returns 1.0.
                 return 1.0
 
         mock_interaction = MagicMock(reward=1.0)
@@ -849,8 +1055,16 @@ class TestInferenceServiceWorkflow:
 
     @pytest.mark.asyncio
     async def test_offline_mode_discards_export_when_agent_fails(self):
+        # [FUNCTION DOC]
+        # Group of 2 with a FailingAgent and reward normalization; asserts arun_episode
+        # returns None and the export is still called for both sessions with
+        # discard_trajectory True.
         class FailingAgent:
+            # [CLASS DOC]
+            # HELPER: Agent whose run() always raises RuntimeError("agent failed").
             async def run(self, data, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Always raises RuntimeError.
                 raise RuntimeError("agent failed")
 
         workflow = InferenceServiceWorkflow(
@@ -888,6 +1102,10 @@ class TestInferenceServiceWorkflow:
 
     @pytest.mark.asyncio
     async def test_offline_group_is_concurrent_by_default(self):
+        # [FUNCTION DOC]
+        # Asserts that by default the 4 group members run concurrently (peak active 4),
+        # all indices start, and per-member rewards 0..3 are recorded via tracker.scalar
+        # in member order.
         result, max_active, start_order, tracker, _ = await self._run_offline_group(
             serialize_group_samples=False,
         )
@@ -904,6 +1122,9 @@ class TestInferenceServiceWorkflow:
 
     @pytest.mark.asyncio
     async def test_offline_group_serial_flag_preserves_within_group_order(self):
+        # [FUNCTION DOC]
+        # Asserts serialize_group_samples runs members one at a time (peak 1) in index
+        # order and records rewards 0..3 in order.
         result, max_active, start_order, tracker, _ = await self._run_offline_group(
             serialize_group_samples=True,
         )
@@ -920,6 +1141,10 @@ class TestInferenceServiceWorkflow:
 
     @pytest.mark.asyncio
     async def test_offline_group_serial_flag_exports_after_failure(self):
+        # [FUNCTION DOC]
+        # Serialized group with member 1 failing: asserts result None, still serial in
+        # order, _set_last_reward awaited for all 4 members, and no reward stats
+        # recorded.
         (
             result,
             max_active,
@@ -944,7 +1169,14 @@ class TestInferenceServiceWorkflow:
 
 
 class TestMultiNodeConfig:
+    # [CLASS DOC]
+    # Tests for multi-node instance sizing (tensor parallel size > GPUs per node).
     def test_scheduler_zero_gpus_raises(self):
+        # [FUNCTION DOC]
+        # Asserts a scheduler with 0 GPUs per node makes construction raise ValueError
+        # "n_gpus_per_node must be >= 1".
+        # KNOWN ISSUE: the local `scheduler` from _make_scheduler is configured but
+        # unused; a separate MagicMock is passed to the constructor.
         cfg = InferenceEngineConfig(backend="sglang:d1t8", admin_api_key="test-key")
         scheduler = _make_scheduler()
         scheduler.n_gpus_per_node = 0
@@ -952,6 +1184,10 @@ class TestMultiNodeConfig:
             RolloutControllerV2(config=cfg, scheduler=MagicMock(n_gpus_per_node=0))
 
     def test_gpus_not_divisible_raises(self):
+        # [FUNCTION DOC]
+        # Asserts tp 8 with 3 GPUs per node raises ValueError "must be divisible by
+        # n_gpus_per_node".
+        # KNOWN ISSUE: the local `scheduler` is configured but unused (same as above).
         cfg = InferenceEngineConfig(backend="sglang:d1t8", admin_api_key="test-key")
         scheduler = _make_scheduler()
         scheduler.n_gpus_per_node = 3
@@ -959,6 +1195,8 @@ class TestMultiNodeConfig:
             RolloutControllerV2(config=cfg, scheduler=MagicMock(n_gpus_per_node=3))
 
     def test_single_node_backward_compat(self):
+        # [FUNCTION DOC]
+        # Asserts sglang:d2t4 on 8-GPU nodes yields _nnodes_per_instance 1.
         cfg = InferenceEngineConfig(backend="sglang:d2t4", admin_api_key="test-key")
         controller = RolloutControllerV2(
             config=cfg, scheduler=MagicMock(n_gpus_per_node=8)
@@ -966,6 +1204,8 @@ class TestMultiNodeConfig:
         assert controller._nnodes_per_instance == 1
 
     def test_multi_node_valid_config(self):
+        # [FUNCTION DOC]
+        # Asserts sglang:d1t16 on 8-GPU nodes yields _nnodes_per_instance 2.
         # tp=16, n_gpus_per_node=8 → nnodes_per_instance=2
         cfg = InferenceEngineConfig(backend="sglang:d1t16", admin_api_key="test-key")
         controller = RolloutControllerV2(
@@ -975,6 +1215,12 @@ class TestMultiNodeConfig:
 
     @pytest.mark.asyncio
     async def test_async_initialize_multinode_worker_count(self):
+        # [FUNCTION DOC]
+        # Multi-node (tp 8, 4 GPUs/node) with pre-existing server_infos: patches
+        # _async_fork_on_guard (router, data proxy, gateway) and runs _async_initialize;
+        # asserts the scheduler's create_workers job has replicas 1 (dp_size only),
+        # exactly three forks occurred and only one was a data proxy.
+        # KNOWN ISSUE: worker1 is built but never used.
         """With multi-node and pre-existing server_infos, should create dp_size workers."""
         from areal.api.cli_args import SchedulingSpec
         from areal.api.io_struct import LocalInfServerInfo
@@ -1033,6 +1279,17 @@ class TestMultiNodeConfig:
 
     @pytest.mark.asyncio
     async def test_async_initialize_multinode_fork_path(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Full multi-node fork path (server_infos None) with TRITON_CACHE_DIR/PATH env
+        # set. Patches _get_async_client with a fake whose post() answers /alloc_ports
+        # with incrementing ports and records /fork payloads, and patches
+        # _async_fork_on_guard, _async_wait_for_service and SGLang version checks.
+        # Asserts create_workers replicas 2, three port allocations (1 rendezvous + 2
+        # per node), two inf-server forks with worker_index 0 and 1, unique per-fork
+        # Triton cache dirs/paths prefixed by the env values plus "inf-server-", a
+        # dist-init-addr flag in every fork command, and one data proxy fork.
+        # KNOWN ISSUE: the inline comment mentions "2 forks = 5" async posts, but only
+        # the 3 allocs and 2 forks are asserted separately.
         """Exercise the full multi-node fork path (server_infos=None)."""
         from areal.api.cli_args import SchedulingSpec
 
@@ -1068,6 +1325,10 @@ class TestMultiNodeConfig:
         fork_calls = []
 
         async def mock_async_post(url, json=None, timeout=None):
+            # [FUNCTION DOC]
+            # HELPER: Fake async POST returning a MagicMock 200 response; /alloc_ports
+            # increments the counter and returns the URL's host with port 30000+counter,
+            # /fork records the JSON payload and returns success.
             nonlocal alloc_port_counter
             resp = MagicMock()
             resp.status_code = 200

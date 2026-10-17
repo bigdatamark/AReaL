@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Unit tests for data-proxy standalone mode: /chat/completions requests whose bearer
+# token is absent, the admin key, or an unknown key are served without a session and
+# without caching (areal_cache None); a valid session key still uses the session flow.
+# Uses an in-process ASGI client with a mocked tokenizer and OpenAI-style client.
 """Unit tests for data proxy standalone mode (no-session requests).
 
 Tests that /chat/completions works without a session.
@@ -26,6 +31,10 @@ ADMIN_KEY = "areal-admin-key"
 
 @pytest.fixture
 def config():
+    # [FUNCTION DOC]
+    # Fixture: DataProxyConfig on 127.0.0.1:18082 with fake backend
+    # "http://mock-sglang:30000", tokenizer "mock-tokenizer" and 10s timeout; other
+    # fields (including the admin key, assumed to equal ADMIN_KEY) use defaults.
     return DataProxyConfig(
         host="127.0.0.1",
         port=18082,
@@ -37,6 +46,10 @@ def config():
 
 @pytest.fixture
 def mock_tokenizer():
+    # [FUNCTION DOC]
+    # Fixture: MagicMock tokenizer with async tokenize -> [101, 102, 103], decode_token
+    # -> "tok_<id>", decode_tokens -> "hello world", async apply_chat_template -> [100,
+    # 200, 300], eos 2 / pad 0 (also on inner _tok).
     tok = MagicMock()
     tok.tokenize = AsyncMock(return_value=[101, 102, 103])
     tok.decode_token = MagicMock(side_effect=lambda tid: f"tok_{tid}")
@@ -52,6 +65,10 @@ def mock_tokenizer():
 
 @pytest.fixture
 def mock_areal_client():
+    # [FUNCTION DOC]
+    # Fixture: MagicMock client whose chat.completions.create is an AsyncMock always
+    # returning one prebuilt ChatCompletion (id "chatcmpl-standalone-test", content
+    # "Hello!").
     """Mock ArealOpenAI client that returns a valid ChatCompletion."""
     from openai.types.chat import ChatCompletion, ChatCompletionMessage
     from openai.types.chat.chat_completion import Choice
@@ -76,6 +93,9 @@ def mock_areal_client():
     )
 
     async def _mock_create(*, areal_cache=None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake create(); ignores areal_cache and kwargs and returns the fixed
+        # completion.
         return completion
 
     mock_client.chat.completions.create = AsyncMock(side_effect=_mock_create)
@@ -84,6 +104,12 @@ def mock_areal_client():
 
 @pytest_asyncio.fixture
 async def client(config, mock_tokenizer, mock_areal_client):
+    # [FUNCTION DOC]
+    # Async fixture: creates the app, a PauseState and a real InfBridge
+    # (SGLangBridgeBackend, 0.01s resubmit wait), injects tokenizer, inf_bridge,
+    # areal_client, pause_state, config and a fresh SessionStore into app.state, and
+    # yields an httpx AsyncClient on "http://test" with no default auth header. App
+    # exceptions propagate (raise_app_exceptions default).
     """Create app with mocked deps and yield an httpx async client (no auth header)."""
     from areal.v2.inference_service.data_proxy.pause import PauseState
     from areal.v2.inference_service.inf_bridge import InfBridge
@@ -112,6 +138,9 @@ async def client(config, mock_tokenizer, mock_areal_client):
 
 
 def admin_headers():
+    # [FUNCTION DOC]
+    # HELPER: Returns an Authorization header dict carrying the admin bearer key
+    # ADMIN_KEY.
     return {"Authorization": f"Bearer {ADMIN_KEY}"}
 
 
@@ -121,7 +150,13 @@ def admin_headers():
 
 
 class TestStandaloneChat:
+    # [CLASS DOC]
+    # Tests for session-less /chat/completions requests and backend selection.
     def test_config_can_select_vllm_backend(self):
+        # [FUNCTION DOC]
+        # Builds a DataProxyConfig with backend_type "vllm" and asserts the private
+        # _create_inf_bridge factory returns a bridge whose backend is a
+        # VLLMBridgeBackend.
         """backend_type=vllm creates a vLLM-backed InfBridge."""
         from areal.v2.inference_service.data_proxy.app import (
             _create_inf_bridge,
@@ -143,6 +178,9 @@ class TestStandaloneChat:
 
     @pytest.mark.asyncio
     async def test_no_auth_chat_completions_returns_valid_response(self, client):
+        # [FUNCTION DOC]
+        # Posts a chat request with no auth header; asserts 200 and the mocked
+        # id/content.
         """No auth header → standalone mode, returns valid response."""
         resp = await client.post(
             "/chat/completions",
@@ -158,6 +196,9 @@ class TestStandaloneChat:
 
     @pytest.mark.asyncio
     async def test_admin_key_chat_completions_returns_valid_response(self, client):
+        # [FUNCTION DOC]
+        # Posts a chat request with the admin key; asserts 200 and the mocked
+        # id/content.
         """Admin key → standalone mode, returns valid response."""
         resp = await client.post(
             "/chat/completions",
@@ -174,6 +215,8 @@ class TestStandaloneChat:
 
     @pytest.mark.asyncio
     async def test_unknown_key_chat_completions_returns_valid_response(self, client):
+        # [FUNCTION DOC]
+        # Posts with an unknown bearer key; asserts it is served (200), not rejected.
         """Unknown key → standalone mode (not rejected)."""
         resp = await client.post(
             "/chat/completions",
@@ -189,6 +232,9 @@ class TestStandaloneChat:
 
     @pytest.mark.asyncio
     async def test_standalone_chat_no_session_created(self, client):
+        # [FUNCTION DOC]
+        # Posts without auth and asserts the app's SessionStore still has session_count
+        # 0 (reaches into the ASGI transport's app via private attributes).
         """Standalone mode does NOT create a session."""
         resp = await client.post(
             "/chat/completions",
@@ -203,6 +249,9 @@ class TestStandaloneChat:
 
     @pytest.mark.asyncio
     async def test_standalone_chat_passes_none_cache(self, client, mock_areal_client):
+        # [FUNCTION DOC]
+        # Posts without auth and asserts create was called exactly once with areal_cache
+        # None.
         """Standalone mode passes areal_cache=None (no caching)."""
         resp = await client.post(
             "/chat/completions",
@@ -224,10 +273,17 @@ class TestStandaloneChat:
 
 
 class TestSessionKeyUnchanged:
+    # [CLASS DOC]
+    # Tests that the session-key flow still works alongside standalone mode.
     @pytest.mark.asyncio
     async def test_session_chat_completions_still_works(
         self, client, mock_areal_client
     ):
+        # [FUNCTION DOC]
+        # Starts a session via POST /rl/start_session (admin key, task_id "test-task"),
+        # expects 201, takes sessions[0].session_api_key, then posts a chat request with
+        # that key and asserts 200 with content "Hello!". Does not assert that caching
+        # was actually used.
         """Session key callers still use the session-based flow."""
         # Start a session first
         resp = await client.post(

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Slow end-to-end example test for the experimental inference service: runs the tau2
+# rollout example (examples/experimental/inference_service/tau2_rollout.py) against a
+# separately launched SGLang "user LLM" server. Module-level pytestmark marks all tests
+# slow; logs via the "InferenceServiceExamples" logger.
 import os
 import re
 import subprocess
@@ -21,6 +26,18 @@ pytestmark = pytest.mark.slow
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_tau2_rollout(tmp_path_factory):
+    # [FUNCTION DOC]
+    # SGLang multi-GPU test. Skips if the tau2 package is missing, TAU2_DATA_DIR is
+    # unset or nonexistent, the Qwen3 non-thinking chat template file is missing, or
+    # fewer than 3 devices exist. Resolves Qwen3-0.6B, launches an sglang.launch_server
+    # subprocess on the last visible device (port 30081, qwen25 tool-call parser, mem
+    # fraction 0.8, output discarded), sleeps a fixed 60s for startup, then runs the
+    # example via run_example with backend sglang:d2 on 2 GPUs, temp
+    # experiment/name_resolve dirs, batch size 2, the user LLM base URL and wandb
+    # disabled, waiting up to 600s for the "Rollout complete" log pattern. Asserts
+    # success; always force-kills the user LLM process tree afterwards.
+    # KNOWN ISSUE: startup is a fixed 60s sleep with no health check, so a slow server
+    # load can cause flaky failures.
     tau2 = pytest.importorskip("tau2")
     del tau2
 

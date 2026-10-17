@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Unit tests for the data-proxy version endpoints POST /set_version, GET /get_version
+# and the "version" field of /health, using an in-process ASGI client with mocked
+# tokenizer, OpenAI-style client and InfBridge pause/resume.
 """Unit tests for data proxy version management endpoints (/set_version, /get_version)."""
 
 from __future__ import annotations
@@ -20,6 +24,10 @@ from areal.v2.inference_service.data_proxy.session import SessionStore
 
 @pytest.fixture
 def config():
+    # [FUNCTION DOC]
+    # Fixture: returns a DataProxyConfig on 127.0.0.1:18083 pointing at a fake SGLang
+    # backend "http://mock-sglang:30000" with tokenizer "mock-tokenizer", 10s request
+    # timeout, 5 resubmit retries and a 0.01s resubmit wait (fast tests). No I/O.
     return DataProxyConfig(
         host="127.0.0.1",
         port=18083,
@@ -33,6 +41,11 @@ def config():
 
 @pytest.fixture
 def mock_tokenizer():
+    # [FUNCTION DOC]
+    # Fixture: returns a MagicMock tokenizer: async tokenize -> [101, 102, 103],
+    # decode_token -> "tok_<id>", decode_tokens -> "hello world", async
+    # apply_chat_template -> [100, 200, 300], eos_token_id 2 and pad_token_id 0 (also on
+    # the inner _tok mock).
     tok = MagicMock()
     tok.tokenize = AsyncMock(return_value=[101, 102, 103])
     tok.decode_token = MagicMock(side_effect=lambda tid: f"tok_{tid}")
@@ -48,6 +61,9 @@ def mock_tokenizer():
 
 @pytest.fixture
 def mock_areal_client():
+    # [FUNCTION DOC]
+    # Fixture: returns a MagicMock ArealOpenAI-like client whose chat.completions.create
+    # is an AsyncMock delegating to the nested _mock_create.
     """Mock ArealOpenAI client that returns a valid ChatCompletion."""
     from openai.types.chat import ChatCompletion, ChatCompletionMessage
     from openai.types.chat.chat_completion import Choice
@@ -56,6 +72,13 @@ def mock_areal_client():
     mock_client = MagicMock()
 
     async def _mock_create(*, areal_cache=None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake create(); builds a fixed ChatCompletion (id "chatcmpl-mock", one
+        # "stop" choice with content "mocked response", usage 3/5/8). If areal_cache (a
+        # dict) is given, also builds an InteractionWithTokenLogpReward with a cached
+        # input_ids [100, 200, 300] and output_tokens [1234, 5678] tensors and the
+        # completion, stored in areal_cache under the completion id (mutates the passed
+        # dict). Extra kwargs ignored. Returns the completion.
         import torch
 
         completion = ChatCompletion(
@@ -98,6 +121,12 @@ def mock_areal_client():
 
 @pytest_asyncio.fixture
 async def app_client(config, mock_tokenizer, mock_areal_client):
+    # [FUNCTION DOC]
+    # Async fixture: creates the data proxy app, a PauseState and a real InfBridge
+    # (SGLangBridgeBackend) with pause/resume replaced by plain AsyncMocks, injects
+    # tokenizer, inf_bridge, areal_client, pause_state, config, a SessionStore and
+    # version 0 into app.state, and yields (httpx AsyncClient on "http://test", app).
+    # App exceptions become 500 responses.
     """Create an ASGI test client with all app.state attributes injected."""
     from areal.v2.inference_service.inf_bridge import InfBridge
     from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
@@ -136,10 +165,14 @@ async def app_client(config, mock_tokenizer, mock_areal_client):
 
 
 class TestVersionEndpoints:
+    # [CLASS DOC]
+    # Tests for the version endpoints.
     """Test POST /set_version and GET /get_version endpoints."""
 
     @pytest.mark.asyncio
     async def test_get_version_default_zero(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts GET /get_version returns exactly {"version": 0} initially.
         client, app = app_client
         resp = await client.get("/get_version")
         assert resp.status_code == 200
@@ -148,6 +181,9 @@ class TestVersionEndpoints:
 
     @pytest.mark.asyncio
     async def test_set_version_success(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts POST /set_version {"version": 5} returns 200 with status "ok" and
+        # version 5.
         client, app = app_client
         resp = await client.post("/set_version", json={"version": 5})
         assert resp.status_code == 200
@@ -157,6 +193,8 @@ class TestVersionEndpoints:
 
     @pytest.mark.asyncio
     async def test_get_version_after_set(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts GET /get_version returns 42 after setting it to 42.
         client, app = app_client
         await client.post("/set_version", json={"version": 42})
         resp = await client.get("/get_version")
@@ -165,18 +203,24 @@ class TestVersionEndpoints:
 
     @pytest.mark.asyncio
     async def test_set_version_missing_field(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts POST /set_version with an empty body returns 400.
         client, app = app_client
         resp = await client.post("/set_version", json={})
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_set_version_invalid_type(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts POST /set_version with a non-integer version ("abc") returns 400.
         client, app = app_client
         resp = await client.post("/set_version", json={"version": "abc"})
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
     async def test_health_includes_version(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts GET /health returns 200 and includes a "version" key.
         client, app = app_client
         resp = await client.get("/health")
         assert resp.status_code == 200
@@ -185,6 +229,8 @@ class TestVersionEndpoints:
 
     @pytest.mark.asyncio
     async def test_health_version_updates_after_set(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts /health reports version 99 after setting it.
         client, app = app_client
         await client.post("/set_version", json={"version": 99})
         resp = await client.get("/health")
@@ -193,6 +239,8 @@ class TestVersionEndpoints:
 
     @pytest.mark.asyncio
     async def test_set_version_multiple_times(self, app_client):
+        # [FUNCTION DOC]
+        # Asserts the last of three successive set_version calls (3) wins.
         client, app = app_client
         await client.post("/set_version", json={"version": 1})
         await client.post("/set_version", json={"version": 2})
