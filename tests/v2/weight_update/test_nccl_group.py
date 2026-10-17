@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# CPU unit tests for the v2 weight-update NCCL group setup and the AWEX transfer
+# adapters (FSDP, Megatron, SGLang). They verify that weight payloads use the NCCL
+# process group while setup/completion barriers use a companion Gloo "sidecar" group,
+# that both groups are created and destroyed together, and that SGLang synchronizes the
+# device after copying received weights before the barrier. Torch tensor factories,
+# platform calls, torch.distributed and adapter helpers are monkeypatched with mocks.
 # SPDX-License-Identifier: Apache-2.0
 
 from unittest.mock import MagicMock, call
@@ -10,6 +17,9 @@ from areal.v2.weight_update.awex import fsdp_adapter, megatron_adapter, sglang_a
 
 
 def test_setup_batch_isend_irecv_uses_sidecar_for_final_barrier(monkeypatch):
+    # [FUNCTION DOC]
+    # setup_batch_isend_irecv with barrier_group given calls dist.barrier once on the
+    # sidecar group (no device_ids).
     """The liveness payload uses NCCL while its final barrier uses the sidecar."""
     process_group = MagicMock(name="nccl_group")
     barrier_group = MagicMock(name="gloo_group")
@@ -33,6 +43,10 @@ def test_setup_batch_isend_irecv_uses_sidecar_for_final_barrier(monkeypatch):
 
 
 def test_setup_batch_isend_irecv_defaults_to_payload_group(monkeypatch):
+    # [FUNCTION DOC]
+    # Without a barrier_group, setup_batch_isend_irecv barriers on the payload group
+    # with
+    # device_ids [current device].
     """Callers without a sidecar retain the existing payload-group barrier."""
     process_group = MagicMock(name="nccl_group")
     barrier = MagicMock()
@@ -54,6 +68,12 @@ def test_setup_batch_isend_irecv_defaults_to_payload_group(monkeypatch):
 
 
 def test_megatron_adapter_initializes_nccl_and_gloo_groups(monkeypatch):
+    # [FUNCTION DOC]
+    # AwexMegatronAdapter.init_weight_update_group calls init_weights_update_group
+    # twice:
+    # NCCL group "awex_<pair>" then Gloo group "awex_<pair>_gloo" (backend gloo), both
+    # with
+    # the same address, port, rank, world size and role training.
     """The training adapter creates matching payload and sidecar groups."""
     adapter = megatron_adapter.AwexMegatronAdapter(MagicMock())
     builder = MagicMock()
@@ -102,6 +122,10 @@ def test_megatron_adapter_initializes_nccl_and_gloo_groups(monkeypatch):
 
 
 def test_fsdp_adapter_initializes_nccl_and_gloo_groups(monkeypatch):
+    # [FUNCTION DOC]
+    # AwexFSDPAdapter.init_weight_update_group creates the same NCCL and Gloo groups
+    # with
+    # role training.
     """The FSDP training adapter creates matching payload and sidecar groups."""
     adapter = fsdp_adapter.AwexFSDPAdapter(MagicMock())
     builder = MagicMock()
@@ -148,6 +172,10 @@ def test_fsdp_adapter_initializes_nccl_and_gloo_groups(monkeypatch):
 
 
 def test_sglang_adapter_initializes_nccl_and_gloo_groups(monkeypatch):
+    # [FUNCTION DOC]
+    # AwexSGLangAdapter.init_weight_update_group (model context patched to TP/PP 1)
+    # creates
+    # the NCCL and Gloo groups with role inference.
     """The inference adapter creates matching payload and sidecar groups."""
     adapter = sglang_adapter.AwexSGLangAdapter(MagicMock())
     builder = MagicMock()
@@ -207,6 +235,13 @@ def test_sglang_adapter_initializes_nccl_and_gloo_groups(monkeypatch):
     ],
 )
 def test_awex_adapters_use_sidecar_for_setup_barrier(adapter_cls, module, monkeypatch):
+    # [FUNCTION DOC]
+    # Parametrized over the three adapters (constructed without __init__):
+    # batch_isend_irecv
+    # passes the payload group, transfer rank and world size to setup_batch_isend_irecv
+    # with
+    # barrier_group set to the Gloo group.
+    # KNOWN ISSUE: docstring says "Both AWEX adapters" but three are parametrized.
     """Both AWEX adapters retain NCCL payloads and select the Gloo barrier."""
     adapter = object.__new__(adapter_cls)
     payload_group = MagicMock(name="nccl_group")
@@ -250,6 +285,12 @@ def test_awex_adapters_use_sidecar_for_setup_barrier(adapter_cls, module, monkey
 def test_awex_adapters_use_sidecar_for_completion_barrier(
     adapter_cls, module, build_ops_name, monkeypatch
 ):
+    # [FUNCTION DOC]
+    # Parametrized over adapters with send ops (FSDP/Megatron) or recv ops (SGLang)
+    # patched
+    # to empty: execute_weight_update calls the completion barrier exactly once on the
+    # Gloo
+    # group.
     """Payload ops stay on NCCL while the completion barrier uses Gloo."""
     adapter = adapter_cls(MagicMock())
     payload_group = MagicMock(name="nccl_group")
@@ -271,6 +312,10 @@ def test_awex_adapters_use_sidecar_for_completion_barrier(
 
 
 def test_sglang_synchronizes_weight_copies_before_gloo_barrier(monkeypatch):
+    # [FUNCTION DOC]
+    # SGLang execute_weight_update copies each received contiguous buffer into its
+    # original
+    # tensor, then synchronizes the device, then runs the barrier, in that order.
     """The success barrier runs only after inference weights reach the device."""
     adapter = sglang_adapter.AwexSGLangAdapter(MagicMock())
     adapter._transfer_plan = MagicMock()
@@ -315,6 +360,10 @@ def test_sglang_synchronizes_weight_copies_before_gloo_barrier(monkeypatch):
 def test_awex_adapters_destroy_payload_and_sidecar_groups(
     adapter_cls, module, monkeypatch
 ):
+    # [FUNCTION DOC]
+    # Parametrized over adapters: teardown_weight_update_group destroys the payload then
+    # sidecar groups, clears both handles, and (Megatron/SGLang) resets
+    # _separation_wire_dtypes to None.
     """Adapter teardown destroys both process groups and clears their handles."""
     adapter = adapter_cls(MagicMock())
     payload_group = MagicMock(name="nccl_group")

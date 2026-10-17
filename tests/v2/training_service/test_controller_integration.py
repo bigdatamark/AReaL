@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Multi-GPU (2 GPU) integration test for the v2 GatewayTrainController. For each
+# parallel strategy case (FSDP dp2, Megatron dp2/tp2/cp2/pp2 and expert-parallel MoE) it
+# launches real RPC train workers through a LocalScheduler, then drives health,
+# topology, train/eval mode, versioning, forward, stats, offload/onload, HF save/load,
+# LR
+# and optimizer steps via the controller. Skipped without CUDA, local model weights, or
+# 2
+# GPUs.
 from __future__ import annotations
 
 import os
@@ -32,6 +41,9 @@ pytestmark = pytest.mark.skipif(
 
 
 def _resolve_model_path_or_skip() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the local Qwen3-0.6B path if it exists, otherwise skips the test.
+    # The trailing RuntimeError is unreachable (pytest.skip raises).
     if os.path.exists(LOCAL_MODEL_PATH):
         return LOCAL_MODEL_PATH
     pytest.skip(
@@ -42,6 +54,8 @@ def _resolve_model_path_or_skip() -> str:
 
 
 def _resolve_moe_model_path_or_skip() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the local Qwen3-30B-A3B MoE path if it exists, otherwise skips.
     if os.path.exists(LOCAL_MOE_MODEL_PATH):
         return LOCAL_MOE_MODEL_PATH
     pytest.skip(
@@ -53,6 +67,9 @@ def _resolve_moe_model_path_or_skip() -> str:
 
 @dataclass(frozen=True)
 class _StrategyCase:
+    # [CLASS DOC]
+    # HELPER: Immutable parameter case: case name, train engine import path, backend
+    # allocation string, model path resolver callable, and expected data-parallel size.
     name: str
     train_engine: str
     backend: str
@@ -61,6 +78,8 @@ class _StrategyCase:
 
 
 def _strategy_cases_2gpu() -> list[_StrategyCase]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the six 2-GPU strategy cases with their expected DP sizes.
     return [
         _StrategyCase(
             name="fsdp_dp2",
@@ -113,6 +132,20 @@ def _build_cuda_gateway_controller(
     *,
     case: _StrategyCase,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Context manager that skips on fewer than 2 GPUs, resolves the model,
+    # creates
+    # fileroot and name-resolve temp dirs, builds a LocalScheduler on GPUs 0-1 (TMS
+    # offload
+    # enabled) and a TrainEngineConfig (rpc_server command, 128-token micro-batches,
+    # default
+    # optimizer, per-case admin key), and initializes a GatewayTrainController (waiting
+    # for
+    # readiness). On init failure it destroys the controller and deletes workers,
+    # skipping on
+    # CUDA OOM messages and re-raising otherwise. Yields (controller, tmp_path_factory)
+    # and
+    # always destroys the controller and deletes workers on exit.
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
 
@@ -190,6 +223,9 @@ def _build_cuda_gateway_controller(
 
 
 def _make_batch(n: int = 4, seq_len: int = 16) -> list[dict[str, torch.Tensor]]:
+    # [FUNCTION DOC]
+    # HELPER: Returns n samples each with random input_ids (1 x seq_len, ids < 100) and
+    # all-true attention and loss masks.
     return [
         {
             "input_ids": torch.randint(0, 100, (1, seq_len), dtype=torch.long),
@@ -207,6 +243,17 @@ def test_gateway_controller_integration(
     tmp_path_factory: pytest.TempPathFactory,
     case: _StrategyCase,
 ):
+    # [FUNCTION DOC]
+    # Parametrized over strategy cases: checks gateway/router /health; model /topology
+    # reports the expected dp_size, two workers, and DP heads/groups/ranks consistent
+    # with
+    # DP=2 (two singleton groups) or DP=1 (one group of two); then runs train/eval
+    # toggles,
+    # set/get version, forward_batch, export_stats, offload/onload, HF save and load to
+    # a
+    # temp dir, LR step, zero_grad/optimizer_step, clear_batches, a second offload cycle
+    # and
+    # final stats, asserting only basic result types.
     with _build_cuda_gateway_controller(tmp_path_factory, case=case) as (
         controller,
         tmp_factory,

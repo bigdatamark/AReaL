@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Tests that the v2 data proxy and guard command-line entrypoints (their __main__ main
+# functions) handle IPv6 hosts: argument parsing, app creation and server launch are
+# patched so main() runs without starting servers.
 from __future__ import annotations
 
 import argparse
@@ -5,6 +9,14 @@ from unittest.mock import MagicMock, patch
 
 
 def test_data_proxy_main_formats_ipv6_serving_addr():
+    # [FUNCTION DOC]
+    # Runs data_proxy __main__.main with parsed args for host ::1 port 8082 (create_app
+    # and
+    # uvicorn.run patched); asserts the DataProxyConfig passed to create_app has
+    # bracketed
+    # serving_addr "[::1]:8082", deterministic_sampling False, empty
+    # message_preprocessors
+    # tuple and prefix_matcher None, and uvicorn.run was called once.
     from areal.v2.inference_service.data_proxy import (
         __main__ as data_proxy_main,
     )
@@ -51,6 +63,13 @@ def test_data_proxy_main_formats_ipv6_serving_addr():
 
 
 def test_guard_main_registers_ipv6_worker_addr():
+    # [FUNCTION DOC]
+    # Runs guard __main__.main with a mocked base parser yielding args for host ::1;
+    # configure_state_from_args (returning "::1") and run_server are patched. Asserts
+    # the
+    # module _state object was configured and run_server got host "::1" and port 0 as
+    # its
+    # third and fourth positional arguments.
     from areal.v2.inference_service.guard import __main__ as guard_main
 
     args = argparse.Namespace(

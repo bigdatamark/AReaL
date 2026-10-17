@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Unit tests for InfBridge, the async generate engine that sends ModelRequests to an
+# inference server through a pluggable backend (SGLangBridgeBackend or
+# VLLMBridgeBackend), resubmitting on "abort" with accumulated tokens, honoring a
+# PauseState, and building ModelResponse objects with versions. Network calls are
+# replaced by stubbing the bridge's _send_request.
 """Unit tests for InfBridge -- _AsyncGenerateEngine protocol via pluggable backend."""
 
 from __future__ import annotations
@@ -24,6 +30,10 @@ def _make_sglang_response(
     token_logprobs: list[tuple[float, int]],
     finish_reason_type: str = "stop",
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a minimal SGLang /generate response dict with finish_reason type
+    # and
+    # output_token_logprobs as (logprob, token_id) pairs.
     """Build a minimal SGLang /generate JSON response.
 
     Args:
@@ -46,6 +56,10 @@ def _make_vllm_response(
     token_logprobs: list[float],
     finish_reason: str = "stop",
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a minimal vLLM completions response with one choice; tokens are
+    # encoded
+    # as "token:<id>" strings alongside the given logprobs and finish_reason.
     """Build a minimal vLLM completions JSON response."""
     return {
         "choices": [
@@ -71,6 +85,11 @@ def _make_request(
     metadata: dict[str, Any] | None = None,
     lora_name: str | None = None,
 ) -> ModelRequest:
+    # [FUNCTION DOC]
+    # HELPER: Builds a ModelRequest with a GenerationHyperparameters config from the
+    # given
+    # sampling options (default input_ids [1, 2, 3]); sets gconfig.lora_name when
+    # provided.
     """Create a ModelRequest with sensible defaults for testing."""
     if input_ids is None:
         input_ids = [1, 2, 3]
@@ -96,6 +115,11 @@ def _make_bridge(
     backend: SGLangBridgeBackend | VLLMBridgeBackend | None = None,
     **kwargs: Any,
 ) -> InfBridge:
+    # [FUNCTION DOC]
+    # HELPER: Builds an InfBridge with a fresh PauseState and SGLang backend by default,
+    # backend_addr http://mock and resubmit_wait 0.01 unless overridden; extra kwargs go
+    # to
+    # the InfBridge constructor.
     """Create an InfBridge with a pluggable backend and sensible defaults."""
     if pause_state is None:
         pause_state = PauseState()
@@ -116,12 +140,19 @@ def _make_bridge(
 
 
 class TestInfBridge:
+    # [CLASS DOC]
+    # Tests for the abort/resubmit loop and ModelResponse construction with SGLang
+    # backend.
     """Tests for InfBridge abort/resubmit loop and ModelResponse construction."""
 
     # -- 1. Normal stop ---------------------------------------------------------
 
     @pytest.mark.asyncio
     async def test_normal_stop_returns_model_response(self):
+        # [FUNCTION DOC]
+        # A stop response yields output tokens, logprobs, stop reason, input tokens,
+        # positive
+        # latency, and a single send.
         """SGLang returns stop -- verify all ModelResponse fields populated."""
         pause_state = PauseState()
         bridge = _make_bridge(pause_state=pause_state)
@@ -144,10 +175,15 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_single_abort_then_stop_accumulates_tokens(self):
+        # [FUNCTION DOC]
+        # An abort followed by stop concatenates tokens and logprobs from both calls.
         """One abort, then stop -- verify token accumulation across resubmits."""
         call_count = 0
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Returns abort with two tokens on the first call, stop with two on
+            # the next.
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -169,10 +205,15 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_resubmit_input_ids_extended(self):
+        # [FUNCTION DOC]
+        # The resubmitted request's input_ids are the original prompt plus accumulated
+        # outputs.
         """Verify resubmit passes input_ids + accumulated output as new input."""
         calls: list[dict[str, Any]] = []
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records input_ids and sampling params; abort first, then stop.
             # Capture the payload that InfBridge sends
             calls.append(
                 {
@@ -200,10 +241,15 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_max_new_tokens_decremented_on_resubmit(self):
+        # [FUNCTION DOC]
+        # max_new_tokens on resubmit is reduced by the number of tokens already
+        # generated.
         """Verify max_new_tokens decreases by accumulated token count."""
         calls: list[dict[str, Any]] = []
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records input_ids and sampling params; abort first, then stop.
             calls.append(
                 {
                     "input_ids": list(http_req.payload["input_ids"]),
@@ -230,10 +276,15 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_max_new_tokens_exhausted_becomes_length(self):
+        # [FUNCTION DOC]
+        # When accumulated tokens reach max_new_tokens across aborts, the loop ends with
+        # stop_reason "length" after two calls and 10 tokens.
         """When accumulated tokens reach max_new_tokens, stop_reason='length'."""
         call_count = 0
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Always returns five tokens with abort, counting calls.
             nonlocal call_count
             call_count += 1
             # Always return 5 tokens with abort
@@ -258,6 +309,10 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_max_retries_final_abort_becomes_length(self):
+        # [FUNCTION DOC]
+        # With max_resubmit_retries=3 and constant aborts, exactly 3 sends occur and the
+        # final
+        # reason is "length" with 3 tokens.
         """After max retries, final abort is converted to 'length'."""
         sglang_resp = _make_sglang_response([(-0.1, 10)], "abort")
 
@@ -275,6 +330,9 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_paused_blocks_until_resumed(self):
+        # [FUNCTION DOC]
+        # While PauseState is paused agenerate does not complete; after unpausing it
+        # finishes.
         """While paused, agenerate waits; after resume, it completes."""
         sglang_resp = _make_sglang_response([(-0.5, 100)], "stop")
 
@@ -297,6 +355,8 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_tool_calls_stop_reason_passthrough(self):
+        # [FUNCTION DOC]
+        # A tool_calls finish reason ends the loop after one send and is passed through.
         """stop_reason='tool_calls' exits the loop normally."""
         sglang_resp = _make_sglang_response([(-0.5, 100), (-0.3, 101)], "tool_calls")
 
@@ -314,6 +374,8 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_output_versions_populated(self):
+        # [FUNCTION DOC]
+        # output_versions equals the bridge version repeated per output token.
         """Verify output_versions = [version] * len(output_tokens)."""
         sglang_resp = _make_sglang_response(
             [(-0.5, 100), (-0.3, 101), (-0.2, 102)], "stop"
@@ -330,6 +392,8 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_output_versions_tracks_version_changes(self):
+        # [FUNCTION DOC]
+        # output_versions uses the version set via set_version before the call.
         """output_versions uses the version at call time, not construction time."""
         sglang_resp = _make_sglang_response([(-0.5, 100)], "stop")
 
@@ -346,6 +410,8 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_n_samples_validation_raises_value_error(self):
+        # [FUNCTION DOC]
+        # n_samples other than 1 raises ValueError mentioning n_samples=1.
         """n_samples != 1 raises ValueError."""
         bridge = _make_bridge()
 
@@ -357,10 +423,14 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_max_new_tokens_capped_by_max_tokens(self):
+        # [FUNCTION DOC]
+        # Effective max_new_tokens is min(max_tokens - prompt length, max_new_tokens).
         """max_new_tokens = min(max_tokens - input_len, max_new_tokens)."""
         calls: list[dict[str, Any]] = []
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records input_ids and sampling params and returns stop.
             calls.append(
                 {
                     "input_ids": list(http_req.payload["input_ids"]),
@@ -382,6 +452,8 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_set_get_version(self):
+        # [FUNCTION DOC]
+        # set_version/get_version round-trip.
         """Version tracking works via set_version / get_version."""
         bridge = _make_bridge(version=0)
 
@@ -395,10 +467,14 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_greedy_sets_temperature_zero(self):
+        # [FUNCTION DOC]
+        # greedy=True forces temperature 0.0 in sampling params.
         """gconfig.greedy=True -> sampling_params temperature=0.0 in HTTP payload."""
         calls: list[dict[str, Any]] = []
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records input_ids and sampling params and returns stop.
             calls.append(
                 {
                     "input_ids": list(http_req.payload["input_ids"]),
@@ -419,6 +495,8 @@ class TestInfBridge:
 
     @pytest.mark.asyncio
     async def test_length_stop_reason_passthrough(self):
+        # [FUNCTION DOC]
+        # A length finish reason ends the loop without resubmission.
         """stop_reason='length' exits the loop normally without resubmit."""
         sglang_resp = _make_sglang_response([(-0.5, 100)], "length")
 
@@ -433,12 +511,23 @@ class TestInfBridge:
 
 
 class TestVLLMBridgeBackend:
+    # [CLASS DOC]
+    # InfBridge tests using the vLLM backend and direct VLLMBridgeBackend
+    # request/response
+    # building.
     @pytest.mark.asyncio
     async def test_vllm_text_abort_then_stop_accumulates_tokens(self):
+        # [FUNCTION DOC]
+        # vLLM abort then stop: second request's prompt is extended with outputs and
+        # max_tokens
+        # shrinks by generated count; tokens/logprobs accumulate.
         """vLLM text completions resubmit by extending prompt + shrinking max_tokens."""
         calls: list[dict[str, Any]] = []
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records prompt and max_tokens; abort with two tokens first, then
+            # stop.
             calls.append(
                 {
                     "prompt": list(http_req.payload["prompt"]),
@@ -464,6 +553,10 @@ class TestVLLMBridgeBackend:
         assert resp.stop_reason == "stop"
 
     def test_vllm_build_generation_request_for_text(self):
+        # [FUNCTION DOC]
+        # Text requests target /v1/completions with prompt=input_ids, max_tokens and
+        # stream
+        # False.
         """vLLM bridge uses flat completions payload for text requests."""
         backend = VLLMBridgeBackend()
         req = _make_request(input_ids=[11, 12], max_new_tokens=7)
@@ -477,6 +570,8 @@ class TestVLLMBridgeBackend:
 
     @pytest.mark.parametrize("seed", [None, 12345])
     def test_vllm_build_generation_request_forwards_seed_when_set(self, seed):
+        # [FUNCTION DOC]
+        # Parametrized over seed None/12345: seed is forwarded only when set.
         """vLLM bridge forwards explicit seeds and omits unspecified seeds."""
         backend = VLLMBridgeBackend()
         req = _make_request(input_ids=[11, 12], max_new_tokens=7, seed=seed)
@@ -489,6 +584,10 @@ class TestVLLMBridgeBackend:
             assert http_req.payload["seed"] == seed
 
     def test_vllm_parse_generation_response_for_chat_format(self):
+        # [FUNCTION DOC]
+        # parse_generation_response handles chat-style logprobs content, decoding
+        # "token:<id>"
+        # into ids, and returns stop reason.
         """vLLM bridge parses chat logprobs content format."""
         backend = VLLMBridgeBackend()
         response = {
@@ -515,10 +614,14 @@ class TestVLLMBridgeBackend:
 
     @pytest.mark.asyncio
     async def test_vllm_max_new_tokens_capped_by_max_tokens(self):
+        # [FUNCTION DOC]
+        # vLLM max_tokens is capped by context max_tokens minus prompt length.
         """vLLM: max_tokens = min(max_tokens - input_len, max_new_tokens)."""
         calls: list[dict[str, Any]] = []
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records prompt and max_tokens and returns stop.
             calls.append(
                 {
                     "prompt": list(http_req.payload["prompt"]),
@@ -540,10 +643,14 @@ class TestVLLMBridgeBackend:
 
     @pytest.mark.asyncio
     async def test_vllm_greedy_sets_temperature_zero(self):
+        # [FUNCTION DOC]
+        # greedy=True sets temperature 0.0 in the vLLM payload.
         """vLLM: gconfig.greedy=True -> temperature=0.0 in HTTP payload."""
         calls: list[dict[str, Any]] = []
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records payload temperature and returns stop.
             calls.append({"temperature": http_req.payload["temperature"]})
             return _make_vllm_response([100], [-0.5], "stop")
 
@@ -558,6 +665,8 @@ class TestVLLMBridgeBackend:
     # -- 6. LoRA name in payload --------------------------------------------------
 
     def test_vllm_lora_name_in_payload(self):
+        # [FUNCTION DOC]
+        # with_lora=True sets payload model to the versioned LoRA name.
         """vLLM: with_lora=True sets payload['model'] to versioned lora name."""
         backend = VLLMBridgeBackend()
         req = _make_request(input_ids=[1, 2], lora_name="my_lora")
@@ -570,6 +679,9 @@ class TestVLLMBridgeBackend:
     # -- 7. Vision request uses chat endpoint ------------------------------------
 
     def test_vllm_vision_request_uses_chat_endpoint(self):
+        # [FUNCTION DOC]
+        # Requests with vision_msg_vllm go to /v1/chat/completions with a messages
+        # payload.
         """vLLM: vision_msg_vllm field routes request to /v1/chat/completions."""
         backend = VLLMBridgeBackend()
         gconfig = GenerationHyperparameters(
@@ -608,6 +720,8 @@ class TestVLLMBridgeBackend:
 
     @pytest.mark.asyncio
     async def test_vllm_pause_blocks_until_resumed(self):
+        # [FUNCTION DOC]
+        # vLLM backend: agenerate blocks while paused and completes after resume.
         """vLLM: while paused, agenerate waits; after resume, it completes."""
         vllm_resp = _make_vllm_response([100], [-0.5], "stop")
 
@@ -630,6 +744,8 @@ class TestVLLMBridgeBackend:
 
     @pytest.mark.asyncio
     async def test_vllm_length_stop_reason_passthrough(self):
+        # [FUNCTION DOC]
+        # vLLM length finish reason ends without resubmission.
         """vLLM: stop_reason='length' exits the loop normally without resubmit."""
         vllm_resp = _make_vllm_response([100], [-0.5], "length")
 
@@ -646,6 +762,8 @@ class TestVLLMBridgeBackend:
 
     @pytest.mark.asyncio
     async def test_vllm_output_versions_populated(self):
+        # [FUNCTION DOC]
+        # vLLM output_versions repeat the bridge version per token.
         """vLLM: output_versions = [version] * len(output_tokens)."""
         vllm_resp = _make_vllm_response([100, 101, 102], [-0.5, -0.3, -0.2], "stop")
 
@@ -662,6 +780,8 @@ class TestVLLMBridgeBackend:
 
     @pytest.mark.asyncio
     async def test_vllm_max_retries_abort_becomes_length(self):
+        # [FUNCTION DOC]
+        # vLLM constant aborts with 3 retries yield 3 sends and final reason "length".
         """vLLM: after max retries, final abort is converted to 'length'."""
         vllm_resp = _make_vllm_response([10], [-0.1], "abort")
 

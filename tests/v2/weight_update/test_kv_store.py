@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Unit tests for WeightMetaStore, the in-memory, thread-safe key/value and set store
+# used by the weight update gateway, namespaced by "pair" (trainer/inference pair id).
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
@@ -10,16 +13,22 @@ from areal.v2.weight_update.gateway.kv_store import WeightMetaStore
 
 @pytest.fixture()
 def store() -> WeightMetaStore:
+    # [FUNCTION DOC]
+    # Fixture: returns a fresh empty WeightMetaStore.
     return WeightMetaStore()
 
 
 def test_put_get_roundtrip_simple_dict(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # put then get returns an equal simple dict.
     payload = {"version": 3, "status": "ready"}
     store.put("pair_a", "meta", payload)
     assert store.get("pair_a", "meta") == payload
 
 
 def test_put_get_roundtrip_nested_complex(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # put then get returns an equal nested structure with lists, dicts and None.
     payload = {
         "weights": [1.0, 2.0, 3.0],
         "config": {"lr": 0.001, "layers": [64, 128]},
@@ -30,22 +39,30 @@ def test_put_get_roundtrip_nested_complex(store: WeightMetaStore):
 
 
 def test_get_missing_key_returns_none(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # get returns None for unknown pair or unknown key.
     assert store.get("nonexistent_pair", "key") is None
     store.put("pair_a", "k1", "v1")
     assert store.get("pair_a", "missing") is None
 
 
 def test_delete_removes_entry(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # delete returns True for an existing key and the key is gone afterwards.
     store.put("pair_a", "k1", "v1")
     assert store.delete("pair_a", "k1") is True
     assert store.get("pair_a", "k1") is None
 
 
 def test_delete_nonexistent_returns_false(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # delete of a missing key returns False.
     assert store.delete("pair_a", "nope") is False
 
 
 def test_add_to_set_and_set_size(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # add_to_set has set semantics: two members give size 2 and duplicates are ignored.
     store.add_to_set("pair_a", "barrier_1", "worker_0")
     store.add_to_set("pair_a", "barrier_1", "worker_1")
     assert store.set_size("pair_a", "barrier_1") == 2
@@ -55,10 +72,14 @@ def test_add_to_set_and_set_size(store: WeightMetaStore):
 
 
 def test_set_size_nonexistent_returns_zero(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # set_size of a missing set is 0.
     assert store.set_size("pair_a", "no_set") == 0
 
 
 def test_clear_pair_removes_all_data(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # clear_pair removes all keys and sets of that pair; list_keys becomes empty.
     store.put("pair_a", "k1", "v1")
     store.put("pair_a", "k2", "v2")
     store.add_to_set("pair_a", "barrier", "w0")
@@ -70,6 +91,8 @@ def test_clear_pair_removes_all_data(store: WeightMetaStore):
 
 
 def test_pair_isolation(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # Data of different pairs is isolated, including under clear_pair.
     store.put("pair_a", "key", "value_a")
     store.put("pair_b", "key", "value_b")
     assert store.get("pair_a", "key") == "value_a"
@@ -80,6 +103,8 @@ def test_pair_isolation(store: WeightMetaStore):
 
 
 def test_list_keys(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # list_keys returns the pair's keys, and [] for an unknown pair.
     store.put("pair_a", "k1", 1)
     store.put("pair_a", "k2", 2)
     keys = store.list_keys("pair_a")
@@ -88,11 +113,19 @@ def test_list_keys(store: WeightMetaStore):
 
 
 def test_thread_safety_concurrent_puts(store: WeightMetaStore):
+    # [FUNCTION DOC]
+    # Ten threads each put 100 distinct keys concurrently; no errors and all 1000 keys
+    # are
+    # present.
     num_threads = 10
     writes_per_thread = 100
     errors: list[Exception] = []
 
     def writer(thread_id: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Thread body writing writes_per_thread keys for its thread id; records
+        # any
+        # exception in the shared errors list.
         try:
             for i in range(writes_per_thread):
                 store.put("pair_a", f"t{thread_id}_k{i}", f"v{thread_id}_{i}")

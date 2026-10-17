@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tests for VLM image input support across the OpenAI-compatible stack: the
+# _extract_images_from_messages and _build_messages_list helpers from the experimental
+# OpenAI client, image_data forwarding in SGLang/vLLM bridge backends, preservation of
+# image_data across InfBridge abort/resubmit, and pass-through of image messages by the
+# data proxy /chat/completions endpoint. Uses real PNG bytes generated with PIL.
 """Tests for VLM image input through the OpenAI-compatible API.
 
 Uses real base64-encoded PNG images (tiny 1x1 and 2x2 pixels) generated
@@ -34,6 +40,10 @@ from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 
 
 def _make_png_base64(width: int = 1, height: int = 1, color="red") -> str:
+    # [FUNCTION DOC]
+    # HELPER: Creates a width x height RGB PNG of the given color with PIL and returns
+    # the
+    # raw base64 string (no data-URI prefix).
     """Create a real PNG image and return its raw base64 string (no URI prefix)."""
     img = Image.new("RGB", (width, height), color=color)
     buf = io.BytesIO()
@@ -42,10 +52,18 @@ def _make_png_base64(width: int = 1, height: int = 1, color="red") -> str:
 
 
 def _make_data_uri(b64: str, mime: str = "image/png") -> str:
+    # [FUNCTION DOC]
+    # HELPER: Wraps a base64 string as a data URI with the given MIME type (default
+    # png).
     return f"data:{mime};base64,{b64}"
 
 
 def _materialize(obj):
+    # [FUNCTION DOC]
+    # HELPER: Recursively converts dicts, lists/tuples and other non-string iterables
+    # (e.g.
+    # Pydantic ValidatorIterator) into plain dicts/lists; non-iterables returned
+    # unchanged.
     """Recursively convert Pydantic ValidatorIterators (and other iterables) to plain lists/dicts."""
     if isinstance(obj, dict):
         return {k: _materialize(v) for k, v in obj.items()}
@@ -61,11 +79,15 @@ def _materialize(obj):
 
 @pytest.fixture
 def red_pixel_b64():
+    # [FUNCTION DOC]
+    # Fixture: base64 of a 1x1 red PNG.
     return _make_png_base64(1, 1, "red")
 
 
 @pytest.fixture
 def blue_pixel_b64():
+    # [FUNCTION DOC]
+    # Fixture: base64 of a 1x1 blue PNG.
     return _make_png_base64(1, 1, "blue")
 
 
@@ -75,7 +97,17 @@ def blue_pixel_b64():
 
 
 class TestExtractImagesFromMessages:
+    # [CLASS DOC]
+    # Tests for _extract_images_from_messages, which returns (image_data list, messages
+    # for
+    # the tokenizer with image parts replaced by bare image markers, vLLM-style messages
+    # with
+    # placeholder URLs).
     def test_single_base64_image(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # One data-URI image yields its raw base64, a {"type": "image"} tokenizer part,
+        # and a
+        # vLLM image_url part whose url is "placeholder".
         data_uri = _make_data_uri(red_pixel_b64)
         messages = [
             {
@@ -101,6 +133,9 @@ class TestExtractImagesFromMessages:
         assert vllm_content[1]["image_url"]["url"] == "placeholder"
 
     def test_multiple_images_in_single_message(self, red_pixel_b64, blue_pixel_b64):
+        # [FUNCTION DOC]
+        # Two images in one message are extracted in order and both become image
+        # markers.
         messages = [
             {
                 "role": "user",
@@ -130,6 +165,9 @@ class TestExtractImagesFromMessages:
         assert tok_content[2] == {"type": "image"}
 
     def test_images_across_multiple_messages(self, red_pixel_b64, blue_pixel_b64):
+        # [FUNCTION DOC]
+        # Images across several messages are extracted in order; text-only messages
+        # unchanged.
         messages = [
             {"role": "system", "content": "You are a VLM assistant."},
             {
@@ -165,6 +203,8 @@ class TestExtractImagesFromMessages:
         assert tok_msgs[2] == {"role": "assistant", "content": "I see a red pixel."}
 
     def test_http_url_preserved_as_is(self):
+        # [FUNCTION DOC]
+        # An http(s) image URL is kept verbatim in image_data.
         url = "https://example.com/photo.jpg"
         messages = [
             {
@@ -183,6 +223,8 @@ class TestExtractImagesFromMessages:
         assert tok_msgs[0]["content"][1] == {"type": "image"}
 
     def test_no_images_returns_empty(self):
+        # [FUNCTION DOC]
+        # Text-only messages give empty image_data and unchanged tokenizer messages.
         messages = [
             {"role": "user", "content": "What is 2+2?"},
             {"role": "assistant", "content": "4"},
@@ -195,6 +237,8 @@ class TestExtractImagesFromMessages:
         assert tok_msgs[1] == messages[1]
 
     def test_string_content_passes_through(self):
+        # [FUNCTION DOC]
+        # String content passes through unchanged in both message variants.
         messages = [{"role": "user", "content": "Hello"}]
 
         image_data, tok_msgs, vllm_msgs = _extract_images_from_messages(messages)
@@ -204,6 +248,8 @@ class TestExtractImagesFromMessages:
         assert vllm_msgs[0]["content"] == "Hello"
 
     def test_original_messages_not_mutated(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # The input message list is not mutated.
         data_uri = _make_data_uri(red_pixel_b64)
         messages = [
             {
@@ -221,6 +267,8 @@ class TestExtractImagesFromMessages:
         assert messages == original
 
     def test_jpeg_data_uri(self):
+        # [FUNCTION DOC]
+        # A JPEG data URI yields its base64 payload.
         jpeg_b64 = base64.b64encode(b"\xff\xd8\xff\xe0fake-jpeg").decode()
         data_uri = _make_data_uri(jpeg_b64, mime="image/jpeg")
         messages = [
@@ -238,6 +286,8 @@ class TestExtractImagesFromMessages:
         assert image_data[0] == jpeg_b64
 
     def test_detail_parameter_ignored_for_extraction(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # The image_url "detail" field does not affect extraction.
         data_uri = _make_data_uri(red_pixel_b64)
         messages = [
             {
@@ -257,6 +307,9 @@ class TestExtractImagesFromMessages:
         assert image_data[0] == red_pixel_b64
 
     def test_real_png_roundtrip(self):
+        # [FUNCTION DOC]
+        # A 4x4 PNG round-trips through extraction and decodes back to the same size and
+        # pixel.
         """Create a real 4x4 image, encode it, extract it, and decode back."""
         original = Image.new("RGB", (4, 4), color=(42, 128, 200))
         buf = io.BytesIO()
@@ -288,7 +341,12 @@ class TestExtractImagesFromMessages:
 
 
 class TestSGLangBridgeBackendImageForwarding:
+    # [CLASS DOC]
+    # Tests that SGLangBridgeBackend.build_generation_request puts image_data in the
+    # /generate payload.
     def test_image_data_included_in_payload(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # A single image list is included alongside input_ids on endpoint /generate.
         backend = SGLangBridgeBackend()
         gconfig = GenerationHyperparameters(
             n_samples=1,
@@ -309,6 +367,8 @@ class TestSGLangBridgeBackendImageForwarding:
         assert http_req.payload["input_ids"] == [1, 2, 3]
 
     def test_image_data_none_included_in_payload(self):
+        # [FUNCTION DOC]
+        # image_data None is carried as None in the payload.
         backend = SGLangBridgeBackend()
         gconfig = GenerationHyperparameters(
             n_samples=1,
@@ -327,6 +387,8 @@ class TestSGLangBridgeBackendImageForwarding:
         assert http_req.payload["image_data"] is None
 
     def test_multiple_images_in_payload(self, red_pixel_b64, blue_pixel_b64):
+        # [FUNCTION DOC]
+        # Multiple images are forwarded in order.
         backend = SGLangBridgeBackend()
         gconfig = GenerationHyperparameters(
             n_samples=1,
@@ -351,7 +413,13 @@ class TestSGLangBridgeBackendImageForwarding:
 
 
 class TestVLLMBridgeBackendVisionMessages:
+    # [CLASS DOC]
+    # Tests that VLLMBridgeBackend builds /v1/chat/completions requests by replacing
+    # placeholder image URLs in vision_msg_vllm with data URIs from image_data.
     def test_vision_messages_get_real_data_uris(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # Placeholder becomes a png data URI of the image; seed from gconfig is
+        # forwarded.
         backend = VLLMBridgeBackend()
         gconfig = GenerationHyperparameters(
             n_samples=1,
@@ -392,6 +460,8 @@ class TestVLLMBridgeBackendVisionMessages:
         assert image_part["image_url"]["url"] == expected_uri
 
     def test_multiple_vision_images_injected(self, red_pixel_b64, blue_pixel_b64):
+        # [FUNCTION DOC]
+        # Two placeholders are filled with the two images in order.
         backend = VLLMBridgeBackend()
         gconfig = GenerationHyperparameters(
             n_samples=1,
@@ -431,6 +501,8 @@ class TestVLLMBridgeBackendVisionMessages:
         )
 
     def test_mismatched_image_count_raises(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # Fewer images than placeholders raises ValueError "Not enough images".
         backend = VLLMBridgeBackend()
         gconfig = GenerationHyperparameters(
             n_samples=1,
@@ -460,6 +532,9 @@ class TestVLLMBridgeBackendVisionMessages:
             backend.build_generation_request(req, with_lora=False, version=0)
 
     def test_real_image_survives_data_uri_roundtrip(self):
+        # [FUNCTION DOC]
+        # A real 2x2 PNG survives injection into the payload and decodes to the same
+        # size.
         """Encode a real 2x2 PNG, build vLLM request, decode from the payload."""
         original = Image.new("RGB", (2, 2), color=(255, 0, 0))
         buf = io.BytesIO()
@@ -507,6 +582,10 @@ def _make_sglang_response(
     token_logprobs: list[tuple[float, int]],
     finish_reason_type: str = "stop",
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a fake SGLang /generate response dict with meta_info finish_reason
+    # type
+    # and output_token_logprobs (list of (logprob, token_id)).
     return {
         "meta_info": {
             "finish_reason": {"type": finish_reason_type},
@@ -516,12 +595,21 @@ def _make_sglang_response(
 
 
 class TestInfBridgeImagePreservation:
+    # [CLASS DOC]
+    # Tests that InfBridge keeps image_data in every payload it sends.
     @pytest.mark.asyncio
     async def test_image_data_present_in_initial_request(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # With _send_request replaced by a capturing stub returning "stop", one request
+        # is sent
+        # containing image_data and the response stop_reason is stop.
         """image_data is forwarded in the first HTTP payload."""
         captured_payloads: list[dict] = []
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Captures a copy of the payload and returns a stop response with
+            # token 100.
             captured_payloads.append(dict(http_req.payload))
             return _make_sglang_response([(-0.5, 100)], "stop")
 
@@ -552,11 +640,18 @@ class TestInfBridgeImagePreservation:
 
     @pytest.mark.asyncio
     async def test_image_data_persists_through_resubmit(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # First call returns abort (token 100), second stop (token 200): two requests
+        # are sent,
+        # both carry image_data, and output tokens accumulate to [100, 200].
         """image_data stays in payload across abort/resubmit iterations."""
         captured_payloads: list[dict] = []
         call_count = 0
 
         async def mock_send(http_req, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Counts calls, captures payloads; abort on first call, stop
+            # afterwards.
             nonlocal call_count
             call_count += 1
             captured_payloads.append(dict(http_req.payload))
@@ -600,6 +695,14 @@ ADMIN_KEY = "areal-admin-key"
 
 
 def _make_mock_areal_client_for_images():
+    # [FUNCTION DOC]
+    # HELPER: Builds a MagicMock ArealOpenAI client whose chat.completions.create is an
+    # AsyncMock that records call kwargs (materializing messages to a list) in
+    # _captured_calls, builds an InteractionWithTokenLogpReward with a fixed 6-token
+    # tensor
+    # cache, stores it in areal_cache under the completion id when given, and returns a
+    # fixed
+    # ChatCompletion ("I see a red pixel.").
     """Mock ArealOpenAI client that captures kwargs and returns a ChatCompletion."""
     from openai.types.chat import ChatCompletion, ChatCompletionMessage
     from openai.types.chat.chat_completion import Choice
@@ -629,6 +732,9 @@ def _make_mock_areal_client_for_images():
     )
 
     async def _mock_create(*, areal_cache=None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Side effect for the mocked create; see enclosing helper. Imports torch
+        # lazily.
         import torch
 
         raw_messages = kwargs.get("messages", [])
@@ -664,6 +770,12 @@ def _make_mock_areal_client_for_images():
 
 @pytest_asyncio.fixture
 async def image_test_client():
+    # [FUNCTION DOC]
+    # Async fixture: creates a data proxy app with a mock backend config and overrides
+    # its
+    # app.state with a mock tokenizer, an InfBridge (SGLang backend, fast resubmit), the
+    # image-capturing mock client, a PauseState, a SessionStore and version 0. Yields
+    # (httpx ASGI client, mock client).
     """Data proxy test client wired with an image-capturing mock."""
     from areal.v2.inference_service.data_proxy.app import create_app
     from areal.v2.inference_service.data_proxy.config import DataProxyConfig
@@ -708,8 +820,15 @@ async def image_test_client():
 
 
 class TestDataProxyImagePassthrough:
+    # [CLASS DOC]
+    # Tests that data proxy /chat/completions forwards image messages to the Areal
+    # client.
     @pytest.mark.asyncio
     async def test_image_url_messages_passed_through(self, image_test_client):
+        # [FUNCTION DOC]
+        # An image_url message is passed unchanged (same data URI) to the client and the
+        # mocked
+        # completion is returned.
         client, mock_areal = image_test_client
         b64 = _make_png_base64(1, 1, "green")
         data_uri = _make_data_uri(b64)
@@ -745,6 +864,12 @@ class TestDataProxyImagePassthrough:
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_session_lifecycle_with_image_messages(self, image_test_client):
+        # [FUNCTION DOC]
+        # (Skipped pending schema migration.) start_session, image chat, set_reward and
+        # export_trajectories produce one interaction.
+        # KNOWN ISSUE: a comment claims set_reward_finish_timeout=0 but the fixture
+        # config does
+        # not set it; ADMIN_KEY relies on the DataProxyConfig default admin key.
         """Full lifecycle: start → image chat → reward → end → export."""
         client, mock_areal = image_test_client
         b64 = _make_png_base64(2, 2, "yellow")
@@ -806,6 +931,8 @@ class TestDataProxyImagePassthrough:
 
     @pytest.mark.asyncio
     async def test_mixed_text_and_image_messages(self, image_test_client):
+        # [FUNCTION DOC]
+        # System text message plus an image message are forwarded intact.
         """Multiple messages with only some containing images."""
         client, mock_areal = image_test_client
         b64 = _make_png_base64(1, 1, "white")
@@ -836,6 +963,8 @@ class TestDataProxyImagePassthrough:
 
     @pytest.mark.asyncio
     async def test_plain_text_still_works(self, image_test_client):
+        # [FUNCTION DOC]
+        # Plain text-only requests still reach the client unchanged.
         """Non-image requests still work after image support is added."""
         client, mock_areal = image_test_client
 
@@ -859,11 +988,18 @@ class TestDataProxyImagePassthrough:
 
 
 class TestBuildMessagesList:
+    # [CLASS DOC]
+    # Tests for _build_messages_list (Responses API input item to Chat Completions
+    # messages).
     def test_string_content(self):
+        # [FUNCTION DOC]
+        # String content becomes a single message as-is.
         result = _build_messages_list({"role": "user", "content": "Hello"})
         assert result == [{"role": "user", "content": "Hello"}]
 
     def test_output_text_flattened(self):
+        # [FUNCTION DOC]
+        # A single output_text part is flattened to a string content message.
         item = {
             "role": "assistant",
             "content": [{"type": "output_text", "text": "Answer A"}],
@@ -872,6 +1008,8 @@ class TestBuildMessagesList:
         assert result == [{"role": "assistant", "content": "Answer A"}]
 
     def test_multiple_output_text_each_becomes_message(self):
+        # [FUNCTION DOC]
+        # Each output_text part becomes its own message.
         item = {
             "role": "assistant",
             "content": [
@@ -886,6 +1024,8 @@ class TestBuildMessagesList:
         ]
 
     def test_input_text_flattened(self):
+        # [FUNCTION DOC]
+        # A single input_text part is flattened to string content.
         item = {
             "role": "user",
             "content": [{"type": "input_text", "text": "Describe this"}],
@@ -894,6 +1034,10 @@ class TestBuildMessagesList:
         assert result == [{"role": "user", "content": "Describe this"}]
 
     def test_input_image_produces_multimodal_message(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # input_text plus input_image produce one multimodal message with text and
+        # image_url
+        # parts.
         data_uri = _make_data_uri(red_pixel_b64)
         item = {
             "role": "user",
@@ -914,6 +1058,8 @@ class TestBuildMessagesList:
         }
 
     def test_input_image_with_detail_forwarded(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # input_image detail is forwarded into image_url.
         data_uri = _make_data_uri(red_pixel_b64)
         item = {
             "role": "user",
@@ -930,6 +1076,8 @@ class TestBuildMessagesList:
         }
 
     def test_input_image_without_detail_omits_key(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # Without detail, the image_url dict has no detail key.
         data_uri = _make_data_uri(red_pixel_b64)
         item = {
             "role": "user",
@@ -942,6 +1090,8 @@ class TestBuildMessagesList:
         assert "detail" not in img_part["image_url"]
 
     def test_input_image_missing_image_url_raises(self):
+        # [FUNCTION DOC]
+        # input_image without image_url raises ValueError.
         item = {
             "role": "user",
             "content": [{"type": "input_image"}],
@@ -950,6 +1100,8 @@ class TestBuildMessagesList:
             _build_messages_list(item)
 
     def test_input_image_empty_image_url_raises(self):
+        # [FUNCTION DOC]
+        # input_image with empty image_url raises ValueError.
         item = {
             "role": "user",
             "content": [{"type": "input_image", "image_url": ""}],
@@ -958,6 +1110,8 @@ class TestBuildMessagesList:
             _build_messages_list(item)
 
     def test_mixed_text_and_image(self, red_pixel_b64):
+        # [FUNCTION DOC]
+        # Interleaved text/image/text parts keep order in one multimodal message.
         data_uri = _make_data_uri(red_pixel_b64)
         item = {
             "role": "user",
@@ -976,6 +1130,8 @@ class TestBuildMessagesList:
         assert parts[2] == {"type": "text", "text": "and describe it"}
 
     def test_unsupported_content_type_raises(self):
+        # [FUNCTION DOC]
+        # Unsupported part type input_file raises ValueError naming it.
         item = {
             "role": "user",
             "content": [{"type": "input_file", "file_id": "file-123"}],
@@ -984,6 +1140,8 @@ class TestBuildMessagesList:
             _build_messages_list(item)
 
     def test_non_dict_content_part_raises(self):
+        # [FUNCTION DOC]
+        # A non-dict content part raises ValueError.
         item = {
             "role": "user",
             "content": ["plain string"],
@@ -992,6 +1150,8 @@ class TestBuildMessagesList:
             _build_messages_list(item)
 
     def test_function_call_output_converted(self):
+        # [FUNCTION DOC]
+        # function_call_output becomes a tool message with content and tool_call_id.
         item = {
             "type": "function_call_output",
             "call_id": "call_abc",
@@ -1004,6 +1164,9 @@ class TestBuildMessagesList:
         assert result[0]["tool_call_id"] == "call_abc"
 
     def test_function_call_output_without_call_id(self):
+        # [FUNCTION DOC]
+        # function_call_output without call_id becomes a tool message lacking
+        # tool_call_id.
         item = {
             "type": "function_call_output",
             "output": "done",
@@ -1021,7 +1184,12 @@ class TestBuildMessagesList:
 
 
 class TestExtractImagesValidation:
+    # [CLASS DOC]
+    # Validation tests: malformed image_url parts raise ValueError "empty or missing
+    # URL".
     def test_empty_url_raises(self):
+        # [FUNCTION DOC]
+        # Empty url string raises.
         messages = [
             {
                 "role": "user",
@@ -1034,6 +1202,8 @@ class TestExtractImagesValidation:
             _extract_images_from_messages(messages)
 
     def test_missing_url_key_raises(self):
+        # [FUNCTION DOC]
+        # Missing url key raises.
         messages = [
             {
                 "role": "user",
@@ -1046,6 +1216,8 @@ class TestExtractImagesValidation:
             _extract_images_from_messages(messages)
 
     def test_missing_image_url_obj_raises(self):
+        # [FUNCTION DOC]
+        # Missing image_url object raises.
         messages = [
             {
                 "role": "user",
@@ -1058,6 +1230,8 @@ class TestExtractImagesValidation:
             _extract_images_from_messages(messages)
 
     def test_non_dict_image_url_obj_raises(self):
+        # [FUNCTION DOC]
+        # Non-dict image_url value raises.
         messages = [
             {
                 "role": "user",

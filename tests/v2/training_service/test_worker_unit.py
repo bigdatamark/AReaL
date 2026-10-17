@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Unit tests for the v2 training-service worker Flask app: engine creation via
+# /create_engine with the CPU FakeTrainEngine, topology reporting, and RPC-style engine
+# method endpoints (train, forward, initialize, SFT, PPO) using serialized args/kwargs.
+# Module-level worker globals (engine, node address, engine thread and work queue) are
+# reset around every test.
 """Unit tests for training-service worker Flask app."""
 
 from __future__ import annotations
@@ -14,6 +20,11 @@ MODULE = "areal.v2.training_service.worker.app"
 
 @pytest.fixture(autouse=True)
 def reset_worker_state():
+    # [FUNCTION DOC]
+    # Autouse fixture: before and after each test, stops any engine worker thread
+    # (sending
+    # a None sentinel to its queue and joining up to 1s) and resets the worker module's
+    # _engine, _node_addr, _engine_thread and _engine_work_queue globals.
     import areal.v2.training_service.worker.app as worker_app
 
     if worker_app._engine_work_queue is not None:
@@ -41,6 +52,9 @@ def reset_worker_state():
 
 @pytest.fixture
 def client():
+    # [FUNCTION DOC]
+    # Fixture: creates the worker Flask app (127.0.0.1:19001, admin key) and returns its
+    # test client.
     from areal.v2.training_service.worker.app import create_app
 
     app = create_app(
@@ -54,7 +68,11 @@ def client():
 
 
 class TestWorkerEngineCreation:
+    # [CLASS DOC]
+    # Tests for /create_engine.
     def test_create_engine_requires_engine_class(self, client):
+        # [FUNCTION DOC]
+        # Missing engine_class returns 400 mentioning engine_class.
         resp = client.post(
             "/create_engine",
             json={"init_args": [], "init_kwargs": {}},
@@ -63,6 +81,8 @@ class TestWorkerEngineCreation:
         assert "engine_class" in resp.get_json()["error"]
 
     def test_create_engine_success(self, client):
+        # [FUNCTION DOC]
+        # Creating FakeTrainEngine by import path with serialized args returns success.
         resp = client.post(
             "/create_engine",
             json={
@@ -77,12 +97,18 @@ class TestWorkerEngineCreation:
 
 
 class TestWorkerEndpoints:
+    # [CLASS DOC]
+    # Tests for worker endpoints after engine creation.
     def test_topology_before_create_engine_returns_400(self, client):
+        # [FUNCTION DOC]
+        # /topology before engine creation returns 400 "Engine not created".
         resp = client.get("/topology")
         assert resp.status_code == 400
         assert "Engine not created" in resp.get_json()["error"]
 
     def test_train_batch_after_create_engine(self, client):
+        # [FUNCTION DOC]
+        # /train_batch on the fake engine returns a serialized dict containing total.
         create_resp = client.post(
             "/create_engine",
             json={
@@ -108,6 +134,10 @@ class TestWorkerEndpoints:
         assert "total" in result
 
     def test_topology_after_create_engine(self, client):
+        # [FUNCTION DOC]
+        # /topology with RANK/WORLD_SIZE/LOCAL_RANK env set reports rank 0, world_size
+        # 1,
+        # dp_size 1.
         create_resp = client.post(
             "/create_engine",
             json={
@@ -131,6 +161,10 @@ class TestWorkerEndpoints:
         assert topo["dp_size"] == 1
 
     def test_ppo_endpoints_return_400_when_engine_method_missing(self, client):
+        # [FUNCTION DOC]
+        # PPO actor/critic endpoints return 400 "does not implement method" since the
+        # fake
+        # engine lacks those methods.
         create_resp = client.post(
             "/create_engine",
             json={
@@ -159,6 +193,9 @@ class TestWorkerEndpoints:
     def test_forward_batch_after_initialize_succeeds_without_distributed_group(
         self, client
     ):
+        # [FUNCTION DOC]
+        # After /initialize, /forward_batch works without a distributed group and echoes
+        # output_seqlens.
         create_resp = client.post(
             "/create_engine",
             json={
@@ -195,6 +232,9 @@ class TestWorkerEndpoints:
     def test_sft_route_succeeds_without_distributed_group_for_single_worker(
         self, client
     ):
+        # [FUNCTION DOC]
+        # /sft/train succeeds for a single worker without a distributed group and
+        # returns total.
         create_resp = client.post(
             "/create_engine",
             json={
@@ -218,6 +258,9 @@ class TestWorkerEndpoints:
         assert "total" in result
 
     def test_sft_route_ignores_rpc_meta_override_for_single_worker(self, client):
+        # [FUNCTION DOC]
+        # /sft/train with an rpc_meta broadcast override still succeeds for a single
+        # worker.
         create_resp = client.post(
             "/create_engine",
             json={

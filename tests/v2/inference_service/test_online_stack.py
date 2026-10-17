@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Lightweight in-process integration tests of the online (human-in-the-loop) flow
+# Gateway -> Router -> Data Proxy. All three FastAPI apps run behind httpx ASGI
+# transports; the data proxy uses a mocked Areal OpenAI client and tokenizer, and the
+# gateway's router/forward helpers are monkeypatched to call the in-process router and
+# data proxy clients. No GPU required.
 """Lightweight online-stack integration tests.
 
 These tests exercise the Gateway -> Router -> Data Proxy online flow in-process
@@ -35,6 +41,14 @@ ROUTER_ADDR = "http://router"
 
 
 def _make_mock_areal_client():
+    # [FUNCTION DOC]
+    # HELPER: Builds a MagicMock Areal client whose chat.completions.create AsyncMock
+    # returns
+    # ChatCompletions with ids chatcmpl-test0, chatcmpl-test1, ... ("Hello!"), and
+    # stores a
+    # matching InteractionWithTokenLogpReward (fixed 6-token tensor cache) into
+    # areal_cache
+    # when provided.
     from openai.types.chat import ChatCompletion, ChatCompletionMessage
     from openai.types.chat.chat_completion import Choice
     from openai.types.completion_usage import CompletionUsage
@@ -45,6 +59,11 @@ def _make_mock_areal_client():
     call_index = 0
 
     async def _mock_create(*, areal_cache=None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Side effect for create: builds the completion for the current call
+        # index,
+        # increments it, caches the interaction and returns the completion. Imports
+        # torch lazily.
         import torch
 
         nonlocal call_index
@@ -88,6 +107,16 @@ def _make_mock_areal_client():
 
 @pytest_asyncio.fixture
 async def online_stack(monkeypatch):
+    # [FUNCTION DOC]
+    # Async fixture: builds data proxy (state overridden with mock tokenizer, InfBridge,
+    # mocked client, PauseState, SessionStore with admin key, mock http client, version
+    # 0),
+    # router (round robin, effectively no polling) and gateway apps; opens ASGI clients
+    # for
+    # each, registers the data proxy with the router, and monkeypatches the gateway
+    # module's
+    # query_router, forward_request and revoke_session_in_router to in-process versions.
+    # Yields gateway client, router app and data proxy app.
     import areal.v2.inference_service.gateway.app as gateway_app_module
     from areal.v2.inference_service.data_proxy.pause import PauseState
     from areal.v2.inference_service.inf_bridge import InfBridge
@@ -178,6 +207,14 @@ async def online_stack(monkeypatch):
             model: str | None = None,
             client: httpx.AsyncClient | None = None,
         ) -> str:
+            # [FUNCTION DOC]
+            # HELPER: Replacement for gateway query_router: posts to router /route with
+            # model,
+            # session_id (or api_key and path) and optional admin bearer; maps 404/503
+            # to
+            # RouterKeyRejectedError(detail, status), other >=400 to
+            # RouterUnreachableError, and
+            # returns worker_addr. router_addr, timeout and client are ignored.
             del router_addr, timeout, client
             payload: dict[str, str] = {}
             if model is not None:
@@ -208,6 +245,10 @@ async def online_stack(monkeypatch):
             *,
             client: httpx.AsyncClient | None = None,
         ):
+            # [FUNCTION DOC]
+            # HELPER: Replacement for gateway forward_request: strips the data proxy
+            # base URL and
+            # posts the raw body and headers to the in-process data proxy client.
             del timeout, client
             path = url.replace(DATA_PROXY_ADDR, "")
             return await dp_client.post(path, content=body, headers=headers)
@@ -220,6 +261,9 @@ async def online_stack(monkeypatch):
             *,
             client: httpx.AsyncClient | None = None,
         ) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Replacement for revoke_session_in_router: posts group_id to router
+            # /remove_session with the admin key and asserts 200.
             del router_addr, timeout, client
             resp = await router_client.post(
                 "/remove_session",
@@ -244,16 +288,27 @@ async def online_stack(monkeypatch):
 
 
 def _admin_headers() -> dict[str, str]:
+    # [FUNCTION DOC]
+    # HELPER: Authorization header with the admin key.
     return {"Authorization": f"Bearer {ADMIN_KEY}"}
 
 
 def _hitl_headers() -> dict[str, str]:
+    # [FUNCTION DOC]
+    # HELPER: Authorization header for HITL/online requests.
+    # KNOWN ISSUE: identical to _admin_headers (uses the admin key), so tests do not
+    # distinguish a separate online/HITL credential.
     return {"Authorization": f"Bearer {ADMIN_KEY}"}
 
 
 @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
 @pytest.mark.asyncio
 async def test_online_stack_latest_ready_export_keeps_session_pinned(online_stack):
+    # [FUNCTION DOC]
+    # (Skipped.) Two chat+reward rounds on the __hitl__ session; second reward is
+    # trajectory 1; export without trajectory_id returns only chatcmpl-test1 and the
+    # router
+    # still pins __hitl__ to the data proxy.
     gw = online_stack["gateway_client"]
     router_app = online_stack["router_app"]
 
@@ -296,6 +351,10 @@ async def test_online_stack_latest_ready_export_keeps_session_pinned(online_stac
 @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
 @pytest.mark.asyncio
 async def test_online_stack_explicit_then_latest_export(online_stack):
+    # [FUNCTION DOC]
+    # (Skipped.) Two rounds give trajectory ids 0 and 1; explicit export of trajectory 0
+    # returns chatcmpl-test0 and a latest export returns chatcmpl-test1 (remove_session
+    # False).
     gw = online_stack["gateway_client"]
 
     await gw.post(
@@ -356,6 +415,10 @@ async def test_online_stack_explicit_then_latest_export(online_stack):
 async def test_online_stack_reward_creates_pending_ready_event_without_callback(
     online_stack,
 ):
+    # [FUNCTION DOC]
+    # One chat plus set_reward creates exactly one pending online callback in the data
+    # proxy
+    # session store for session __hitl__, trajectory 0, even without a callback server.
     gw = online_stack["gateway_client"]
     data_proxy_app = online_stack["data_proxy_app"]
 

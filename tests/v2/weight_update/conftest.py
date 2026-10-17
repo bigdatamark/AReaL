@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Pytest conftest for weight_update tests. On Python versions older than 3.12 it
+# pre-registers lightweight namespace module stubs for areal, areal.experimental,
+# areal.v2 and areal.v2.weight_update (pointing at the real source directories) so that
+# importing areal.v2.weight_update submodules does not execute the top-level
+# areal/__init__.py, which uses 3.12-only syntax. Side effect at import time: mutates
+# sys.modules.
 """Pre-import hook for Python < 3.12 compatibility.
 
 The top-level ``areal/__init__.py`` imports from modules that use PEP 695 syntax
@@ -27,6 +34,12 @@ _STUB_PACKAGES = [
 
 
 def _ensure_namespace_stubs():
+    # [FUNCTION DOC]
+    # HELPER: For each stub package not already imported, creates an empty ModuleType
+    # with
+    # __path__ set to the real directory and registers it in sys.modules; then links
+    # each
+    # child stub as an attribute on its parent module. Returns None.
     """Insert namespace-style modules for ``areal`` ancestors with real paths."""
     for name, path in _STUB_PACKAGES:
         if name not in sys.modules:

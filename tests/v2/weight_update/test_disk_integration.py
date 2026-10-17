@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for disk-mode weight updates in the v2 weight update gateway. Unit tests drive
+# the gateway app (/connect, /update_weights, /disconnect) with a Starlette TestClient
+# and a mocked aiohttp session that records outbound worker calls; a GPU end-to-end test
+# runs real FSDP training workers and SGLang inference workers, saves HF weights to a
+# shared directory through the gateway, and checks the inference server loaded them.
+# Shared helpers come from test_nccl_integration.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
@@ -25,6 +32,8 @@ from areal.v2.weight_update.gateway.config import (
 
 @pytest.fixture()
 def config() -> WeightUpdateConfig:
+    # [FUNCTION DOC]
+    # Fixture: WeightUpdateConfig with admin key "test-key" and 5s init/update timeouts.
     return WeightUpdateConfig(
         admin_api_key="test-key",
         init_timeout_s=5,
@@ -34,11 +43,15 @@ def config() -> WeightUpdateConfig:
 
 @pytest.fixture()
 def app(config):
+    # [FUNCTION DOC]
+    # Fixture: creates the weight update gateway app from the config.
     return create_app(config)
 
 
 @pytest.fixture()
 def client(app):
+    # [FUNCTION DOC]
+    # Fixture: returns a Starlette TestClient for the app (lazy import).
     from starlette.testclient import TestClient
 
     return TestClient(app)
@@ -48,10 +61,20 @@ ADMIN_HEADERS = {"Authorization": "Bearer test-key"}
 
 
 def _make_mock_aiohttp_session(called_urls: list[tuple[str, str]]):
+    # [FUNCTION DOC]
+    # HELPER: Returns a MagicMock session whose post/get are async context managers that
+    # append ("POST"|"GET", url) to called_urls and yield a fake 200 response with
+    # raise_for_status no-op and an async json() (success result for POST, empty dict
+    # for
+    # GET).
     mock_session = MagicMock()
 
     @asynccontextmanager
     async def _fake_post(url, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake aiohttp POST context manager; records the URL and yields a
+        # success
+        # response.
         called_urls.append(("POST", url))
         resp = MagicMock()
         resp.status = 200
@@ -61,6 +84,10 @@ def _make_mock_aiohttp_session(called_urls: list[tuple[str, str]]):
 
     @asynccontextmanager
     async def _fake_get(url, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake aiohttp GET context manager; records the URL and yields an empty-
+        # JSON
+        # response.
         called_urls.append(("GET", url))
         resp = MagicMock()
         resp.status = 200
@@ -74,7 +101,11 @@ def _make_mock_aiohttp_session(called_urls: list[tuple[str, str]]):
 
 
 class TestDiskConnect:
+    # [CLASS DOC]
+    # Validation and registration tests for /connect in disk mode.
     def test_disk_connect_requires_non_empty_save_path(self, client, app):
+        # [FUNCTION DOC]
+        # Empty save_path returns 400 with the exact error and registers nothing.
         resp = client.post(
             "/connect",
             json={
@@ -92,6 +123,9 @@ class TestDiskConnect:
         assert app.state.registry.get_by_name("missing_path") is None
 
     def test_disk_connect_requires_absolute_save_path(self, client, app):
+        # [FUNCTION DOC]
+        # Relative save_path returns 400 requiring an absolute path and registers
+        # nothing.
         resp = client.post(
             "/connect",
             json={
@@ -111,6 +145,8 @@ class TestDiskConnect:
         assert app.state.registry.get_by_name("relative_path") is None
 
     def test_disk_connect_requires_lora_name_when_lora_enabled(self, client, app):
+        # [FUNCTION DOC]
+        # use_lora True with empty lora_name returns 400 and registers nothing.
         resp = client.post(
             "/connect",
             json={
@@ -130,6 +166,10 @@ class TestDiskConnect:
         assert app.state.registry.get_by_name("missing_lora_name") is None
 
     def test_disk_connect_registers_pair(self, client, app):
+        # [FUNCTION DOC]
+        # Valid disk connect returns the pair name and registers a pair with mode,
+        # save_path and
+        # worker URLs.
         resp = client.post(
             "/connect",
             json={
@@ -153,6 +193,8 @@ class TestDiskConnect:
         assert pair.inference_worker_urls == ["http://infer:9000"]
 
     def test_disk_connect_with_lora(self, client, app):
+        # [FUNCTION DOC]
+        # Disk connect with LoRA stores use_lora and lora_name on the pair.
         resp = client.post(
             "/connect",
             json={
@@ -173,6 +215,8 @@ class TestDiskConnect:
         assert pair.lora_name == "my-adapter"
 
     def test_disk_connect_does_not_call_awex_endpoints(self, client, app):
+        # [FUNCTION DOC]
+        # Disk connect makes no outbound worker calls (no awex initialization).
         called_urls: list[tuple[str, str]] = []
         app.state.http_session = _make_mock_aiohttp_session(called_urls)
 
@@ -192,8 +236,14 @@ class TestDiskConnect:
 
 
 class TestDiskUpdateWeights:
+    # [CLASS DOC]
+    # /update_weights tests for a registered full-weight disk pair.
     @pytest.fixture(autouse=True)
     def _register_disk_pair(self, app):
+        # [FUNCTION DOC]
+        # Autouse fixture: registers disk pair "test_disk" (one train and one inference
+        # URL,
+        # save_path /shared/weights) in the app registry.
         pair_info = PairInfo(
             pair_name="test_disk",
             train_worker_urls=["http://train:8000"],
@@ -204,6 +254,12 @@ class TestDiskUpdateWeights:
         app.state.registry.register(pair_info)
 
     def test_disk_update_versioned_save_path(self, client, app):
+        # [FUNCTION DOC]
+        # /update_weights with version 42 triggers a POST to the train worker's /save
+        # endpoint.
+        # KNOWN ISSUE: despite its name it only checks the /save URL, not the versioned
+        # save path
+        # in the request body.
         called_urls: list[tuple[str, str]] = []
         app.state.http_session = _make_mock_aiohttp_session(called_urls)
 
@@ -217,6 +273,8 @@ class TestDiskUpdateWeights:
         assert save_url == "http://train:8000/save"
 
     def test_disk_update_not_found_pair(self, client, app):
+        # [FUNCTION DOC]
+        # /update_weights for an unknown pair returns 404.
         resp = client.post(
             "/update_weights",
             json={"pair_name": "nonexistent", "version": 1},
@@ -226,8 +284,13 @@ class TestDiskUpdateWeights:
 
 
 class TestDiskUpdateWeightsLora:
+    # [CLASS DOC]
+    # /update_weights tests for a LoRA disk pair.
     @pytest.fixture(autouse=True)
     def _register_lora_pair(self, app):
+        # [FUNCTION DOC]
+        # Autouse fixture: registers LoRA disk pair "lora_disk" with adapter "my-
+        # adapter".
         pair_info = PairInfo(
             pair_name="lora_disk",
             train_worker_urls=["http://train:8000"],
@@ -240,6 +303,10 @@ class TestDiskUpdateWeightsLora:
         app.state.registry.register(pair_info)
 
     def test_lora_update_uses_load_lora_adapter(self, client, app):
+        # [FUNCTION DOC]
+        # LoRA update returns ok and calls the inference worker's /load_lora_adapter
+        # instead of
+        # /update_weights_from_disk.
         called_urls: list[tuple[str, str]] = []
         app.state.http_session = _make_mock_aiohttp_session(called_urls)
 
@@ -257,7 +324,11 @@ class TestDiskUpdateWeightsLora:
 
 
 class TestDiskDisconnect:
+    # [CLASS DOC]
+    # /disconnect tests.
     def test_disconnect_removes_disk_pair(self, client, app):
+        # [FUNCTION DOC]
+        # A connected disk pair is removed from the registry by /disconnect.
         client.post(
             "/connect",
             json={
@@ -291,6 +362,19 @@ class TestDiskDisconnect:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("n_gpus", [2, 4, 8], ids=["2gpu", "4gpu", "8gpu"])
 def test_disk_e2e_weight_update(n_gpus, tmp_path_factory):
+    # [FUNCTION DOC]
+    # GPU E2E, parametrized over 2/4/8 GPUs (skipped if fewer): splits GPUs in half
+    # between
+    # an SGLang RolloutControllerV2 and an FSDP GatewayTrainController on one local
+    # scheduler; randomizes inference parameters, starts a WeightUpdateController
+    # gateway,
+    # connects a disk pair, updates weights at version 1 (expects ok), disconnects,
+    # checks
+    # weight_update_v1/config.json exists under the shared dir, that /generate still
+    # works,
+    # and that training and inference parameters match. Always destroys all controllers
+    # and
+    # scheduler workers.
     """Full round trip: FSDPEngine save → shared disk → SGLang load.
 
     Same infrastructure as :func:`test_awex_e2e_weight_update` but uses

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# GPU integration tests for the full v2 inference stack: client -> Gateway -> Router ->
+# Data Proxy -> SGLang (or vLLM). Module-scoped fixtures launch a real inference server
+# subprocess and run data proxy, router and gateway FastAPI apps in daemon uvicorn
+# threads on free localhost ports, register the data proxy as a router worker, then
+# exercise health, chat completions (streaming and not), RL session lifecycle, session
+# pinning, auth and pause/continue through the gateway over real HTTP. Skipped without
+# GPU.
 """Full-stack integration test: client → Gateway → Router → Data Proxy → SGLang.
 
 Requires GPU and a model. Run with:
@@ -44,14 +52,23 @@ ADMIN_KEY = "integ-admin-key"
 
 
 def _get_test_model_path() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the Qwen3-0.6B model path (local storage path if present, else HF
+    # id).
     return get_model_path(LOCAL_MODEL_PATH, HF_MODEL_ID)
 
 
 def _has_gpu() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True when CUDA is available with at least one device.
     return torch.cuda.is_available() and torch.cuda.device_count() > 0
 
 
 def _find_free_port() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Binds a TCP socket to 127.0.0.1 port 0 and returns the OS-assigned port;
+    # the
+    # socket is closed, so the port may be raced by another process.
     """Find a free TCP port on localhost."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -59,6 +76,10 @@ def _find_free_port() -> int:
 
 
 def _check_health(base_url: str, timeout: float = 5.0) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: GET base_url/health; returns True on HTTP 200, False on any httpx error or
+    # other
+    # status. timeout is the per-request timeout in seconds.
     try:
         resp = httpx.get(f"{base_url}/health", timeout=timeout)
         return resp.status_code == 200
@@ -67,6 +88,10 @@ def _check_health(base_url: str, timeout: float = 5.0) -> bool:
 
 
 def _wait_for_health(base_url: str, timeout: float, label: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Polls _check_health every 0.3s until healthy or timeout seconds elapse;
+    # raises
+    # RuntimeError naming the label and URL on timeout.
     """Block until the service at base_url/health returns 200."""
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -79,6 +104,10 @@ def _wait_for_health(base_url: str, timeout: float, label: str) -> None:
 
 
 def _run_uvicorn(app, host: str, port: int) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Thread target that runs uvicorn.run (blocking) for the app at host:port
+    # with
+    # warning log level.
     """Run uvicorn in the current thread (blocking). Used as a thread target."""
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
@@ -90,6 +119,16 @@ def _run_uvicorn(app, host: str, port: int) -> None:
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC]
+    # Module fixture: skips without GPU; builds an SGLang launch command (skip tokenizer
+    # init,
+    # mem fraction 0.3, tp 1, GPU 0) on the host IP with two free ports, spawns it,
+    # polls
+    # /health for up to SERVER_STARTUP_TIMEOUT, failing and killing the process tree on
+    # timeout. Yields a dict with host, port and base_url; kills the process tree on
+    # teardown.
+    # KNOWN ISSUE: docstring says it yields a (host, port, base_url) tuple but it yields
+    # a dict.
     """Launch an SGLang server and yield its ``(host, port, base_url)``."""
     if not _has_gpu():
         pytest.skip("GPU required for SGLang server")
@@ -132,6 +171,11 @@ def sglang_server():
 
 @pytest.fixture(scope="module")
 def vllm_server():
+    # [FUNCTION DOC]
+    # Module fixture: skips without GPU; launches a vLLM server via integration_utils
+    # launch_vllm_server, yields its info dict, and kills the process tree on teardown.
+    # KNOWN ISSUE: docstring says it yields a tuple; it yields whatever info launch
+    # returns.
     """Launch a vLLM server and yield its ``(host, port, base_url)``."""
     if not _has_gpu():
         pytest.skip("GPU required for vLLM server")
@@ -149,11 +193,24 @@ def vllm_server():
 
 @pytest.fixture(scope="module")
 def model_path() -> str:
+    # [FUNCTION DOC]
+    # Module fixture returning the test model path.
     return _get_test_model_path()
 
 
 @pytest.fixture(scope="module")
 def gateway_stack(sglang_server, model_path):
+    # [FUNCTION DOC]
+    # Module fixture: allocates three free ports, builds DataProxy (backed by the SGLang
+    # server, admin key), Router (round-robin, 2s polling) and Gateway apps, starts each
+    # in a
+    # daemon uvicorn thread, waits for all /health, registers the data proxy with the
+    # router
+    # (/register, capturing worker_id), sleeps 3s for health polling, and registers
+    # model
+    # "sglang" via the gateway /register_model. Yields a dict of gateway/router/data
+    # proxy
+    # addresses, admin key and worker_id. No teardown (daemon threads die with process).
     """Launch the full gateway stack (data proxy + router + gateway) on free ports.
 
     Yields a dict with addresses and ports for all services.
@@ -279,10 +336,16 @@ def gateway_stack(sglang_server, model_path):
 @pytest.mark.sglang
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestGatewayStackHealth:
+    # [CLASS DOC]
+    # Checks health of every service in the launched stack.
     """Verify all services are healthy after stack launch."""
 
     @pytest.mark.asyncio
     async def test_all_services_healthy(self, gateway_stack):
+        # [FUNCTION DOC]
+        # Gateway /health is ok and /models lists "sglang"; router /health reports 1
+        # worker; data
+        # proxy /health is ok.
         """All three services report healthy."""
         async with httpx.AsyncClient(timeout=10.0) as client:
             # Gateway health
@@ -313,10 +376,16 @@ class TestGatewayStackHealth:
 @pytest.mark.sglang
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestGatewayChatCompletions:
+    # [CLASS DOC]
+    # Chat completions through the full SGLang-backed stack.
     """Test /chat/completions endpoint through the full stack."""
 
     @pytest.mark.asyncio
     async def test_admin_non_streaming_chat(self, gateway_stack):
+        # [FUNCTION DOC]
+        # Admin-key non-streaming chat returns a single assistant choice with non-empty
+        # content
+        # and finish_reason stop or length.
         """Admin key → Gateway /chat/completions (non-streaming, standalone mode)."""
         gw = gateway_stack["gateway_addr"]
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -341,6 +410,11 @@ class TestGatewayChatCompletions:
 
     @pytest.mark.asyncio
     async def test_session_non_streaming_chat(self, gateway_stack):
+        # [FUNCTION DOC]
+        # Starts a session, runs one chat with the session key (checks content and usage
+        # token
+        # counts), then set_reward reports interaction_count 1 and ready_transition
+        # True.
         """Session key → Gateway /chat/completions (non-streaming, with caching)."""
         gw = gateway_stack["gateway_addr"]
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -388,6 +462,12 @@ class TestGatewayChatCompletions:
 
     @pytest.mark.asyncio
     async def test_session_streaming_chat(self, gateway_stack):
+        # [FUNCTION DOC]
+        # Session streaming chat: parses SSE data lines until [DONE]; expects >=2
+        # chunks, first
+        # with role assistant, last with finish_reason, at least one content chunk and a
+        # single
+        # shared completion id; set_reward then reports ready_transition True.
         """Session key → Gateway /chat/completions stream=True → SSE chunks."""
         gw = gateway_stack["gateway_addr"]
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -459,6 +539,10 @@ class TestGatewayChatCompletions:
 
     @pytest.mark.asyncio
     async def test_multi_turn_session_chat(self, gateway_stack):
+        # [FUNCTION DOC]
+        # Two sequential chats in one session (second includes first turn's answer) have
+        # distinct
+        # ids; set_reward reports interaction_count 2.
         """Two sequential chat completions in the same session through the gateway."""
         gw = gateway_stack["gateway_addr"]
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -523,11 +607,18 @@ class TestGatewayChatCompletions:
 @pytest.mark.sglang
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestGatewaySessionLifecycle:
+    # [CLASS DOC]
+    # Full RL session lifecycle tests through the gateway.
     """Test full RL session lifecycle through the gateway stack."""
 
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_full_lifecycle(self, gateway_stack):
+        # [FUNCTION DOC]
+        # (Skipped pending schema migration.) start_session, chat, set_reward(1.0), then
+        # export_trajectories by session id returns one interaction carrying
+        # tensor_dict, reward
+        # 1.0 and interaction_id.
         """start_session → chat → set_reward(finish=True) → export_trajectories."""
         gw = gateway_stack["gateway_addr"]
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -588,6 +679,11 @@ class TestGatewaySessionLifecycle:
 
     @pytest.mark.asyncio
     async def test_session_pinning(self, gateway_stack):
+        # [FUNCTION DOC]
+        # Starts a session; router /route by session_id and by session api_key both
+        # return the
+        # data proxy address; a chat then succeeds and set_reward reports
+        # ready_transition True.
         """Verify that session key routes to the same data proxy (pinned worker)."""
         gw = gateway_stack["gateway_addr"]
         router = gateway_stack["router_addr"]
@@ -649,10 +745,14 @@ class TestGatewaySessionLifecycle:
 @pytest.mark.sglang
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestGatewayAuth:
+    # [CLASS DOC]
+    # Auth enforcement tests on the live gateway.
     """Test authentication enforcement through the gateway."""
 
     @pytest.mark.asyncio
     async def test_missing_auth_rejected(self, gateway_stack):
+        # [FUNCTION DOC]
+        # /chat/completions without Authorization header returns 401.
         """Requests without Authorization header are rejected."""
         gw = gateway_stack["gateway_addr"]
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -668,6 +768,9 @@ class TestGatewayAuth:
 
     @pytest.mark.asyncio
     async def test_non_admin_on_admin_endpoint(self, gateway_stack):
+        # [FUNCTION DOC]
+        # Non-admin bearer key on /rl/start_session and /pause_generation/{id} returns
+        # 403.
         """Non-admin key on admin-only endpoints is rejected with 403."""
         gw = gateway_stack["gateway_addr"]
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -691,10 +794,16 @@ class TestGatewayAuth:
 @pytest.mark.sglang
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestGatewayPauseContinue:
+    # [CLASS DOC]
+    # Pause/continue generation tests targeting the registered worker by id.
     """Test pause/continue generation through the gateway (targets worker by ID)."""
 
     @pytest.mark.asyncio
     async def test_pause_continue_by_worker_id(self, gateway_stack):
+        # [FUNCTION DOC]
+        # Pausing via gateway yields one ok result and data proxy /health shows paused
+        # True;
+        # continuing yields ok and paused False; an admin chat then succeeds.
         """Pause → verify data proxy paused → Continue → verify resumed → chat works."""
         gw = gateway_stack["gateway_addr"]
         dp = gateway_stack["data_proxy_addr"]
@@ -748,6 +857,12 @@ class TestGatewayPauseContinue:
 
     @pytest.mark.asyncio
     async def test_pause_during_chat_completions_then_resume(self, gateway_stack):
+        # [FUNCTION DOC]
+        # Runs a long session chat concurrently with a task that pauses the worker after
+        # 0.5s and
+        # continues it after 1s more; the chat must still complete normally with
+        # finish_reason
+        # stop or length.
         """Pause SGLang while /chat/completions is in-flight through gateway."""
         import asyncio
 
@@ -764,6 +879,9 @@ class TestGatewayPauseContinue:
             session_api_key = resp.json()["sessions"][0]["session_api_key"]
 
             async def do_chat():
+                # [FUNCTION DOC]
+                # HELPER: Posts a 256-token sampled chat with the session key; returns
+                # the response.
                 return await client.post(
                     f"{gw}/chat/completions",
                     json={
@@ -781,6 +899,9 @@ class TestGatewayPauseContinue:
                 )
 
             async def pause_then_resume():
+                # [FUNCTION DOC]
+                # HELPER: Sleeps 0.5s, pauses the worker via gateway, sleeps 1s, then
+                # continues it.
                 await asyncio.sleep(0.5)
                 await client.post(
                     f"{gw}/pause_generation/{worker_id}",
@@ -815,6 +936,12 @@ class TestGatewayPauseContinue:
 
 @pytest.fixture(scope="module")
 def gateway_stack_vllm(vllm_server, model_path):
+    # [FUNCTION DOC]
+    # Module fixture: same as gateway_stack but the data proxy uses backend_type vllm
+    # against
+    # the vLLM server; registers the worker and sleeps 3s. Yields the same dict.
+    # KNOWN ISSUE: unlike gateway_stack it does not call /register_model, so model-based
+    # routing for new sessions (start_session) may have no registered model pool.
     """Launch the full gateway stack backed by vLLM on free ports."""
     from areal.v2.inference_service.data_proxy.app import (
         create_app as create_dp_app,
@@ -910,8 +1037,13 @@ def gateway_stack_vllm(vllm_server, model_path):
 @pytest.mark.vllm
 @pytest.mark.skipif(not _has_gpu(), reason="GPU required")
 class TestGatewayVLLM:
+    # [CLASS DOC]
+    # Tests through the vLLM-backed gateway stack.
     @pytest.mark.asyncio
     async def test_admin_non_streaming_chat_vllm(self, gateway_stack_vllm):
+        # [FUNCTION DOC]
+        # Admin non-streaming chat (model "vllm") returns one assistant choice with
+        # content.
         """Admin key non-streaming /chat/completions through full vLLM stack."""
         gw = gateway_stack_vllm["gateway_addr"]
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -936,6 +1068,12 @@ class TestGatewayVLLM:
     @pytest.mark.skip(reason="pending /export_trajectories traj schema migration")
     @pytest.mark.asyncio
     async def test_full_lifecycle_vllm(self, gateway_stack_vllm):
+        # [FUNCTION DOC]
+        # (Skipped pending schema migration.) vLLM lifecycle: start_session, chat,
+        # set_reward
+        # 1.0 (interaction_count 1, ready_transition True), export returns one
+        # interaction with
+        # reward 1.0.
         """Full RL lifecycle through vLLM gateway stack."""
         gw = gateway_stack_vllm["gateway_addr"]
         async with httpx.AsyncClient(timeout=60.0) as client:

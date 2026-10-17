@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Unit tests for the v2 training-service gateway FastAPI app and its streaming helpers
+# (query_router, forward_request). Router and upstream HTTP clients are MagicMocks with
+# AsyncMock get/post injected into app.state; streaming helpers are patched per test to
+# check auth handling, error mapping and request forwarding.
 """Unit tests for training-service gateway."""
 
 from __future__ import annotations
@@ -25,6 +30,10 @@ WORKER_ADDR = "http://mock-worker:18082"
 
 @pytest.fixture
 def config() -> GatewayConfig:
+    # [FUNCTION DOC]
+    # Fixture: GatewayConfig with mock router address, admin key, 2s router timeout and
+    # 20s
+    # forward timeout.
     return GatewayConfig(
         host="127.0.0.1",
         port=18080,
@@ -37,6 +46,10 @@ def config() -> GatewayConfig:
 
 @pytest_asyncio.fixture
 async def client(config, router_client, upstream_client):
+    # [FUNCTION DOC]
+    # Async fixture: creates the gateway app, injects the mock router and upstream
+    # clients
+    # into app.state, and yields an httpx ASGI client.
     app = create_app(config)
     app.state.router_client = router_client
     app.state.upstream_client = upstream_client
@@ -47,6 +60,8 @@ async def client(config, router_client, upstream_client):
 
 @pytest.fixture
 def router_client():
+    # [FUNCTION DOC]
+    # Fixture: MagicMock router HTTP client with AsyncMock get/post.
     client = MagicMock()
     client.get = AsyncMock()
     client.post = AsyncMock()
@@ -55,6 +70,8 @@ def router_client():
 
 @pytest.fixture
 def upstream_client():
+    # [FUNCTION DOC]
+    # Fixture: MagicMock upstream (model) HTTP client with AsyncMock get/post.
     client = MagicMock()
     client.get = AsyncMock()
     client.post = AsyncMock()
@@ -62,8 +79,12 @@ def upstream_client():
 
 
 class TestGatewayHealth:
+    # [CLASS DOC]
+    # Health endpoint tests.
     @pytest.mark.asyncio
     async def test_health_reports_router(self, client, config):
+        # [FUNCTION DOC]
+        # /health returns ok and the configured router address.
         resp = await client.get("/health")
         assert resp.status_code == 200
         data = resp.json()
@@ -72,8 +93,15 @@ class TestGatewayHealth:
 
 
 class TestGatewayRoutingAndForwarding:
+    # [CLASS DOC]
+    # Tests for routing, forwarding and error mapping in the gateway.
     @pytest.mark.asyncio
     async def test_query_router_uses_provided_client(self, router_client, config):
+        # [FUNCTION DOC]
+        # query_router posts {"api_key": key} to router /route with the admin bearer
+        # header and
+        # router timeout using the supplied client, returning model_addr from the
+        # response.
         router_client.post.return_value = httpx.Response(
             200,
             json={"model_addr": WORKER_ADDR},
@@ -98,6 +126,10 @@ class TestGatewayRoutingAndForwarding:
 
     @pytest.mark.asyncio
     async def test_forward_request_uses_provided_client(self, upstream_client):
+        # [FUNCTION DOC]
+        # forward_request posts the body to the URL with the supplied client, drops the
+        # Host
+        # header, and uses a default 600s timeout.
         upstream_client.post.return_value = httpx.Response(
             200,
             json={"status": "success"},
@@ -121,12 +153,16 @@ class TestGatewayRoutingAndForwarding:
 
     @pytest.mark.asyncio
     async def test_missing_bearer_token_returns_401(self, client):
+        # [FUNCTION DOC]
+        # Requests without a bearer token return 401.
         resp = await client.post("/train_batch", json={"args": [], "kwargs": {}})
         assert resp.status_code == 401
 
     @pytest.mark.asyncio
     @patch(f"{MODULE}.streaming.query_router", new_callable=AsyncMock)
     async def test_router_unreachable_maps_to_502(self, mock_query_router, client):
+        # [FUNCTION DOC]
+        # RouterUnreachableError from query_router maps to 502.
         mock_query_router.side_effect = RouterUnreachableError("router unavailable")
 
         resp = await client.post(
@@ -139,6 +175,8 @@ class TestGatewayRoutingAndForwarding:
     @pytest.mark.asyncio
     @patch(f"{MODULE}.streaming.query_router", new_callable=AsyncMock)
     async def test_router_404_key_rejected_maps_to_401(self, mock_query_router, client):
+        # [FUNCTION DOC]
+        # RouterKeyRejectedError 404 maps to 401.
         mock_query_router.side_effect = RouterKeyRejectedError("unknown key", 404)
 
         resp = await client.post(
@@ -160,6 +198,11 @@ class TestGatewayRoutingAndForwarding:
         upstream_client,
         config,
     ):
+        # [FUNCTION DOC]
+        # /forward_batch queries the router with session key, timeout, admin key and the
+        # shared
+        # router client, forwards with the shared upstream client, and returns the
+        # response.
         mock_query_router.return_value = WORKER_ADDR
         mock_forward_request.return_value = httpx.Response(
             200,
@@ -191,6 +234,8 @@ class TestGatewayRoutingAndForwarding:
         mock_forward_request,
         client,
     ):
+        # [FUNCTION DOC]
+        # /ppo/actor/compute_logp is routed and forwarded, returning success.
         mock_query_router.return_value = WORKER_ADDR
         mock_forward_request.return_value = httpx.Response(
             200,
@@ -214,6 +259,8 @@ class TestGatewayRoutingAndForwarding:
         mock_forward_request,
         client,
     ):
+        # [FUNCTION DOC]
+        # /sft/train is routed and forwarded, returning success.
         mock_query_router.return_value = WORKER_ADDR
         mock_forward_request.return_value = httpx.Response(
             200,
@@ -237,9 +284,17 @@ class TestGatewayRoutingAndForwarding:
         mock_forward_request,
         client,
     ):
+        # [FUNCTION DOC]
+        # /offload is forwarded upstream with the admin key in Authorization instead of
+        # the
+        # caller's session key.
         mock_query_router.return_value = WORKER_ADDR
 
         async def _check_forward(_url, _body, headers, _timeout, *, client):
+            # [FUNCTION DOC]
+            # HELPER: Forward stub asserting a client is passed and the admin bearer
+            # header is used;
+            # returns a success response.
             assert client is not None
             assert headers["Authorization"] == f"Bearer {ADMIN_KEY}"
             return httpx.Response(200, json={"status": "success", "result": None})
@@ -264,6 +319,12 @@ class TestGatewayRoutingAndForwarding:
         upstream_client,
         config,
     ):
+        # [FUNCTION DOC]
+        # GET /get_version routes via the shared router client and performs an upstream
+        # GET to
+        # the model's /get_version with the forward timeout and the caller's
+        # authorization
+        # header.
         mock_query_router.return_value = WORKER_ADDR
         upstream_client.get.return_value = httpx.Response(
             200,

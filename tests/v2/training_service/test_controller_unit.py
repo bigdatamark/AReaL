@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Unit tests for GatewayTrainController initialization in the v2 training service. The
+# scheduler, guard HTTP calls, process forking, engine creation and router registration
+# are all mocked so the async bootstrap sequence can be verified without processes.
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +18,10 @@ MODULE = "areal.v2.training_service.controller.controller"
 
 
 def _make_response(method: str, url: str, *, json=None) -> httpx.Response:
+    # [FUNCTION DOC]
+    # HELPER: Builds a 200 httpx.Response with the given JSON body and an attached
+    # request
+    # (method, url) so raise_for_status works.
     return httpx.Response(
         200,
         json=json,
@@ -22,6 +30,12 @@ def _make_response(method: str, url: str, *, json=None) -> httpx.Response:
 
 
 def _make_controller(scheduler: MagicMock | None = None) -> GatewayTrainController:
+    # [FUNCTION DOC]
+    # HELPER: Builds a GatewayTrainController for FSDPEngine with backend fsdp:d2, a
+    # single
+    # rpc_server SchedulingSpec, admin key and 5s request/setup timeouts, using the
+    # given
+    # scheduler mock (or a new MagicMock).
     return GatewayTrainController(
         train_engine="areal.engine.FSDPEngine",
         scheduler=scheduler or MagicMock(),
@@ -46,24 +60,41 @@ def _make_controller(scheduler: MagicMock | None = None) -> GatewayTrainControll
 
 
 class _FakeAsyncClient:
+    # [CLASS DOC]
+    # HELPER: Async-context-manager stand-in for httpx.AsyncClient that returns queued
+    # responses (or raises queued exceptions) in FIFO order for get/post, which are
+    # AsyncMocks so calls can be inspected.
     def __init__(self, responses_or_errors):
+        # [FUNCTION DOC]
+        # Stores a copy of the queued responses/errors and wraps _get/_post in
+        # AsyncMocks.
         self._responses_or_errors = list(responses_or_errors)
         self.get = AsyncMock(side_effect=self._get)
         self.post = AsyncMock(side_effect=self._post)
 
     async def __aenter__(self):
+        # [FUNCTION DOC]
+        # Returns self on async context entry.
         return self
 
     async def __aexit__(self, *_args):
+        # [FUNCTION DOC]
+        # No-op async context exit; does not suppress exceptions.
         return None
 
     async def _get(self, _url: str):
+        # [FUNCTION DOC]
+        # HELPER: Pops the next queued item; raises it if it is an exception, else
+        # returns it.
+        # Raises IndexError when the queue is empty.
         next_item = self._responses_or_errors.pop(0)
         if isinstance(next_item, Exception):
             raise next_item
         return next_item
 
     async def _post(self, _url: str, json=None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Same as _get for POST; json and kwargs are ignored.
         _ = json
         next_item = self._responses_or_errors.pop(0)
         if isinstance(next_item, Exception):
@@ -72,8 +103,24 @@ class _FakeAsyncClient:
 
 
 class TestGatewayTrainControllerInitialization:
+    # [CLASS DOC]
+    # Tests for GatewayTrainController._async_initialize.
     @pytest.mark.asyncio
     async def test_async_initialize_offloads_scheduler_and_uses_async_helpers(self):
+        # [FUNCTION DOC]
+        # With two guard workers, a fake HTTP client answering /alloc_ports,
+        # asyncio.to_thread
+        # patched to run inline and all fork/engine/register helpers mocked: asserts
+        # scheduler
+        # create_workers and get_workers(role "train-role-guard", timeout 5) run via
+        # to_thread,
+        # guard env set once, five async forks (2 workers, router, model gateway/data
+        # proxy,
+        # gateway) and no sync forks, 2 engine creations, 4 engine endpoint calls,
+        # router
+        # registration with router/model addresses and api key;
+        # worker/router/model/gateway
+        # addresses are recorded and the api key starts with "ak-train-role-".
         worker0 = MagicMock(ip="127.0.0.1", worker_ports=[18000], id="guard-0")
         worker1 = MagicMock(ip="127.0.0.1", worker_ports=[18001], id="guard-1")
 
@@ -95,6 +142,8 @@ class TestGatewayTrainControllerInitialization:
         )
 
         async def _run_in_thread(func, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Replacement for asyncio.to_thread that calls func synchronously.
             return func(*args, **kwargs)
 
         with (
