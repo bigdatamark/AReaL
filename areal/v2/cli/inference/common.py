@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Inference-CLI domain helpers: backend spec parsing, help strings for pass-through
+# args, ordered teardown of a service, TaskHandle formatting for status tables, and
+# spawning plus registering a model's worker/data-proxy replicas via a Scheduler.
+# KNOWN ISSUE: the comment above __all__ talks about "imports kept at bottom" / stdlib
+# re-exports, but the block only declares __all__.
 # SPDX-License-Identifier: Apache-2.0
 
 """Domain-specific helpers for the inference CLI.
@@ -56,6 +62,10 @@ PROXY_ARGS_HELP = (
 
 
 def parse_backend_spec(spec: str) -> tuple[str, int, int, int]:
+    # [FUNCTION DOC]
+    # Parses a spec like "sglang:d4" or "vllm:d2t4" with ModelAllocation.from_str and
+    # returns (engine, tp, dp, pp). Raises click.BadParameter if parsing fails or the
+    # engine is not sglang or vllm.
     """Parse a backend spec into ``(engine, tp, dp, pp)``.
 
     Delegates to ``ModelAllocation.from_str`` so the CLI accepts the same
@@ -81,6 +91,8 @@ def parse_backend_spec(spec: str) -> tuple[str, int, int, int]:
 
 
 def split_args(value: str) -> list[str]:
+    # [FUNCTION DOC]
+    # Shell-splits a pass-through argument string into a list; empty string gives [].
     import shlex
 
     return shlex.split(value) if value else []
@@ -89,6 +101,10 @@ def split_args(value: str) -> list[str]:
 def terminate_runtime_state(
     state: RuntimeState, *, grace_s: float, force: bool = False
 ) -> None:
+    # [FUNCTION DOC]
+    # Kills the whole service in data-flow order: all data proxies, then all workers,
+    # then the gateway, then the router, each phase via kill_pids on positive pids with
+    # grace_s (0 when force). Empty phases are skipped. No state files are touched.
     """Tear down the whole inference service in data-flow order: kill the
     data-proxies first (so in-flight requests fail at the proxy boundary
     rather than mid-worker), then workers, then gateway, then router.
@@ -98,6 +114,8 @@ def terminate_runtime_state(
     """
 
     def _pids(handles: list[TaskHandle]) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Returns the positive pids of the given handles.
         return [h.pid for h in handles if h.pid > 0]
 
     phases = (
@@ -114,6 +132,9 @@ def terminate_runtime_state(
 
 
 def format_placement(backend: str, handle: TaskHandle) -> str:
+    # [FUNCTION DOC]
+    # Returns a placement string for a handle: local host name for "local", "node/pod"
+    # for "k8s", "node/job=<id>" for "slurm" ("?" for missing ref keys), "-" otherwise.
     if backend == "local":
         import socket
 
@@ -130,6 +151,9 @@ def format_placement(backend: str, handle: TaskHandle) -> str:
 
 
 def format_ref(backend: str, handle: TaskHandle) -> str:
+    # [FUNCTION DOC]
+    # Returns "pid=<pid>" (local, if pid > 0), "pod=<name>" (k8s), "job=<id>" (slurm),
+    # or "-" when unknown/missing.
     if backend == "local":
         return f"pid={handle.pid}" if handle.pid > 0 else "-"
     if backend == "k8s":
@@ -142,6 +166,8 @@ def format_ref(backend: str, handle: TaskHandle) -> str:
 
 
 def format_gpu_count(handle: TaskHandle) -> str:
+    # [FUNCTION DOC]
+    # Returns a multiplication-sign prefixed GPU count (e.g. "x2") or "-" when no GPUs.
     n = len(handle.gpu_devices)
     return f"×{n}" if n > 0 else "-"
 
@@ -162,6 +188,17 @@ def register_internal(
     log_dir: Path,
     scheduler: Scheduler,
 ) -> list[ModelReplica]:
+    # [FUNCTION DOC]
+    # Spawns dp replicas for a model and registers them. Parses backend into
+    # engine/tp/dp/pp (ClickException if pp > 1). For each rank: builds an sglang or
+    # vllm worker TaskSpec (log <model>-worker-<rank>.log), submits it to the scheduler,
+    # waits up to model_health_timeout for its /health; then builds and submits a data-
+    # proxy TaskSpec pointing at the worker (with tokenizer, admin key, log level, extra
+    # args; log <model>-data-proxy-<rank>.log) and waits 30s for health. After all
+    # ranks, registers each proxy address with the router and the model (with all proxy
+    # addresses) with the gateway, converting HTTP/network errors to ClickException. On
+    # any exception kills all spawned pids (grace 10s), logs an error, and re-raises.
+    # Returns the list of ModelReplica.
     engine, tp, dp, pp = parse_backend_spec(backend)
     if pp > 1:
         raise click.ClickException(
@@ -275,6 +312,8 @@ def register_internal(
 
 
 def validate_register_opts(opts: dict) -> None:
+    # [FUNCTION DOC]
+    # Raises click.UsageError if opts lacks backend or model_path.
     if not opts.get("backend"):
         raise click.UsageError("--backend <spec> is required.")
     if not opts.get("model_path"):
@@ -292,6 +331,12 @@ def register_model(
     scheduler_backend: str,
     occupied_gpus: set[int],
 ) -> ModelEntry:
+    # [FUNCTION DOC]
+    # Validates opts, builds a scheduler for scheduler_backend aware of occupied_gpus,
+    # and calls register_internal with values from opts (tokenizer defaults to the model
+    # path, extra args shell-split, health timeout default 600s, log level default
+    # info). Returns a ModelEntry with the backend spec and replicas; does not modify
+    # model state.
     """Validate registration opts and spawn the model's worker + data-proxy
     fleet. The returned ModelEntry is meant to be slotted into model_state
     by the caller — this helper does not touch model_state itself so the

@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Click command "areal inf ps": lists locally known inference services and their status.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -12,10 +14,19 @@ from areal.v2.cli.utils import json_or_table
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
 @click.option("--all", "include_all", is_flag=True, help="Include stale services.")
 def ps_cmd(as_json: bool, include_all: bool) -> None:
+    # [FUNCTION DOC]
+    # Click entry point. Options: --json, --all (include stale services). Exits via
+    # SystemExit with do_ps's return code.
     raise SystemExit(do_ps(as_json, include_all) or 0)
 
 
 def do_ps(as_json: bool, include_all: bool) -> int:
+    # [FUNCTION DOC]
+    # Iterates over all service names in the inf store. Services whose state fails to
+    # load are listed as "stale" only with include_all. For loaded states, running =
+    # gateway pid alive; running services (or all, with include_all) produce a row with
+    # service, status, backend, gateway_url, gateway_pid, router_url and model count.
+    # Prints JSON or a table; returns 0.
     rows: list[dict] = []
     for service in inf_lifecycle.list_services():
         try:
@@ -43,11 +54,17 @@ def do_ps(as_json: bool, include_all: bool) -> int:
 
 
 def _print_table(rows: list[dict]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints an aligned SERVICE / STATUS / BACKEND / MODELS / GATEWAY / PID
+    # table, using defaults for keys missing in stale rows, or "no inference services"
+    # when empty.
     if not rows:
         click.echo("no inference services")
         return
 
     def _pid_cell(row: dict) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the gateway pid as text, or "-" when missing or zero.
         pid = row.get("gateway_pid", 0)
         return str(pid) if pid else "-"
 

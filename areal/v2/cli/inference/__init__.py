@@ -1,3 +1,6 @@
+# [PACKAGE DOC]
+# Click group "areal inf" for managing local inference services; wires the run, stop,
+# status, ps, register, deregister, models and logs subcommands and loads TOML defaults.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -28,6 +31,10 @@ from areal.v2.cli.inference.lifecycle import inf_lifecycle
 )
 @click.pass_context
 def inf(ctx: click.Context, config_file: Path | None) -> None:
+    # [FUNCTION DOC]
+    # Group callback: sets the click context default_map from the inf namespace
+    # config.toml merged with the optional --config file (must exist), so subcommand
+    # option defaults come from config.
     ctx.default_map = load_click_default_map(extra=config_file)
 
 

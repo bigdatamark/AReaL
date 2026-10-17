@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Spawns the local agent service stack as detached subprocesses (router, gateway, and
+# worker/data-proxy pairs from areal.v2.agent_service), waits for each to become
+# healthy, and returns the resulting ServiceState. All services bind to 127.0.0.1; logs
+# go to the service's log directory in the agent state store.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -29,6 +34,16 @@ def launch_agent_stack(
     drain_timeout: float,
     log_level: str,
 ) -> ServiceState:
+    # [FUNCTION DOC]
+    # Launches the full stack. Reserves 2 + 2*num_pairs free ports at once (router,
+    # gateway, then worker/proxy port per pair) to avoid port races. Spawns the router
+    # and waits for its /health (setup_timeout); creates a RouterClient with
+    # admin_api_key; for each pair index spawns a worker plus data proxy via _spawn_pair
+    # and registers the proxy URL with the router; then spawns the gateway pointed at
+    # the router and waits for health. Returns an unsaved ServiceState (launch_mode
+    # "detached") holding pids, URLs, log files and the timeouts. Raises whatever
+    # wait_http_health / RouterClient raise (e.g. RuntimeError, ServiceHTTPError) on
+    # failure; already-spawned processes are not cleaned up here.
     log_dir = store.logs_dir(service)
 
     # Reserve every port we need up front from the non-ephemeral pool to
@@ -111,6 +126,9 @@ def _spawn_router(
     log_level: str,
     log_file: Path,
 ) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Starts "python -m areal.v2.agent_service.router" with host, port, admin
+    # API key and log level, stdout/stderr to log_file. Returns the child pid.
     return spawn_process(
         [
             sys.executable,
@@ -138,6 +156,9 @@ def _spawn_gateway(
     log_level: str,
     log_file: Path,
 ) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Starts "python -m areal.v2.agent_service.gateway" with host, port, router
+    # address, admin API key and log level, logging to log_file. Returns the child pid.
     return spawn_process(
         [
             sys.executable,
@@ -169,6 +190,13 @@ def _spawn_pair(
     log_dir: Path,
     setup_timeout: float,
 ) -> PairState:
+    # [FUNCTION DOC]
+    # HELPER: Starts one worker ("areal.v2.agent_service.worker" with the agent import
+    # path on worker_port) and waits for its health, then starts its data proxy
+    # ("areal.v2.agent_service.data_proxy" pointed at the worker, on proxy_port, with
+    # session_timeout truncated to int seconds) and waits for health. Logs to
+    # worker-<index>.log / proxy-<index>.log in log_dir. Returns a PairState with
+    # component names worker-<index> and proxy-<index>.
     worker_log = log_dir / f"worker-{index}.log"
     worker_pid = spawn_process(
         [

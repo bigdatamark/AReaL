@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Click command "areal inf register": spawns a model's worker/data-proxy fleet and
+# registers it with a running inference service.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -36,10 +39,23 @@ from areal.v2.cli.inference.state import store
     show_default=True,
 )
 def register_cmd(model_name: str, service: str | None, **opts) -> None:
+    # [FUNCTION DOC]
+    # Click entry point. Options: --model-name (required), --service, --backend (spec
+    # such as "sglang:d4"), --model-path, --tokenizer-path, --engine-args, --proxy-args,
+    # --model-health-timeout (600s), --log-level. All options except model name and
+    # service are passed as an opts dict to do_register; exits via SystemExit with its
+    # return code.
     raise SystemExit(do_register(model_name, opts, service=service) or 0)
 
 
 def do_register(model_name: str, opts: dict, *, service: str | None = None) -> int:
+    # [FUNCTION DOC]
+    # Resolves the service name and, holding the model-state file lock, loads the
+    # running state (raises if not running), raises ClickException if the model already
+    # exists, then calls register_model with gateway/router clients, the service log
+    # dir, admin key, the service's scheduler backend and the GPUs already occupied.
+    # Stores the returned entry in the model state, saves it, logs replica count and
+    # GPUs used, and returns 0. Spawns processes.
     service_name = inf_lifecycle.resolve_service_name(service)
     with store.lock_model_state(service_name):
         state = inf_lifecycle.load_running_state(service_name)

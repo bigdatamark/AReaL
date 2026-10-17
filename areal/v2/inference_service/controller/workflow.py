@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# RolloutWorkflow that produces trajectories through the inference service gateway. In
+# offline mode it runs a user agent against gateway sessions and exports the recorded
+# interactions; in online mode it waits for externally produced trajectories announced
+# to the controller and exports them.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -43,6 +48,12 @@ _CONNECTION_ERROR_TYPES: tuple[type[BaseException], ...] = (
 
 
 class InferenceServiceWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # Holds the controller, optional agent (object with async run(data, base_url,
+    # http_client, api_key) returning a float or dict of rewards), gateway address,
+    # admin key, export settings (discount, style, drop_retry_orphans,
+    # reward_normalization), online wait timeout, group_size and whether group members
+    # run serially.
     def __init__(
         self,
         controller: RolloutControllerV2,
@@ -57,6 +68,8 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         drop_retry_orphans: bool = False,
         reward_normalization: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Stores configuration; strips trailing slash from gateway_addr.
         self.controller = controller
         self.agent = agent
         self.gateway_addr = gateway_addr.rstrip("/") if gateway_addr else ""
@@ -76,6 +89,10 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         task_id: str,
         group_size: int = 1,
     ) -> tuple[str | None, list[tuple[str, str]]]:
+        # [FUNCTION DOC]
+        # HELPER: POSTs {task_id, group_size} to the gateway's rl/start_session with
+        # admin auth (retried on HTTP errors by the decorator). Returns (group_id or
+        # None, list of (session_id, session_api_key)). Raises on non-2xx.
         """Start one or more sessions. Returns (group_id, [(session_id, api_key), ...])."""
         url = f"{self.gateway_addr}/{_RL_START_SESSION_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
@@ -96,6 +113,10 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         reward: float,
         session_api_key: str,
     ) -> int | None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs reward for the session's last interaction (interaction_id None)
+        # to rl/set_reward using the session API key. Returns the trajectory_id as int
+        # or None.
         url = f"{self.gateway_addr}/{_RL_SET_REWARD_PATHNAME}"
         headers = {"Authorization": f"Bearer {session_api_key}"}
         payload: dict[str, Any] = {"interaction_id": None, "reward": reward}
@@ -114,6 +135,11 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         trajectory_id: int | None = None,
         discard_trajectory: bool = False,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: POSTs to export_trajectories with admin auth, sending session ids,
+        # group id, trajectory id, discount, export style, remove_session True, retry-
+        # orphan and reward normalization flags and discard flag. Returns the
+        # deserialized "traj" value (dict of interactions/tensors).
         url = f"{self.gateway_addr}/{_EXPORT_TRAJECTORIES_PATHNAME}"
         headers = {"Authorization": f"Bearer {self._admin_api_key}"}
         payload: dict[str, Any] = {
@@ -138,6 +164,10 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         engine: InferenceEngine,
         data: dict[str, Any],
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
+        # [FUNCTION DOC]
+        # Ignores engine; gets the shared aiohttp session from the workflow context and
+        # runs offline mode if an agent is configured, else online mode. Returns the
+        # trajectory dict or None to reject.
         del engine
         http_session = await workflow_context.get_aiohttp_session()
 
@@ -150,6 +180,14 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         http_session: aiohttp.ClientSession,
         data: dict[str, Any],
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
+        # [FUNCTION DOC]
+        # HELPER: Starts group_size sessions for the current task id, then runs the
+        # agent once per session (serially or concurrently via gather). Each member's
+        # reward (last dict value, or the number) is posted to set_reward. Always
+        # exports the group (which also removes the sessions), with discard_trajectory
+        # if any member failed. Returns None if any member failed or the export is
+        # empty; otherwise records each reward in the stats tracker and returns the
+        # exported trajectory.
         task_id = workflow_context.get().task_id
         group_id, sessions = await self._start_session(
             http_session, str(task_id), group_size=self.group_size
@@ -175,6 +213,11 @@ class InferenceServiceWorkflow(RolloutWorkflow):
             session_id: str,
             session_api_key: str,
         ) -> float | None:
+            # [FUNCTION DOC]
+            # HELPER: Runs the agent for one session and returns its final reward, or
+            # None on failure. On exceptions logs a warning (brief for connection
+            # errors, including the cause chain one level), tries to set reward 0.0, and
+            # returns None. Logs start/finish at DEBUG.
             """Run one agent session. Returns reward on success, ``None`` on failure."""
             logger.debug(
                 "V2 rollout member start: task_id=%s group_id=%s member=%d "
@@ -290,6 +333,13 @@ class InferenceServiceWorkflow(RolloutWorkflow):
         self,
         http_session: aiohttp.ClientSession,
     ) -> dict[str, InteractionWithTokenLogpReward] | None:
+        # [FUNCTION DOC]
+        # HELPER: Waits (up to timeout) for the controller to deliver an online export
+        # request {session_id, trajectory_id}; returns None on timeout/empty. Exports
+        # that trajectory, then takes the last reward from the rewards tensor
+        # (localizing an RTensor) or from the last interaction's reward; if neither
+        # exists logs a warning and returns None. Records the reward in stats and
+        # returns the trajectory.
         logger.debug("Waiting for next ready online trajectory")
         export_request = await self.controller.wait_for_online_trajectory(
             timeout=self.timeout

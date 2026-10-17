@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# FastAPI application for the data proxy: sits between the router/gateway and one
+# inference backend (SGLang/vLLM via InfBridge) or external OpenAI-compatible providers.
+# Serves OpenAI chat completions and Anthropic messages while recording per-session
+# interactions, manages RL sessions and rewards, exports trajectories (large tensors as
+# RTensor shards stored on this node), forwards pause/resume/offload/version control,
+# pushes "trajectory ready" callbacks to the controller, and mounts the RTensor data
+# blueprint.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -67,6 +75,10 @@ _INLINE_TRAJECTORY_FIELDS = frozenset(("rewards", "original_rewards"))
 
 
 def _remotize_trajectory(traj: dict[str, Any], node_addr: str) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Splits traj into inline reward fields ("rewards", "original_rewards") kept
+    # as-is and the rest, which is converted to RTensor references stored at node_addr.
+    # Returns the merged dict.
     """Keep scalar reward metadata local while remotizing large tensors."""
     inline = {key: traj[key] for key in _INLINE_TRAJECTORY_FIELDS if key in traj}
     remote_payload = {key: value for key, value in traj.items() if key not in inline}
@@ -75,6 +87,9 @@ def _remotize_trajectory(traj: dict[str, Any], node_addr: str) -> dict[str, Any]
 
 
 async def _safe_stream_wrapper(stream: AsyncGenerator[Any, None]):
+    # [FUNCTION DOC]
+    # HELPER: Async generator re-yielding stream items and always calling the stream's
+    # aclose (if present) when iteration ends or the client disconnects.
     """Close an upstream stream when forwarding ends or the client disconnects."""
     try:
         async for chunk in stream:
@@ -90,6 +105,9 @@ async def _safe_stream_wrapper(stream: AsyncGenerator[Any, None]):
 
 
 class DataProxyHealthResponse(BaseModel):
+    # [CLASS DOC]
+    # Health payload: status, backend address, session count, paused flag, weight
+    # version.
     status: str
     backend: str | None
     sessions: int
@@ -98,24 +116,36 @@ class DataProxyHealthResponse(BaseModel):
 
 
 class DataProxyStatusResponse(BaseModel):
+    # [CLASS DOC]
+    # Generic {status} response.
     status: str
 
 
 class PauseGenerationResponse(BaseModel):
+    # [CLASS DOC]
+    # {status, paused} response for pause/continue endpoints.
     status: str
     paused: bool
 
 
 class SetVersionResponse(BaseModel):
+    # [CLASS DOC]
+    # {status, version} response.
     status: str
     version: int
 
 
 class GetVersionResponse(BaseModel):
+    # [CLASS DOC]
+    # {version} response.
     version: int
 
 
 class SetRewardResponse(BaseModel):
+    # [CLASS DOC]
+    # Reward response: message, interaction count, session id, trajectory id (if a
+    # trajectory became/was ready), trajectory_ready flag, and whether this call caused
+    # the ready transition.
     message: str
     interaction_count: int
     session_id: str
@@ -125,11 +155,15 @@ class SetRewardResponse(BaseModel):
 
 
 class RegisterModelResponse(BaseModel):
+    # [CLASS DOC]
+    # {status, name} response.
     status: str
     name: str
 
 
 class ConfigureBackendResponse(BaseModel):
+    # [CLASS DOC]
+    # {status, backend_addr} response.
     status: str
     backend_addr: str
 
@@ -140,6 +174,9 @@ class ConfigureBackendResponse(BaseModel):
 
 
 def _extract_bearer_token(request: Request) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the token from "Authorization: Bearer" (case-insensitive prefix)
+    # or the x-api-key header; raises HTTPException 401 if neither is present.
     """Extract API token from an OpenAI or Anthropic authentication header.
 
     Raises HTTPException(401) if missing or malformed.
@@ -160,6 +197,9 @@ def _extract_bearer_token(request: Request) -> str:
 
 
 def _require_admin_key(request: Request, store: SessionStore) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Extracts the token and constant-time compares it with the store's admin
+    # key; 403 on mismatch. Returns the token.
     """Validate that the request carries the admin API key."""
     token = _extract_bearer_token(request)
     if not hmac.compare_digest(token, store.admin_api_key):
@@ -168,6 +208,8 @@ def _require_admin_key(request: Request, store: SessionStore) -> str:
 
 
 def _require_session_key(request: Request, store: SessionStore) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Extracts the token and returns the session id it maps to; 401 if unknown.
     """Resolve session_id from an OpenAI or Anthropic session API key."""
     token = _extract_bearer_token(request)
     session = store.get_session_by_api_key(token)
@@ -182,6 +224,9 @@ def _resolve_session_from_token(
     token: str | None,
     store: SessionStore,
 ) -> SessionData | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns the session for a session key, the persistent human-in-the-loop
+    # session for the admin key (created on demand), or None for missing/unknown tokens.
     """Resolve a session from an API token.
 
     Session key → lookup by API key.
@@ -198,6 +243,8 @@ def _resolve_session_from_token(
 
 
 def _try_extract_bearer_token(request: Request) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Like _extract_bearer_token but returns None instead of raising.
     """Extract an OpenAI or Anthropic token if present.
 
     Unlike _extract_bearer_token, this never raises — it's for endpoints
@@ -217,6 +264,9 @@ def _create_inf_bridge(
     pause_state: PauseState,
     config: DataProxyConfig,
 ) -> InfBridge:
+    # [FUNCTION DOC]
+    # HELPER: Builds an InfBridge with an SGLang or vLLM backend adapter (ValueError for
+    # other types), the pause state, request timeout and resubmit settings from config.
     """Create an InfBridge instance from proxy config."""
     if config.backend_type == "sglang":
         backend = SGLangBridgeBackend()
@@ -240,6 +290,9 @@ def _create_areal_client(
     tok: TokenizerProxy,
     config: DataProxyConfig,
 ) -> ArealOpenAI:
+    # [FUNCTION DOC]
+    # HELPER: Builds an ArealOpenAI client using the bridge as engine, the proxy's
+    # underlying tokenizer, and parser/template/max-token options from config.
     """Create an ArealOpenAI client backed by the given InfBridge."""
     return ArealOpenAI(
         engine=inf_bridge,
@@ -259,6 +312,11 @@ async def _post_online_ready_callback(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: POSTs {session_id, trajectory_id} to <callback>/callback/online_ready with
+    # admin auth using the given or a temporary client. Returns True on status < 400;
+    # False when no callback address is configured, on error status, or on any exception
+    # (all logged).
     if not callback_server_addr:
         return False
 
@@ -266,6 +324,8 @@ async def _post_online_ready_callback(
     try:
 
         async def _do(c: httpx.AsyncClient) -> httpx.Response:
+            # [FUNCTION DOC]
+            # HELPER: Performs the callback POST with the given client.
             return await c.post(
                 f"{callback_base}/callback/online_ready",
                 json={
@@ -303,6 +363,10 @@ async def _post_online_ready_callback(
 
 
 async def _flush_ready_trajectories(app: FastAPI) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Finalizes rewarded trajectories in the session store (logging each ready
+    # one), then concurrently delivers all pending online-ready notifications and marks
+    # the delivered ones in the store so they are not resent.
     store: SessionStore = app.state.session_store
     config: DataProxyConfig = app.state.config
     http_client: httpx.AsyncClient | None = getattr(app.state, "http_client", None)
@@ -320,6 +384,9 @@ async def _flush_ready_trajectories(app: FastAPI) -> None:
     async def _deliver(
         notification: ReadyNotification,
     ) -> tuple[ReadyNotification, bool]:
+        # [FUNCTION DOC]
+        # HELPER: Delivers one notification, treating any exception as not delivered.
+        # Returns (notification, delivered).
         try:
             delivered = await _post_online_ready_callback(
                 config.callback_server_addr,
@@ -348,12 +415,23 @@ async def _flush_ready_trajectories(app: FastAPI) -> None:
 
 
 async def _ready_trajectory_loop(app: FastAPI) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Background task: flushes ready trajectories every 0.1s forever.
     while True:
         await _flush_ready_trajectories(app)
         await asyncio.sleep(0.1)
 
 
 def create_app(config: DataProxyConfig) -> FastAPI:
+    # [FUNCTION DOC]
+    # Builds the FastAPI app. Eagerly imports and instantiates configured message
+    # preprocessor classes and imports the optional prefix matcher. The lifespan sets up
+    # app.state (pause state, config, SessionStore with admin key, version 0, shared
+    # httpx client, and when a backend address is configured a TokenizerProxy, InfBridge
+    # and ArealOpenAI client; otherwise these are None) and runs the ready-trajectory
+    # loop, closing everything on shutdown. Registers the endpoints below plus a WSGI
+    # mount of the RTensor data blueprint at "/". Keeps a closure-local registry of
+    # external models. Returns the app.
     """Factory that creates the FastAPI app with lifespan-managed resources."""
 
     message_preprocessors: list[MessagePreprocessor] = []
@@ -369,6 +447,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # [FUNCTION DOC]
+        # HELPER: Async context manager creating and tearing down the app.state
+        # resources and the background ready-trajectory task described above.
         logger.info(
             "Data proxy starting — backend=%s, tokenizer=%s",
             config.backend_addr or "(none)",
@@ -419,6 +500,13 @@ def create_app(config: DataProxyConfig) -> FastAPI:
         body_json: dict[str, Any],
         session: SessionData | None,
     ) -> tuple[Any, bool]:
+        # [FUNCTION DOC]
+        # HELPER: Runs a chat completion through the ArealOpenAI client (503 if no
+        # backend). Drops "model", defaults temperature/top_p to 1.0, uses the session's
+        # completion cache when a session is given, and with deterministic sampling
+        # assigns a seed derived from the session's seed identity and request index if
+        # none was given. Any client error becomes HTTPException 500. Returns (result,
+        # is_streaming).
         areal_client: ArealOpenAI | None = app.state.areal_client
         if areal_client is None:
             raise HTTPException(status_code=503, detail="Inference backend unavailable")
@@ -462,6 +550,11 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.get("/health", response_model=DataProxyHealthResponse)
     async def health():
+        # [FUNCTION DOC]
+        # GET /health: returns status, configured backend address, session count, paused
+        # flag and version.
+        # KNOWN ISSUE: reports the backend address from the startup config, not the one
+        # set via /configure_backend.
         store: SessionStore = app.state.session_store
         pause_state: PauseState = app.state.pause_state
         return DataProxyHealthResponse(
@@ -474,6 +567,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/configure", response_model=DataProxyStatusResponse)
     async def configure():
+        # [FUNCTION DOC]
+        # POST /configure: no-op returning status ok.
         return DataProxyStatusResponse(status="ok")
 
     # =========================================================================
@@ -482,6 +577,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/pause_generation", response_model=PauseGenerationResponse)
     async def pause_generation():
+        # [FUNCTION DOC]
+        # POST /pause_generation (no auth): pauses the bridge (503 if no backend).
+        # Returns paused.
         inf_bridge: InfBridge | None = app.state.inf_bridge
         if inf_bridge is None:
             raise HTTPException(
@@ -493,6 +591,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/continue_generation", response_model=PauseGenerationResponse)
     async def continue_generation():
+        # [FUNCTION DOC]
+        # POST /continue_generation (no auth): resumes the bridge (503 if no backend).
         inf_bridge: InfBridge | None = app.state.inf_bridge
         if inf_bridge is None:
             raise HTTPException(
@@ -504,6 +604,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/release_memory_occupation")
     async def release_memory_occupation():
+        # [FUNCTION DOC]
+        # POST /release_memory_occupation: offloads backend memory via the bridge (503
+        # if none).
         inf_bridge: InfBridge | None = app.state.inf_bridge
         if inf_bridge is None:
             raise HTTPException(
@@ -515,6 +618,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/resume_memory_occupation")
     async def resume_memory_occupation(request: Request):
+        # [FUNCTION DOC]
+        # POST /resume_memory_occupation: onloads backend memory with optional body
+        # "tags" (503 if no backend).
         inf_bridge: InfBridge | None = app.state.inf_bridge
         if inf_bridge is None:
             raise HTTPException(
@@ -532,6 +638,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/set_version", response_model=SetVersionResponse)
     async def set_version(request: Request):
+        # [FUNCTION DOC]
+        # POST /set_version: requires int "version" (400 otherwise), stores it and
+        # propagates it to the bridge for token version stamping.
         body = await request.json()
         version = body.get("version")
         if version is None or not isinstance(version, int):
@@ -546,6 +655,8 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.get("/get_version", response_model=GetVersionResponse)
     async def get_version():
+        # [FUNCTION DOC]
+        # GET /get_version: returns the current version.
         return GetVersionResponse(version=app.state.version)
 
     # =========================================================================
@@ -556,6 +667,13 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     async def start_session(
         body: StartSessionRequest, request: Request
     ) -> StartSessionResponse:
+        # [FUNCTION DOC]
+        # POST /rl/start_session (admin key): creates max(group_size, 1) sessions for
+        # task_id, the first optionally using the caller-supplied api_key, with seed
+        # identity "task:i" for groups. A ValueError from the store (e.g. duplicate key)
+        # gives 409. Returns a new random group id and the session credentials.
+        # KNOWN ISSUE: sessions created before a 409 failure within a group are not
+        # rolled back.
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
 
@@ -582,6 +700,10 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/rl/set_reward", response_model=SetRewardResponse)
     async def set_reward(body: SetRewardRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /rl/set_reward: authenticates by session key (or admin key for the HITL
+        # session; 401 otherwise), assigns the reward to the given or last interaction
+        # (400 on ValueError), and returns the reward result fields.
         store: SessionStore = app.state.session_store
         token = _extract_bearer_token(request)
         session = _resolve_session_from_token(token, store)
@@ -617,6 +739,16 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/chat/completions")
     async def chat_completions(request: Request):
+        # [FUNCTION DOC]
+        # POST /chat/completions (never rejects auth). Parses JSON (400 if invalid),
+        # resolves an optional session and touches its access time. If the model name is
+        # a registered external model with a URL, forwards the request to
+        # <url>/chat/completions (model renamed, auth replaced by the provider key, hop
+        # headers dropped): streaming responses are relayed and, on success, the
+        # concatenated text is recorded as a string interaction; non-streaming responses
+        # are returned verbatim and recorded when 200 (502 on transport error).
+        # Otherwise uses the internal backend, returning a ChatCompletion or an SSE
+        # stream ending in "[DONE]".
         raw_body = await request.body()
         try:
             body_json = json.loads(raw_body)
@@ -660,6 +792,10 @@ def create_app(config: DataProxyConfig) -> FastAPI:
                 collected_chunks: list[str] = []
 
                 async def _stream_and_cache():
+                    # [FUNCTION DOC]
+                    # HELPER: Streams the external provider response, emitting an SSE
+                    # error event on non-200 or exceptions, and records the collected
+                    # text as an interaction on success.
                     success = False
                     try:
                         async with create_httpx_client(
@@ -743,6 +879,9 @@ def create_app(config: DataProxyConfig) -> FastAPI:
             # result is an async generator of ChatCompletionChunk
 
             async def _sse_stream():
+                # [FUNCTION DOC]
+                # HELPER: Serializes internal completion chunks as SSE events followed
+                # by "[DONE]".
                 async for chunk in result:
                     yield f"data: {chunk.model_dump_json()}\n\n".encode()
                 yield b"data: [DONE]\n\n"
@@ -761,6 +900,12 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/v1/messages", response_model=None)
     async def anthropic_messages(request: Request) -> Message | StreamingResponse:
+        # [FUNCTION DOC]
+        # POST /v1/messages: requires a session (or admin) key (401). Translates the
+        # Anthropic request to OpenAI form with the message preprocessors (400 for
+        # malformed input, 500 for unexpected errors), runs it internally, and
+        # translates the result back to an Anthropic Message or Anthropic SSE stream
+        # (500 on translation failures, closing the upstream).
         """Serve Anthropic Messages API requests for session-backed agent rollouts."""
         store: SessionStore = app.state.session_store
         token = _try_extract_bearer_token(request)
@@ -829,6 +974,10 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/register_model", response_model=RegisterModelResponse)
     async def register_model(request: Request):
+        # [FUNCTION DOC]
+        # POST /register_model (admin key, to prevent SSRF): registers name (from "name"
+        # or "model", 400 if missing) -> {url, upstream model, api_key}. Empty url means
+        # internal.
         # /register_model configures an external upstream URL that the data
         # proxy will fetch on behalf of /chat/completions callers. Without
         # authentication, any network-adjacent attacker could point a model
@@ -855,6 +1004,18 @@ def create_app(config: DataProxyConfig) -> FastAPI:
     async def export_trajectories(
         body: ExportTrajectoriesRequest, request: Request
     ) -> ExportTrajectoriesResponse:
+        # [FUNCTION DOC]
+        # POST /export_trajectories (admin key; 400 for empty session_ids). For each
+        # session exports the requested (or latest) trajectory with
+        # discount/style/retry-orphan options, using None for missing sessions or
+        # KeyError. If discard_trajectory, drops everything; else with
+        # reward_normalization and multiple sessions normalizes rewards across the
+        # group, dropping it all if incomplete. Merges interactions; if all have tensor
+        # data, concatenates padded tensors and remotizes them as RTensor on this node,
+        # else concatenates string interactions. Optionally removes the sessions.
+        # Returns the serialized trajectory.
+        # KNOWN ISSUE: when nothing is merged (discard or all missing) the all() check
+        # is vacuously true and an empty list is passed to concat_padded_tensors.
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)
 
@@ -920,6 +1081,13 @@ def create_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/configure_backend", response_model=ConfigureBackendResponse)
     async def configure_backend(request: Request):
+        # [FUNCTION DOC]
+        # POST /configure_backend (admin key; 400 without backend_addr): builds a new
+        # InfBridge and ArealOpenAI client for the new address, swaps
+        # config/bridge/client in app.state, then closes the old bridge.
+        # KNOWN ISSUE: if the proxy started without a backend the tokenizer is None and
+        # client creation fails; closing the old bridge right away can break in-flight
+        # requests that still use it, contrary to the inline comment.
         """Reconfigure the inference backend address after process start."""
         store: SessionStore = app.state.session_store
         _require_admin_key(request, store)

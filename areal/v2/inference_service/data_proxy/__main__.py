@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Command-line entry point for the data proxy (python -m
+# areal.v2.inference_service.data_proxy): parses args, builds DataProxyConfig and serves
+# the FastAPI app with uvicorn.
 # SPDX-License-Identifier: Apache-2.0
 
 """CLI entrypoint: python -m areal.v2.inference_service.data_proxy"""
@@ -19,6 +23,14 @@ from areal.v2.inference_service.data_proxy.config import DataProxyConfig
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses arguments (host 0.0.0.0, port 8082, backend addr/type sglang|vllm, required
+    # tokenizer path, log level, request timeout, set-reward finish timeout, admin key,
+    # callback server addr, deterministic sampling, tool-call/reasoning parsers, engine
+    # max tokens, chat template type hf|concat, repeatable message preprocessors, prefix
+    # matcher); unknown args are ignored. Validates the admin key for the bind host (may
+    # raise/exit), resolves a wildcard host to the machine IP for serving_addr, builds
+    # the config, silences HTTP loggers and runs uvicorn (blocking).
     parser = argparse.ArgumentParser(description="AReaL Data Proxy")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8082)

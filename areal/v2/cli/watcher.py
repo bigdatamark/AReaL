@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Foreground watcher used by non-detached "run" commands: blocks while the service is
+# alive and maps signals to either teardown (SIGTERM, and Ctrl+C) or quiet detach
+# (SIGHUP).
 # SPDX-License-Identifier: Apache-2.0
 
 """Foreground watcher with signal-aware teardown.
@@ -26,6 +30,11 @@ Disposition = Literal["teardown", "detach"]
 
 
 class ForegroundWatcher:
+    # [CLASS DOC]
+    # Configured with is_alive and teardown callbacks, idle_poll seconds, a service name
+    # (unused informational field) and a signal -> disposition map ("teardown" or
+    # "detach"). Default map: SIGTERM teardown, SIGHUP detach (when the platform has
+    # SIGHUP).
     """Block the calling thread until the service exits.
 
     Construct with an ``is_alive`` callback (typically
@@ -49,6 +58,9 @@ class ForegroundWatcher:
         service_name: str = "",
         signal_dispositions: dict[int, Disposition] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores callbacks and settings; copies the given dispositions or the class
+        # defaults.
         self.is_alive = is_alive
         self.teardown = teardown
         self.idle_poll = idle_poll
@@ -60,6 +72,13 @@ class ForegroundWatcher:
         )
 
     def watch(self) -> int:
+        # [FUNCTION DOC]
+        # Installs signal handlers, then loops sleeping idle_poll while is_alive() is
+        # True. On KeyboardInterrupt (Ctrl+C or a teardown signal) runs teardown and
+        # returns 0. On SystemExit (detach signal) returns its int code or 0 without
+        # teardown. Any other exception runs teardown and re-raises. Always restores
+        # previous handlers. Returns 0 when is_alive() turns False on its own (no
+        # teardown). Must be called from the main thread.
         previous = self._install_handlers()
         try:
             while self.is_alive():
@@ -85,6 +104,9 @@ class ForegroundWatcher:
     # Signal plumbing
 
     def _install_handlers(self) -> dict[int, object]:
+        # [FUNCTION DOC]
+        # HELPER: Installs a handler for each configured signal and returns the previous
+        # handlers.
         previous: dict[int, object] = {}
         for sig, disposition in self.dispositions.items():
             previous[sig] = signal.getsignal(sig)
@@ -92,18 +114,27 @@ class ForegroundWatcher:
         return previous
 
     def _restore_handlers(self, previous: dict[int, object]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Reinstalls the saved previous signal handlers.
         for sig, handler in previous.items():
             signal.signal(sig, handler)
 
     def _handler_for(self, disposition: Disposition):
+        # [FUNCTION DOC]
+        # HELPER: Returns a signal handler raising KeyboardInterrupt for "teardown" or
+        # SystemExit(0) for any other disposition (detach).
         if disposition == "teardown":
 
             def teardown_handler(signum, frame):  # noqa: ARG001
+                # [FUNCTION DOC]
+                # HELPER: Signal handler that raises KeyboardInterrupt.
                 raise KeyboardInterrupt
 
             return teardown_handler
 
         def detach_handler(signum, frame):  # noqa: ARG001
+            # [FUNCTION DOC]
+            # HELPER: Signal handler that raises SystemExit(0).
             raise SystemExit(0)
 
         return detach_handler

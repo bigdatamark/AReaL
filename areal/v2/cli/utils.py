@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Stateless helpers for the service CLIs: POSIX file locking, polling a component until
+# healthy, JSON-or-table output dispatch, and colored CLI logger registration.
 # SPDX-License-Identifier: Apache-2.0
 
 """Stateless utility helpers shared across subcommand CLIs.
@@ -37,6 +40,10 @@ from areal.v2.cli.process import pid_alive
 
 @contextmanager
 def file_lock(path: Path) -> Iterator[None]:
+    # [FUNCTION DOC]
+    # Context manager: opens (creating) path and holds an exclusive blocking flock on it
+    # while the block runs, releasing it afterwards. Creates parent dirs. POSIX-only
+    # (fcntl).
     """Hold an exclusive flock on ``path`` for the duration of the ``with`` block.
 
     The lock file is created if missing; concurrent waiters block until
@@ -60,7 +67,12 @@ def file_lock(path: Path) -> Iterator[None]:
 
 
 class _HealthCheckable(Protocol):
+    # [CLASS DOC]
+    # HELPER: Protocol for objects with a health(timeout=...) method (e.g.
+    # BaseHTTPClient).
     def health(self, *, timeout: float) -> object: ...
+        # [FUNCTION DOC]
+        # Protocol method: performs a health check, raising on failure.
 
 
 def wait_http_health(
@@ -72,6 +84,14 @@ def wait_http_health(
     poll_interval: float = 0.5,
     request_timeout: float = 2.0,
 ) -> None:
+    # [FUNCTION DOC]
+    # Polls <url>/health until a response with status below 500 or timeout seconds
+    # elapse. Before each attempt, if pid > 0 and the pid is dead, raises ClickException
+    # ("died during startup"). Network errors are recorded and followed by poll_interval
+    # sleep. On deadline raises ClickException including the last error. request_timeout
+    # bounds each request.
+    # KNOWN ISSUE: a 5xx surfaces as HTTPError (a URLError) so it is treated like a
+    # network error; a 2xx/3xx/4xx distinction is likewise lost since 4xx also raises.
     """Poll ``GET <url>/health`` until it returns < 5xx.
 
     Raises ``ClickException`` if the deadline elapses, or if the spawned
@@ -104,6 +124,10 @@ def wait_client_health(
     poll_interval: float = 0.3,
     request_timeout: float = 1.5,
 ) -> None:
+    # [FUNCTION DOC]
+    # Calls client.health(timeout=request_timeout) until it returns without raising,
+    # sleeping poll_interval after each failure; raises ClickException with the last
+    # error if timeout seconds pass.
     """Poll ``client.health(timeout=...)`` until it returns without raising.
 
     Any exception from ``client.health`` is treated as "not ready yet"
@@ -136,6 +160,9 @@ def json_or_table(
     table_renderer: Callable[[Any], None],
     indent: int = 2,
 ) -> None:
+    # [FUNCTION DOC]
+    # Echoes payload as indented JSON (stringifying unknown types) when as_json,
+    # otherwise calls table_renderer(payload).
     """Emit ``payload`` as JSON or hand it to a table renderer.
 
     Most subcommand ``ps`` / ``status`` / ``models`` verbs follow the
@@ -156,6 +183,9 @@ def json_or_table(
 
 
 def register_cli_logger(name: str, color: str = "blue") -> logging.Logger:
+    # [FUNCTION DOC]
+    # Registers name with color (default blue) in the global logger color table (global
+    # state mutation) and returns areal's logger for that name.
     """Register ``name`` with ``color`` in ``areal.utils.logging``'s
     color table and return the configured Logger.
 

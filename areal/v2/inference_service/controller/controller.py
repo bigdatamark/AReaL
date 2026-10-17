@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# RolloutControllerV2: a rollout controller, duck-type compatible with
+# RolloutController, that launches the whole inference service stack (RPCGuard workers
+# via the scheduler, then inference servers, router, data proxies and gateway forked
+# through the guards) and drives rollouts, versioning, pause/resume and memory offload
+# over HTTP. Also runs a small Flask callback server to receive "online trajectory
+# ready" notifications.
 # SPDX-License-Identifier: Apache-2.0
 
 """RolloutControllerV2 — parallel implementation to RolloutController.
@@ -45,10 +52,15 @@ _DEFAULT_SERVICE_LOG_LEVEL = "warning"
 
 @dataclass
 class _OnlineWaiter:
+    # [CLASS DOC]
+    # HELPER: Wraps an asyncio future awaiting one online trajectory export request.
     future: asyncio.Future
 
 
 class _DummyDataLoader:
+    # [CLASS DOC]
+    # HELPER: Iterable yielding exactly one batch of batch_size empty dicts (online
+    # mode).
     """Minimal dataloader that yields a single batch of empty dicts.
 
     Used by :meth:`RolloutControllerV2.prepare_batch` when
@@ -56,13 +68,26 @@ class _DummyDataLoader:
     """
 
     def __init__(self, batch_size: int) -> None:
+        # [FUNCTION DOC]
+        # Stores batch_size.
         self.batch_size = batch_size
 
     def __iter__(self):
+        # [FUNCTION DOC]
+        # Yields a single list of batch_size empty dicts.
         yield [{} for _ in range(self.batch_size)]
 
 
 class RolloutControllerV2:
+    # [CLASS DOC]
+    # Controller state: config, scheduler, parsed rollout allocation (None in external
+    # mode where config.api_url is set), nodes per inference instance, guard workers,
+    # service addresses (inference servers, router, data proxies, gateway), router
+    # worker ids, weight version (lock-protected), workflow executor and staleness
+    # manager, online waiter queue and bounded backlog of completed online results
+    # (1024), callback server/thread/loop, forked-service records (guard, role, index)
+    # for teardown, shared sync/async httpx clients, and background-initialization
+    # synchronization (future, lock, events).
     """Inference controller that routes everything through the gateway HTTP stack.
 
     This is a **parallel** implementation to ``RolloutController`` (NOT a
@@ -85,6 +110,12 @@ class RolloutControllerV2:
         config: InferenceEngineConfig,
         scheduler: Scheduler,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates admin_api_key (non-empty) and model (non-empty), raising ValueError.
+        # Parses config.backend into a ModelAllocation unless api_url is set. Computes
+        # nodes-per-instance = tp*pp / scheduler.n_gpus_per_node when it exceeds one
+        # node (ValueError if n_gpus_per_node < 1 or not divisible). Initializes all
+        # bookkeeping and a sync httpx client (30s). No processes started.
         if config.admin_api_key is None or not config.admin_api_key.strip():
             raise ValueError(
                 "InferenceEngineConfig.admin_api_key must be set (not None or empty)"
@@ -197,6 +228,14 @@ class RolloutControllerV2:
         wait: bool = False,
         **kwargs: Any,
     ) -> concurrent.futures.Future | None:
+        # [FUNCTION DOC]
+        # Starts the online callback server, then submits background initialization to
+        # the "ctrl_init" executor and blocks until guard workers are created (or the
+        # background task fails), up to config.workers_ready_timeout (TimeoutError
+        # otherwise). Re-raises an early background failure. If wait, blocks until
+        # initialization completes and returns None; otherwise returns the future.
+        # Raises RuntimeError if an initialization is already pending. Extra args are
+        # forwarded to the async initializer.
         from areal.infra.utils.concurrent import get_executor
 
         if self._init_future is not None:
@@ -225,6 +264,9 @@ class RolloutControllerV2:
         return self._init_future
 
     def _guarded_bg_initialize(self, *args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Runs _bg_initialize, setting the workers-ready event on failure so
+        # initialize() does not hang, then re-raises.
         """Ensure _workers_ready is signaled even if _bg_initialize fails."""
         try:
             self._bg_initialize(*args, **kwargs)
@@ -239,6 +281,14 @@ class RolloutControllerV2:
         *args: Any,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Runs _async_initialize in a fresh event loop, registers data proxies
+        # in the router, builds the StalenessManager (max concurrent =
+        # max_concurrent_rollouts or consumer_batch_size, staleness =
+        # max_head_offpolicyness) and WorkflowExecutor (using this controller as the
+        # inference engine), then registers config.model with the gateway (with
+        # api_url/provider key for external mode). Returns early at each stage if
+        # shutdown was requested.
         from areal.infra.utils.concurrent import run_async_task
 
         run_async_task(
@@ -296,6 +346,9 @@ class RolloutControllerV2:
             )
 
     def _ensure_initialized(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If background init is pending, waits for it under the init lock (up to
+        # setup_timeout, re-raising its error) and clears the future. No-op otherwise.
         if self._init_future is None:
             return
         with self._init_lock:
@@ -312,6 +365,18 @@ class RolloutControllerV2:
         *args: Any,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Builds the stack. Step 0: creates RPCGuard workers for role
+        # "<role>-inf" via the scheduler: in external mode dp=1 CPU-only workers;
+        # otherwise dp*nnodes workers each with the per-node share of GPUs/CPU/mem (or
+        # dp GPU-less workers when server_infos are given). Raises RuntimeError if the
+        # worker count differs; signals workers-ready. Step 1+2: concurrently forks the
+        # router on guard 0 and launches inference servers (skipped in external mode;
+        # existing server_infos are reused as given). Step 3+4: concurrently forks one
+        # data proxy per dp group on the group's head guard (pointing at its inference
+        # server, with tokenizer, timeouts, callback address and agent parser options)
+        # and the gateway on guard 0 pointing at the router. Records all addresses and
+        # forked services in deterministic order. Stops early if shutdown is requested.
         from dataclasses import asdict
 
         from areal.api.cli_args import SchedulingSpec, SchedulingStrategy
@@ -491,6 +556,10 @@ class RolloutControllerV2:
             ]
 
         async def _fork_data_proxy(group_idx: int) -> tuple[str, int, str]:
+            # [FUNCTION DOC]
+            # HELPER: Forks the data proxy for one dp group on the group's head guard
+            # (external mode: empty backend address), waits for its health, and returns
+            # (host, port, guard address).
             if self.external_mode:
                 head_worker = inf_workers[group_idx]
             else:
@@ -565,6 +634,16 @@ class RolloutControllerV2:
         worker_env: dict[str, str],
         server_args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Launches dp inference server groups through guard /alloc_ports and
+        # /fork. Uses SGLang or vLLM command builders (ValueError for others). For
+        # multi-node instances first allocates a rendezvous port on the head guard as
+        # dist_init_addr. Each node gets its own port and a launch command built from
+        # server_args plus host/port/nnodes/node_rank; SGLang nodes get unique Triton
+        # cache dirs, vLLM nodes unique Triton/vLLM cache roots and runtime LoRA
+        # updating enabled. Records head host/port per group as inference address and
+        # LocalInfServerInfo (process None), records forked services, then waits for all
+        # servers' /health (setup_timeout).
         if inf_backend == "sglang":
             from areal.api.cli_args import SGLangConfig
 
@@ -579,6 +658,9 @@ class RolloutControllerV2:
         async def _fork_group(
             group_idx: int,
         ) -> tuple[str, int, list[tuple[str, str, int]]]:
+            # [FUNCTION DOC]
+            # HELPER: Forks all nodes of one dp group in parallel and returns (head
+            # host, head port, forked service records).
             group_workers = inf_workers[
                 group_idx * nnodes_per_instance : (group_idx + 1) * nnodes_per_instance
             ]
@@ -600,6 +682,10 @@ class RolloutControllerV2:
                 dist_init_addr = format_hostport(rendezvous_host, rendezvous_port)
 
             async def _fork_node(node_rank: int, worker: Any) -> tuple[str, int, str]:
+                # [FUNCTION DOC]
+                # HELPER: Allocates a port on the node's guard, builds the launch
+                # command and environment, and forks it as role "inf-server" with global
+                # worker index. Returns (host, port, guard).
                 guard_addr = (
                     f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}"
                 )
@@ -721,6 +807,9 @@ class RolloutControllerV2:
     def _wait_for_service(
         self, url: str, name: str, timeout: float | None = None
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Synchronously polls url every 0.1s until HTTP 200 (2s per request),
+        # logging readiness; raises TimeoutError after timeout (default setup_timeout).
         """Wait for a service to become healthy."""
         timeout = timeout or self.config.setup_timeout
         deadline = time.monotonic() + timeout
@@ -738,6 +827,9 @@ class RolloutControllerV2:
     async def _async_wait_for_service(
         self, url: str, name: str, timeout: float | None = None
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Async version of _wait_for_service using the shared async client; any
+        # exception counts as not ready.
         timeout = timeout or self.config.setup_timeout
         deadline = time.monotonic() + timeout
         client = await self._get_async_client()
@@ -753,6 +845,10 @@ class RolloutControllerV2:
         raise TimeoutError(f"{name} did not become healthy at {url} within {timeout}s")
 
     def _register_data_proxies_in_router(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: In a thread pool, POSTs each data proxy address to the router's
+        # /register with admin auth (each thread uses its own httpx client) and stores
+        # returned worker ids. Raises on HTTP errors.
         """Register all data proxy workers in the router and store their worker IDs."""
         if not self._data_proxy_addrs:
             return
@@ -763,6 +859,8 @@ class RolloutControllerV2:
         router_addr = self._router_addr
 
         def _register_one(data_proxy_addr: str) -> tuple[str, str | None]:
+            # [FUNCTION DOC]
+            # HELPER: Registers one data proxy and returns (address, worker_id or None).
             # Each thread gets its own httpx.Client because httpx.Client
             # is not thread-safe and must not be shared across threads.
             with httpx.Client() as client:
@@ -795,6 +893,9 @@ class RolloutControllerV2:
         api_key: str | None = None,
         data_proxy_addrs: list[str] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Waits for initialization, then registers a model with the gateway (see
+        # _register_model_impl).
         self._ensure_initialized()
         self._register_model_impl(model, url, api_key, data_proxy_addrs)
 
@@ -805,6 +906,9 @@ class RolloutControllerV2:
         api_key: str | None = None,
         data_proxy_addrs: list[str] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs {model, url, api_key, data_proxy_addrs (default all)} to the
+        # gateway's /register_model with admin auth; raises on non-2xx.
         if data_proxy_addrs is None:
             data_proxy_addrs = self._data_proxy_addrs
         resp = self._sync_client.post(
@@ -822,9 +926,19 @@ class RolloutControllerV2:
 
     @property
     def external_mode(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: True when config.api_url is set (external model provider, no local
+        # servers).
         return self.config.api_url is not None
 
     def _start_online_callback_server(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Idempotently starts a single-threaded Flask/werkzeug server on this
+        # host's IP and a free port, in a daemon thread that owns a dedicated event
+        # loop. Route POST /callback/online_ready requires the admin bearer key (403
+        # otherwise) and runs _handle_online_ready_callback on that loop; RuntimeError
+        # gives 425, other errors 500. Request logging is silenced. Blocks until the
+        # loop exists.
         """Start callback server used by the router to deliver ready trajectories."""
         if self._callback_server is not None:
             return
@@ -838,6 +952,8 @@ class RolloutControllerV2:
 
         @app.route("/callback/online_ready", methods=["POST"])
         def online_ready():
+            # [FUNCTION DOC]
+            # HELPER: Flask handler for the online-ready callback described above.
             if request.headers.get("Authorization") != (
                 f"Bearer {self.config.admin_api_key}"
             ):
@@ -872,6 +988,9 @@ class RolloutControllerV2:
         )
 
         def serve_forever():
+            # [FUNCTION DOC]
+            # HELPER: Thread target: creates and installs the callback event loop,
+            # signals readiness and serves requests until shutdown.
             self._callback_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._callback_loop)
             self._callback_loop_ready.set()
@@ -889,6 +1008,9 @@ class RolloutControllerV2:
         self._callback_loop_ready.wait()
 
     def _stop_online_callback_server(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Shuts down the callback server, joins its thread (5s), closes its loop
+        # and resets all callback fields. No-op if not running.
         if self._callback_server is not None:
             logger.info("Stopping online callback server...")
             self._callback_server.shutdown()
@@ -906,11 +1028,16 @@ class RolloutControllerV2:
 
     @property
     def callback_addr(self) -> str:
+        # [FUNCTION DOC]
+        # Property: "host:port" of the callback server; RuntimeError if not started.
         if self._callback_host is None or self._callback_port is None:
             raise RuntimeError("Callback server not started")
         return format_hostport(self._callback_host, self._callback_port)
 
     def _pop_online_waiter(self) -> _OnlineWaiter | None:
+        # [FUNCTION DOC]
+        # HELPER: Under the waiter lock, pops and returns the first non-cancelled
+        # waiter, or None.
         with self._online_waiters_lock:
             while self._online_waiters:
                 waiter = self._online_waiters.popleft()
@@ -919,6 +1046,8 @@ class RolloutControllerV2:
         return None
 
     def _remove_online_waiter(self, future: asyncio.Future) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Under the lock, removes the waiter owning future from the queue.
         with self._online_waiters_lock:
             self._online_waiters = deque(
                 waiter for waiter in self._online_waiters if waiter.future is not future
@@ -927,6 +1056,11 @@ class RolloutControllerV2:
     async def wait_for_online_trajectory(
         self, timeout: float | None = None
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns a buffered completed online export request immediately if any;
+        # otherwise enqueues a waiter and awaits it (optionally with timeout, raising
+        # asyncio.TimeoutError). The waiter is always removed afterwards. Result:
+        # {session_id, trajectory_id}.
         future = asyncio.get_running_loop().create_future()
         with self._online_waiters_lock:
             if self._completed_online_results:
@@ -942,6 +1076,14 @@ class RolloutControllerV2:
     async def _handle_online_ready_callback(
         self, payload: dict[str, Any]
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Validates payload has session_id and trajectory_id (RuntimeError
+        # otherwise), then hands {session_id, trajectory_id:int} to the oldest live
+        # waiter thread-safely via its loop, or buffers it if no waiter is available.
+        # Returns an "ok" status dict.
+        # KNOWN ISSUE: a waiter may be cancelled between the done() check and the
+        # scheduled set_result, in which case set_result raises in the waiter's loop and
+        # the result is lost.
         session_id = payload.get("session_id")
         trajectory_id = payload.get("trajectory_id")
         if not session_id or trajectory_id is None:
@@ -972,6 +1114,12 @@ class RolloutControllerV2:
     # -- Destroy -----------------------------------------------------------
 
     def destroy(self) -> None:
+        # [FUNCTION DOC]
+        # Idempotent teardown: requests shutdown and cancels pending init, stops the
+        # callback server, destroys the workflow executor, kills forked services in
+        # reverse order through guard /kill_forked_worker (errors logged), closes HTTP
+        # clients, deletes scheduler worker roles in reverse order (errors logged),
+        # cancels pending online waiters and clears all state.
         """Tear down all services and release resources."""
         if self._destroyed:
             return
@@ -1049,6 +1197,9 @@ class RolloutControllerV2:
     # -- Version management ------------------------------------------------
 
     def set_version(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # Waits for init, sets the local version under lock and, if the gateway exists,
+        # POSTs /set_version to every data proxy concurrently.
         """Set version locally and broadcast to all data proxy workers."""
         from areal.infra.utils.concurrent import run_async_task
 
@@ -1063,6 +1214,9 @@ class RolloutControllerV2:
         run_async_task(self._async_set_version, version)
 
     async def _async_set_version(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Broadcasts the version to all data proxies, logging failures; raises
+        # RuntimeError only if every proxy failed.
         payload = {"version": version}
         results = await asyncio.gather(
             *[
@@ -1080,6 +1234,8 @@ class RolloutControllerV2:
             )
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the local weight version under lock (VersionProvider protocol).
         """Return the local version (compatible with VersionProvider protocol)."""
         with self._version_lock:
             return self._version
@@ -1087,6 +1243,9 @@ class RolloutControllerV2:
     # -- Capacity ----------------------------------------------------------
 
     def get_capacity(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the staleness manager's current rollout capacity; RuntimeError if
+        # uninitialized.
         if self.staleness_manager is None:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
         return self.staleness_manager.get_capacity()
@@ -1105,6 +1264,10 @@ class RolloutControllerV2:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> int:
+        # [FUNCTION DOC]
+        # Waits for init; rejects drop_incomplete_group (ValueError). Resolves the
+        # workflow (agent or online) and accept predicate, then submits one item to the
+        # workflow executor and returns its task id.
         self._ensure_initialized()
         if drop_incomplete_group:
             raise ValueError(
@@ -1131,6 +1294,10 @@ class RolloutControllerV2:
         timeout: float | None = None,
         raise_timeout: bool = True,
     ) -> list[dict[str, Any] | None]:
+        # [FUNCTION DOC]
+        # Waits for init, then waits for count results from the executor (timeout,
+        # raise_timeout semantics of WorkflowExecutor.wait). Returns results, possibly
+        # containing None.
         self._ensure_initialized()
         return self.workflow_executor.wait(
             count, timeout=timeout, raise_timeout=raise_timeout
@@ -1142,6 +1309,8 @@ class RolloutControllerV2:
         timeout: float | None = None,
         raise_timeout: bool = True,
     ) -> dict[str, Any] | None:
+        # [FUNCTION DOC]
+        # Waits for a specific task's result via the executor.
         return self.workflow_executor.wait_for_task(
             task_id,
             timeout=timeout,
@@ -1159,6 +1328,11 @@ class RolloutControllerV2:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Waits for init; ValueError for drop_incomplete_group, RuntimeError if no
+        # gateway. Uses batch_size empty dicts when data is None (batch_size required)
+        # or checks len(data) == batch_size if given. Resolves workflow/predicate,
+        # submits every item, waits for all, and returns non-None trajectories.
         """Submit a batch of data items and wait for all results.
 
         Parameters
@@ -1235,6 +1409,11 @@ class RolloutControllerV2:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Like rollout_batch but delegates to the executor's prepare_batch over a
+        # dataloader (or a one-batch dummy loader when dataloader is None, requiring
+        # batch_size), with optional dynamic batch sizing. Returns non-None
+        # trajectories.
         """Prepare a full training batch by consuming data from a dataloader.
 
         Parameters
@@ -1302,6 +1481,12 @@ class RolloutControllerV2:
         session_api_key: str | None = None,
         **kwargs,
     ) -> ChatCompletion | AsyncGenerator[ChatCompletionChunk, None]:
+        # [FUNCTION DOC]
+        # Sends an OpenAI chat completion for config.model through the gateway using the
+        # session API key or the admin key. Body: messages, temperature (1.0), top_p
+        # (1.0), max_completion_tokens (512), stream, plus any extra_body dict. Non-
+        # streaming returns a ChatCompletion and raises RuntimeError on non-200; with
+        # stream=True returns an async generator of chunks.
         """Send a chat completion request through the gateway HTTP stack.
 
         Parameters
@@ -1372,6 +1557,10 @@ class RolloutControllerV2:
         body: dict[str, Any],
         headers: dict[str, str],
     ) -> AsyncGenerator[ChatCompletionChunk, None]:
+        # [FUNCTION DOC]
+        # HELPER: Async generator: POSTs the body, raises RuntimeError on non-200, then
+        # parses "data: " SSE lines into ChatCompletionChunk objects until "[DONE]".
+        # Always closes the aiohttp session.
         """Parse SSE stream from the gateway into ChatCompletionChunk objects."""
         import aiohttp
 
@@ -1407,18 +1596,27 @@ class RolloutControllerV2:
     # -- Pause / Resume / Offload -------------------------------------------
 
     def pause(self) -> None:
+        # [FUNCTION DOC]
+        # Waits for init and pauses the workflow executor's dispatching.
+        # KNOWN ISSUE: the docstring says it also pauses all workers, but only the
+        # executor is paused here.
         """Pause dispatcher + pause all workers."""
         self._ensure_initialized()
         assert self._workflow_executor is not None
         self._workflow_executor.pause()
 
     def resume(self) -> None:
+        # [FUNCTION DOC]
+        # Waits for init and resumes the workflow executor.
+        # KNOWN ISSUE: the docstring mentions resuming workers, which is not done here.
         """Resume all workers + resume dispatcher."""
         self._ensure_initialized()
         assert self._workflow_executor is not None
         self._workflow_executor.resume()
 
     def offload(self) -> None:
+        # [FUNCTION DOC]
+        # Waits for init and asks all data proxies to release memory occupation.
         """Offload model memory on all inference workers."""
         from areal.infra.utils.concurrent import run_async_task
 
@@ -1426,6 +1624,9 @@ class RolloutControllerV2:
         run_async_task(self._async_offload)
 
     async def _async_offload(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /release_memory_occupation to every data proxy; logs failures
+        # and raises RuntimeError only if all fail.
         if not self._data_proxy_addrs:
             return
         results = await asyncio.gather(
@@ -1442,6 +1643,9 @@ class RolloutControllerV2:
             raise RuntimeError(f"offload failed on ALL {len(failed)} workers")
 
     def onload(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Waits for init and asks all data proxies to resume memory occupation (optional
+        # tags).
         """Reload model memory on all inference workers."""
         from areal.infra.utils.concurrent import run_async_task
 
@@ -1449,6 +1653,9 @@ class RolloutControllerV2:
         run_async_task(self._async_onload, tags)
 
     async def _async_onload(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /resume_memory_occupation (with tags if given) to every data
+        # proxy; raises RuntimeError only if all fail.
         if not self._data_proxy_addrs:
             return
         payload: dict = {"tags": tags} if tags is not None else {}
@@ -1466,6 +1673,8 @@ class RolloutControllerV2:
             raise RuntimeError(f"onload failed on ALL {len(failed)} workers")
 
     def pause_generation(self) -> None:
+        # [FUNCTION DOC]
+        # Waits for init and pauses generation on all data proxies.
         """Pause generation on all workers."""
         from areal.infra.utils.concurrent import run_async_task
 
@@ -1473,6 +1682,8 @@ class RolloutControllerV2:
         run_async_task(self._async_pause_generation)
 
     async def _async_pause_generation(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /pause_generation to every data proxy; raises only if all fail.
         if not self._data_proxy_addrs:
             return
         results = await asyncio.gather(
@@ -1489,6 +1700,8 @@ class RolloutControllerV2:
             raise RuntimeError(f"pause_generation failed on ALL {len(failed)} workers")
 
     def continue_generation(self) -> None:
+        # [FUNCTION DOC]
+        # Waits for init and resumes generation on all data proxies.
         """Continue generation on all workers."""
         from areal.infra.utils.concurrent import run_async_task
 
@@ -1496,6 +1709,9 @@ class RolloutControllerV2:
         run_async_task(self._async_continue_generation)
 
     async def _async_continue_generation(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /continue_generation to every data proxy; raises only if all
+        # fail.
         if not self._data_proxy_addrs:
             return
         results = await asyncio.gather(
@@ -1516,19 +1732,27 @@ class RolloutControllerV2:
     # -- Stats -------------------------------------------------------------
 
     def export_stats(self) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Exports and resets all stats recorded in the process-wide stats tracker.
         """Export and reset statistics recorded by the local workflow executor."""
         return stats_tracker.export_all()
 
     def config_perf_tracer(self, config: Any = None, role: str = "") -> None:
+        # [FUNCTION DOC]
+        # No-op for API compatibility.
         """No-op — gateway does not have per-worker perf tracing."""
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # No-op for API compatibility.
         """No-op."""
 
     # -- Proxy compatibility (gateway IS the proxy) ------------------------
 
     @property
     def proxy_gateway_addr(self) -> str:
+        # [FUNCTION DOC]
+        # Property: gateway address (waits for init).
         self._ensure_initialized()
         return self._gateway_addr
 
@@ -1536,11 +1760,15 @@ class RolloutControllerV2:
 
     @property
     def inference_worker_urls(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Property: copy of inference server URLs (waits for init).
         self._ensure_initialized()
         return list(self._inf_addrs)
 
     @property
     def inference_guard_addrs(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Property: RPCGuard base URLs of all guard workers (waits for init).
         self._ensure_initialized()
         return [
             f"http://{format_hostport(w.ip, int(w.worker_ports[0]))}"
@@ -1549,22 +1777,30 @@ class RolloutControllerV2:
 
     @property
     def server_infos(self) -> list[LocalInfServerInfo]:
+        # [FUNCTION DOC]
+        # Property: list of LocalInfServerInfo (waits for init).
         self._ensure_initialized()
         return self._server_infos
 
     @property
     def worker_ids(self) -> dict[str, str]:
+        # [FUNCTION DOC]
+        # Property: copy of data proxy address -> router worker id (waits for init).
         """Return mapping from data proxy address to router-assigned worker_id."""
         self._ensure_initialized()
         return dict(self._worker_ids)
 
     @property
     def staleness_manager(self):
+        # [FUNCTION DOC]
+        # Property: the StalenessManager or None (waits for init).
         self._ensure_initialized()
         return self._staleness_manager
 
     @property
     def workflow_executor(self):
+        # [FUNCTION DOC]
+        # Property: the WorkflowExecutor; RuntimeError if not initialized.
         self._ensure_initialized()
         if self._workflow_executor is None:
             raise RuntimeError("RolloutControllerV2.initialize() must be called first")
@@ -1578,6 +1814,11 @@ class RolloutControllerV2:
         group_size: int = 1,
         reward_normalization: bool = False,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Builds an InferenceServiceWorkflow for agent using the gateway
+        # address, admin key, agent config (turn discount, export style,
+        # drop_retry_orphans), group_size, serialize_group_samples and
+        # reward_normalization. ValueError if no gateway yet.
         """Wrap an agent in an InferenceServiceWorkflow.
 
         Parameters
@@ -1623,6 +1864,14 @@ class RolloutControllerV2:
         group_size=1,
         reward_normalization=False,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Converts workflow input into an InferenceServiceWorkflow. External
+        # mode allows only workflow None and group_size 1. None means online mode
+        # (ValueError if reward_normalization or group_size > 1), with workflow_kwargs
+        # (minus controller) forwarded and drop_retry_orphans defaulted from agent
+        # config. Strings are imported; RolloutWorkflow classes/instances raise
+        # TypeError; classes are instantiated with workflow_kwargs; objects without a
+        # callable run raise TypeError; the agent is then wrapped.
         """Resolve a workflow-like input to an InferenceServiceWorkflow.
 
         Unlike ``RolloutController._resolve_workflow``, this method does
@@ -1728,6 +1977,9 @@ class RolloutControllerV2:
     def _resolve_should_accept_fn(
         should_accept_fn: Callable[[dict[str, Any]], bool] | str | None,
     ) -> Callable[[dict[str, Any]], bool] | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns None, the callable itself, or the callable imported from an
+        # import-path string; raises TypeError for non-callable imports or other types.
         """Resolve should_accept_fn to a callable or None."""
         if should_accept_fn is None:
             return None
@@ -1744,6 +1996,8 @@ class RolloutControllerV2:
 
     @property
     def _agent_config(self):
+        # [FUNCTION DOC]
+        # HELPER: Property returning config.agent.
         return self.config.agent
 
     # -- Internal HTTP helpers ---------------------------------------------
@@ -1756,6 +2010,11 @@ class RolloutControllerV2:
         raw_cmd: list[str],
         health_path: str = "/health",
     ) -> tuple[str, int]:
+        # [FUNCTION DOC]
+        # HELPER: Synchronous fork: allocates a port on the guard, forks raw_cmd plus
+        # --host/--port with the given role/index, records it for cleanup, waits for
+        # health_path, and returns (host, port). Raises on HTTP errors or health
+        # timeout.
         """Fork a process on a RPCGuard worker via ``/fork`` with ``raw_cmd``.
 
         Returns ``(host, port)`` of the forked service and records the entry
@@ -1797,6 +2056,10 @@ class RolloutControllerV2:
         raw_cmd: list[str],
         health_path: str = "/health",
     ) -> tuple[str, int]:
+        # [FUNCTION DOC]
+        # HELPER: Async fork like _fork_on_guard (30s request timeouts) but does not
+        # record the service; the caller appends to the forked-services list. Returns
+        # (host, port).
         """Async fork a process on a RPCGuard worker via ``/fork``.
 
         Returns ``(host, port)`` of the forked service.  The caller is
@@ -1830,6 +2093,9 @@ class RolloutControllerV2:
     def _kill_forked_service(
         self, guard_addr: str, role: str, worker_index: int
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /kill_forked_worker {role, worker_index} to the guard (10s);
+        # logs success, non-200 as warning, and HTTP errors as error (never raises).
         try:
             resp = self._sync_client.post(
                 f"{guard_addr}/kill_forked_worker",
@@ -1851,6 +2117,10 @@ class RolloutControllerV2:
             )
 
     async def _get_async_client(self) -> httpx.AsyncClient:
+        # [FUNCTION DOC]
+        # HELPER: Returns the shared async httpx client, recreating it (and closing the
+        # old one) when called from a different event loop than the one it was created
+        # on.
         """Return the shared async HTTP client, recreating it when the event loop changes.
 
         ``run_async_task`` creates a fresh event loop per invocation via
@@ -1877,6 +2147,11 @@ class RolloutControllerV2:
     async def _async_data_proxy_post(
         self, addr: str, endpoint: str, payload: dict[str, Any]
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs payload to addr+endpoint on a data proxy; status >= 400 or httpx
+        # errors raise RuntimeError. Wrapped with the HTTP retry decorator.
+        # KNOWN ISSUE: httpx errors are converted to RuntimeError, which may prevent the
+        # retry decorator from recognizing them as retryable network errors.
         """POST directly to a data proxy, bypassing gateway/router resolution."""
         url = f"{addr}{endpoint}"
         try:

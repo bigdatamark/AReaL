@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Click command "areal inf status": per-component health drill-down for one inference
+# service, as a table or JSON.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -26,10 +29,19 @@ from areal.v2.cli.status import ColumnSpec, StatusReporter
 @click.option("--service", default=None, help="Target service instance.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
 def status_cmd(service: str | None, as_json: bool) -> None:
+    # [FUNCTION DOC]
+    # Click entry point. Options: --service, --json. Exits via SystemExit with
+    # do_status's code.
     raise SystemExit(do_status(as_json, service=service) or 0)
 
 
 def do_status(as_json: bool, *, service: str | None = None) -> int:
+    # [FUNCTION DOC]
+    # Resolves the service; if no state file, prints a not-running message (or JSON with
+    # running False) and returns 0. Loading failures raise ClickException. Otherwise
+    # probes all components via StatusReporter and prints either the JSON snapshot or a
+    # table with a header (service, backend, gateway addr, model count, running yes/no).
+    # Returns 0.
     service_name = inf_lifecycle.resolve_service_name(service)
     if not inf_lifecycle.state_path(service_name).exists():
         if as_json:
@@ -68,24 +80,40 @@ def do_status(as_json: bool, *, service: str | None = None) -> int:
 
 
 def _columns(backend: str) -> list[ColumnSpec]:
+    # [FUNCTION DOC]
+    # HELPER: Builds column specs COMPONENT, PLACEMENT, GPUS, ADDR, REF, ALIVE;
+    # placement and ref text depend on the scheduler backend. Returns list of
+    # ColumnSpec.
     def _component(label: str, _: SupportsComponentProbe, __: bool) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the component label.
         return label
 
     def _placement(_: str, handle: SupportsComponentProbe, __: bool) -> str:
         # SupportsComponentProbe doesn't promise the TaskHandle surface,
         # but in practice every inf component handle IS a TaskHandle.
+        # [FUNCTION DOC]
+        # HELPER: Returns format_placement(backend, handle) or "-" if empty.
         return format_placement(backend, handle) or "-"  # type: ignore[arg-type]
 
     def _gpus(_: str, handle: SupportsComponentProbe, __: bool) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the GPU count text for the handle.
         return format_gpu_count(handle)  # type: ignore[arg-type]
 
     def _addr(_: str, handle: SupportsComponentProbe, __: bool) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the handle address or "-".
         return handle.addr or "-"
 
     def _ref(_: str, handle: SupportsComponentProbe, __: bool) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the backend-specific reference text (pid/pod/job).
         return format_ref(backend, handle)  # type: ignore[arg-type]
 
     def _alive(_: str, __: SupportsComponentProbe, alive: bool) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns "yes" if alive else "no".
         return "yes" if alive else "no"
 
     return [
@@ -101,6 +129,11 @@ def _columns(backend: str) -> list[ColumnSpec]:
 def _json_snapshot(
     state: RuntimeState, reporter: StatusReporter, alive: list[bool]
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Builds the JSON status dict: service, backend, running, gateway/router
+    # handles as dicts, started_at, models (as dicts), and per-component rows from the
+    # reporter snapshot each augmented with its label. Raises ValueError if lengths of
+    # the snapshot and component list differ (strict zip).
     handle_pairs: list[tuple[str, TaskHandle]] = list(state.components())  # type: ignore[arg-type]
     rows = [
         {**snap, "label": label}

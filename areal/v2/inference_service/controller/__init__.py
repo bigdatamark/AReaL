@@ -1,3 +1,6 @@
+# [PACKAGE DOC]
+# Rollout controller subpackage; re-exports RolloutControllerV2 and
+# InferenceEngineConfig.
 # SPDX-License-Identifier: Apache-2.0
 
 from areal.api.cli_args import InferenceEngineConfig

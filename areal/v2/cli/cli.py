@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Root click group of the AReaL operator CLI ("areal"), with the agent, inf and train
+# subcommand groups attached and a --version option.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -16,6 +19,8 @@ from areal.version import __version__
 )
 @click.version_option(__version__, prog_name="areal")
 def cli() -> None:
+    # [FUNCTION DOC]
+    # Root group callback; does nothing itself. Accepts -h/--help.
     pass
 
 

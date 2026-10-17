@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Click command "areal train run": imports a user-specified training driver function and
+# invokes it in-process with a --config argv plus pass-through hydra overrides.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -28,10 +31,20 @@ import click
 )
 @click.argument("overrides", nargs=-1, type=click.UNPROCESSED)
 def run_cmd(config_path: Path, driver_spec: str, overrides: tuple[str, ...]) -> None:
+    # [FUNCTION DOC]
+    # Click entry point. Options: --config (existing YAML file, required), --driver
+    # ("module.path:func", required), and any number of unprocessed override arguments
+    # (unknown options allowed). Exits via SystemExit with do_run's return code.
     raise SystemExit(do_run(config_path, driver_spec, list(overrides)) or 0)
 
 
 def do_run(config_path: Path, driver_spec: str, overrides: list[str]) -> int:
+    # [FUNCTION DOC]
+    # Validates the driver spec contains ":" (UsageError otherwise), imports the module
+    # (ClickException on ImportError) and gets the function (ClickException if missing).
+    # Calls it with argv ["--config", <absolute config path>, *overrides]. Returns the
+    # function's result if it is an int, else 0. Runs the training in the current
+    # process.
     if ":" not in driver_spec:
         raise click.UsageError(
             f"--driver must be in 'module.path:func' form, got: {driver_spec!r}"

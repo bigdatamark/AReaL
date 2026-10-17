@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Backend-dispatching termination helper for tasks identified by a handle ref dict; only
+# the local backend is implemented.
 # SPDX-License-Identifier: Apache-2.0
 
 """Unified termination dispatch for service-style CLIs.
@@ -19,6 +22,9 @@ def terminate(
     backend: str = "local",
     grace_s: float = 10.0,
 ) -> None:
+    # [FUNCTION DOC]
+    # For backend "local", reads ref["pid"] (0 if missing/falsy) and, if positive, kills
+    # the pid's process tree with grace_s; returns. Any other backend raises ValueError.
     """Terminate the task identified by ``ref`` using the given backend.
 
     For ``backend="local"`` ``ref`` must contain a ``"pid"`` key — the

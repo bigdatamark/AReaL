@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Click command "areal inf run": starts an inference service (router + gateway),
+# optionally registers an initial model, persists state, and either detaches or runs a
+# foreground watcher that tears the service down on Ctrl+C/SIGTERM.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -88,10 +92,31 @@ from areal.v2.cli.watcher import ForegroundWatcher
 )
 @click.option("--force", is_flag=True, help="Replace stale or running service state.")
 def run_cmd(**opts) -> None:
+    # [FUNCTION DOC]
+    # Click entry point; passes all options as one dict to do_run and exits with its
+    # code. Options include --service, --port (8080), --host, --admin-api-key,
+    # --routing-strategy (round_robin/least_busy), --log-level, --launch-timeout (30s),
+    # -d/--detach, --model, --backend, --model-path, --tokenizer-path, --engine-args,
+    # --proxy-args, --model-health-timeout (600s), --scheduler (only "local"), --force.
     raise SystemExit(do_run(opts) or 0)
 
 
 def do_run(opts: dict) -> int:
+    # [FUNCTION DOC]
+    # With force, kills/clears any existing service slot; otherwise refuses if one is
+    # running. If --model is given validates registration opts; --backend without
+    # --model is a UsageError. Spawns the router on a free local port, sleeps 0.3s,
+    # spawns the gateway on host:port (URL uses 127.0.0.1 when bound to a wildcard
+    # address), and waits for gateway health, killing both on any failure. Builds
+    # ServiceState (scheduler backend default "local", TaskHandles with pid refs) and an
+    # empty ModelState and, under the model-state lock, saves both and optionally
+    # registers the initial model (on failure tears down everything and removes state,
+    # then re-raises). Returns 0 if detach. Otherwise runs a ForegroundWatcher whose
+    # liveness is the gateway pid and whose teardown is _cleanup_runtime (grace 10s); if
+    # the watcher returns 0 because the gateway died on its own, removes both state
+    # files. Returns the watcher's return code.
+    # KNOWN ISSUE: wait for router health is not performed; only a fixed 0.3s sleep
+    # precedes gateway start.
     service = opts["service"]
     if opts["force"]:
         inf_lifecycle.force_replace_slot(service, grace_s=5.0)
@@ -222,6 +247,10 @@ def _cleanup_runtime(
     *,
     grace_s: float,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Terminates all processes of the service using the freshest model state
+    # (see _latest_model_state_for_cleanup) with grace_s, and always removes the service
+    # and model state files afterwards.
     model_state = _latest_model_state_for_cleanup(service, model_state)
     try:
         terminate_runtime_state(
@@ -237,6 +266,10 @@ def _latest_model_state_for_cleanup(
     service: str,
     fallback: ModelState,
 ) -> ModelState:
+    # [FUNCTION DOC]
+    # HELPER: Loads the on-disk model state (to include models registered by other
+    # commands) and overlays the in-memory fallback's models on it; returns fallback if
+    # loading fails.
     try:
         latest = ModelState.load(service)
     except Exception:

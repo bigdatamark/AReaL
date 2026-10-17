@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# TOML config binding for the agent CLI: maps (section, key) pairs in the agent
+# namespace config file to click option defaults for the agent subcommands, and exposes
+# a loader.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -26,4 +30,8 @@ agent_config_loader = ConfigLoader(namespace=AGENT_NAMESPACE, bindings=AGENT_BIN
 
 
 def load_click_default_map(extra: Path | None = None) -> dict:
+    # [FUNCTION DOC]
+    # Returns a click default_map built by the module-level agent ConfigLoader,
+    # optionally merging an extra config file path. Input: extra (Path or None). Output:
+    # dict of subcommand name to option defaults. Reads config files from disk.
     return agent_config_loader.load_click_default_map(extra=extra)

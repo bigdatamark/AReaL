@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Click command "areal inf deregister": removes a model from a running inference service
+# and terminates its worker and data-proxy processes.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -19,12 +22,23 @@ from areal.v2.cli.process import kill_pids
 def deregister_cmd(
     model_name: str, service: str | None, grace: float, force: bool
 ) -> None:
+    # [FUNCTION DOC]
+    # Click entry point. Options: --model-name (required), --service (default current),
+    # --grace seconds before SIGKILL (10.0), --force (immediate SIGKILL). Exits via
+    # SystemExit with do_deregister's return code.
     raise SystemExit(do_deregister(model_name, grace, force, service=service) or 0)
 
 
 def do_deregister(
     model_name: str, grace: float, force: bool, *, service: str | None = None
 ) -> int:
+    # [FUNCTION DOC]
+    # Loads the running service state (raises if not running) and raises ClickException
+    # if the model is not registered. Asks the router to remove the model (404 ignored,
+    # other HTTP errors and unreachability logged as warnings), unregisters each
+    # replica's data proxy address from the router (failures logged), then kills proxy
+    # pids then worker pids (positive pids only) with grace 0 if force else grace.
+    # Deletes the model from the model state, saves it, logs and returns 0.
     state = inf_lifecycle.load_running_state(service)
     if model_name not in state.models:
         raise click.ClickException(

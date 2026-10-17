@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Generic TOML config loader that converts a CLI namespace's config.toml (plus an
+# optional extra file) into a click default_map via a (section, key) -> (verb(s),
+# option) binding table.
 # SPDX-License-Identifier: Apache-2.0
 
 """TOML config loader for subcommand CLIs.
@@ -23,6 +27,10 @@ BindingMap = dict[tuple[str, str], tuple[str | tuple[str, ...], str]]
 
 
 class ConfigLoader:
+    # [CLASS DOC]
+    # Holds namespace, bindings (BindingMap) and a NamespacedStateStore for the
+    # namespace. Can be configured by subclass attributes or constructor arguments.
+    # KNOWN ISSUE: the class-level bindings default is a shared mutable dict.
     """Subclass and set ``namespace`` + ``bindings`` (or pass them in)."""
 
     namespace: str = ""
@@ -34,6 +42,9 @@ class ConfigLoader:
         namespace: str | None = None,
         bindings: BindingMap | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Overrides namespace/bindings when given, raises ValueError if the namespace
+        # ends up empty, and creates the state store for it.
         if namespace is not None:
             self.namespace = namespace
         if bindings is not None:
@@ -43,9 +54,17 @@ class ConfigLoader:
         self.store = NamespacedStateStore(self.namespace)
 
     def default_config_path(self) -> Path:
+        # [FUNCTION DOC]
+        # Returns the namespace's config.toml path from the store.
         return self.store.config_path()
 
     def load_click_default_map(self, extra: Path | None = None) -> dict:
+        # [FUNCTION DOC]
+        # Reads the default config then extra (if not None), flattens each to (section,
+        # key) and merges with later files winning. For each pair present in bindings,
+        # sets default_map[verb][option] = value for each bound verb (a single string
+        # verb is treated as a one-element tuple). Unbound keys are ignored. Returns
+        # dict verb -> option dict.
         """Return a ``click`` ``default_map`` built by merging the
         namespace's default config.toml with an optional extra file.
 
@@ -75,6 +94,10 @@ class ConfigLoader:
     # Helpers — subclasses generally don't need to override these
 
     def _read_toml(self, path: Path) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: Parses a TOML file and returns its dict; returns {} if tomllib is
+        # unavailable, the file does not exist, or parsing/reading fails for any reason
+        # (errors are swallowed).
         try:
             import tomllib
         except ImportError:
@@ -88,6 +111,10 @@ class ConfigLoader:
             return {}
 
     def _flatten(self, toml: dict, parent: str = "") -> dict[tuple[str, str], object]:
+        # [FUNCTION DOC]
+        # HELPER: Recursively flattens nested tables into (section, key) -> value where
+        # the section is the dotted path of parent tables (top-level scalars get section
+        # ""). Output: dict.
         """Flatten nested TOML tables to ``(section, key) -> value``.
 
         Nested keys are dotted on the section side:

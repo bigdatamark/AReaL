@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Click command "areal agent run": launches a detached agent service stack (router,
+# gateway and N worker/data-proxy pairs) as local subprocesses and persists its
+# ServiceState.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -32,6 +36,13 @@ logger = register_cli_logger("AgentCli")
 )
 @click.option("--force", is_flag=True, help="Replace stale or running service state.")
 def run_cmd(**opts) -> None:
+    # [FUNCTION DOC]
+    # Click entry point; all options are forwarded as keyword args to do_run and the
+    # process exits via SystemExit with do_run's return code (0 if it returns None/0).
+    # Options: --service (default DEFAULT_SERVICE), --agent (import path, required in
+    # practice), --num-pairs (1), --admin-api-key ("areal-agent-admin"), --setup-timeout
+    # (120s), --health-poll-interval (5s), --drain-timeout (30s), --session-timeout
+    # (1800s), --log-level (debug/info/warning/error, default info), --force (flag).
     raise SystemExit(do_run(**opts) or 0)
 
 
@@ -48,6 +59,19 @@ def do_run(
     log_level: str,
     force: bool,
 ) -> int:
+    # [FUNCTION DOC]
+    # Implements "agent run". Raises click.UsageError if agent is empty. With force,
+    # calls agent_lifecycle.force_replace_slot(service, grace 5s) to kill/clear any
+    # existing service of that name; otherwise
+    # agent_lifecycle.refuse_if_running(service) aborts if one is running. Then calls
+    # launch_agent_stack with the given options and saves the returned state to disk
+    # (also marking it as the current service). On ServiceHTTPError, ServiceUnreachable,
+    # RuntimeError or ValueError it kills any recorded component pids (grace 5s) and re-
+    # raises as click.ClickException. Logs the service and gateway URL at INFO and
+    # returns 0.
+    # KNOWN ISSUE: if launch_agent_stack itself raises, launched is still None, so
+    # processes it already spawned (router, pairs) are not cleaned up; only a failing
+    # save() triggers cleanup.
     if not agent:
         raise click.UsageError("--agent is required")
 

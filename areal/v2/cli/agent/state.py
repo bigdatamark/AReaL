@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Persisted on-disk state of an agent service (gateway, router and worker/proxy pairs),
+# stored as JSON in the "agent" namespace of the CLI state store.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -25,6 +28,8 @@ store = NamespacedStateStore(AGENT_NAMESPACE)
 
 @dataclass
 class ProcessState:
+    # [CLASS DOC]
+    # Record of one spawned component: component name, pid, base url and log_file path.
     component: str
     pid: int
     url: str
@@ -32,11 +37,15 @@ class ProcessState:
 
     @property
     def addr(self) -> str:
+        # [FUNCTION DOC]
+        # Property returning the URL as the component's address (for status probing).
         return self.url
 
 
 @dataclass
 class PairState:
+    # [CLASS DOC]
+    # Record of one worker/data-proxy pair: its index and the two ProcessState entries.
     index: int
     worker: ProcessState
     data_proxy: ProcessState
@@ -44,6 +53,11 @@ class PairState:
 
 @dataclass
 class ServiceState(ServiceStateBase):
+    # [CLASS DOC]
+    # Full agent service state: service name, launch_mode, agent import path, admin API
+    # key, gateway and router processes, list of pairs, session/health/drain timing
+    # settings, and started_at timestamp (defaults to now). Implements the
+    # ServiceStateBase contract.
     service: str
     launch_mode: str
     agent: str
@@ -57,11 +71,22 @@ class ServiceState(ServiceStateBase):
     started_at: float = field(default_factory=time.time)
 
     def save(self) -> None:
+        # [FUNCTION DOC]
+        # Atomically writes the dataclass as JSON to the service's state path and marks
+        # this service as the current one in the store. Side effect: filesystem writes.
         atomic_write_json(store.service_state_path(self.service), asdict(self))
         store.set_current_service(self.service)
 
     @classmethod
     def load(cls, service: str) -> ServiceState:
+        # [FUNCTION DOC]
+        # Reads and parses the JSON state file for service, rebuilding nested
+        # ProcessState and PairState objects. Renames a legacy created_at key to
+        # started_at, drops leftover created_at and legacy
+        # inf_addr/inf_api_key/inf_model keys. Returns a ServiceState. Raises
+        # OSError/JSON/TypeError errors on missing or malformed files.
+        # KNOWN ISSUE: the inline comment says "forward compatibility" but handling old
+        # files is backward compatibility.
         with open(store.service_state_path(service)) as f:
             raw = json.load(f)
         raw["gateway"] = ProcessState(**raw["gateway"])
@@ -85,6 +110,9 @@ class ServiceState(ServiceStateBase):
 
     @classmethod
     def remove(cls, service: str) -> None:
+        # [FUNCTION DOC]
+        # Deletes the service's state file if present and clears the current-service
+        # pointer if it names this service.
         path = store.service_state_path(service)
         if path.exists():
             path.unlink()
@@ -94,9 +122,15 @@ class ServiceState(ServiceStateBase):
         # The CLI treats "running" as "gateway process still alive". The
         # gateway is the entry point — without it, the rest of the stack
         # is unreachable even if some children survived.
+        # [FUNCTION DOC]
+        # Returns True if the gateway pid is alive; the service counts as running only
+        # then.
         return pid_alive(self.gateway.pid)
 
     def components(self) -> Iterable[tuple[str, SupportsComponentProbe]]:
+        # [FUNCTION DOC]
+        # Yields (label, handle) pairs: gateway, router, then for each pair the worker
+        # and proxy using their component names as labels.
         yield "gateway", self.gateway
         yield "router", self.router
         for pair in self.pairs:

@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Local process primitives for the service CLIs: pid liveness check, detached subprocess
+# spawning with log redirection, and tree-wide termination of pids.
 # SPDX-License-Identifier: Apache-2.0
 
 """Local-only process primitives for service-style CLIs.
@@ -23,6 +26,12 @@ from areal.infra.utils.proc import kill_process_tree
 
 
 def pid_alive(pid: int) -> bool:
+    # [FUNCTION DOC]
+    # Returns False for pid <= 0. First tries a non-blocking waitpid to reap the pid if
+    # it is a zombie child of this process (returns False if reaped; errors ignored),
+    # then probes with signal 0: ProcessLookupError means dead, PermissionError means
+    # alive (exists, owned by someone else), success means alive. Side effect: may reap
+    # a child.
     if pid <= 0:
         return False
     # If ``pid`` is one of our own children we may catch it mid-zombie:
@@ -49,6 +58,12 @@ def pid_alive(pid: int) -> bool:
 def spawn_process(
     cmd: list[str], log_file: Path, env: dict[str, str] | None = None
 ) -> int:
+    # [FUNCTION DOC]
+    # Starts cmd as a detached child in a new session (immune to the parent's SIGHUP)
+    # with stdin from /dev/null and stdout+stderr appended unbuffered to log_file
+    # (parent dirs created). Environment is the current one with PYTHONUNBUFFERED=1 by
+    # default plus env overrides. Returns the child pid; Popen errors (e.g. OSError)
+    # propagate.
     """Spawn a detached subprocess that survives parent exit.
 
     ``start_new_session=True`` puts the child in its own session so the
@@ -78,6 +93,12 @@ def spawn_process(
 
 
 def kill_pids(pids: list[int], grace_s: float) -> None:
+    # [FUNCTION DOC]
+    # For each positive pid, kills its process tree via kill_process_tree: graceful
+    # SIGTERM, wait, then SIGKILL. Sequential per pid, so total time may reach len(pids)
+    # * grace.
+    # KNOWN ISSUE: grace_s is truncated to int seconds, so fractional grace periods (and
+    # any grace < 1) become 0.
     """SIGTERM → wait ``grace_s`` → SIGKILL across local pids and their
     descendant process trees.
 

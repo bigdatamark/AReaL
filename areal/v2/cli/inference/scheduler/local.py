@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Local subprocess implementation of the inference Scheduler: allocates GPUs from the
+# detected set minus occupied ones, allocates free ports, and spawns tasks with
+# CUDA_VISIBLE_DEVICES masking.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -19,6 +23,12 @@ logger = getLogger("InfLocalScheduler")
 
 
 def _detect_gpus() -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Returns GPU ids from CUDA_VISIBLE_DEVICES if set and parseable as comma-
+    # separated ints (logs a warning if malformed); otherwise counts /dev/nvidiaN device
+    # nodes and returns their sorted indices. Falls back to [0] if none found or /dev is
+    # unreadable.
+    # KNOWN ISSUE: the [0] fallback claims a GPU exists on machines that have none.
     vis = os.environ.get("CUDA_VISIBLE_DEVICES")
     if vis:
         try:
@@ -40,6 +50,10 @@ def _detect_gpus() -> list[int]:
 
 
 class LocalScheduler(Scheduler):
+    # [CLASS DOC]
+    # Short-lived scheduler for one CLI command; tracks all_gpus, occupied_gpus, host
+    # (default 127.0.0.1) and the ports it has already handed out. Only pids are
+    # retained in handles.
     """Ephemeral local subprocess scheduler for ``areal inf``.
 
     The instance is discarded after each CLI command — Popen handles are
@@ -55,6 +69,9 @@ class LocalScheduler(Scheduler):
         occupied_gpus: set[int] | None = None,
         host: str = "127.0.0.1",
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores all_gpus (or detects them), a copy of occupied_gpus, host, and an empty
+        # set of allocated ports.
         self.all_gpus = list(all_gpus) if all_gpus is not None else _detect_gpus()
         self.occupied_gpus: set[int] = set(occupied_gpus or ())
         self.host = host
@@ -64,6 +81,12 @@ class LocalScheduler(Scheduler):
         self._allocated_ports: set[int] = set()
 
     def submit(self, spec: TaskSpec) -> TaskHandle:
+        # [FUNCTION DOC]
+        # Allocates the requested GPUs and ports, builds the command from the
+        # allocation, sets CUDA_VISIBLE_DEVICES to the chosen GPU ids (in addition to
+        # spec.env) when GPUs are used, and spawns the process logging to spec.log_file.
+        # Spawn OSError becomes SchedulerError. Marks the GPUs occupied, logs at INFO,
+        # and returns a TaskHandle with ref pid.
         gpus = self._allocate_gpus(spec.resources.gpu)
         ports = self._allocate_ports(spec.resources.ports)
         alloc = TaskAllocation(host=self.host, ports=ports, gpu_devices=gpus)
@@ -95,6 +118,9 @@ class LocalScheduler(Scheduler):
         )
 
     def _allocate_gpus(self, n: int) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Returns the first n free GPU ids (none for n <= 0); raises
+        # SchedulerError if fewer than n are free. Does not mark them occupied.
         if n <= 0:
             return []
         free = [g for g in self.all_gpus if g not in self.occupied_gpus]
@@ -106,6 +132,9 @@ class LocalScheduler(Scheduler):
         return free[:n]
 
     def _allocate_ports(self, n: int) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Finds n free ports excluding ones previously allocated by this
+        # instance, records them, and returns them.
         ports = find_free_ports(n, exclude_ports=self._allocated_ports)
         self._allocated_ports.update(ports)
         return ports

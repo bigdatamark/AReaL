@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# TOML config bindings for "areal inf": maps [default], [launch], [scheduler] and
+# [register.internal] keys in the inf namespace config.toml to click option defaults.
 # SPDX-License-Identifier: Apache-2.0
 
 """User config loader for ``areal inf``.
@@ -63,4 +66,7 @@ inf_config_loader = ConfigLoader(namespace=INF_NAMESPACE, bindings=INF_BINDINGS)
 
 
 def load_click_default_map(extra: Path | None = None) -> dict:
+    # [FUNCTION DOC]
+    # Returns the click default_map built by the inf ConfigLoader, optionally merging an
+    # extra config file (which wins on conflicts).
     return inf_config_loader.load_click_default_map(extra=extra)

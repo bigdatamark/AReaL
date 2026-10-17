@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Defines agent_lifecycle, the shared ServiceLifecycle instance for the agent namespace
+# (uses agent ServiceState and suggests "areal agent stop" to users).
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
