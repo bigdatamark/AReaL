@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Unit tests for SlurmScheduler: SchedulingSpec reservation/exclusive options rendered
+# into the generated sbatch script, and env-var precedence in _prepare_worker_specs
+# (user scheduling_spec env vars override framework defaults; roles do not share env
+# dicts). Schedulers are built with object.__new__ and only the needed attributes set.
 # SPDX-License-Identifier: Apache-2.0
 """Tests for reservation/exclusive sbatch options and env-var precedence."""
 
@@ -10,7 +15,11 @@ from areal.infra.scheduler.slurm import SlurmScheduler
 
 
 class TestSchedulingSpecSlurmOptions:
+    # [CLASS DOC]
+    # Tests the reservation/exclusive Slurm options on SchedulingSpec.
     def test_reservation_and_exclusive_default_to_off(self):
+        # [FUNCTION DOC]
+        # Asserts a default SchedulingSpec has reservation None and exclusive False.
         spec = SchedulingSpec()
 
         assert spec.reservation is None
@@ -28,6 +37,12 @@ class TestSchedulingSpecSlurmOptions:
     def test_options_reach_the_sbatch_script(
         self, reservation, exclusive, present, absent
     ):
+        # [FUNCTION DOC]
+        # Parametrized over reservation/exclusive combos. Builds a bare SlurmScheduler
+        # with experiment/trial names, fileroot, NFS name-resolve config, apptainer
+        # container and srun args, generates an sbatch script for an 8-GPU actor role,
+        # and asserts the expected "--reservation=..." / "--exclusive" tokens are
+        # present or absent.
         scheduler = object.__new__(SlurmScheduler)
         scheduler._n_gpus_per_node = 8
         scheduler.experiment_name = "exp"
@@ -64,7 +79,13 @@ class TestSchedulingSpecSlurmOptions:
 
 
 class TestUserEnvPrecedence:
+    # [CLASS DOC]
+    # Tests env-var merging in SlurmScheduler._prepare_worker_specs.
     def test_user_env_wins_over_framework_defaults(self):
+        # [FUNCTION DOC]
+        # Patches get_env_vars (OMP_NUM_THREADS=1, AREAL_X=1) and get_thread_env_vars
+        # (OMP_NUM_THREADS=4); asserts the spec's OMP_NUM_THREADS=13 wins and AREAL_X is
+        # kept.
         scheduler = object.__new__(SlurmScheduler)
         scheduler.enable_tms_offload = False
         spec = SchedulingSpec(cpu=4, env_vars={"OMP_NUM_THREADS": "13"})
@@ -87,6 +108,9 @@ class TestUserEnvPrecedence:
         assert out[0].env_vars["AREAL_X"] == "1"
 
     def test_roles_keep_independent_env_vars(self):
+        # [FUNCTION DOC]
+        # With empty framework env vars, prepares specs for actor (with an alloc-conf
+        # var) and rollout (none); asserts the var appears only in the actor's env.
         scheduler = object.__new__(SlurmScheduler)
         scheduler.enable_tms_offload = False
         actor = SchedulingSpec(cpu=4, env_vars={"PYTORCH_CUDA_ALLOC_CONF": "a:1"})

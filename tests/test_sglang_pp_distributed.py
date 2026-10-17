@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Multi-GPU (4 GPU) tests for SGLang pipeline-parallel weight updates. E2E tests launch
+# the GSM8K GRPO example per training engine (megatron/fsdp/archon) with a PP=2 TP=2
+# SGLang rollout and wait for the first train step log line. Torchrun tests launch
+# tests/torchrun/run_sglang_pp_weight_sync.py to check per-PP-rank NCCL group init and
+# weight sync, reading "Passed" from an output file. Skips when fewer than 4 devices.
 """Distributed tests for sglang PP pipeline parallelism.
 
 These tests verify that per-PP-rank NCCL weight update groups work correctly
@@ -81,6 +87,12 @@ async def run_example(
     timeout: int = 480,
     success_pattern=SUCCESS_PATTERN,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Async. Spawns "python3 example_file --config config_name" plus extra overrides
+    # with merged stdout/stderr, streams each line to the logger, and polls: sets
+    # success when success_pattern matches a line, then sends SIGINT. Stops early if the
+    # process exits (logs error) or timeout seconds elapse (logs error, SIGINT). Always
+    # kills the process tree at the end and returns success (bool).
     """Run a single example in single-controller mode and return the result.
 
     This is the same pattern used in test_examples.py.
@@ -147,6 +159,12 @@ async def run_example(
 @pytest.mark.slow
 @pytest.mark.parametrize("engine_type", ENGINE_TYPES)
 def test_pp_e2e_train(tmp_path_factory, engine_type):
+    # [FUNCTION DOC]
+    # Parametrized by engine type; skips if < 4 devices. Creates temp experiment and
+    # name-resolve dirs, resolves model (Qwen2.5-1.5B-Instruct) and GSM8K paths, and
+    # runs examples/math/gsm8k_rl.py with the engine's config/backends and small batch
+    # overrides (local scheduler, 2 train steps, 900s timeout). Asserts the first step
+    # completed.
     """End-to-end PP training test for each engine type.
 
     Runs one of the 3 verified working commands:
@@ -201,6 +219,9 @@ def test_pp_e2e_train(tmp_path_factory, engine_type):
 
 
 def _get_alloc_mode(engine_type: str, dp: int, pp: int, tp: int) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns "<engine>:d{dp}p{pp}t{tp}", except for fsdp with pp > 1 where PP
+    # is folded into DP giving "fsdp:d{dp*pp}t{tp}" (FSDP has no PP).
     """Build a valid allocation mode string for the given engine type.
 
     FSDP training does not support pipeline parallelism (PP > 1).
@@ -213,6 +234,10 @@ def _get_alloc_mode(engine_type: str, dp: int, pp: int, tp: int) -> str:
 
 
 def _reader_thread(pipe, collected, prefix):
+    # [FUNCTION DOC]
+    # HELPER: Thread target; echoes each line of pipe to stdout with a "[prefix]" tag
+    # and appends it to collected (list, mutated). Swallows ValueError from a closed
+    # pipe.
     """Read lines from *pipe*, print with a prefix, and append to *collected*."""
     try:
         for line in pipe:
@@ -224,6 +249,9 @@ def _reader_thread(pipe, collected, prefix):
 
 
 def _kill_process_tree_torchrun(proc):
+    # [FUNCTION DOC]
+    # HELPER: SIGKILLs the process group of proc, then proc.kill(), ignoring
+    # lookup/permission/OS errors, and waits for it to exit.
     """Send SIGKILL to the process group rooted at *proc*."""
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -243,6 +271,13 @@ def _run_test_with_torchrun(
     gen_pp_size: int = 1,
     engine_type: str = "megatron",
 ):
+    # [FUNCTION DOC]
+    # HELPER: Picks a free port, derives world size from alloc_mode, and launches
+    # torchrun with the PP weight-sync worker script (backend, output path, test_type,
+    # gen_pp_size, engine_type) in a new session; a daemon thread streams output. Waits
+    # up to 300s: on nonzero exit or timeout calls pytest.fail with the last 50 output
+    # lines (killing the group on timeout/other errors). Finally asserts the output file
+    # contains "Passed".
     """Launch the distributed test worker under torchrun."""
     port = find_free_ports(1)[0]
     n_gpus = ModelAllocation.from_str(alloc_mode).parallel.world_size
@@ -312,6 +347,10 @@ def _run_test_with_torchrun(
 @pytest.mark.sglang
 @pytest.mark.parametrize("engine_type", ENGINE_TYPES)
 def test_pp_weight_group_init(tmp_path_factory, engine_type):
+    # [FUNCTION DOC]
+    # Parametrized by engine type; skips if < 4 devices. Runs the "group_init" torchrun
+    # test with dp=1 pp=2 tp=2 and gen_pp_size 2, checking per-PP-rank group names, PP-
+    # head detection and world sizes (verified inside the worker).
     """Test per-PP-rank NCCL group initialization with PP=2, TP=2.
 
     Verifies:
@@ -345,6 +384,9 @@ def test_pp_weight_group_init(tmp_path_factory, engine_type):
 @pytest.mark.sglang
 @pytest.mark.parametrize("engine_type", ENGINE_TYPES)
 def test_pp_weight_sync(tmp_path_factory, engine_type):
+    # [FUNCTION DOC]
+    # Parametrized by engine type; skips if < 4 devices. Runs the "weight_sync" torchrun
+    # test with dp=1 pp=2 tp=2 and gen_pp_size 2.
     """Test weight sync with PP=2, TP=2 (4 GPUs).
 
     Verifies:

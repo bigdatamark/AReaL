@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Integration tests for SlurmScheduler on a real Slurm cluster (module skipped when srun
+# is not on PATH). Covers worker creation/discovery, status caching, timeouts, RPC
+# env/engine calls, input validation, deletion, construction from config, and colocation
+# (forked workers for a role colocated with a target). Uses an NFS fileroot under
+# /storage/openpsi.
 import os
 import shutil
 import time
@@ -34,6 +40,11 @@ ROOT_NFS_PATH = Path("/storage/openpsi/")
 
 @pytest.fixture
 def scheduler(tmp_path):
+    # [FUNCTION DOC]
+    # Fixture: builds a BaseExperimentConfig (unique trial name from current time, 8
+    # GPUs/node, fileroot and NFS name-resolve root under /storage/openpsi mirroring
+    # tmp_path), creates a SlurmScheduler with 300s startup timeout, yields it, then
+    # deletes all workers (printing any cleanup error).
     """Create SlurmScheduler for testing."""
     config = BaseExperimentConfig(
         experiment_name="test_slurm_scheduler",
@@ -63,6 +74,8 @@ def scheduler(tmp_path):
 
 @pytest.fixture
 def simple_job():
+    # [FUNCTION DOC]
+    # Fixture: Job "test_worker" with 2 replicas, each 2 CPU, 4 GPU, 4 GB mem, 2 ports.
     """Simple job with 2 workers."""
     return Job(
         role="test_worker",
@@ -84,6 +97,12 @@ def simple_job():
 
 
 def test_create_and_get_workers(scheduler, simple_job):
+    # [FUNCTION DOC]
+    # Creates 2 workers, asserts ids test_worker/0 and /1, waits for discovery and
+    # checks ip, numeric ports, internal discovered/ready state; asserts a second
+    # _check_job_status within the cache TTL takes < 0.1s; asserts duplicate creation
+    # raises WorkerCreationError; deletes and asserts get_workers raises
+    # WorkerNotFoundError and internal maps are cleared.
     """Test basic worker creation and discovery."""
     # Create workers
     worker_ids = scheduler.create_workers(simple_job)
@@ -135,6 +154,9 @@ def test_create_and_get_workers(scheduler, simple_job):
 
 
 def test_worker_timeout(scheduler):
+    # [FUNCTION DOC]
+    # Creates a full-node job and asserts get_workers with 1s timeout raises
+    # WorkerTimeoutError.
     """Test timeout when workers don't start."""
     job = Job(
         role="timeout_test",
@@ -158,6 +180,9 @@ def test_worker_timeout(scheduler):
 
 @pytest.mark.asyncio
 async def test_set_worker_env(scheduler, simple_job):
+    # [FUNCTION DOC]
+    # Async. Creates workers and calls set_worker_env on the first; passes if no
+    # exception.
     """Test setting environment variables on workers."""
     scheduler.create_workers(simple_job)
     workers = scheduler.get_workers("test_worker", timeout=180)
@@ -179,6 +204,9 @@ async def test_set_worker_env(scheduler, simple_job):
 
 @pytest.mark.asyncio
 async def test_create_engine_invalid_import(scheduler, simple_job):
+    # [FUNCTION DOC]
+    # Async. Asserts create_engine with a nonexistent import path raises
+    # EngineCreationError.
     """Test engine creation with invalid import path."""
     scheduler.create_workers(simple_job)
     workers = scheduler.get_workers("test_worker", timeout=180)
@@ -195,6 +223,9 @@ async def test_create_engine_invalid_import(scheduler, simple_job):
 
 @pytest.mark.asyncio
 async def test_create_engine_not_string(scheduler, simple_job):
+    # [FUNCTION DOC]
+    # Async. Asserts create_engine with a non-string engine raises EngineCreationError
+    # "must be a string".
     """Test that engine parameter must be string."""
     scheduler.create_workers(simple_job)
     workers = scheduler.get_workers("test_worker", timeout=180)
@@ -208,6 +239,9 @@ async def test_create_engine_not_string(scheduler, simple_job):
 
 @pytest.mark.asyncio
 async def test_rpc_on_nonexistent_worker(scheduler):
+    # [FUNCTION DOC]
+    # Async. Asserts set_worker_env and create_engine on an unknown worker id raise
+    # WorkerNotFoundError.
     """Test RPC calls on nonexistent workers fail properly."""
     with pytest.raises(WorkerNotFoundError):
         await scheduler.set_worker_env("nonexistent/0", {"TEST": "value"})
@@ -222,6 +256,9 @@ async def test_rpc_on_nonexistent_worker(scheduler):
 
 
 def test_worker_discovery_timeout(scheduler):
+    # [FUNCTION DOC]
+    # Asserts get_workers with a 2s timeout raises WorkerTimeoutError before discovery
+    # markers appear.
     """Test that discovery handles workers that never write markers."""
     # Create job but it will timeout before workers write discovery markers
     job = Job(
@@ -245,6 +282,8 @@ def test_worker_discovery_timeout(scheduler):
 
 
 def test_empty_scheduling_spec_fails(scheduler):
+    # [FUNCTION DOC]
+    # Asserts a job with no tasks raises ValueError "No scheduling specs".
     """Test that job with no scheduling specs fails."""
     job = Job(role="empty_spec", replicas=2, tasks=[])
 
@@ -253,6 +292,8 @@ def test_empty_scheduling_spec_fails(scheduler):
 
 
 def test_mismatched_spec_count_fails(scheduler):
+    # [FUNCTION DOC]
+    # Asserts 2 specs for 3 replicas raises ValueError "must be 1 or match".
     """Test that mismatched spec count fails."""
     job = Job(
         role="mismatched",
@@ -268,6 +309,8 @@ def test_mismatched_spec_count_fails(scheduler):
 
 
 def test_zero_replicas_fails(scheduler):
+    # [FUNCTION DOC]
+    # Asserts replicas=0 raises WorkerCreationError "replicas must be greater than 0".
     """Test that zero replicas fails."""
     job = Job(
         role="zero_replicas",
@@ -280,6 +323,9 @@ def test_zero_replicas_fails(scheduler):
 
 
 def test_delete_all_workers(scheduler, simple_job):
+    # [FUNCTION DOC]
+    # Creates two roles, waits for both, calls delete_workers() and asserts _workers and
+    # _jobs empty.
     """Test deleting all workers at once."""
     # Create multiple roles
     job1 = Job(role="role1", replicas=1, tasks=[SchedulingSpec(cpu=1, gpu=8, mem=1)])
@@ -304,6 +350,9 @@ def test_delete_all_workers(scheduler, simple_job):
 
 
 def test_scheduler_initialization_from_config(tmp_path):
+    # [FUNCTION DOC]
+    # Builds SlurmScheduler from exp_config only; asserts GPUs/node, names and fileroot
+    # come from config.
     """Test scheduler initialization from config."""
     config = BaseExperimentConfig(
         experiment_name="test_init",
@@ -323,6 +372,12 @@ def test_scheduler_initialization_from_config(tmp_path):
 
 
 def test_scheduler_initialization_with_overrides(tmp_path):
+    # [FUNCTION DOC]
+    # Passes explicit n_gpus_per_node/experiment/trial along with exp_config; asserts
+    # the config values win (4 GPUs, test_override, trial_001).
+    # KNOWN ISSUE: inline comments label the explicit arguments as "Override", but the
+    # assertions show exp_config takes precedence; comments and test name are
+    # misleading.
     """Test scheduler parameter overrides."""
     config = BaseExperimentConfig(
         experiment_name="test_override",
@@ -344,6 +399,11 @@ def test_scheduler_initialization_with_overrides(tmp_path):
 
 
 def test_scheduler_no_config_no_gpus_fails():
+    # [FUNCTION DOC]
+    # Asserts SlurmScheduler() with no arguments raises ValueError requiring
+    # experiment_name and trial_name.
+    # KNOWN ISSUE: docstring mentions n_gpus_per_node but the asserted error is about
+    # names.
     """Test that initialization fails without config or n_gpus_per_node."""
     with pytest.raises(
         ValueError, match="experiment_name and trial_name must be provided"
@@ -357,6 +417,10 @@ def test_scheduler_no_config_no_gpus_fails():
 
 
 def test_create_workers_with_colocate_strategy(scheduler):
+    # [FUNCTION DOC]
+    # Creates actor workers then a colocated "ref" role; asserts new forked ids ref/0,
+    # ref/1, and that _colocated_roles maps ref to actor and ref has its own _workers
+    # entry.
     """Test colocation reuses existing workers from target role."""
     # Create target role first
     actor_job = Job(
@@ -393,6 +457,11 @@ def test_create_workers_with_colocate_strategy(scheduler):
 
 
 def test_get_workers_for_colocated_role_delegates_to_target(scheduler):
+    # [FUNCTION DOC]
+    # Asserts forked colocated ref workers match actor count, have ref/ ids, same IPs
+    # and different ports than their actor counterparts.
+    # KNOWN ISSUE: test name says get_workers "delegates to target", but it asserts
+    # distinct forked workers are returned.
     """Test that get_workers for forked colocated role returns forked workers."""
     # Create target role
     actor_job = Job(
@@ -431,6 +500,9 @@ def test_get_workers_for_colocated_role_delegates_to_target(scheduler):
 
 
 def test_delete_colocated_role_does_not_kill_processes(scheduler):
+    # [FUNCTION DOC]
+    # Deletes the colocated ref role; asserts its mapping and workers are removed while
+    # the actor workers remain available.
     """Test deleting colocated role only removes mapping, not actual workers."""
     # Create target role
     actor_job = Job(
@@ -468,6 +540,9 @@ def test_delete_colocated_role_does_not_kill_processes(scheduler):
 
 
 def test_colocation_replica_mismatch_raises_error(scheduler):
+    # [FUNCTION DOC]
+    # Asserts colocating 3 replicas on a 2-replica target raises WorkerCreationError
+    # "Replica count mismatch".
     """Test that colocation fails if replica count doesn't match target."""
     # Create target role
     actor_job = Job(
@@ -496,6 +571,8 @@ def test_colocation_replica_mismatch_raises_error(scheduler):
 
 
 def test_colocation_target_not_found_raises_error(scheduler):
+    # [FUNCTION DOC]
+    # Asserts colocating with a nonexistent target raises WorkerNotFoundError.
     """Test that colocation fails if target role doesn't exist."""
     # Create colocated role without target
     ref_job = Job(

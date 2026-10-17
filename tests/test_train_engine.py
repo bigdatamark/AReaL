@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for FSDPEngine (single-process, needs a GPU and the Qwen3-0.6B model) covering
+# micro-batched forward consistency, eval_batch/train_batch, HF and DCP save/load round
+# trips, plus CPU-only checks of TrainEngineConfig attn_impl validation, attn_impl/dtype
+# forwarding in _create_llm_actor_or_critic, use_kernels/gradient checkpointing in
+# _create_device_model, from_pretrained config construction, and a 4-GPU torchrun
+# allocation-mode test.
 """Test script for Engine implementation."""
 
 import os
@@ -29,16 +36,28 @@ MODEL_PATH = get_model_path(
 
 
 class DummyDeviceStats:
+    # [CLASS DOC]
+    # HELPER: Device-stats stub whose log method does nothing.
     def log(self, *_args, **_kwargs) -> None:
+        # [FUNCTION DOC]
+        # HELPER: No-op; ignores all arguments.
         pass
 
 
 class DummyModel:
+    # [CLASS DOC]
+    # HELPER: Fake HF model exposing use_kernels and recording
+    # gradient_checkpointing_enable calls.
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Sets use_kernels False and an empty list of gradient-checkpointing
+        # call kwargs.
         self.use_kernels = False
         self.gradient_checkpointing_calls = []
 
     def gradient_checkpointing_enable(self, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Appends the kwargs dict to gradient_checkpointing_calls.
         self.gradient_checkpointing_calls.append(kwargs)
 
 
@@ -49,6 +68,13 @@ def mock_input(
     max_seqlen=20,
     device=current_platform.device_type,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Module-scoped fixture (parameters use their defaults). Draws batch_size random
+    # lengths in [min_seqlen, max_seqlen), builds right-padded random input_ids (vocab
+    # 100, pad 0) and a bool attention mask on the platform device. Returns
+    # {"input_ids", "attention_mask"}.
+    # KNOWN ISSUE: docstring says position_ids are returned, but only input_ids and
+    # attention_mask are.
     """Create mock padded input data (same format for huggingface) for testing.
     Returns a dict with input_ids, attention_mask, and position_ids.
     """
@@ -74,6 +100,11 @@ def mock_input(
 
 
 def get_engine(engine_type: str, model_path: str):
+    # [FUNCTION DOC]
+    # HELPER: Builds an FSDPEngine (only "fsdp" supported) from a TrainEngineConfig
+    # (backend fsdp:d1, default optimizer, given model path), creates its process group
+    # and initializes it with a 1-epoch, 100-sample, batch-2 FinetuneSpec. Returns the
+    # engine. Initializes torch.distributed and loads the model onto the GPU.
     from areal.engine import FSDPEngine
 
     engine_cls = {"fsdp": FSDPEngine}[engine_type]
@@ -98,6 +129,8 @@ def mock_loss_fn(
     input_data: dict,
     **kwargs,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Loss function stub returning the mean of logprobs; other args ignored.
     """Mock loss function for testing."""
     return torch.mean(logprobs)
 
@@ -109,6 +142,12 @@ def mock_loss_fn(
     ]
 )
 def engine(request):
+    # [FUNCTION DOC]
+    # Parametrized fixture over construction via config or FSDPEngine.from_pretrained.
+    # Sets single-process distributed env vars
+    # (WORLD_SIZE/RANK/LOCAL_RANK/MASTER_ADDR/PORT 7777) in os.environ, builds and
+    # initializes the engine, prints a success line, yields it, and on teardown destroys
+    # it and asserts torch.distributed is no longer initialized.
     os.environ.update(
         {
             "WORLD_SIZE": "1",
@@ -153,6 +192,9 @@ def engine(request):
 
 @torch.no_grad()
 def test_forward_microbatch(engine, mock_input):
+    # [FUNCTION DOC]
+    # No-grad. Runs forward with 2 and then 1 micro-batches and asserts outputs agree
+    # (atol 1e-4, rtol 1e-3) on positions whose next token is also valid.
     engine.eval()
     engine.config.mb_spec = MicroBatchSpec(n_mbs=2, max_tokens_per_mb=100)
     x2 = engine.forward(input_=mock_input)
@@ -173,6 +215,11 @@ def test_forward_microbatch(engine, mock_input):
 
 @torch.no_grad()
 def test_eval_batch(engine, mock_input):
+    # [FUNCTION DOC]
+    # No-grad. Runs eval_batch with 2 micro-batches, mock loss and token-count
+    # weighting; asserts a CUDA tensor result.
+    # KNOWN ISSUE: asserts is_cuda, so it fails on non-CUDA accelerators even though the
+    # device is taken from current_platform.
     engine.eval()
     engine.config.mb_spec = MicroBatchSpec(n_mbs=2, max_tokens_per_mb=100)
     eval_result = engine.eval_batch(
@@ -187,6 +234,9 @@ def test_eval_batch(engine, mock_input):
 
 
 def test_train_batch(engine, mock_input):
+    # [FUNCTION DOC]
+    # Runs train_batch with 2 micro-batches; asserts a dict result with non-None
+    # grad_norm and lr.
     engine.train()
     engine.config.mb_spec = MicroBatchSpec(n_mbs=2, max_tokens_per_mb=100)
     train_result = engine.train_batch(
@@ -202,6 +252,9 @@ def test_train_batch(engine, mock_input):
 
 @torch.no_grad()
 def test_hf_save_load_weights(tmp_path_factory, engine, mock_input):
+    # [FUNCTION DOC]
+    # No-grad. Forwards, saves in HF format (with optimizer) to a temp dir, zeroes all
+    # params, loads, forwards again and asserts outputs match.
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     path = tmp_path_factory.mktemp("hf_engine_test")
     save_load_meta = SaveLoadMeta(
@@ -227,6 +280,8 @@ def test_hf_save_load_weights(tmp_path_factory, engine, mock_input):
 @torch.no_grad()
 @pytest.mark.slow
 def test_dcp_save_load_weights(tmp_path_factory, engine, mock_input):
+    # [FUNCTION DOC]
+    # Slow, no-grad. Same as the HF test but using DCP format.
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     path = tmp_path_factory.mktemp("dcp_engine_test")
     save_load_meta = SaveLoadMeta(
@@ -259,6 +314,10 @@ def test_dcp_save_load_weights(tmp_path_factory, engine, mock_input):
     ],
 )
 def test_train_engine_config_accepts_builtin_and_kernel_attn_impls(attn_impl):
+    # [FUNCTION DOC]
+    # Parametrized over builtin attention impls and kernels-community specs (with
+    # optional revision/entry and fallback "|" syntax); asserts TrainEngineConfig
+    # accepts and stores them.
     config = TrainEngineConfig(
         backend="fsdp:d1",
         experiment_name="test-experiment",
@@ -279,6 +338,9 @@ def test_train_engine_config_accepts_builtin_and_kernel_attn_impls(attn_impl):
     ],
 )
 def test_train_engine_config_rejects_invalid_kernel_attn_impl(attn_impl):
+    # [FUNCTION DOC]
+    # Parametrized malformed kernel specs; asserts ValueError "attn_impl must be one
+    # of".
     with pytest.raises(ValueError, match="attn_impl must be one of"):
         TrainEngineConfig(
             backend="fsdp:d1",
@@ -296,18 +358,30 @@ def test_train_engine_config_rejects_invalid_kernel_attn_impl(attn_impl):
 def test_create_llm_actor_or_critic_forwards_attn_impl(
     monkeypatch, memory_efficient_load, expected_loader
 ):
+    # [FUNCTION DOC]
+    # Parametrized memory_efficient_load. Patches AutoConfig, vision detection and
+    # AutoModelForCausalLM with a recording factory; asserts _create_llm_actor_or_critic
+    # uses from_config when memory-efficient else from_pretrained, passing the
+    # configured attn_implementation and dtype bfloat16 (from optimizer_dtype).
     import areal.engine.fsdp_engine as fsdp_module
 
     calls = []
 
     class FakeModelFactory:
+        # [CLASS DOC]
+        # HELPER: Fake AutoModelForCausalLM recording which loader is used.
         @staticmethod
         def from_config(config, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records ("from_config", config, kwargs) and returns a DummyModel.
             calls.append(("from_config", config, kwargs))
             return DummyModel()
 
         @staticmethod
         def from_pretrained(pretrained_model_name_or_path, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records ("from_pretrained", path, kwargs) and returns a
+            # DummyModel.
             calls.append(("from_pretrained", pretrained_model_name_or_path, kwargs))
             return DummyModel()
 
@@ -341,6 +415,11 @@ def test_create_llm_actor_or_critic_forwards_attn_impl(
 
 @pytest.mark.parametrize("memory_efficient_load", [False, True])
 def test_create_device_model_applies_use_kernels(monkeypatch, memory_efficient_load):
+    # [FUNCTION DOC]
+    # Parametrized memory_efficient_load. Patches config/tokenizer/platform/device-
+    # stats/rank and the model factory; runs _create_device_model on CPU and asserts the
+    # dummy model is used, use_kernels is set True and gradient checkpointing was
+    # enabled once with use_reentrant False.
     import areal.engine.fsdp_engine as fsdp_module
 
     monkeypatch.setattr(
@@ -390,6 +469,9 @@ def test_create_device_model_applies_use_kernels(monkeypatch, memory_efficient_l
 
 
 def test_fsdp_engine_config_construction():
+    # [FUNCTION DOC]
+    # Builds an engine via from_pretrained (dp 1, lr 1e-5, LoRA) and one via an
+    # equivalent TrainEngineConfig; asserts path, backend, lr and use_lora match.
     """Test that FSDPEngine.from_pretrained builds a valid config."""
     import areal.engine.fsdp_engine as fsdp_module
 
@@ -421,6 +503,12 @@ def test_fsdp_engine_config_construction():
     reason="requires 4 GPUs and 4 processes (torchrun --nproc_per_node=4)",
 )
 def test_fsdp_engine_alloc_mode_construction():
+    # [FUNCTION DOC]
+    # Skipped unless 4 CUDA devices and WORLD_SIZE >= 4 (torchrun). Builds via
+    # from_pretrained with dp 2 / tp 2 and LoRA, creates the process group, barriers,
+    # asserts parallel_helper dp/tp sizes are 2, then destroys.
+    # KNOWN ISSUE: docstring repeats the config-construction description although the
+    # test checks process-group / parallel sizes.
     """
     Test that FSDPEngine.from_pretrained builds a valid config.
 

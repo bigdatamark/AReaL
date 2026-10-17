@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Unit tests for StalenessManager, which gates rollout submission by both a concurrency
+# limit (max_concurrent_rollouts - running) and a staleness limit ((max_staleness +
+# version + 1) * consumer_batch_size - (accepted + running)), taking the minimum as
+# capacity. Tests cover counters through enqueue/submit/accept/reject, capacity math,
+# thread safety, edge cases, realistic scenarios and on_version_recovered.
 """Unit tests for StalenessManager.
 
 This module provides comprehensive test coverage for the StalenessManager class,
@@ -13,19 +19,30 @@ from areal.infra.staleness_manager import StalenessManager
 
 
 class MockVersionProvider:
+    # [CLASS DOC]
+    # HELPER: Version provider stub holding a mutable integer version.
     """Mock version provider for testing."""
 
     def __init__(self, initial_version: int = 0):
+        # [FUNCTION DOC]
+        # HELPER: Stores initial_version (default 0).
         self._version = initial_version
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Returns the current version.
         return self._version
 
     def set_version(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sets the current version (mutates state).
         self._version = version
 
 
 def enqueue_and_submit(manager: StalenessManager, count: int = 1) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Calls on_rollout_enqueued then on_rollout_submitted on manager count times
+    # (default 1). Returns None.
     """Convenience helper to enqueue and submit rollouts sequentially."""
     for _ in range(count):
         manager.on_rollout_enqueued()
@@ -33,9 +50,14 @@ def enqueue_and_submit(manager: StalenessManager, count: int = 1) -> None:
 
 
 class TestStalenessManagerBasics:
+    # [CLASS DOC]
+    # Basic construction and initial capacity tests.
     """Test basic functionality of StalenessManager."""
 
     def test_initialization(self):
+        # [FUNCTION DOC]
+        # Asserts constructor arguments are stored and initial stats (enqueued,
+        # accepted, running) are zero.
         """Test manager initialization with various parameters."""
         version_provider = MockVersionProvider(0)
 
@@ -56,6 +78,8 @@ class TestStalenessManagerBasics:
         assert stats.running == 0
 
     def test_initial_capacity_full(self):
+        # [FUNCTION DOC]
+        # Asserts initial capacity is 10, limited by max_concurrent_rollouts.
         """Test that initial capacity equals max_concurrent_rollouts."""
         version_provider = MockVersionProvider(0)
 
@@ -71,6 +95,8 @@ class TestStalenessManagerBasics:
         assert capacity == 10  # max_concurrent_rollouts
 
     def test_initial_capacity_with_large_staleness(self):
+        # [FUNCTION DOC]
+        # With staleness capacity 352 > concurrency 100, asserts capacity is 100.
         """Test capacity with large staleness allowance."""
         version_provider = MockVersionProvider(0)
 
@@ -89,9 +115,13 @@ class TestStalenessManagerBasics:
 
 
 class TestCapacityCalculations:
+    # [CLASS DOC]
+    # Capacity formula tests under different counter states.
     """Test capacity calculation logic under various scenarios."""
 
     def test_concurrency_limit(self):
+        # [FUNCTION DOC]
+        # After 3 submissions with limit 5, asserts capacity 2.
         """Test that concurrency limit is enforced."""
         version_provider = MockVersionProvider(0)
 
@@ -109,6 +139,8 @@ class TestCapacityCalculations:
         assert capacity == 2  # 5 - 3 = 2 remaining
 
     def test_staleness_limit(self):
+        # [FUNCTION DOC]
+        # Asserts staleness-limited capacity (2+0+1)*4 = 12 at version 0.
         """Test that staleness limit is enforced."""
         version_provider = MockVersionProvider(0)
 
@@ -125,6 +157,8 @@ class TestCapacityCalculations:
         assert capacity == 12
 
     def test_staleness_increases_with_version(self):
+        # [FUNCTION DOC]
+        # Asserts capacity rises from 12 at version 0 to 32 at version 5.
         """Test that allowed capacity increases with version."""
         version_provider = MockVersionProvider(0)
 
@@ -149,6 +183,8 @@ class TestCapacityCalculations:
         assert capacity_v5 > capacity_v0
 
     def test_capacity_with_running_rollouts(self):
+        # [FUNCTION DOC]
+        # With 3 running, asserts capacity is min(10-3, 12-3) = 7.
         """Test capacity calculation with running rollouts."""
         version_provider = MockVersionProvider(0)
 
@@ -169,6 +205,8 @@ class TestCapacityCalculations:
         assert capacity == 7
 
     def test_capacity_with_accepted_rollouts(self):
+        # [FUNCTION DOC]
+        # With 5 accepted and none running, asserts staleness-limited capacity 7.
         """Test capacity calculation with accepted rollouts."""
         version_provider = MockVersionProvider(0)
 
@@ -193,6 +231,8 @@ class TestCapacityCalculations:
         assert capacity == 7
 
     def test_capacity_at_limit(self):
+        # [FUNCTION DOC]
+        # With running equal to concurrency limit, asserts capacity 0.
         """Test capacity when at exactly the limit."""
         version_provider = MockVersionProvider(0)
 
@@ -212,6 +252,8 @@ class TestCapacityCalculations:
         assert capacity == 0  # Limited by concurrency
 
     def test_capacity_can_be_negative(self):
+        # [FUNCTION DOC]
+        # Submitting far above limits, asserts capacity is negative (not clamped).
         """Test that capacity can be negative when over limit."""
         version_provider = MockVersionProvider(0)
 
@@ -229,6 +271,11 @@ class TestCapacityCalculations:
         assert capacity < 0
 
     def test_min_values_are_enforced(self):
+        # [FUNCTION DOC]
+        # Constructs with zero concurrency/batch size/staleness and asserts capacity >=
+        # 0.
+        # KNOWN ISSUE: comments claim zero values are clamped to 1, but the test only
+        # checks that capacity is non-negative and never verifies the clamping.
         """Test that minimum values of 1 are enforced."""
         version_provider = MockVersionProvider(0)
 
@@ -246,9 +293,13 @@ class TestCapacityCalculations:
 
 
 class TestRolloutLifecycle:
+    # [CLASS DOC]
+    # Counter transitions for individual rollouts.
     """Test rollout state transitions through their lifecycle."""
 
     def test_submit_increments_counters(self):
+        # [FUNCTION DOC]
+        # Asserts enqueue+submit leaves enqueued 0, running 1, accepted 0, rejected 0.
         """Test that submitting a rollout increments both submitted and running."""
         version_provider = MockVersionProvider(0)
 
@@ -269,6 +320,8 @@ class TestRolloutLifecycle:
         assert stats.rejected == 0
 
     def test_accept_updates_counters(self):
+        # [FUNCTION DOC]
+        # Asserts accept moves the rollout from running to accepted.
         """Test that accepting a rollout updates counters correctly."""
         version_provider = MockVersionProvider(0)
 
@@ -290,6 +343,8 @@ class TestRolloutLifecycle:
         assert stats.rejected == 0
 
     def test_reject_updates_counters(self):
+        # [FUNCTION DOC]
+        # Asserts reject decrements running and increments rejected but not accepted.
         """Test that rejecting a rollout updates counters correctly."""
         version_provider = MockVersionProvider(0)
 
@@ -311,6 +366,8 @@ class TestRolloutLifecycle:
         assert stats.rejected == 1
 
     def test_multiple_rollouts_lifecycle(self):
+        # [FUNCTION DOC]
+        # Submits 5, accepts 3, rejects 2; asserts running 0, accepted 3, rejected 2.
         """Test multiple rollouts going through their lifecycle."""
         version_provider = MockVersionProvider(0)
 
@@ -339,6 +396,9 @@ class TestRolloutLifecycle:
         assert stats.rejected == 2
 
     def test_accept_without_submit_is_invalid(self):
+        # [FUNCTION DOC]
+        # Asserts accepting without a submit is not guarded: running becomes -1 and
+        # accepted 1.
         """Test that accepting without submitting leads to incorrect state."""
         version_provider = MockVersionProvider(0)
 
@@ -359,9 +419,15 @@ class TestRolloutLifecycle:
 
 
 class TestThreadSafety:
+    # [CLASS DOC]
+    # Concurrency tests with threads; verifies counters stay consistent under
+    # contention.
     """Test thread safety of StalenessManager operations."""
 
     def test_concurrent_submissions(self):
+        # [FUNCTION DOC]
+        # Ten threads each enqueue+submit 100 times; asserts running is 1000 and others
+        # zero.
         """Test that concurrent submissions are thread-safe."""
         version_provider = MockVersionProvider(0)
 
@@ -376,6 +442,8 @@ class TestThreadSafety:
         submissions_per_thread = 100
 
         def submit_many():
+            # [FUNCTION DOC]
+            # HELPER: Enqueues and submits submissions_per_thread rollouts.
             for _ in range(submissions_per_thread):
                 manager.on_rollout_enqueued()
                 manager.on_rollout_submitted()
@@ -394,6 +462,9 @@ class TestThreadSafety:
         assert stats.rejected == 0
 
     def test_concurrent_mixed_operations(self):
+        # [FUNCTION DOC]
+        # Runs submit (100), accept (50) and reject (50) loops concurrently in a thread
+        # pool; asserts final running 0, accepted 50, rejected 50.
         """Test concurrent mixed operations (submit, accept, reject)."""
         version_provider = MockVersionProvider(0)
 
@@ -407,15 +478,21 @@ class TestThreadSafety:
         num_operations = 100
 
         def submit_operations():
+            # [FUNCTION DOC]
+            # HELPER: Enqueues and submits num_operations rollouts.
             for _ in range(num_operations):
                 manager.on_rollout_enqueued()
                 manager.on_rollout_submitted()
 
         def accept_operations():
+            # [FUNCTION DOC]
+            # HELPER: Accepts num_operations // 2 rollouts.
             for _ in range(num_operations // 2):
                 manager.on_rollout_accepted()
 
         def reject_operations():
+            # [FUNCTION DOC]
+            # HELPER: Rejects num_operations // 2 rollouts.
             for _ in range(num_operations // 2):
                 manager.on_rollout_rejected()
 
@@ -436,6 +513,9 @@ class TestThreadSafety:
         assert stats.rejected == num_operations // 2
 
     def test_concurrent_capacity_checks(self):
+        # [FUNCTION DOC]
+        # Five threads each read capacity 100 times with no state change; asserts all
+        # equal.
         """Test that concurrent capacity checks don't cause race conditions."""
         version_provider = MockVersionProvider(0)
 
@@ -449,6 +529,8 @@ class TestThreadSafety:
         results = []
 
         def check_capacity():
+            # [FUNCTION DOC]
+            # HELPER: Appends get_capacity() to results 100 times.
             for _ in range(100):
                 capacity = manager.get_capacity()
                 results.append(capacity)
@@ -463,6 +545,12 @@ class TestThreadSafety:
         assert all(c == results[0] for c in results)
 
     def test_concurrent_get_stats(self):
+        # [FUNCTION DOC]
+        # After 10 submissions, five threads read stats concurrently; asserts no
+        # negative counters.
+        # KNOWN ISSUE: the comment says rollouts are submitted "in background", but
+        # submission happens before the threads start, and the tuple's first element
+        # (named submitted) is actually enqueued.
         """Test that concurrent get_stats calls are thread-safe."""
         version_provider = MockVersionProvider(0)
 
@@ -479,6 +567,9 @@ class TestThreadSafety:
         results = []
 
         def get_stats_many():
+            # [FUNCTION DOC]
+            # HELPER: Appends (enqueued, running, accepted) from get_stats() to results
+            # 100 times.
             for _ in range(100):
                 stats = manager.get_stats()
                 results.append((stats.enqueued, stats.running, stats.accepted))
@@ -497,9 +588,13 @@ class TestThreadSafety:
 
 
 class TestEdgeCases:
+    # [CLASS DOC]
+    # Boundary-condition tests.
     """Test edge cases and boundary conditions."""
 
     def test_zero_max_staleness(self):
+        # [FUNCTION DOC]
+        # max_staleness 0: asserts capacity 8 at version 0 and 48 at version 5.
         """Test with zero staleness (immediate consumption required)."""
         version_provider = MockVersionProvider(0)
 
@@ -521,6 +616,9 @@ class TestEdgeCases:
         assert capacity == 48
 
     def test_very_large_version(self):
+        # [FUNCTION DOC]
+        # At version 1,000,000 asserts capacity is capped at the concurrency limit
+        # 10000.
         """Test with very large version numbers."""
         version_provider = MockVersionProvider(0)
 
@@ -539,6 +637,8 @@ class TestEdgeCases:
         assert capacity == 10000  # Limited by max_concurrent_rollouts
 
     def test_single_rollout_batch_size(self):
+        # [FUNCTION DOC]
+        # consumer_batch_size 1: asserts capacity 3 at version 0.
         """Test with batch size of 1."""
         version_provider = MockVersionProvider(0)
 
@@ -554,6 +654,8 @@ class TestEdgeCases:
         assert capacity == 3
 
     def test_all_rollouts_rejected(self):
+        # [FUNCTION DOC]
+        # Submits and rejects 10; asserts counters and that capacity returns to 10.
         """Test scenario where all rollouts are rejected."""
         version_provider = MockVersionProvider(0)
 
@@ -581,6 +683,9 @@ class TestEdgeCases:
         assert capacity == 10  # Back to max_concurrent_rollouts
 
     def test_mixed_acceptance_rate(self):
+        # [FUNCTION DOC]
+        # 20 submitted, 15 accepted, 5 rejected; asserts counters and staleness-limited
+        # capacity 17.
         """Test with a realistic mixed acceptance rate."""
         version_provider = MockVersionProvider(0)
 
@@ -617,9 +722,14 @@ class TestEdgeCases:
 
 
 class TestRealWorldScenarios:
+    # [CLASS DOC]
+    # Scenario-style tests mimicking training dynamics.
     """Test realistic scenarios that might occur in production."""
 
     def test_typical_training_scenario(self):
+        # [FUNCTION DOC]
+        # Submits 16, accepts 14 / rejects 2, bumps version to 1 and asserts capacity 32
+        # (concurrency), then submits 16 more and checks counters.
         """Test a typical training scenario with version progression."""
         version_provider = MockVersionProvider(0)
 
@@ -657,6 +767,9 @@ class TestRealWorldScenarios:
         assert stats.rejected == 2
 
     def test_burst_load_scenario(self):
+        # [FUNCTION DOC]
+        # Bursts 100 submissions (capacity negative), then completes all and asserts
+        # capacity is positive again.
         """Test handling burst load of rollouts."""
         version_provider = MockVersionProvider(0)
 
@@ -689,6 +802,9 @@ class TestRealWorldScenarios:
         assert capacity > 0
 
     def test_slow_consumption_scenario(self):
+        # [FUNCTION DOC]
+        # Accepts 30 rollouts at version 0 and asserts capacity 2 under the staleness
+        # limit 32.
         """Test scenario where rollouts are consumed slower than generated."""
         version_provider = MockVersionProvider(0)
 
@@ -728,6 +844,9 @@ class TestRealWorldScenarios:
 def test_parametrized_initialization(
     max_concurrent_rollouts, consumer_batch_size, max_staleness
 ):
+    # [FUNCTION DOC]
+    # Parametrized parameter combos; asserts attributes stored and get_capacity returns
+    # an int.
     """Test initialization with various parameter combinations."""
     version_provider = MockVersionProvider(0)
 
@@ -749,6 +868,8 @@ def test_parametrized_initialization(
 
 @pytest.mark.parametrize("version", [0, 1, 10, 100, 1000])
 def test_parametrized_version_progression(version):
+    # [FUNCTION DOC]
+    # Parametrized version; asserts capacity equals min(1000, (5+version+1)*32).
     """Test capacity calculation across different versions."""
     version_provider = MockVersionProvider(version)
 
@@ -768,6 +889,10 @@ def test_parametrized_version_progression(version):
 
 @pytest.mark.parametrize("recovered_version", [0, 5, 10, 50])
 def test_on_version_recovered(recovered_version):
+    # [FUNCTION DOC]
+    # Parametrized recovered version; after setting the version and calling
+    # on_version_recovered, asserts capacity is (2+1)*16 regardless of version (accepted
+    # is adjusted).
     """Test that on_version_recovered adjusts accepted so capacity stays bounded."""
     version_provider = MockVersionProvider(0)
     manager = StalenessManager(
@@ -789,6 +914,9 @@ def test_on_version_recovered(recovered_version):
 
 @pytest.mark.parametrize("running", [1, 5, 16])
 def test_on_version_recovered_with_running_rollouts(running):
+    # [FUNCTION DOC]
+    # Parametrized number of in-flight rollouts; after recovery to version 10 asserts
+    # capacity is (2+1)*16 - running.
     """Test that on_version_recovered sets accepted correctly even when running > 0."""
     recovered_version = 10
     version_provider = MockVersionProvider(0)

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Regression test for a weight-version race in RemoteInfEngine.agenerate: if the engine
+# version advances while a generation request is in flight, the output tokens must be
+# labelled with the version captured when the request was issued, not the new one.
 import asyncio
 from types import SimpleNamespace
 from unittest import mock
@@ -7,6 +11,14 @@ from areal.infra.remote_inf_engine import RemoteInfEngine
 
 
 def _build_engine(versions_seen):
+    # [FUNCTION DOC]
+    # HELPER: Builds a RemoteInfEngine without calling __init__ and fills the minimal
+    # attributes agenerate needs (version 10, a stub config, one address, round-robin
+    # state, non-paused workflow executor, get_version closure). Installs a fake backend
+    # whose build_generation_request appends ("request", version) to versions_seen
+    # (list, mutated) and whose parse_generation_response bumps engine._version to 11
+    # (simulating a weight update mid-flight) and returns three tokens with stop reason
+    # "stop". Returns the engine.
     """Engine whose weight version advances while a request is in flight."""
     engine = RemoteInfEngine.__new__(RemoteInfEngine)
     engine._version = 10
@@ -25,15 +37,24 @@ def _build_engine(versions_seen):
     engine.workflow_executor = SimpleNamespace(is_paused=lambda: False)
 
     def _get_version():
+        # [FUNCTION DOC]
+        # HELPER: Returns the engine's current _version.
         return engine._version
 
     engine.get_version = _get_version
 
     def _build_generation_request(req, with_lora, version):
+        # [FUNCTION DOC]
+        # HELPER: Fake backend request builder; records the version it was given and
+        # returns a POST /generate request namespace with empty payload.
         versions_seen.append(("request", version))
         return SimpleNamespace(endpoint="/generate", payload={}, method="POST")
 
     def _parse_generation_response(_response):
+        # [FUNCTION DOC]
+        # HELPER: Fake response parser; sets engine._version to 11 and returns a
+        # namespace with three output tokens, zero logprobs, stop_reason "stop", no
+        # routed experts.
         # The weight update lands while the request is in flight.
         engine._version = 11
         return SimpleNamespace(
@@ -51,6 +72,10 @@ def _build_engine(versions_seen):
 
 
 def test_output_versions_use_the_version_that_served_the_request():
+    # [FUNCTION DOC]
+    # Runs agenerate with HTTP retry and workflow_context patched out; asserts the
+    # request was built with version 10, the engine now reports 11, and output_versions
+    # are all 10.
     versions_seen = []
     engine = _build_engine(versions_seen)
     gconfig = GenerationHyperparameters(max_new_tokens=3)

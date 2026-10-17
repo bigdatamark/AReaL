@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Unit tests that per-key reduce_group overrides passed to
+# DistributedStatsTracker.scalar / stat are used by export instead of the export-level
+# default group (all_reduce patched).
 # SPDX-License-Identifier: Apache-2.0
 
 from unittest.mock import patch
@@ -8,6 +12,9 @@ from areal.utils.stats_tracker import DistributedStatsTracker
 
 
 def test_stats_tracker_scalar_reduce_group_override_used_on_export():
+    # [FUNCTION DOC]
+    # Records scalar "score" with an override group, exports with a different default;
+    # asserts two all_reduce calls, both on the override group.
     # Arrange
     tracker = DistributedStatsTracker()
     default_group = object()
@@ -27,6 +34,9 @@ def test_stats_tracker_scalar_reduce_group_override_used_on_export():
 
 
 def test_stats_tracker_stat_reduce_group_override_used_on_export():
+    # [FUNCTION DOC]
+    # Records a mask denominator and a masked "loss" stat with an override group;
+    # exports "loss" and asserts four all_reduce calls, all on the override group.
     # Arrange
     tracker = DistributedStatsTracker()
     default_group = object()

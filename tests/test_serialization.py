@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Round-trip tests for RPC serialize_value/deserialize_value covering primitives,
+# collections, torch tensors (incl. bfloat16 and meta), numpy arrays, PIL images,
+# dataclasses, HF tokenizers/processors (loaded from local storage or the HF hub),
+# nested mixes, and CUDA-to-CPU conversion.
 """Tests for RPC serialization utilities."""
 
 from dataclasses import dataclass
@@ -16,15 +21,23 @@ from areal.infra.rpc.serialization import deserialize_value, serialize_value
 
 @dataclass
 class SampleData:
+    # [CLASS DOC]
+    # HELPER: Simple dataclass (name str, value int, tensor) used to test dataclass
+    # serialization.
     name: str
     value: int
     tensor: torch.Tensor
 
 
 class TestSerializationRoundTrip:
+    # [CLASS DOC]
+    # Groups the serialization round-trip tests.
     """Test serialization/deserialization for all supported types."""
 
     def test_primitives_and_collections(self):
+        # [FUNCTION DOC]
+        # Asserts a dict of primitives, lists and nested dicts round-trips to an equal
+        # value.
         """Test primitives and basic collections."""
         payload = {
             "str": "hello",
@@ -40,6 +53,10 @@ class TestSerializationRoundTrip:
         assert deserialized == payload
 
     def test_tensors(self):
+        # [FUNCTION DOC]
+        # For int64, float32, bfloat16 and meta tensors asserts serialized type "tensor"
+        # and that the round-trip keeps dtype, shape and values (or meta-ness for meta
+        # tensors).
         """Test torch tensors including special dtypes."""
         tensors = {
             "int": torch.tensor([1, 2, 3], dtype=torch.int64),
@@ -61,6 +78,9 @@ class TestSerializationRoundTrip:
             assert deserialized.shape == original.shape
 
     def test_numpy_arrays(self):
+        # [FUNCTION DOC]
+        # For int32, float64 and bool arrays asserts type "ndarray" and strict equality
+        # with dtype.
         """Test NumPy array serialization."""
         arrays = {
             "int": np.array([1, 2, 3], dtype=np.int32),
@@ -76,12 +96,18 @@ class TestSerializationRoundTrip:
             assert deserialized.dtype == original.dtype
 
     def test_numpy_object_array_rejected(self):
+        # [FUNCTION DOC]
+        # Asserts serializing an object-dtype array raises ValueError "Object or void
+        # dtype".
         """Object arrays should be rejected."""
         array = np.array([{"a": 1}], dtype=object)
         with pytest.raises(ValueError, match="Object or void dtype"):
             serialize_value(array)
 
     def test_pil_image_roundtrip(self):
+        # [FUNCTION DOC]
+        # Asserts an RGB PIL image serializes as "pil_image" and round-trips with same
+        # size, mode and identical PNG-encoded bytes.
         """Test PIL image serialization for VLM RPC payloads."""
         original = Image.new("RGB", (8, 6), color=(12, 34, 56))
 
@@ -100,6 +126,9 @@ class TestSerializationRoundTrip:
             assert o_buf.getvalue() == d_buf.getvalue()
 
     def test_dataclass(self):
+        # [FUNCTION DOC]
+        # Asserts a SampleData instance serializes as "dataclass" with a class_path
+        # ending in SampleData and round-trips with equal fields and tensor.
         """Test dataclass serialization with nested tensors."""
         original = SampleData(
             name="test",
@@ -118,6 +147,10 @@ class TestSerializationRoundTrip:
         assert torch.equal(deserialized.tensor, original.tensor)
 
     def test_tokenizer(self):
+        # [FUNCTION DOC]
+        # Loads the Qwen3-0.6B tokenizer (network or local path), asserts type
+        # "tokenizer" and that the round-tripped tokenizer has the same vocab size and
+        # encodes "test" identically.
         """Test Hugging Face tokenizer serialization."""
         original = AutoTokenizer.from_pretrained(
             get_model_path(
@@ -133,6 +166,9 @@ class TestSerializationRoundTrip:
         assert deserialized.encode("test") == original.encode("test")
 
     def test_processor(self):
+        # [FUNCTION DOC]
+        # Loads the Qwen2.5-VL-3B processor, asserts type "processor" and equal
+        # tokenizer vocab size and encoding after round-trip.
         """Test Hugging Face processor serialization."""
         from transformers import AutoProcessor
 
@@ -153,6 +189,9 @@ class TestSerializationRoundTrip:
         )
 
     def test_nested_structure(self):
+        # [FUNCTION DOC]
+        # Round-trips a dict mixing tensor, ndarray, dataclass, list of tensor/array and
+        # nested dict; asserts key values are preserved.
         """Test complex nested structure with multiple types."""
         payload = {
             "tensor": torch.tensor([1.0, 2.0, 3.0]),
@@ -181,6 +220,9 @@ class TestSerializationRoundTrip:
         reason="CUDA not available",
     )
     def test_cuda_tensors_moved_to_cpu(self):
+        # [FUNCTION DOC]
+        # Skipped without CUDA. Asserts a CUDA tensor deserializes on CPU with equal
+        # values.
         """CUDA tensors should be serialized as CPU tensors."""
         original = torch.randn(3, 3).cuda()
         serialized = serialize_value(original)

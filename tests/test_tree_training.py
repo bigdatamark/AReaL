@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# GPU tests for tree training (prefix-sharing tree attention) on Megatron, FSDP and
+# Archon engines with flex or Triton tree-attention backends. Builds a batch whose
+# sequences are prefixes of one shared sequence, then compares logprobs (forward) and
+# gradients (forward-backward) between a baseline engine and an enable_tree_training
+# engine within loose tolerances. Requires the Qwen3-0.6B model and single-process
+# distributed env.
 import os
 
 import pytest
@@ -34,6 +41,19 @@ def mock_tree_input(
     total_tokens=256,
     device=current_platform.device_type,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Builds a padded batch of batch_size sequences that are all prefixes of the
+    # token run 1..tree_tokens: the first has length tree_tokens and the remaining
+    # total_tokens - tree_tokens tokens are spread over the other rows (each at least 1,
+    # at most tree_tokens, remainder added to the last). Validates inputs, raising
+    # ValueError on non-positive batch size, total < tree tokens or batch, too few
+    # tokens, or batch 1 with total != tree; raises RuntimeError if lengths do not sum
+    # to total or the trie of sequences does not have exactly tree_tokens nodes. Returns
+    # dict of input_ids (zero-padded), bool attention_mask and loss_mask (copy of the
+    # mask) on device (default current platform).
+    # KNOWN ISSUE: if the remainder added to the last row pushes it beyond tree_tokens,
+    # slicing the base sequence silently truncates it and the later trie/sum checks
+    # raise instead of producing a valid batch.
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     if total_tokens < tree_tokens:
@@ -81,6 +101,9 @@ def mock_tree_input(
         sequences.append(seq_tokens.tolist())
 
     def _count_unique_nodes(seqs: list[list[int]]) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Counts nodes in a prefix trie built from the token sequences (one node
+        # per distinct prefix). Returns int.
         root: dict[int, dict] = {}
         count = 0
         for seq in seqs:
@@ -108,6 +131,12 @@ def mock_tree_input(
 def _collect_gradients(
     engine: FSDPEngine | MegatronEngine | ArchonEngine,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Returns {param name: cloned grad} for parameters with gradients. FSDP
+    # iterates engine.model, Archon iterates engine.model_parts, Megatron iterates
+    # engine.model chunks and prefers main_grad over grad.
+    # KNOWN ISSUE: for Archon/Megatron with several model parts, names from different
+    # parts can collide and overwrite each other in the dict.
     """Collect gradients from engine (supports FSDP, Megatron, and Archon)."""
     grads = {}
     if isinstance(engine, FSDPEngine):
@@ -134,6 +163,9 @@ def _collect_gradients(
 def _collect_parameters(
     engine: FSDPEngine | MegatronEngine | ArchonEngine,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Returns {param name: cloned data} for all parameters, walking the engine's
+    # model(s) the same way as _collect_gradients.
     """Collect parameters from engine (supports FSDP, Megatron, and Archon)."""
     params = {}
     if isinstance(engine, FSDPEngine):
@@ -152,6 +184,11 @@ def _collect_parameters(
 
 
 def _check_nan_params(params: dict[str, torch.Tensor], label: str) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the names of tensors in params containing NaN, printing per-tensor
+    # NaN counts and then a summary header with label.
+    # KNOWN ISSUE: the header line is printed after the per-parameter lines, so console
+    # output is in reverse order.
     nan_params = []
     for name, param in params.items():
         if torch.isnan(param).any():
@@ -172,6 +209,13 @@ def _create_engine(
     max_tokens_per_mb: int = 256,
     n_mbs: int | None = None,
 ) -> FSDPEngine | MegatronEngine | ArchonEngine:
+    # [FUNCTION DOC]
+    # HELPER: Sets single-process distributed env vars (MASTER_PORT=port), builds a
+    # TrainEngineConfig (Qwen3-0.6B, max_tokens_per_mb and optional n_mbs, default
+    # optimizer, enable_tree_training flag, pad_to_maximum True), instantiates
+    # FSDPEngine / ArchonEngine / MegatronEngine (anything else) and creates the process
+    # group and initializes it with a d1p1t1 allocation and small FinetuneSpec; logs the
+    # model. Returns the engine.
     """Create and initialize an engine of the specified type."""
     os.environ.update(
         {
@@ -220,6 +264,14 @@ def _create_engine(
 @pytest.mark.parametrize("engine_type", ["megatron", "fsdp", "archon"])
 @pytest.mark.parametrize("tree_attn_backend", ["flex", "triton"])
 def test_tree_training_forward(engine_type, tree_attn_backend):
+    # [FUNCTION DOC]
+    # Parametrized engine type x backend (skip triton if unavailable). Forces the
+    # USE_TRITON_TREE_ATTN flag in the tree attention modules, computes logprobs with a
+    # baseline engine (port 7777) and then a tree-training engine (port 7778), restores
+    # FSDP patches for fsdp, logs details of mismatches, and asserts all values are
+    # close (rtol=atol=0.2).
+    # KNOWN ISSUE: the module-level USE_TRITON_TREE_ATTN flags are mutated and never
+    # restored, leaking into later tests.
     """Test tree training forward pass produces correct logprobs."""
     if tree_attn_backend == "triton" and not TRITON_AVAILABLE:
         pytest.skip("Triton is not available")
@@ -306,6 +358,13 @@ def test_tree_training_forward(engine_type, tree_attn_backend):
 @pytest.mark.parametrize("engine_type", ["megatron", "fsdp", "archon"])
 @pytest.mark.parametrize("tree_attn_backend", ["flex", "triton"])
 def test_tree_training_forward_backward(engine_type, tree_attn_backend):
+    # [FUNCTION DOC]
+    # Parametrized engine type x backend. Trains one batch with baseline and tree
+    # engines, collects grads and params, logs differences, and asserts identical grad
+    # key sets, no NaN grads or params, and every common grad having mean relative
+    # difference <= 25%.
+    # KNOWN ISSUE: same global USE_TRITON_TREE_ATTN mutation without restore; engines
+    # are not destroyed if an exception occurs mid-test.
     """Test tree training forward-backward pass produces correct gradients."""
     if tree_attn_backend == "triton" and not TRITON_AVAILABLE:
         pytest.skip("Triton is not available")
@@ -313,9 +372,13 @@ def test_tree_training_forward_backward(engine_type, tree_attn_backend):
     use_triton = tree_attn_backend == "triton"
 
     def loss_fn(logprobs, entropy, input_data, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Loss = mean of logprobs; other inputs ignored.
         return logprobs.mean()
 
     def loss_weight_fn(input_data):
+        # [FUNCTION DOC]
+        # HELPER: Loss weight = number of nonzero entries in loss_mask.
         return input_data["loss_mask"].count_nonzero()
 
     areal.models.tree_attn.tree.USE_TRITON_TREE_ATTN = use_triton

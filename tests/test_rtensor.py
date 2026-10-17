@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for RTensor (remote tensor handles) and its HTTP backend. A module-scoped
+# fixture launches a real RPC server subprocess; tests PUT serialized tensors to
+# /data/<shard_id>, build RTensors with meta-device placeholders, and verify
+# to_local/localize/remotize, batch fetch (/data/batch), clearing (/data/clear), error
+# handling, concurrency, the client-side fetch buffer, flatten_shard_ids and
+# TensorShardInfo fields.
 """Integration tests for RTensor with RPC server."""
 
 import asyncio
@@ -23,6 +30,12 @@ from areal.utils.network import find_free_ports
 
 @pytest.fixture(scope="module")
 def rpc_server():
+    # [FUNCTION DOC]
+    # Module-scoped pytest fixture. Picks a free port, spawns "python -m
+    # areal.infra.rpc.rpc_server" as role master / worker 0 (stdout/stderr to the test's
+    # stdout), polls GET /health once a second for up to 60 attempts, and raises
+    # RuntimeError (after killing the process) if it never returns 200. Yields
+    # "localhost:<port>" and on teardown kills the whole process tree.
     """Start RPC server for integration tests."""
     RPC_SERVER_PORT = find_free_ports(1)[0]
     proc = subprocess.Popen(
@@ -67,9 +80,15 @@ def rpc_server():
 
 
 class TestRTensorIntegration:
+    # [CLASS DOC]
+    # Integration tests that store/fetch shards against the real RPC server fixture.
     """Integration tests using real RPC server."""
 
     def test_single_shard_storage_and_retrieval(self, rpc_server):
+        # [FUNCTION DOC]
+        # Stores a CPU tensor on the server under a fresh uuid shard id, builds an
+        # RTensor pointing at it with a meta placeholder, checks shard fields and shape,
+        # then asserts to_local returns an equal tensor.
         """Test storing and retrieving a single tensor shard (InferenceEngine workflow)."""
         # Create tensor and shard ID
         tensor = torch.randn(5, 10).cpu()
@@ -105,6 +124,10 @@ class TestRTensorIntegration:
         assert torch.allclose(localized, tensor)
 
     def test_localize_nested_structure(self, rpc_server):
+        # [FUNCTION DOC]
+        # Stores two tensors, builds a dict mixing two RTensors and a plain nested dict,
+        # and asserts RTensor.localize replaces RTensors with equal tensors and leaves
+        # other values.
         """Test localizing nested structures containing RTensors."""
         # Create tensors
         tensor1 = torch.randn(3, 4).cpu()
@@ -151,6 +174,10 @@ class TestRTensorIntegration:
         assert torch.allclose(localized["values"], tensor2)
 
     def test_remotize_and_localize_roundtrip(self, rpc_server):
+        # [FUNCTION DOC]
+        # Remotizes a dict (tensor + float) onto the server address, then pushes the
+        # locally stored tensor (fetched by the new shard id) to the server and asserts
+        # localize restores the original tensor and scalar.
         """Test remotize and localize roundtrip."""
         # Simulate output with tensors
         output = {
@@ -185,6 +212,9 @@ class TestRTensorIntegration:
         assert localized["score"] == 0.95
 
     def test_clear_batch_data(self, rpc_server):
+        # [FUNCTION DOC]
+        # Stores three shards, DELETEs /data/clear with their ids, asserts status ok and
+        # cleared_count 3, then asserts each GET returns 404.
         """Test clearing stored tensor shards."""
         # Store some tensors
         shard_ids = []
@@ -215,6 +245,9 @@ class TestRTensorIntegration:
             assert resp.status_code == 404
 
     def test_batch_shard_retrieval(self, rpc_server):
+        # [FUNCTION DOC]
+        # Stores two shards and POSTs /data/batch; asserts the deserialized response is
+        # a list of tensors equal to the originals, in order.
         """Retrieve multiple shards with one HTTP request."""
         tensors = [torch.randn(2, 3).cpu(), torch.randn(4, 5).cpu()]
         shard_ids = [str(uuid.uuid4()) for _ in tensors]
@@ -239,6 +272,9 @@ class TestRTensorIntegration:
             assert torch.allclose(actual, expected)
 
     def test_batch_shard_retrieval_reports_missing_shards(self, rpc_server):
+        # [FUNCTION DOC]
+        # Requests a batch containing one existing and one missing shard; asserts HTTP
+        # 400 with status "error" and missing_shard_ids listing only the missing id.
         """Missing shards return a structured client error instead of a compatibility 404."""
         tensor = torch.randn(2, 3).cpu()
         present_shard_id = str(uuid.uuid4())
@@ -261,9 +297,16 @@ class TestRTensorIntegration:
 
 
 class TestHttpRTensorBackendBatching:
+    # [CLASS DOC]
+    # Unit tests of HttpRTensorBackend batching using monkeypatched sessions (no
+    # server).
     """Unit tests for HTTP batch fetching behavior."""
 
     def test_fetch_chunks_large_requests(self, monkeypatch):
+        # [FUNCTION DOC]
+        # With max_shards_per_request=2 and five shards on one node, patches
+        # _create_session and _fetch_shard_group to record requests; asserts fetch
+        # issues chunks [s0,s1],[s2,s3],[s4] and returns results in original order.
         """Large same-node fetches are split into bounded batch requests."""
         backend = HttpRTensorBackend(max_shards_per_request=2)
         shards = [
@@ -272,13 +315,23 @@ class TestHttpRTensorBackendBatching:
         requested_chunks = []
 
         class _FakeSession:
+            # [CLASS DOC]
+            # HELPER: No-op async context manager standing in for an aiohttp session.
             async def __aenter__(self):
+                # [FUNCTION DOC]
+                # HELPER: Async enter; returns self.
                 return self
 
             async def __aexit__(self, exc_type, exc, tb):
+                # [FUNCTION DOC]
+                # HELPER: Async exit; returns False (does not suppress exceptions).
                 return False
 
         async def fake_fetch_shard_group(self, session, node_addr, grouped):
+            # [FUNCTION DOC]
+            # HELPER: Replacement for _fetch_shard_group; records (node_addr, shard ids)
+            # and returns one 1-element tensor per shard holding the numeric suffix of
+            # its id.
             requested_chunks.append(
                 (node_addr, [shard.shard_id for _, shard in grouped])
             )
@@ -305,6 +358,10 @@ class TestHttpRTensorBackendBatching:
         assert [int(tensor.item()) for tensor in results] == [0, 1, 2, 3, 4]
 
     def test_fetch_shard_group_raises_on_missing_batch_endpoint(self):
+        # [FUNCTION DOC]
+        # Calls _fetch_shard_group with a fake session whose POST returns status 404 and
+        # body "missing endpoint"; asserts RuntimeError with the exact "Failed to fetch
+        # shard batch" message including URL, status and body.
         """404 on /data/batch surfaces as an error."""
         backend = HttpRTensorBackend()
         grouped = [
@@ -313,19 +370,33 @@ class TestHttpRTensorBackendBatching:
         ]
 
         class _FakeResponse:
+            # [CLASS DOC]
+            # HELPER: Fake aiohttp response with status 404 usable as an async context
+            # manager.
             status = 404
 
             async def __aenter__(self):
+                # [FUNCTION DOC]
+                # HELPER: Async enter; returns self.
                 return self
 
             async def __aexit__(self, exc_type, exc, tb):
+                # [FUNCTION DOC]
+                # HELPER: Async exit; returns False.
                 return False
 
             async def text(self):
+                # [FUNCTION DOC]
+                # HELPER: Returns body text "missing endpoint".
                 return "missing endpoint"
 
         class _FakeSession:
+            # [CLASS DOC]
+            # HELPER: Fake session whose post asserts the batch URL and payload.
             def post(self, url, json):
+                # [FUNCTION DOC]
+                # HELPER: Asserts url is http://node-a/data/batch and json lists s0,s1;
+                # returns a _FakeResponse.
                 assert url == "http://node-a/data/batch"
                 assert json == {"shard_ids": ["s0", "s1"]}
                 return _FakeResponse()
@@ -338,9 +409,14 @@ class TestHttpRTensorBackendBatching:
 
 
 class TestRTensorErrorHandling:
+    # [CLASS DOC]
+    # Tests failure paths of RTensor.to_local.
     """Test error handling for network and storage failures."""
 
     def test_to_local_with_missing_shard(self, rpc_server):
+        # [FUNCTION DOC]
+        # Asserts to_local on a non-existent shard id raises RuntimeError "Failed to
+        # fetch shard".
         """RuntimeError on HTTP 404."""
         rtensor = RTensor(
             shard=TensorShardInfo(
@@ -354,6 +430,13 @@ class TestRTensorErrorHandling:
             rtensor.to_local()
 
     def test_to_local_with_server_error(self, rpc_server):
+        # [FUNCTION DOC]
+        # Stores a tensor in the test process's local rtensor storage, removes it, then
+        # asserts to_local against the server raises RuntimeError.
+        # KNOWN ISSUE: store/remove act on the local in-process storage, not the RPC
+        # server, so the server never held the shard; the test passes from a plain
+        # missing-shard fetch and does not exercise a "server error" or deletion path as
+        # its name/docstring suggest.
         """RuntimeError on deleted shard."""
         from areal.infra.rpc.rtensor import remove, store
 
@@ -373,9 +456,14 @@ class TestRTensorErrorHandling:
 
 
 class TestRTensorConcurrency:
+    # [CLASS DOC]
+    # Concurrency tests against the RPC server storage using threads.
     """Test concurrent operations on storage."""
 
     def test_concurrent_storage_writes(self, rpc_server):
+        # [FUNCTION DOC]
+        # Twenty threads each PUT a distinct shard; afterwards asserts every shard
+        # returns 200.
         """20 threads store different shards."""
         import threading
 
@@ -383,6 +471,8 @@ class TestRTensorConcurrency:
         tensors = [torch.randn(2, 3).cpu() for _ in range(20)]
 
         def store_shard(shard_id, tensor):
+            # [FUNCTION DOC]
+            # HELPER: Serializes the tensor and PUTs it to /data/<shard_id>.
             serialized = serialize_value(tensor)
             requests.put(
                 f"http://{rpc_server}/data/{shard_id}",
@@ -404,6 +494,9 @@ class TestRTensorConcurrency:
             assert resp.status_code == 200
 
     def test_concurrent_storage_reads(self, rpc_server):
+        # [FUNCTION DOC]
+        # Stores one shard; ten threads each build an RTensor for it and call to_local
+        # into a results list; asserts all results equal the original.
         """10 threads fetch same shard."""
         import threading
 
@@ -417,6 +510,9 @@ class TestRTensorConcurrency:
         results = [None] * 10
 
         def fetch_shard(idx):
+            # [FUNCTION DOC]
+            # HELPER: Builds an RTensor for the shared shard and stores to_local's
+            # result at results[idx].
             rtensor = RTensor(
                 shard=TensorShardInfo(
                     shard_id=shard_id,
@@ -437,6 +533,9 @@ class TestRTensorConcurrency:
             assert torch.allclose(result, tensor)
 
     def test_concurrent_clear_operations(self, rpc_server):
+        # [FUNCTION DOC]
+        # Stores ten shards; three threads clear overlapping subsets concurrently;
+        # asserts every shard then returns 404 (no errors from double deletion).
         """3 threads clear overlapping shards."""
         import threading
 
@@ -456,6 +555,8 @@ class TestRTensorConcurrency:
         ]
 
         def clear_shards(shard_list):
+            # [FUNCTION DOC]
+            # HELPER: DELETEs /data/clear with the given shard id list.
             requests.delete(
                 f"http://{rpc_server}/data/clear",
                 json={"shard_ids": shard_list},
@@ -474,9 +575,14 @@ class TestRTensorConcurrency:
 
 
 class TestRTensorComplexPadding:
+    # [CLASS DOC]
+    # Localization tests with higher-rank tensors.
     """Test padding with complex tensor shapes."""
 
     def test_localize_with_3d_nested_padding(self, rpc_server):
+        # [FUNCTION DOC]
+        # Stores two 3D tensors of different shapes, localizes a dict of RTensors, and
+        # asserts both are restored exactly.
         """Nested structures with 3D tensors."""
         tensor1 = torch.randn(2, 5, 16).cpu()
         tensor2 = torch.randn(3, 8, 16).cpu()
@@ -517,9 +623,14 @@ class TestRTensorComplexPadding:
 
 
 class TestRTensorEdgeCases:
+    # [CLASS DOC]
+    # Edge cases of RTensor.remotize.
     """Test edge cases like empty batches and single-item batches."""
 
     def test_remotize_with_none_values(self):
+        # [FUNCTION DOC]
+        # Remotizes a dict with a tensor, None and a float; asserts None and the float
+        # pass through and the tensor becomes an RTensor.
         """None preserved in structures."""
         obj = {"logits": torch.randn(4, 10).cpu(), "mask": None, "score": 0.95}
 
@@ -531,9 +642,15 @@ class TestRTensorEdgeCases:
 
 
 class TestRTensorMemoryCleanup:
+    # [CLASS DOC]
+    # Tests of server-side clearing and shard persistence.
     """Test memory cleanup and storage stats."""
 
     def test_storage_stats_accuracy(self, rpc_server):
+        # [FUNCTION DOC]
+        # Stores five shards and clears them; asserts status ok and cleared_count 5.
+        # KNOWN ISSUE: docstring mentions verifying bytes, but only cleared_count is
+        # checked.
         """Verify cleared_count and bytes."""
         shard_ids = []
         for i in range(5):
@@ -555,6 +672,10 @@ class TestRTensorMemoryCleanup:
         assert result["cleared_count"] == 5
 
     def test_clear_batches_nested_structure(self, rpc_server):
+        # [FUNCTION DOC]
+        # Stores two shards referenced from a nested dict, asserts
+        # RTensor.collect_shards groups both ids under the server address, then clears
+        # them and asserts 404 on GET.
         """collect_shards on nested dict."""
         tensors = [torch.randn(3, 5).cpu(), torch.randn(2, 4).cpu()]
         shard_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
@@ -601,6 +722,9 @@ class TestRTensorMemoryCleanup:
             assert resp.status_code == 404
 
     def test_storage_cleanup_after_localize(self, rpc_server):
+        # [FUNCTION DOC]
+        # Asserts that after to_local the shard is still present on the server (no auto-
+        # delete).
         """Shards persist after fetch."""
         tensor = torch.randn(4, 6).cpu()
         shard_id = str(uuid.uuid4())
@@ -626,9 +750,17 @@ class TestRTensorMemoryCleanup:
 
 
 class TestRemotize:
+    # [CLASS DOC]
+    # Tests of RTensor.remotize over various input shapes. Remotize stores tensors
+    # locally and returns RTensor handles; dicts with attention_mask are trimmed to the
+    # max valid length.
     """Test remotize method with various input types."""
 
     def test_remotize_list_of_dicts(self, rpc_server):
+        # [FUNCTION DOC]
+        # Remotizes a list of two trajectory dicts with different batch sizes; asserts
+        # list/dict structure is kept, logits become RTensors with distinct shard ids
+        # and correct batch dims.
         """Test remotizing list of dicts with different attention masks."""
         # Create two trajectory dicts with different seqlens
         traj1 = {
@@ -659,6 +791,9 @@ class TestRemotize:
         assert result[1]["logits"].shape[0] == 3
 
     def test_remotize_list_of_tensors(self, rpc_server):
+        # [FUNCTION DOC]
+        # Remotizes a list of bare tensors; asserts each becomes an RTensor with the
+        # original shape.
         """Test remotizing list of standalone tensors."""
         tensors = [torch.randn(2, 5).cpu(), torch.randn(3, 7).cpu()]
 
@@ -673,6 +808,9 @@ class TestRemotize:
         assert result[1].data.shape == torch.Size([3, 7])
 
     def test_remotize_list_with_none(self, rpc_server):
+        # [FUNCTION DOC]
+        # Remotizes [dict, None, dict]; asserts None is kept and dicts have RTensor
+        # logits.
         """Test remotizing list with None values interspersed."""
         traj_dict = {
             "attention_mask": torch.tensor([[1, 1, 1, 0]]),
@@ -690,6 +828,9 @@ class TestRemotize:
         assert isinstance(result[2]["logits"], RTensor)
 
     def test_remotize_single_dict(self, rpc_server):
+        # [FUNCTION DOC]
+        # Remotizes a single dict; asserts a dict comes back with RTensor logits of
+        # batch size 1.
         """Test remotizing single dict (not wrapped in list)."""
         traj_dict = {
             "attention_mask": torch.tensor([[1, 1, 1, 0]]),
@@ -703,6 +844,8 @@ class TestRemotize:
         assert result["logits"].shape[0] == 1
 
     def test_remotize_standalone_tensor(self, rpc_server):
+        # [FUNCTION DOC]
+        # Remotizes a bare tensor; asserts an RTensor with the same shape.
         """Test remotizing standalone tensor (not in dict or list)."""
         tensor = torch.randn(2, 5).cpu()
 
@@ -713,11 +856,15 @@ class TestRemotize:
         assert result.data.shape == torch.Size([2, 5])
 
     def test_remotize_none(self):
+        # [FUNCTION DOC]
+        # Asserts remotize(None) returns None.
         """Test that None input returns None."""
         result = RTensor.remotize(None, node_addr="localhost:8080")
         assert result is None
 
     def test_remotize_scalar(self):
+        # [FUNCTION DOC]
+        # Asserts int, bool and float values pass through remotize unchanged.
         """Test that scalar values pass through unchanged."""
         result_int = RTensor.remotize(42, node_addr="localhost:8080")
         assert result_int == 42
@@ -729,6 +876,8 @@ class TestRemotize:
         assert result_float == 3.14
 
     def test_remotize_float_dict(self):
+        # [FUNCTION DOC]
+        # Asserts a dict of floats passes through remotize with unchanged values.
         """Test that dict without tensors returns with values unchanged."""
         obj = {"lr": 0.001, "grad_norm": 1.5}
         result = RTensor.remotize(obj, node_addr="localhost:8080")
@@ -736,11 +885,17 @@ class TestRemotize:
         assert result["grad_norm"] == 1.5
 
     def test_remotize_empty_list(self):
+        # [FUNCTION DOC]
+        # Asserts remotize([]) returns an empty list.
         """Test that empty list returns empty list."""
         result = RTensor.remotize([], node_addr="localhost:8080")
         assert result == []
 
     def test_remotize_roundtrip(self, rpc_server):
+        # [FUNCTION DOC]
+        # Remotizes a padded trajectory dict, pushes the locally stored shards to the
+        # server, then localizes; asserts logits come back trimmed to the max valid
+        # length 3 and match the original prefix.
         """Test remotize->localize roundtrip for trajectory dict."""
         original_traj = {
             "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 0, 0]]),
@@ -774,6 +929,10 @@ class TestRemotize:
         assert torch.allclose(localized["logits"], original_logits[:, :3], atol=1e-5)
 
     def test_remotize_trims_padding_from_attention_mask(self, rpc_server):
+        # [FUNCTION DOC]
+        # Remotizes a dict whose attention mask has max valid length 3 of 5; asserts
+        # every RTensor's meta shape is [2, 3], then after pushing shards and localizing
+        # asserts all tensors are [2, 3] and the mask equals the trimmed mask.
         """Verify remotize trims padding when dict has attention_mask.
 
         Create a dict with attention_mask [[1,1,1,0,0], [1,1,0,0,0]] (seqlen 5,
@@ -820,6 +979,9 @@ class TestRemotize:
 
 
 class TestFetchBuffer:
+    # [CLASS DOC]
+    # Tests for the module-level client-side fetch buffer in areal.infra.rpc.rtensor
+    # that caches fetched shards by id so repeated fetches avoid the network.
     """Test client-side fetch buffer for RTensor caching.
 
     The fetch buffer avoids redundant network fetches when the same
@@ -827,6 +989,9 @@ class TestFetchBuffer:
     """
 
     def setup_method(self):
+        # [FUNCTION DOC]
+        # Clears the global _fetch_buffer under its lock before each test (global state
+        # mutation).
         """Clear fetch buffer before each test."""
         from areal.infra.rpc.rtensor import _fetch_buffer, _fetch_buffer_lock
 
@@ -834,6 +999,9 @@ class TestFetchBuffer:
             _fetch_buffer.clear()
 
     def test_to_local_populates_buffer(self, rpc_server):
+        # [FUNCTION DOC]
+        # Asserts to_local on a server-held shard returns the tensor and adds the id to
+        # _fetch_buffer.
         """to_local() should populate the fetch buffer on first access."""
         from areal.infra.rpc.rtensor import _fetch_buffer
 
@@ -856,6 +1024,10 @@ class TestFetchBuffer:
         assert shard_id in _fetch_buffer
 
     def test_to_local_serves_from_buffer(self, rpc_server):
+        # [FUNCTION DOC]
+        # Fetches a shard once, clears it on the server, then asserts a fresh RTensor
+        # with the same id still resolves (served from the buffer) and equals the first
+        # result.
         """Second to_local() with a fresh RTensor (same shard_id) should
         hit the buffer without making a network request."""
         tensor = torch.randn(4, 6).cpu()
@@ -889,6 +1061,9 @@ class TestFetchBuffer:
         assert torch.allclose(result1, result2)
 
     def test_localize_populates_buffer(self, rpc_server):
+        # [FUNCTION DOC]
+        # Asserts localize of a dict with two RTensors returns correct tensors and
+        # buffers both ids.
         """localize() should populate the fetch buffer for all fetched shards."""
         from areal.infra.rpc.rtensor import _fetch_buffer
 
@@ -922,6 +1097,9 @@ class TestFetchBuffer:
         assert shard_id2 in _fetch_buffer
 
     def test_localize_serves_from_buffer(self, rpc_server):
+        # [FUNCTION DOC]
+        # Localizes once, deletes the shard on the server, and asserts a second localize
+        # with fresh RTensors still succeeds from the buffer with equal data.
         """Second localize() with fresh meta RTensors (same shard_ids) should
         resolve entirely from the buffer."""
         tensor = torch.randn(3, 4).cpu()
@@ -934,6 +1112,8 @@ class TestFetchBuffer:
         )
 
         def _make_rtensor():
+            # [FUNCTION DOC]
+            # HELPER: Builds a fresh meta-placeholder RTensor for the test's shard id.
             return RTensor(
                 shard=TensorShardInfo(shard_id=shard_id, node_addr=rpc_server),
                 data=torch.empty(3, 4, device="meta"),
@@ -953,6 +1133,9 @@ class TestFetchBuffer:
         assert torch.allclose(result1["x"], result2["x"])
 
     def test_localize_partial_buffer_hit(self, rpc_server):
+        # [FUNCTION DOC]
+        # Warms the buffer with shard A only, deletes A on the server, then localizes A
+        # and B and asserts both resolve correctly (A from buffer, B from backend).
         """When some shards are in the buffer and others are not, only the
         misses should be fetched from the backend."""
         from areal.infra.rpc.rtensor import _fetch_buffer
@@ -1000,6 +1183,9 @@ class TestFetchBuffer:
         assert torch.allclose(result["b"], tensor_b)
 
     def test_clear_node_evicts_from_buffer(self, rpc_server):
+        # [FUNCTION DOC]
+        # Fills the buffer via to_local, then runs RTensor.clear_node and asserts the id
+        # is evicted.
         """clear_node() should remove entries from the fetch buffer."""
         from areal.infra.rpc.rtensor import _fetch_buffer
 
@@ -1025,6 +1211,9 @@ class TestFetchBuffer:
         assert shard_id not in _fetch_buffer
 
     def test_clear_fetch_buffer_selective(self):
+        # [FUNCTION DOC]
+        # Asserts clear_fetch_buffer(list) removes only listed ids, ignores missing
+        # ones, and returns the count removed (2).
         """clear_fetch_buffer(sids) pops only the listed entries, misses are no-ops."""
         from areal.infra.rpc.rtensor import _fetch_buffer, clear_fetch_buffer
 
@@ -1039,6 +1228,9 @@ class TestFetchBuffer:
         assert "c" not in _fetch_buffer
 
     def test_clear_fetch_buffer_flush_all(self):
+        # [FUNCTION DOC]
+        # Asserts clear_fetch_buffer(None) empties the buffer and returns the number
+        # dropped.
         """clear_fetch_buffer(None) drops every entry."""
         from areal.infra.rpc.rtensor import _fetch_buffer, clear_fetch_buffer
 
@@ -1050,6 +1242,8 @@ class TestFetchBuffer:
         assert len(_fetch_buffer) == 0
 
     def test_fetch_buffer_stats_reports_entry_count(self):
+        # [FUNCTION DOC]
+        # Asserts fetch_buffer_stats reports num_entries 0 then 2 after adding entries.
         """fetch_buffer_stats() returns {'num_entries': N} matching buffer size."""
         from areal.infra.rpc.rtensor import _fetch_buffer, fetch_buffer_stats
 
@@ -1059,6 +1253,10 @@ class TestFetchBuffer:
         assert fetch_buffer_stats() == {"num_entries": 2}
 
     def test_remove_pops_both_storage_and_fetch_buffer(self):
+        # [FUNCTION DOC]
+        # Regression test (issue 1209): stores a tensor locally and in the fetch buffer,
+        # then asserts remove() returns 1 and drops it from both _storage and
+        # _fetch_buffer.
         """remove() drops the shard from both _storage and _fetch_buffer.
 
         Regression guard for areal-project/AReaL#1209: on a worker that is both
@@ -1087,6 +1285,9 @@ class TestFetchBuffer:
         assert sid not in _fetch_buffer
 
     def test_buffer_thread_safety(self, rpc_server):
+        # [FUNCTION DOC]
+        # Ten threads call to_local on the same shard concurrently; asserts none crash
+        # and all results equal the original.
         """Concurrent to_local() calls with the same shard_id should not crash."""
         import threading
 
@@ -1102,6 +1303,9 @@ class TestFetchBuffer:
         results = [None] * 10
 
         def fetch_shard(idx):
+            # [FUNCTION DOC]
+            # HELPER: Builds an RTensor for the shared shard and stores to_local's
+            # result at results[idx].
             rt = RTensor(
                 shard=TensorShardInfo(shard_id=shard_id, node_addr=rpc_server),
                 data=torch.empty(5, 8, device="meta"),
@@ -1120,6 +1324,9 @@ class TestFetchBuffer:
 
 
 class TestFlattenShardIds:
+    # [CLASS DOC]
+    # Tests for flatten_shard_ids, which walks nested dict/list/tuple structures and
+    # returns a flat list of RTensor shard ids (duplicates preserved).
     """Tests for flatten_shard_ids helper used by TrainController.clear_batches.
 
     The helper walks a nested (dict / list / tuple) structure and returns a flat
@@ -1132,12 +1339,17 @@ class TestFlattenShardIds:
 
     @staticmethod
     def _make_rt(sid: str) -> RTensor:
+        # [FUNCTION DOC]
+        # HELPER: Builds an RTensor with the given shard id, dummy address and 1-element
+        # meta data.
         return RTensor(
             shard=TensorShardInfo(shard_id=sid, node_addr="127.0.0.1:0"),
             data=torch.empty(1, device="meta"),
         )
 
     def test_empty_structures_return_empty_list(self):
+        # [FUNCTION DOC]
+        # Asserts empty tuple/dict/list and None yield [].
         from areal.infra.rpc.rtensor import flatten_shard_ids
 
         assert flatten_shard_ids(()) == []
@@ -1146,12 +1358,18 @@ class TestFlattenShardIds:
         assert flatten_shard_ids(None) == []
 
     def test_structure_without_rtensor_returns_empty_list(self):
+        # [FUNCTION DOC]
+        # Asserts structures without RTensors (scalars, strings, plain tensors) yield
+        # [].
         from areal.infra.rpc.rtensor import flatten_shard_ids
 
         assert flatten_shard_ids({"x": 1, "y": "str"}) == []
         assert flatten_shard_ids([torch.tensor([1, 2])]) == []
 
     def test_nested_dict_list_tuple_are_all_walked(self):
+        # [FUNCTION DOC]
+        # Asserts nested dict/list/tuple structures are fully walked and repeated
+        # RTensors appear once per occurrence.
         from areal.infra.rpc.rtensor import flatten_shard_ids
 
         rt_a = self._make_rt("sid-a")
@@ -1169,9 +1387,13 @@ class TestFlattenShardIds:
 
 
 class TestTensorShardInfoDocumentation:
+    # [CLASS DOC]
+    # Basic construction tests for TensorShardInfo.
     """Tests verifying TensorShardInfo construction and field semantics."""
 
     def test_construction_with_all_fields(self):
+        # [FUNCTION DOC]
+        # Asserts shard_id and node_addr are stored as given.
         """TensorShardInfo can be constructed with required fields."""
         from areal.infra.rpc.rtensor import TensorShardInfo
 
@@ -1183,6 +1405,8 @@ class TestTensorShardInfoDocumentation:
         assert shard.node_addr == "localhost:8080"
 
     def test_http_backend_node_addr(self):
+        # [FUNCTION DOC]
+        # Asserts a host:port node_addr is kept (contains a colon).
         """HTTP backend uses host:port for node_addr."""
         from areal.infra.rpc.rtensor import TensorShardInfo
 

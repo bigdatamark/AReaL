@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# CPU unit tests for areal.utils.data micro-batch helpers: align_mb_list_sequences (per-
+# sequence alignment of packed micro-batches without adding batch rows, with
+# unpad_logits inverse) and the pad/pack/split/unpack/reorder pipeline used to build
+# micro-batches.
 import pytest
 import torch
 
@@ -30,6 +35,13 @@ VOCAB_SIZE = 100
 def test_align_mb_list_sequences_does_not_add_batch_row(
     seq_lens, seq_align_to, expected_cu_seqlens
 ):
+    # [FUNCTION DOC]
+    # Parametrized (seq_lens, seq_align_to, expected cu_seqlens). Builds a packed micro-
+    # batch with sequential input_ids, aligns it, and asserts the padded cu_seqlens
+    # equal the expectation with one entry per real sequence plus one, zero micro-batch
+    # padding, padded length equal to the last cu_seqlen, all sequence lengths divisible
+    # by seq_align_to, and that unpad_logits with the old cu_seqlens restores the
+    # original input_ids exactly.
     """BSHD sequence alignment must preserve the number of real batch rows."""
     total_length = sum(seq_lens)
     cu_seqlens = torch.tensor(
@@ -73,6 +85,11 @@ def test_align_mb_list_sequences_does_not_add_batch_row(
 
 @pytest.fixture
 def mock_padded_data():
+    # [FUNCTION DOC]
+    # Fixture: builds BS=16 random sequences (prompt length in [1,8), answer length in
+    # [1,16)) with input_ids, loss_mask (0 for prompt, 1 for answer), random logprobs
+    # and position_ids, and returns them right-padded into batched tensors via
+    # pad_sequences_to_tensors.
     prompt_lens = torch.randint(1, MAX_PROMPT_LEN, size=(BS,))
     answer_lens = torch.randint(1, MAX_ANSWER_LEN, size=(BS,))
     all_data = []
@@ -93,6 +110,14 @@ def mock_padded_data():
 @pytest.mark.parametrize("n_mbs", [1, 2, 4, 8])
 @pytest.mark.parametrize("n_mbs_divisor", [1, 2, 3])
 def test_micro_batch_split(mock_padded_data, n_mbs, max_tokens_per_mb, n_mbs_divisor):
+    # [FUNCTION DOC]
+    # Parametrized over max_tokens_per_mb, n_mbs and n_mbs_divisor. Packs the padded
+    # data and checks packed lengths match attention mask sums; splits into micro-
+    # batches and packs each; asserts at least n_mbs micro-batches, a count divisible by
+    # n_mbs_divisor, and per-key token counts within max_tokens_per_mb; then
+    # concatenates, unpacks with forward-order lengths, reorders back via
+    # backward_indices and asserts equality with both the packed data and the original
+    # padded data.
     mb_spec = MicroBatchSpec(
         n_mbs=n_mbs, max_tokens_per_mb=max_tokens_per_mb, n_mbs_divisor=n_mbs_divisor
     )
