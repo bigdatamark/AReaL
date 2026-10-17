@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# CPU-only pytest unit tests for the scaffolding example's controllers and tasks
+# (PipelineTrajectoryMaker, ChatTracer, TraceTrajectoryMaker, RLVRRewardController,
+# RLVRRewardTask, ChatRewardTask) plus small end-to-end flows. Uses fake controllers
+# that fill tasks in memory and MagicMock completions; generators are driven by
+# exhausting them with list().
+# KNOWN ISSUE: The module docstring says with_task_collection only attaches a
+# class-level ChatTracer without wrapping process; the vendored decorator actually
+# creates a per-instance tracer and wraps process, so the fake rollout's manual hook
+# calls make after_yield run twice per turn (harmless because entries are keyed by
+# completion id).
 """Unit tests for scaffolding controllers (TraceTrajectoryMaker, PipelineTrajectoryMaker).
 
 Tests use fake workers/controllers that simulate LLM inference responses
@@ -68,12 +79,17 @@ def _simple_reward_fn(
     completion_ids: list[int],
     **kwargs,
 ) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Test reward fn returning 1.0 if kwargs "answer" is non-empty and is a
+    # substring of completions, else 0.0.
     """Deterministic reward: 1.0 if completion contains the ground-truth answer, else 0.0."""
     answer = kwargs.get("answer", "")
     return 1.0 if answer and answer in completions else 0.0
 
 
 class FakeGenerationController(Controller):
+    # [CLASS DOC]
+    # Fake generation controller that fills GenerationTasks in memory without an LLM.
     """Fills ``GenerationTask`` fields without calling any LLM backend."""
 
     def __init__(
@@ -84,6 +100,10 @@ class FakeGenerationController(Controller):
         output_logprobs: list[float] | None = None,
         output_versions: list[int] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores the canned output_str, output_tokens (default FAKE_OUTPUT_TOKENS),
+        # input_tokens (default FAKE_INPUT_TOKENS) and optional output_logprobs /
+        # output_versions.
         super().__init__()
         self.output_str = output_str
         self.output_tokens = output_tokens or FAKE_OUTPUT_TOKENS
@@ -92,6 +112,10 @@ class FakeGenerationController(Controller):
         self.output_versions = output_versions
 
     def process(self, tasks: list[Task], **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Generator: for each GenerationTask sets output_str and output_tokens, sets
+        # input_tokens only if None, and stores logprobs/versions in
+        # customized_result_fields when configured; yields the list once.
         for task in tasks:
             if isinstance(task, GenerationTask):
                 task.output_str = self.output_str
@@ -110,6 +134,9 @@ class FakeGenerationController(Controller):
 
 
 def _make_fake_completion(completion_id: str = "cmpl-001") -> MagicMock:
+    # [FUNCTION DOC]
+    # HELPER: Returns a MagicMock ChatCompletion with the given id, created=1000, one
+    # choice whose message content is FAKE_OUTPUT_STR and finish_reason "stop".
     """Create a minimal fake ``ChatCompletion`` object."""
     completion = MagicMock()
     completion.id = completion_id
@@ -121,6 +148,9 @@ def _make_fake_completion(completion_id: str = "cmpl-001") -> MagicMock:
 
 
 class FakeChatRolloutController(Controller):
+    # [CLASS DOC]
+    # Fake multi-turn chat rollout controller that mutates ChatTasks per turn and
+    # optionally calls a ChatTracer's hooks itself.
     """Simulates a multi-turn chat rollout by appending assistant messages.
 
     Each turn:
@@ -137,6 +167,10 @@ class FakeChatRolloutController(Controller):
         output_tokens_per_turn: list[list[int]] | None = None,
         input_tokens_per_turn: list[list[int]] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores n_turns, per-turn responses (default "response_i"), per-turn output
+        # tokens (default 4 distinct ids per turn) and input tokens (default
+        # FAKE_INPUT_TOKENS); _tracer is set later by tests.
         super().__init__()
         self.n_turns = n_turns
         self.responses = responses or [f"response_{i}" for i in range(n_turns)]
@@ -150,6 +184,12 @@ class FakeChatRolloutController(Controller):
         self._tracer: ChatTracer | None = None
 
     def process(self, tasks: list[Task], **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Generator: per turn, for each ChatTask appends an AssistantMessage with that
+        # turn's response, sets output/input tokens and a fake completion
+        # "cmpl-turn-<i>"; calls _tracer.before_yield, yields, calls _tracer.after_yield
+        # (if a tracer is set); between turns appends a plain dict user message
+        # "follow-up-<i>".
         for turn_idx in range(self.n_turns):
             for task in tasks:
                 if isinstance(task, ChatTask):
@@ -179,14 +219,21 @@ class FakeChatRolloutController(Controller):
 
 
 class FakeChatRewardController(Controller):
+    # [CLASS DOC]
+    # Fake reward controller assigning predetermined rewards to ChatRewardTasks.
     """Assigns predetermined rewards to ``ChatRewardTask`` objects."""
 
     def __init__(self, rewards: list[float] | None = None, default_reward: float = 1.0):
+        # [FUNCTION DOC]
+        # Stores optional per-index rewards list and default_reward (1.0).
         super().__init__()
         self.rewards = rewards
         self.default_reward = default_reward
 
     def process(self, tasks: list[Task], **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Generator: for each ChatRewardTask sets reward to rewards[i] if available else
+        # default_reward, also on its interaction; yields the list once.
         for i, task in enumerate(tasks):
             if isinstance(task, ChatRewardTask):
                 reward = (
@@ -207,6 +254,11 @@ class FakeChatRewardController(Controller):
 
 @pytest.fixture(autouse=True)
 def _reset_shared_tracer():
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture; after each test clears the ChatTracer found in the
+    # class-level TraceTrajectoryMaker.task_collections, if any.
+    # KNOWN ISSUE: Tracers are stored per instance, so the class-level lookup finds
+    # nothing and the fixture is effectively a no-op.
     """Reset the class-level ChatTracer before each test.
 
     The lightweight ``with_task_collection`` stores a single ``ChatTracer``
@@ -225,9 +277,14 @@ def _reset_shared_tracer():
 
 
 class TestPipelineTrajectoryMaker:
+    # [CLASS DOC]
+    # Tests for PipelineTrajectoryMaker (single-turn generation then local RLVR reward).
     """Tests for PipelineTrajectoryMaker (single-turn generation + reward)."""
 
     def test_basic_pipeline_correct_answer(self):
+        # [FUNCTION DOC]
+        # Checks a correct answer yields exactly one yielded task list, one interaction
+        # stored on the task, of type InteractionWithTokenLogpReward, with reward 1.0.
         """Pipeline should produce interaction with reward=1.0 for a correct answer."""
         gen_ctrl = FakeGenerationController(output_str="The answer is 42.")
         reward_ctrl = RLVRRewardController(_simple_reward_fn)
@@ -255,6 +312,8 @@ class TestPipelineTrajectoryMaker:
         assert interaction.reward == 1.0
 
     def test_basic_pipeline_wrong_answer(self):
+        # [FUNCTION DOC]
+        # Checks a wrong answer gives interaction reward 0.0.
         """Pipeline should produce interaction with reward=0.0 for a wrong answer."""
         gen_ctrl = FakeGenerationController(output_str="I don't know")
         reward_ctrl = RLVRRewardController(_simple_reward_fn)
@@ -274,6 +333,9 @@ class TestPipelineTrajectoryMaker:
         assert interaction.reward == 0.0
 
     def test_pipeline_multiple_tasks(self):
+        # [FUNCTION DOC]
+        # Checks two tasks produce two interactions in the shared dict, both rewarded
+        # 1.0.
         """Pipeline should handle multiple GenerationTasks in a single batch."""
         gen_ctrl = FakeGenerationController(output_str="42")
         reward_ctrl = RLVRRewardController(_simple_reward_fn)
@@ -298,6 +360,9 @@ class TestPipelineTrajectoryMaker:
             assert interaction.reward == 1.0
 
     def test_pipeline_interaction_has_model_response(self):
+        # [FUNCTION DOC]
+        # Checks the interaction's ModelResponse carries the input tokens and the
+        # provided output tokens, logprobs and versions.
         """Each interaction should contain a valid ModelResponse with tokens."""
         gen_ctrl = FakeGenerationController(
             output_str="42",
@@ -326,10 +391,15 @@ class TestPipelineTrajectoryMaker:
         assert mr.output_versions == [1, 1]
 
     def test_pipeline_uses_constructor_prompt_str(self):
+        # [FUNCTION DOC]
+        # Checks the reward fn receives the constructor's prompt_str rather than the
+        # task's input_str.
         """Reward controller should receive the prompt_str provided at construction."""
         received_prompts = []
 
         def _capture(prompt, completions, prompt_ids, completion_ids, **kw):
+            # [FUNCTION DOC]
+            # HELPER: Recording reward fn: appends the prompt and returns 1.0.
             received_prompts.append(prompt)
             return 1.0
 
@@ -349,10 +419,14 @@ class TestPipelineTrajectoryMaker:
         assert received_prompts == ["custom prompt"]
 
     def test_pipeline_falls_back_to_input_str(self):
+        # [FUNCTION DOC]
+        # Checks an empty constructor prompt_str falls back to task.input_str.
         """When prompt_str is empty, should fall back to task.input_str."""
         received_prompts = []
 
         def _capture(prompt, completions, prompt_ids, completion_ids, **kw):
+            # [FUNCTION DOC]
+            # HELPER: Recording reward fn: appends the prompt and returns 1.0.
             received_prompts.append(prompt)
             return 1.0
 
@@ -374,6 +448,8 @@ class TestPipelineTrajectoryMaker:
         assert received_prompts[0] == "fallback prompt"
 
     def test_pipeline_reward_scores_tracked(self):
+        # [FUNCTION DOC]
+        # Checks RLVRRewardController.scores lists both rewards.
         """RLVRRewardController should track scores in self.scores."""
         gen_ctrl = FakeGenerationController(output_str="42")
         reward_ctrl = RLVRRewardController(_simple_reward_fn)
@@ -394,6 +470,8 @@ class TestPipelineTrajectoryMaker:
         assert reward_ctrl.scores == [1.0, 1.0]
 
     def test_pipeline_default_logprobs_and_versions(self):
+        # [FUNCTION DOC]
+        # Checks missing logprobs/versions become zeros and -1 placeholders.
         """When no logprobs/versions provided, interaction should use placeholders."""
         gen_ctrl = FakeGenerationController(
             output_str="42",
@@ -425,9 +503,14 @@ class TestPipelineTrajectoryMaker:
 
 
 class TestChatTracer:
+    # [CLASS DOC]
+    # Tests for ChatTracer used directly.
     """Tests for ChatTracer (TaskCollection for tracing multi-turn chats)."""
 
     def test_after_yield_creates_interaction(self):
+        # [FUNCTION DOC]
+        # Checks after_yield on a ChatTask with a completion creates one interaction
+        # keyed by the completion id.
         """after_yield should create an interaction for each ChatTask."""
         tracer = ChatTracer(export_style="individual")
         task = ChatTask(messages=[{"role": "user", "content": "hello"}])
@@ -442,6 +525,9 @@ class TestChatTracer:
         assert "cmpl-001" in results
 
     def test_multiple_turns_traced(self):
+        # [FUNCTION DOC]
+        # Checks two after_yield calls with different completion ids on the same task
+        # produce two interactions.
         """Calling after_yield with different completions should trace all."""
         tracer = ChatTracer(export_style="individual")
         task = ChatTask(messages=[{"role": "user", "content": "hello"}])
@@ -465,6 +551,8 @@ class TestChatTracer:
         assert "cmpl-turn-1" in results
 
     def test_tracer_interaction_has_model_response(self):
+        # [FUNCTION DOC]
+        # Checks the traced ModelResponse holds the task's input and output tokens.
         """Traced interactions should have ModelResponse with correct tokens."""
         tracer = ChatTracer(export_style="individual")
         task = ChatTask(messages=[{"role": "user", "content": "hello"}])
@@ -480,6 +568,8 @@ class TestChatTracer:
         assert interaction.model_response.output_tokens == [30, 40, 50]
 
     def test_tracer_clear(self):
+        # [FUNCTION DOC]
+        # Checks clear() empties the trace results.
         """clear() should remove all traced data."""
         tracer = ChatTracer(export_style="individual")
         task = ChatTask(messages=[{"role": "user", "content": "hello"}])
@@ -494,12 +584,16 @@ class TestChatTracer:
         assert tracer.get_trace_results() == {}
 
     def test_tracer_ignores_non_chat_tasks(self):
+        # [FUNCTION DOC]
+        # Checks non-ChatTask tasks are ignored.
         """after_yield should skip non-ChatTask objects."""
         tracer = ChatTracer(export_style="individual")
         tracer.after_yield([GenerationTask(input_str="hello")])
         assert tracer.get_trace_results() == {}
 
     def test_tracer_empty_returns_empty(self):
+        # [FUNCTION DOC]
+        # Checks a fresh tracer exports an empty dict.
         """get_trace_results on a fresh tracer should return empty dict."""
         tracer = ChatTracer(export_style="individual")
         assert tracer.get_trace_results() == {}
@@ -511,6 +605,8 @@ class TestChatTracer:
 
 
 class TestTraceTrajectoryMaker:
+    # [CLASS DOC]
+    # Tests for TraceTrajectoryMaker with fake rollout and reward controllers.
     """Tests for TraceTrajectoryMaker (multi-turn tracing + reward pipeline)."""
 
     @staticmethod
@@ -520,6 +616,10 @@ class TestTraceTrajectoryMaker:
         rewards: list[float] | None = None,
         default_reward: float = 1.0,
     ) -> tuple[TraceTrajectoryMaker, FakeChatRolloutController]:
+        # [FUNCTION DOC]
+        # HELPER: Builds a TraceTrajectoryMaker over a FakeChatRolloutController and
+        # FakeChatRewardController and wires the maker's ChatTracer into the rollout
+        # controller. Returns (maker, rollout controller).
         """Build a ``TraceTrajectoryMaker`` with fake sub-controllers.
 
         Also wires the class-level ``ChatTracer`` into the fake rollout
@@ -538,6 +638,9 @@ class TestTraceTrajectoryMaker:
         return maker, rollout_ctrl
 
     def test_basic_trace_single_turn(self):
+        # [FUNCTION DOC]
+        # Checks a single turn yields one traced interaction with reward 1.0 stored on
+        # the TraceGenerationTask.
         """Single-turn trace should produce one traced interaction with reward."""
         maker, _ = self._make_trace_maker(
             n_turns=1,
@@ -554,6 +657,8 @@ class TestTraceTrajectoryMaker:
         assert interaction.reward == 1.0
 
     def test_multi_turn_trace(self):
+        # [FUNCTION DOC]
+        # Checks three turns produce three traced interactions.
         """Multi-turn trace should produce one interaction per turn."""
         maker, _ = self._make_trace_maker(
             n_turns=3,
@@ -568,6 +673,8 @@ class TestTraceTrajectoryMaker:
         assert len(task.trace_results) == 3
 
     def test_trace_rewards_assigned_correctly(self):
+        # [FUNCTION DOC]
+        # Checks per-turn rewards [0.5, 1.0] are assigned in order.
         """Each traced interaction should get its designated reward."""
         maker, _ = self._make_trace_maker(
             n_turns=2,
@@ -583,6 +690,8 @@ class TestTraceTrajectoryMaker:
         assert rewards == [0.5, 1.0]
 
     def test_trace_results_stored_in_task(self):
+        # [FUNCTION DOC]
+        # Checks trace_results goes from None to a dict after processing.
         """trace_results should be set on the TraceGenerationTask after processing."""
         maker, _ = self._make_trace_maker(n_turns=1, default_reward=0.0)
 
@@ -595,6 +704,8 @@ class TestTraceTrajectoryMaker:
         assert isinstance(task.trace_results, dict)
 
     def test_trace_with_plain_task_fallback(self):
+        # [FUNCTION DOC]
+        # Checks processing a plain ChatTask (not wrapped) does not crash.
         """process should not crash when given a plain ChatTask."""
         maker, _ = self._make_trace_maker(n_turns=1, default_reward=1.0)
 
@@ -603,6 +714,9 @@ class TestTraceTrajectoryMaker:
         # No assertion on trace_results — plain ChatTask doesn't store them.
 
     def test_trace_generation_task_create_from_chat_task(self):
+        # [FUNCTION DOC]
+        # Checks create_from_chat_task wraps the same ChatTask object with no trace
+        # results.
         """TraceGenerationTask.create_from_chat_task should wrap correctly."""
         chat_task = ChatTask.create_from_prompt("hello")
         trace_task = TraceGenerationTask.create_from_chat_task(chat_task)
@@ -611,6 +725,9 @@ class TestTraceTrajectoryMaker:
         assert trace_task.trace_results is None
 
     def test_trace_generation_task_scaffolding_output(self):
+        # [FUNCTION DOC]
+        # Checks create_scaffolding_output copies output_str, output_tokens and
+        # trace_results.
         """create_scaffolding_output should reflect generation_task fields and trace_results."""
         gen_task = GenerationTask(output_str="result text", output_tokens=[10, 20, 30])
         trace_task = TraceGenerationTask(generation_task=gen_task)
@@ -622,6 +739,9 @@ class TestTraceTrajectoryMaker:
         assert output.data == {"id-1": "fake_interaction"}
 
     def test_trace_generation_task_scaffolding_output_empty(self):
+        # [FUNCTION DOC]
+        # Checks create_scaffolding_output with no wrapped task returns empty
+        # text/tokens and None data.
         """create_scaffolding_output with no generation_task should return empty."""
         trace_task = TraceGenerationTask()
         output = trace_task.create_scaffolding_output()
@@ -630,10 +750,17 @@ class TestTraceTrajectoryMaker:
         assert output.data is None
 
     def test_no_reward_tasks_when_no_traces(self):
+        # [FUNCTION DOC]
+        # Checks that a rollout producing no completions yields empty trace results (and
+        # the tracer is registered on the instance).
         """If rollout produces no traceable outputs, reward step should be skipped."""
 
         class EmptyRolloutController(Controller):
+            # [CLASS DOC]
+            # Rollout controller that yields the tasks once without modifying them.
             def process(self, tasks, **kwargs):
+                # [FUNCTION DOC]
+                # Generator yielding tasks unchanged.
                 yield tasks
 
         reward_ctrl = FakeChatRewardController(default_reward=1.0)
@@ -650,6 +777,8 @@ class TestTraceTrajectoryMaker:
         assert len(task.trace_results) == 0
 
     def test_trace_interaction_model_response_tokens(self):
+        # [FUNCTION DOC]
+        # Checks each traced interaction carries that turn's input/output tokens.
         """Traced interactions should carry correct per-turn tokens."""
         maker, _ = self._make_trace_maker(
             n_turns=2,
@@ -677,9 +806,13 @@ class TestTraceTrajectoryMaker:
 
 
 class TestRLVRRewardController:
+    # [CLASS DOC]
+    # Tests for RLVRRewardController.
     """Tests for RLVRRewardController (reward computation)."""
 
     def test_compute_reward_correct(self):
+        # [FUNCTION DOC]
+        # Checks a completion containing the answer gets reward 1.0 and scores [1.0].
         """Should return 1.0 when completion contains the answer."""
         ctrl = RLVRRewardController(_simple_reward_fn)
         task = RLVRRewardTask(
@@ -695,6 +828,8 @@ class TestRLVRRewardController:
         assert ctrl.scores == [1.0]
 
     def test_compute_reward_wrong(self):
+        # [FUNCTION DOC]
+        # Checks a wrong completion gets reward 0.0.
         """Should return 0.0 when completion does not contain the answer."""
         ctrl = RLVRRewardController(_simple_reward_fn)
         task = RLVRRewardTask(
@@ -709,6 +844,8 @@ class TestRLVRRewardController:
         assert task.reward == 0.0
 
     def test_compute_reward_updates_interaction(self):
+        # [FUNCTION DOC]
+        # Checks the reward is propagated to the attached interaction.
         """Reward should be propagated to the attached interaction object."""
         ctrl = RLVRRewardController(_simple_reward_fn)
         interaction = InteractionWithTokenLogpReward(
@@ -733,6 +870,8 @@ class TestRLVRRewardController:
         assert interaction.reward == 1.0
 
     def test_compute_reward_batch(self):
+        # [FUNCTION DOC]
+        # Checks scores for a batch of three tasks are [1, 0, 1].
         """Should process multiple tasks and track all scores."""
         ctrl = RLVRRewardController(_simple_reward_fn)
         tasks = [
@@ -757,6 +896,9 @@ class TestRLVRRewardController:
         assert ctrl.scores == [1.0, 0.0, 1.0]
 
     def test_reward_from_generation_task(self):
+        # [FUNCTION DOC]
+        # Checks GenerationTask path uses task_data/prompt_str kwargs and stores reward
+        # in customized_result_fields.
         """Should handle GenerationTask via customized_result_fields path."""
         ctrl = RLVRRewardController(_simple_reward_fn)
         gen_task = GenerationTask(
@@ -782,9 +924,14 @@ class TestRLVRRewardController:
 
 
 class TestRLVRRewardTask:
+    # [CLASS DOC]
+    # Tests for RLVRRewardTask.create_from_generation_task.
     """Tests for RLVRRewardTask creation and data flow."""
 
     def test_create_from_generation_task(self):
+        # [FUNCTION DOC]
+        # Checks all fields (prompt, completion, tokens, logprobs, versions, task_data)
+        # are copied and reward is None.
         """create_from_generation_task should correctly populate all fields."""
         gen_task = GenerationTask(
             input_str="prompt",
@@ -811,6 +958,8 @@ class TestRLVRRewardTask:
         assert reward_task.reward is None
 
     def test_create_from_generation_task_no_output(self):
+        # [FUNCTION DOC]
+        # Checks None outputs/tokens become empty string/lists.
         """Should handle GenerationTask with None output gracefully."""
         gen_task = GenerationTask()
 
@@ -831,9 +980,14 @@ class TestRLVRRewardTask:
 
 
 class TestChatRewardTask:
+    # [CLASS DOC]
+    # Tests for ChatRewardTask.
     """Tests for ChatRewardTask creation."""
 
     def test_create_from_trace_result(self):
+        # [FUNCTION DOC]
+        # Checks create_from_trace_result stores the same interaction object and id with
+        # reward None.
         """create_from_trace_result should wrap an interaction correctly."""
         interaction = InteractionWithTokenLogpReward(
             model_response=ModelResponse(
@@ -858,9 +1012,14 @@ class TestChatRewardTask:
 
 
 class TestEndToEnd:
+    # [CLASS DOC]
+    # End-to-end style tests of full controller pipelines.
     """Integration tests that exercise the full scaffolding rollout pipeline."""
 
     def test_pipeline_e2e_tensor_dict_compatible(self):
+        # [FUNCTION DOC]
+        # Checks a pipeline interaction converts via to_tensor_dict with input_ids,
+        # loss_mask, logprobs and rewards == 1.0.
         """PipelineTrajectoryMaker interactions should be convertible to tensor dicts."""
         gen_ctrl = FakeGenerationController(
             output_str="42",
@@ -887,6 +1046,8 @@ class TestEndToEnd:
         assert td["rewards"].item() == 1.0
 
     def test_trace_e2e_multi_turn_with_rewards(self):
+        # [FUNCTION DOC]
+        # Checks a 3-turn trace gets rewards [0.0, 0.5, 1.0].
         """Full multi-turn TraceTrajectoryMaker E2E with per-turn rewards."""
         rollout_ctrl = FakeChatRolloutController(
             n_turns=3,
@@ -910,6 +1071,9 @@ class TestEndToEnd:
         assert rewards == [0.0, 0.5, 1.0]
 
     def test_trace_e2e_single_turn_generates_output(self):
+        # [FUNCTION DOC]
+        # Checks a single-turn trace yields one interaction with reward 1.0 and a
+        # ModelResponse.
         """Single-turn trace should produce a valid interaction with reward."""
         rollout_ctrl = FakeChatRolloutController(n_turns=1, responses=["42"])
         reward_ctrl = FakeChatRewardController(default_reward=1.0)

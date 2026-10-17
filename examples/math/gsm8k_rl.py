@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Example GRPO training on GSM8K using the OpenAI-compatible MathAgent workflow for both
+# training and evaluation.
 import sys
 
 from areal import PPOTrainer
@@ -7,6 +10,11 @@ from areal.utils.hf_utils import load_hf_tokenizer
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Entry point: loads GRPOConfig and tokenizer, builds train/test datasets, derives
+    # sampling kwargs (temperature, top_p, max_tokens, max_completion_tokens) from
+    # gconfig, uses a copy with temperature 0.6 for evaluation, and runs
+    # PPOTrainer.train with the MathAgent workflow.
     config, _ = load_expr_config(args, GRPOConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
 

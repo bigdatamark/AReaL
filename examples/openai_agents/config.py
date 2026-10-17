@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Config dataclass for the OpenAI Agents SDK RL example, extending GRPOConfig.
 from dataclasses import dataclass, field
 
 from areal.api.cli_args import GRPOConfig
@@ -5,6 +7,10 @@ from areal.api.cli_args import GRPOConfig
 
 @dataclass
 class AgentRLConfig(GRPOConfig):
+    # [CLASS DOC]
+    # GRPOConfig plus reward_fn_path (dotted path to reward fn, default GSM8K),
+    # agent_builder_path (dotted path to a function returning an OpenAI Agents SDK
+    # Agent) and agent_builder_kwargs (kwargs for that builder).
     reward_fn_path: str = field(
         default="areal.reward.gsm8k.gsm8k_reward_fn",
         metadata={

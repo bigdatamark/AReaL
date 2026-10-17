@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# AReaL-specific scaffolding Task dataclasses: RLVRRewardTask (verifiable reward on one
+# generation), TraceGenerationTask (wraps a chat/generation task whose LLM calls are
+# traced into AReaL interactions) and ChatRewardTask (reward for one traced
+# interaction). These are consumed by the controllers in controllers.py.
 """
 RLVR Tasks for Scaffolding Framework.
 
@@ -23,6 +28,10 @@ if TYPE_CHECKING:
 
 @dataclass
 class RLVRRewardTask(Task):
+    # [CLASS DOC]
+    # Reward task. Inputs: prompt_str, completion_str, input/output token ids, output
+    # logprobs and weight versions, task_data (ground truth, e.g. "answer"), optional
+    # interaction to receive the reward. Output: reward (None until computed).
     """Task for computing RLVR (verifiable) rewards.
 
     This task contains the necessary information to verify whether a generated
@@ -72,6 +81,11 @@ class RLVRRewardTask(Task):
         task_data: dict[str, Any],
         interaction: InteractionWithTokenLogpReward | None = None,
     ) -> RLVRRewardTask:
+        # [FUNCTION DOC]
+        # Builds an RLVRRewardTask from a finished GenerationTask: completion from
+        # output_str ("" if None), token lists copied (empty if None), output_logprobs /
+        # output_versions taken from customized_result_fields (empty if absent), plus
+        # prompt_str, task_data (by reference) and interaction.
         """Create a reward task from a completed generation task.
 
         Parameters
@@ -109,6 +123,10 @@ class RLVRRewardTask(Task):
 
 @dataclass
 class TraceGenerationTask(Task):
+    # [CLASS DOC]
+    # Tracing wrapper task: generation_task (ChatTask or GenerationTask to run) and
+    # trace_results (interaction id -> InteractionWithTokenLogpReward, filled by the
+    # tracing controller).
     """Task for tracing multi-turn generation with ChatTracer.
 
     This task wraps a ChatTask (or GenerationTask) for tracing purposes.
@@ -130,6 +148,9 @@ class TraceGenerationTask(Task):
 
     @staticmethod
     def create_from_prompt(prompt: str) -> TraceGenerationTask:
+        # [FUNCTION DOC]
+        # Returns a TraceGenerationTask wrapping a new ChatTask containing prompt as a
+        # single user message.
         """Create a TraceGenerationTask from a prompt string.
 
         Parameters
@@ -148,6 +169,8 @@ class TraceGenerationTask(Task):
 
     @staticmethod
     def create_from_chat_task(chat_task: ChatTask) -> TraceGenerationTask:
+        # [FUNCTION DOC]
+        # Returns a TraceGenerationTask wrapping the given ChatTask (no copy).
         """Create a TraceGenerationTask from an existing ChatTask.
 
         Parameters
@@ -163,6 +186,12 @@ class TraceGenerationTask(Task):
         return TraceGenerationTask(generation_task=chat_task)
 
     def create_scaffolding_output(self) -> ScaffoldingOutput:
+        # [FUNCTION DOC]
+        # Returns ScaffoldingOutput with text = wrapped task's output_str ("" if None),
+        # token_ids = its output_tokens (copied) and data = trace_results; if there is
+        # no wrapped task, empty text/tokens with data = trace_results.
+        # KNOWN ISSUE: For ChatTasks the worker appends replies to messages rather than
+        # setting output_str, so text is typically empty; callers should read data.
         """Create a ScaffoldingOutput from the trace results.
 
         Returns
@@ -184,6 +213,9 @@ class TraceGenerationTask(Task):
 
 @dataclass
 class ChatRewardTask(Task):
+    # [CLASS DOC]
+    # Reward task for one traced interaction: interaction, interaction_id and output
+    # reward.
     """Task for computing rewards on traced chat interactions.
 
     This task contains a traced InteractionWithTokenLogpReward and is used
@@ -213,6 +245,8 @@ class ChatRewardTask(Task):
         interaction_id: str,
         interaction: InteractionWithTokenLogpReward,
     ) -> ChatRewardTask:
+        # [FUNCTION DOC]
+        # Returns a ChatRewardTask with the given interaction and id (reward unset).
         """Create a ChatRewardTask from a trace result.
 
         Parameters

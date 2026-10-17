@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Example supervised fine-tuning script on GSM8K using SFTTrainer.
 import sys
 
 from areal import SFTTrainer
@@ -7,6 +9,9 @@ from areal.utils.hf_utils import load_hf_tokenizer
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Entry point: loads SFTConfig and tokenizer, builds train and test datasets via
+    # get_custom_dataset, and runs SFTTrainer.train inside its context manager.
     config, _ = load_expr_config(args, SFTConfig)
 
     tokenizer = load_hf_tokenizer(config.tokenizer_path)

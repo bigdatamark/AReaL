@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Example GRPO training script on the BOBA math dataset (local JSON file). Provides the
+# prompt-tokenization, prompt-extraction and reward hooks (referenced by dotted path)
+# for RLVRWorkflow and launches PPOTrainer.
 import sys
 
 from datasets import load_dataset
@@ -9,6 +13,12 @@ from areal.utils.hf_utils import apply_chat_template, load_hf_tokenizer
 
 
 def get_input_ids_fn(data, tokenizer, enable_thinking):
+    # [FUNCTION DOC]
+    # Converts a raw DeepSeek-style prompt string into chat-template token ids. Strips
+    # the literal "<｜User｜>", "<｜Assistant｜>" and "<think>" markers, wraps the remainder
+    # as a single user message and applies the tokenizer chat template with a generation
+    # prompt. Thinking mode is enabled if enable_thinking is true or the original text
+    # contained "<think>". Returns the list of token ids.
     user_token = "<｜User｜>"
     assistant_token = "<｜Assistant｜>"
     think_token = "<think>"
@@ -29,10 +39,16 @@ def get_input_ids_fn(data, tokenizer, enable_thinking):
 
 
 def data_extract_prompt_fn(data):
+    # [FUNCTION DOC]
+    # HELPER: Returns the "prompt" field of a dataset record.
     return data["prompt"]
 
 
 def get_boba_math_dataset(path, tokenizer):
+    # [FUNCTION DOC]
+    # Loads the train split of a JSON dataset at path via HuggingFace datasets and keeps
+    # only rows whose prompt encodes to at most 1024 tokens. Returns the filtered
+    # Dataset.
     dataset = load_dataset(
         path="json",
         split="train",
@@ -45,6 +61,13 @@ def get_boba_math_dataset(path, tokenizer):
 def boba_reward_fn(
     prompts, completions, prompt_ids, completion_ids, solutions, **kwargs
 ) -> float:
+    # [FUNCTION DOC]
+    # Reward function: returns 1.0 if the stringified completions match any of the
+    # solutions according to the math-verify worker, else 0.0. Per-solution and global
+    # exceptions are swallowed and yield 0.0. Extra args (prompts, ids, kwargs) are
+    # ignored.
+    # KNOWN ISSUE: Uses str(completions) on the whole argument rather than a single
+    # completion text; works only if completions is already one string.
     try:
         worker = get_math_verify_worker()
         for sol in solutions:
@@ -61,6 +84,10 @@ def boba_reward_fn(
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Entry point: loads GRPOConfig, tokenizer and the filtered BOBA train set, then
+    # trains with RLVRWorkflow using this module's hooks (thinking enabled) and no
+    # validation set or eval workflow.
     config, _ = load_expr_config(args, GRPOConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
 

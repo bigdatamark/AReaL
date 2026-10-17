@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# SFT profiling entry point that trains on deterministic synthetic long-context data
+# (default 128K tokens per sample) so different parallel layouts can be profiled on
+# identical inputs without external datasets. Defines fake-data config dataclasses, the
+# repeated-sample Dataset, and main().
 # SPDX-License-Identifier: Apache-2.0
 
 """SFT profile entrypoint with deterministic fake 128K samples."""
@@ -74,6 +79,10 @@ optimizes the same target span.
 
 @dataclass
 class ProfileDataConfig:
+    # [CLASS DOC]
+    # Dataclass of fake-data knobs: fake_seq_len (tokens per sample, default 131072),
+    # fake_dataset_size (number of logical samples, default 8), fake_loss_start_ratio
+    # (fraction of the sequence masked out of the loss as prompt, default 0.5).
     """Configuration for deterministic fake SFT profile data."""
 
     fake_seq_len: int = field(
@@ -94,12 +103,17 @@ class ProfileDataConfig:
 
 @dataclass
 class ProfileSFTConfig(SFTConfig):
+    # [CLASS DOC]
+    # SFTConfig with an extra "profile" field of type ProfileDataConfig (configurable
+    # from YAML/CLI).
     """SFT config extended with profile fake-data options."""
 
     profile: ProfileDataConfig = field(default_factory=ProfileDataConfig)
 
 
 class RepeatedProfileSFTDataset(Dataset):
+    # [CLASS DOC]
+    # torch Dataset returning the same pre-tokenized sample for every index.
     """Deterministic repeated long-context samples for profile comparisons."""
 
     def __init__(
@@ -110,6 +124,13 @@ class RepeatedProfileSFTDataset(Dataset):
         dataset_size: int,
         loss_start_ratio: float,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates seq_len >= 2, dataset_size >= 1 and 0 <= loss_start_ratio < 1
+        # (ValueError otherwise). Tokenizes the fixed fake text without special tokens
+        # (falling back to a single eos, pad, or 0 token if empty), tiles it to exactly
+        # seq_len tokens, and builds a loss mask that is 0 for the first loss_start
+        # tokens and 1 afterwards, where loss_start is int(seq_len * ratio) clamped to
+        # [1, seq_len - 1]. Stores both as long tensors.
         if seq_len < 2:
             raise ValueError("profile.fake_seq_len must be at least 2.")
         if dataset_size < 1:
@@ -136,9 +157,14 @@ class RepeatedProfileSFTDataset(Dataset):
         self._dataset_size = dataset_size
 
     def __len__(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the configured logical dataset size.
         return self._dataset_size
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Ignores idx and returns a dict with clones of the input_ids and loss_mask
+        # tensors (1-D, length seq_len).
         del idx
         return {
             "input_ids": self._input_ids.clone(),
@@ -147,6 +173,9 @@ class RepeatedProfileSFTDataset(Dataset):
 
 
 def build_profile_dataset(config: ProfileSFTConfig) -> RepeatedProfileSFTDataset:
+    # [FUNCTION DOC]
+    # Loads the tokenizer from config.tokenizer_path, builds RepeatedProfileSFTDataset
+    # from config.profile, logs the parameters at INFO and returns the dataset.
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
     dataset = RepeatedProfileSFTDataset(
         tokenizer,
@@ -164,6 +193,9 @@ def build_profile_dataset(config: ProfileSFTConfig) -> RepeatedProfileSFTDataset
 
 
 def main(args: list[str]) -> None:
+    # [FUNCTION DOC]
+    # Entry point: loads ProfileSFTConfig from argv, builds the fake dataset and runs
+    # SFTTrainer.train with no validation set. SFTTrainer is imported lazily.
     from areal import SFTTrainer
 
     config, _ = load_expr_config(args, ProfileSFTConfig)

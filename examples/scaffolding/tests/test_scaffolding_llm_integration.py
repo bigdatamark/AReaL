@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Integration tests (CPU, no LLM backend) driving ScaffoldingLlm end to end with a fake
+# worker: PipelineTrajectoryMaker and TraceTrajectoryMaker + MultiTurnChatController
+# pipelines via sync generate, generate_async + result/await, batched and concurrent
+# requests, calls from inside running asyncio/uvloop loops in other threads, and AReaL's
+# AsyncTaskRunner with shared or per-task ScaffoldingLlm instances (deadlock regression
+# tests). Async tests need pytest-asyncio; uvloop tests need uvloop.
+# KNOWN ISSUE: RLVRRewardController ignores ChatRewardTask, so in the
+# TraceTrajectoryMaker tests rewards are never computed; those tests only assert
+# completion. Several docstrings mention an own_loop/_get_loop design that
+# ScaffoldingLlm no longer has (it always runs its own loop thread).
 """Integration tests for ScaffoldingLlm with full controller pipelines.
 
 Tests verify that ScaffoldingLlm can correctly drive:
@@ -48,6 +59,9 @@ def _simple_reward_fn(
     completion_ids: list[int],
     **kwargs,
 ) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Test reward fn returning 1.0 if kwargs "answer" is non-empty and a
+    # substring of completions, else 0.0.
     """Deterministic reward: 1.0 if completion contains the answer, else 0.0."""
     answer = kwargs.get("answer", "")
     return 1.0 if answer and answer in completions else 0.0
@@ -59,6 +73,9 @@ def _simple_reward_fn(
 
 
 def _make_fake_completion(completion_id: str = "cmpl-001") -> MagicMock:
+    # [FUNCTION DOC]
+    # HELPER: Returns a MagicMock ChatCompletion with the given id, created=1000, one
+    # choice with content FAKE_OUTPUT_STR and finish_reason "stop".
     """Create a minimal fake ChatCompletion object."""
     completion = MagicMock()
     completion.id = completion_id
@@ -73,6 +90,9 @@ _chat_handler_call_count = 0
 
 
 class FakeChatWorker(Worker):
+    # [CLASS DOC]
+    # Fake Worker registered for GenerationTask and ChatTask via its class-level
+    # task_handlers.
     """Worker that handles ChatTask and GenerationTask without any backend.
 
     For ChatTask: appends an AssistantMessage and sets completion/tokens.
@@ -84,10 +104,16 @@ class FakeChatWorker(Worker):
         response_text: str = FAKE_OUTPUT_STR,
         output_tokens: list[int] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores response_text and output_tokens (default FAKE_OUTPUT_TOKENS).
         self.response_text = response_text
         self.output_tokens = output_tokens or FAKE_OUTPUT_TOKENS
 
     async def _handle_generation_task(self, task: GenerationTask) -> TaskStatus:
+        # [FUNCTION DOC]
+        # HELPER: Async handler filling a GenerationTask with response text, a copy of
+        # output tokens, default input tokens if None and finish_reason "stop"; returns
+        # SUCCESS.
         task.output_str = self.response_text
         task.output_tokens = list(self.output_tokens)
         if task.input_tokens is None:
@@ -96,6 +122,11 @@ class FakeChatWorker(Worker):
         return TaskStatus.SUCCESS
 
     async def _handle_chat_task(self, task: ChatTask) -> TaskStatus:
+        # [FUNCTION DOC]
+        # HELPER: Async handler for ChatTask: increments the module-global call counter,
+        # attaches a fake completion with id "cmpl-NNN" and the response text, sets
+        # output tokens, default input tokens and finish_reason, appends an
+        # AssistantMessage; returns SUCCESS.
         global _chat_handler_call_count
         _chat_handler_call_count += 1
 
@@ -124,6 +155,9 @@ class FakeChatWorker(Worker):
 
 @pytest.fixture(autouse=True)
 def _reset_chat_handler_count():
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture resetting the global chat handler call counter to 0 before
+    # each test.
     """Reset the global call counter before each test."""
     global _chat_handler_call_count
     _chat_handler_call_count = 0
@@ -132,6 +166,10 @@ def _reset_chat_handler_count():
 
 @pytest.fixture(autouse=True)
 def _reset_shared_tracer():
+    # [FUNCTION DOC]
+    # HELPER: Autouse fixture that after each test clears a class-level ChatTracer on
+    # TraceTrajectoryMaker if present (in practice none, since tracers are per
+    # instance).
     """Reset the class-level ChatTracer before each test."""
     yield
     tracer = TraceTrajectoryMaker.task_collections.get("chat_tracer")
@@ -145,9 +183,14 @@ def _reset_shared_tracer():
 
 
 class TestPipelineViaScaffoldingLlm:
+    # [CLASS DOC]
+    # Tests PipelineTrajectoryMaker driven by ScaffoldingLlm.
     """Test PipelineTrajectoryMaker running through ScaffoldingLlm."""
 
     def test_single_generation_sync(self):
+        # [FUNCTION DOC]
+        # Checks generate() returns a done result whose data has one interaction with
+        # reward 1.0 and the configured input tokens; always shuts down.
         """ScaffoldingLlm.generate() should produce a result with interactions."""
         worker = FakeChatWorker(response_text="The answer is 42.")
         reward_ctrl = RLVRRewardController(_simple_reward_fn)
@@ -184,6 +227,9 @@ class TestPipelineViaScaffoldingLlm:
             llm.shutdown()
 
     def test_single_generation_async(self):
+        # [FUNCTION DOC]
+        # Checks generate_async + result(timeout=10) completes with one interaction
+        # rewarded 1.0.
         """ScaffoldingLlm.generate_async() + await should work."""
         worker = FakeChatWorker(response_text="42")
         reward_ctrl = RLVRRewardController(_simple_reward_fn)
@@ -215,6 +261,9 @@ class TestPipelineViaScaffoldingLlm:
             llm.shutdown()
 
     def test_batch_generation(self):
+        # [FUNCTION DOC]
+        # Checks generate() with three prompts returns three done results each with
+        # data.
         """ScaffoldingLlm.generate() with a list of prompts should work."""
         worker = FakeChatWorker(response_text="42")
         reward_ctrl = RLVRRewardController(_simple_reward_fn)
@@ -247,6 +296,9 @@ class TestPipelineViaScaffoldingLlm:
 
 
 class TestMultiTurnViaScaffoldingLlm:
+    # [CLASS DOC]
+    # Tests MultiTurnChatController + TraceTrajectoryMaker driven by ScaffoldingLlm (the
+    # chat scaffolding workflow architecture).
     """Test MultiTurnChatController + TraceTrajectoryMaker via ScaffoldingLlm.
 
     This reproduces the exact architecture used by ChatScaffoldingWorkflow.
@@ -258,6 +310,11 @@ class TestMultiTurnViaScaffoldingLlm:
         max_turns: int = 2,
         reward_fn=None,
     ) -> tuple[ScaffoldingLlm, MultiTurnChatController, TraceTrajectoryMaker]:
+        # [FUNCTION DOC]
+        # HELPER: Builds a fake worker, NativeGenerationController, RLVRRewardController
+        # (given or default reward fn), MultiTurnChatController ("Try again."
+        # reflection) and TraceTrajectoryMaker, and a ScaffoldingLlm over them. Returns
+        # (llm, multi-turn controller, trace maker).
         """Build the full ChatScaffoldingWorkflow pipeline."""
         worker = FakeChatWorker(response_text=response_text)
         gen_ctrl = NativeGenerationController(
@@ -280,6 +337,8 @@ class TestMultiTurnViaScaffoldingLlm:
         return llm, multi_turn_ctrl, trace_maker
 
     def test_single_turn_sync(self):
+        # [FUNCTION DOC]
+        # Checks a single-turn chat completes and produces some output.
         """Single-turn chat via ScaffoldingLlm.generate() should work."""
         llm, multi_turn_ctrl, _ = self._build_llm(response_text="42", max_turns=1)
         try:
@@ -299,6 +358,9 @@ class TestMultiTurnViaScaffoldingLlm:
             llm.shutdown()
 
     def test_multi_turn_sync(self):
+        # [FUNCTION DOC]
+        # Checks a 2-turn chat completes and the worker's chat handler ran at least
+        # twice.
         """Multi-turn (2-turn) chat via ScaffoldingLlm.generate() should work."""
         llm, multi_turn_ctrl, _ = self._build_llm(response_text="42", max_turns=2)
         try:
@@ -317,6 +379,8 @@ class TestMultiTurnViaScaffoldingLlm:
             llm.shutdown()
 
     def test_multi_turn_async_result(self):
+        # [FUNCTION DOC]
+        # Checks generate_async + result(timeout) completes for 2 turns.
         """generate_async() + result() should complete for multi-turn."""
         llm, multi_turn_ctrl, _ = self._build_llm(response_text="42", max_turns=2)
         try:
@@ -331,6 +395,8 @@ class TestMultiTurnViaScaffoldingLlm:
             llm.shutdown()
 
     def test_trace_results_available(self):
+        # [FUNCTION DOC]
+        # Checks trace data, if present, contains at least one interaction.
         """Trace results should be accessible via ScaffoldingOutput.data."""
         llm, multi_turn_ctrl, _ = self._build_llm(response_text="42", max_turns=1)
         try:
@@ -351,6 +417,8 @@ class TestMultiTurnViaScaffoldingLlm:
             llm.shutdown()
 
     def test_multiple_concurrent_requests(self):
+        # [FUNCTION DOC]
+        # Checks five batched requests all complete.
         """Multiple concurrent requests should all complete."""
         llm, multi_turn_ctrl, _ = self._build_llm(response_text="42", max_turns=1)
         try:
@@ -366,10 +434,17 @@ class TestMultiTurnViaScaffoldingLlm:
             llm.shutdown()
 
     def test_clone_isolation(self):
+        # [FUNCTION DOC]
+        # Checks two sequential requests both complete with per-request controller
+        # clones.
+        # KNOWN ISSUE: The captured completions list is never asserted, so isolation is
+        # not actually verified.
         """Each request should get an independent controller clone."""
         call_messages = []
 
         def _capture_reward(prompt, completions, prompt_ids, completion_ids, **kw):
+            # [FUNCTION DOC]
+            # HELPER: Reward fn that records completions and returns 1.0.
             call_messages.append(completions)
             return 1.0
 
@@ -396,9 +471,13 @@ class TestMultiTurnViaScaffoldingLlm:
 
 
 class TestEdgeCases:
+    # [CLASS DOC]
+    # Edge cases for ScaffoldingLlm usage.
     """Edge cases and error scenarios."""
 
     def test_empty_messages(self):
+        # [FUNCTION DOC]
+        # Checks a multi-turn controller with empty messages still completes.
         """Controller with empty messages should not crash."""
         worker = FakeChatWorker(response_text="hello")
         gen_ctrl = NativeGenerationController(sampling_params={"max_tokens": 10})
@@ -425,6 +504,9 @@ class TestEdgeCases:
             llm.shutdown()
 
     def test_shutdown_is_safe(self):
+        # [FUNCTION DOC]
+        # Checks constructing then immediately shutting down ScaffoldingLlm raises
+        # nothing.
         """Calling shutdown() should not raise."""
         worker = FakeChatWorker()
         gen_ctrl = NativeGenerationController(sampling_params={"max_tokens": 10})
@@ -447,6 +529,9 @@ class TestEdgeCases:
 
 
 class TestAsyncContextScaffoldingLlm:
+    # [CLASS DOC]
+    # Tests calling ScaffoldingLlm from coroutines running on an existing asyncio loop
+    # (pytest-asyncio).
     """Tests that run ScaffoldingLlm from within an existing asyncio event loop.
 
     This reproduces the actual deployment scenario: the rollout framework's
@@ -457,6 +542,9 @@ class TestAsyncContextScaffoldingLlm:
 
     @pytest.mark.asyncio
     async def test_pipeline_in_async_context(self):
+        # [FUNCTION DOC]
+        # Checks awaiting generate_async (with wait_for 10s) from an async test yields
+        # one interaction rewarded 1.0.
         """PipelineTrajectoryMaker should work when called from async context."""
         worker = FakeChatWorker(response_text="The answer is 42.")
         gen_ctrl = NativeGenerationController(sampling_params={"max_tokens": 100})
@@ -489,6 +577,8 @@ class TestAsyncContextScaffoldingLlm:
 
     @pytest.mark.asyncio
     async def test_multi_turn_in_async_context(self):
+        # [FUNCTION DOC]
+        # Checks a 2-turn traced chat completes when awaited from an async context.
         """MultiTurnChatController + TraceTrajectoryMaker in async context."""
         worker = FakeChatWorker(response_text="42")
         gen_ctrl = NativeGenerationController(sampling_params={"max_tokens": 100})
@@ -519,6 +609,9 @@ class TestAsyncContextScaffoldingLlm:
 
     @pytest.mark.asyncio
     async def test_multiple_async_requests(self):
+        # [FUNCTION DOC]
+        # Checks five concurrent generate_async requests awaited via gather of aresult()
+        # all complete with data.
         """Multiple concurrent async requests from within async context."""
         worker = FakeChatWorker(response_text="42")
         gen_ctrl = NativeGenerationController(sampling_params={"max_tokens": 100})
@@ -560,6 +653,9 @@ class TestAsyncContextScaffoldingLlm:
 
 
 class TestUvloopThreadScaffoldingLlm:
+    # [CLASS DOC]
+    # Tests reproducing a uvloop running in a background thread with concurrent
+    # coroutines sharing a lazily created ScaffoldingLlm (former deadlock scenario).
     """Tests that reproduce the exact production deployment architecture.
 
     AsyncTaskRunner runs a uvloop in a separate thread. Multiple coroutines
@@ -575,6 +671,9 @@ class TestUvloopThreadScaffoldingLlm:
         response_text: str = FAKE_OUTPUT_STR,
         max_turns: int = 2,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Builds the fake worker, controllers and TraceTrajectoryMaker; returns
+        # (worker, multi-turn controller, trace maker).
         """Build shared components (simulating ChatScaffoldingWorkflow.__init__)."""
         worker = FakeChatWorker(response_text=response_text)
         gen_ctrl = NativeGenerationController(
@@ -593,6 +692,10 @@ class TestUvloopThreadScaffoldingLlm:
         return worker, multi_turn_ctrl, trace_maker
 
     def test_uvloop_lazy_init_single_request(self):
+        # [FUNCTION DOC]
+        # Runs one request on a uvloop in a new thread (ScaffoldingLlm created inside
+        # the coroutine), asserting the thread finishes within 30s, re-raising captured
+        # errors, and checking the result is done.
         """ScaffoldingLlm lazily initialized on uvloop should handle one request."""
         import threading
 
@@ -608,6 +711,9 @@ class TestUvloopThreadScaffoldingLlm:
         error_holder = {}
 
         async def run_on_uvloop():
+            # [FUNCTION DOC]
+            # HELPER: Coroutine creating the ScaffoldingLlm, awaiting one request (10s
+            # timeout), storing the result or the error, and shutting down.
             try:
                 # Lazy init ScaffoldingLlm inside the uvloop (like _lazy_init_scaffolding)
                 llm = ScaffoldingLlm(
@@ -624,6 +730,9 @@ class TestUvloopThreadScaffoldingLlm:
                 error_holder["error"] = e
 
         def thread_fn():
+            # [FUNCTION DOC]
+            # HELPER: Thread target running the coroutine on a fresh uvloop then closing
+            # it.
             loop = uvloop.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(run_on_uvloop())
@@ -640,6 +749,9 @@ class TestUvloopThreadScaffoldingLlm:
         assert result_holder["result"]._done is True
 
     def test_uvloop_concurrent_coroutines_shared_llm(self):
+        # [FUNCTION DOC]
+        # Runs 10 concurrent simulated episodes sharing one ScaffoldingLlm on a uvloop
+        # thread; asserts no deadlock (60s), no errors, and all 10 results done.
         """Multiple concurrent coroutines on uvloop sharing one ScaffoldingLlm.
 
         This is the exact scenario from the training pipeline:
@@ -661,6 +773,9 @@ class TestUvloopThreadScaffoldingLlm:
         errors = {}
 
         async def run_concurrent():
+            # [FUNCTION DOC]
+            # HELPER: Coroutine creating the shared ScaffoldingLlm and gathering the
+            # simulated episodes, then shutting down.
             # Lazy init ScaffoldingLlm inside uvloop (like _lazy_init_scaffolding)
             llm = ScaffoldingLlm(
                 trace_maker,
@@ -669,6 +784,10 @@ class TestUvloopThreadScaffoldingLlm:
             try:
 
                 async def simulate_arun_episode(idx: int):
+                    # [FUNCTION DOC]
+                    # HELPER: Sets per-episode messages on the shared prototype
+                    # controller, submits and awaits a request (10s), recording result
+                    # or error by index.
                     """Simulate what arun_episode does."""
                     try:
                         # Each coroutine sets per-episode data and calls generate_async
@@ -694,6 +813,8 @@ class TestUvloopThreadScaffoldingLlm:
                 llm.shutdown()
 
         def thread_fn():
+            # [FUNCTION DOC]
+            # HELPER: Thread target running run_concurrent on a fresh uvloop.
             loop = uvloop.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(run_concurrent())
@@ -713,6 +834,9 @@ class TestUvloopThreadScaffoldingLlm:
             assert result._done is True, f"Result {idx} not done"
 
     def test_uvloop_high_concurrency(self):
+        # [FUNCTION DOC]
+        # Stress test: 50 concurrent single-turn episodes on a uvloop thread; asserts no
+        # deadlock, no errors and 50 completions.
         """Stress test: 50 concurrent coroutines on uvloop (closer to 256 in prod)."""
         import threading
 
@@ -729,6 +853,9 @@ class TestUvloopThreadScaffoldingLlm:
         errors = []
 
         async def run_stress():
+            # [FUNCTION DOC]
+            # HELPER: Coroutine creating the ScaffoldingLlm and gathering 50 episodes,
+            # then shutting down.
             llm = ScaffoldingLlm(
                 trace_maker,
                 {NativeGenerationController.WorkerTag.GENERATION: worker},
@@ -736,6 +863,9 @@ class TestUvloopThreadScaffoldingLlm:
             try:
 
                 async def single_episode(idx: int):
+                    # [FUNCTION DOC]
+                    # HELPER: Submits and awaits one request (15s), asserts done and
+                    # increments the counter; records exceptions.
                     try:
                         result = llm.generate_async(f"prompt_{idx}")
                         await asyncio.wait_for(result, timeout=15.0)
@@ -751,6 +881,8 @@ class TestUvloopThreadScaffoldingLlm:
                 llm.shutdown()
 
         def thread_fn():
+            # [FUNCTION DOC]
+            # HELPER: Thread target running run_stress on a fresh uvloop.
             loop = uvloop.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(run_stress())
@@ -772,6 +904,9 @@ class TestUvloopThreadScaffoldingLlm:
 
 
 class TestAsyncTaskRunnerScaffoldingLlm:
+    # [CLASS DOC]
+    # Tests using the real AsyncTaskRunner (uvloop background thread) with one shared,
+    # lazily created ScaffoldingLlm.
     """Tests using the real AsyncTaskRunner to reproduce the production architecture.
 
     This is the closest reproduction of the actual training pipeline:
@@ -782,6 +917,9 @@ class TestAsyncTaskRunnerScaffoldingLlm:
     """
 
     def test_async_task_runner_with_scaffolding_llm(self):
+        # [FUNCTION DOC]
+        # Submits 10 simulated episodes to an AsyncTaskRunner, waits up to 30s and
+        # checks all report done; always shuts down the LLM and destroys the runner.
         """Full integration test using AsyncTaskRunner + shared ScaffoldingLlm."""
         from areal.infra.async_task_runner import AsyncTaskRunner
 
@@ -809,6 +947,10 @@ class TestAsyncTaskRunnerScaffoldingLlm:
         }
 
         async def simulate_arun_episode(episode_idx: int) -> dict:
+            # [FUNCTION DOC]
+            # HELPER: Lazily creates the shared ScaffoldingLlm, sets per-episode
+            # messages on the prototype controller, awaits generate_async and returns
+            # {"episode", "done"}.
             """Simulate ChatScaffoldingWorkflow.arun_episode."""
             # Lazy init (like _lazy_init_scaffolding)
             if shared_state["scaffolding_llm"] is None:
@@ -857,6 +999,8 @@ class TestAsyncTaskRunnerScaffoldingLlm:
             runner.destroy()
 
     def test_async_task_runner_high_concurrency(self):
+        # [FUNCTION DOC]
+        # Same as above with 50 tasks, max_turns 1 and a 60s wait.
         """Stress test: 50 concurrent tasks via AsyncTaskRunner."""
         from areal.infra.async_task_runner import AsyncTaskRunner
 
@@ -881,6 +1025,9 @@ class TestAsyncTaskRunnerScaffoldingLlm:
         }
 
         async def simulate_arun_episode(episode_idx: int) -> dict:
+            # [FUNCTION DOC]
+            # HELPER: Lazily creates the shared ScaffoldingLlm, sets per-episode data,
+            # awaits one request and returns {"episode", "done"}.
             if shared_state["scaffolding_llm"] is None:
                 shared_state["scaffolding_llm"] = ScaffoldingLlm(
                     shared_state["trace_maker"],
@@ -929,6 +1076,9 @@ class TestAsyncTaskRunnerScaffoldingLlm:
 
 
 class TestPerTaskScaffoldingLlm:
+    # [CLASS DOC]
+    # Tests where each task builds its own controllers and ScaffoldingLlm
+    # (per-workflow-instance path).
     """Tests where EACH task creates its own ScaffoldingLlm instance.
 
     In the RolloutController path, RemoteInfEngine._resolve_workflow() creates
@@ -941,6 +1091,10 @@ class TestPerTaskScaffoldingLlm:
     """
 
     def test_multiple_llm_instances_on_async_task_runner(self):
+        # [FUNCTION DOC]
+        # Submits 10 tasks to AsyncTaskRunner, each creating its own ScaffoldingLlm;
+        # checks all complete within 30s; shuts down all instances (ignoring errors) and
+        # destroys the runner.
         """Each task creates its own ScaffoldingLlm — deadlock reproduction."""
         from areal.infra.async_task_runner import AsyncTaskRunner
 
@@ -948,6 +1102,9 @@ class TestPerTaskScaffoldingLlm:
         llm_instances = []
 
         async def simulate_arun_episode_per_instance(episode_idx: int) -> dict:
+            # [FUNCTION DOC]
+            # HELPER: Builds a fresh controller hierarchy and ScaffoldingLlm (recorded
+            # in llm_instances), awaits one request and returns {"episode", "done"}.
             """Each task creates its OWN ScaffoldingLlm (like _resolve_workflow)."""
             # Create fresh controller hierarchy (like workflow.__init__ + build_scaffolding_llm)
             gen_ctrl = NativeGenerationController(
@@ -1001,6 +1158,8 @@ class TestPerTaskScaffoldingLlm:
             runner.destroy()
 
     def test_many_llm_instances_on_async_task_runner(self):
+        # [FUNCTION DOC]
+        # Same as above with 50 tasks and a 60s wait.
         """50 per-task ScaffoldingLlm instances — stress test."""
         from areal.infra.async_task_runner import AsyncTaskRunner
 
@@ -1008,6 +1167,9 @@ class TestPerTaskScaffoldingLlm:
         llm_instances = []
 
         async def simulate_arun_episode_per_instance(episode_idx: int) -> dict:
+            # [FUNCTION DOC]
+            # HELPER: Builds fresh controllers and a ScaffoldingLlm, awaits one request
+            # and returns {"episode", "done"}.
             gen_ctrl = NativeGenerationController(sampling_params={"max_tokens": 50})
             reward_ctrl = RLVRRewardController(_simple_reward_fn)
             multi_turn_ctrl = MultiTurnChatController(

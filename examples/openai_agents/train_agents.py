@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# RL training example for agents built with the OpenAI Agents SDK: the agent runs
+# against an ArealOpenAI client (so its LLM calls are captured), the final output is
+# rewarded, and PPOTrainer trains on the exported interactions.
 from agents import Agent as OpenAIAgent
 from agents import ModelSettings, OpenAIProvider, RunConfig
 from agents import Runner as OpenAIRunner
@@ -16,6 +20,8 @@ from areal.utils.hf_utils import load_hf_tokenizer
 
 
 class OpenAIAgentWrapper:
+    # [CLASS DOC]
+    # Builds and runs one OpenAI Agents SDK agent per episode and computes its reward.
     def __init__(
         self,
         agent_builder_path: str,
@@ -24,6 +30,10 @@ class OpenAIAgentWrapper:
         temperature: float = 1.0,
         max_tokens: int = 512,
     ):
+        # [FUNCTION DOC]
+        # Imports the agent builder and reward function from dotted paths (import errors
+        # propagate), wraps the reward in AsyncRewardWrapper and stores
+        # temperature/max_tokens for model settings.
         self.agent_builder = import_from_string(agent_builder_path)
         self.agent_builder_kwargs = agent_builder_kwargs
         self.async_reward_fn = AsyncRewardWrapper(import_from_string(reward_fn_path))
@@ -31,6 +41,13 @@ class OpenAIAgentWrapper:
         self.max_tokens = max_tokens
 
     async def run_agent(self, data, client: ArealOpenAI):
+        # [FUNCTION DOC]
+        # Builds a fresh agent, runs it with a RunConfig whose provider uses the given
+        # ArealOpenAI client (tracing disabled, given temperature/max_tokens) on the
+        # content of the last message in data["messages"]. Computes the reward from
+        # final_output and data["answer"], passing prompt/prompt_ids/completion_ids
+        # (None if absent) plus all other data fields as kwargs. Sets it as the client's
+        # last reward and returns it.
         agent: OpenAIAgent = self.agent_builder(**self.agent_builder_kwargs)
         run_config = RunConfig(
             model_provider=OpenAIProvider(openai_client=client),
@@ -61,6 +78,8 @@ class OpenAIAgentWrapper:
 
 
 class OpenAIAgentWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow that wraps OpenAIAgentWrapper.
     def __init__(
         self,
         agent_builder_path: str,
@@ -69,6 +88,9 @@ class OpenAIAgentWorkflow(RolloutWorkflow):
         gconfig: GenerationHyperparameters,
         tokenizer: PreTrainedTokenizerFast | str,
     ):
+        # [FUNCTION DOC]
+        # Loads the tokenizer if given as a path, derives gconfig with stop/pad token
+        # ids, and builds the agent wrapper using gconfig temperature and max_tokens.
         if isinstance(tokenizer, str):
             from areal.utils.hf_utils import load_hf_tokenizer
 
@@ -86,6 +108,10 @@ class OpenAIAgentWorkflow(RolloutWorkflow):
         )
 
     async def arun_episode(self, engine, data):
+        # [FUNCTION DOC]
+        # Creates an ArealOpenAI client (qwen25 tool-call parser), runs the agent, logs
+        # the reward scalar, applies a 0.9 turn discount and returns interactions
+        # exported in "individual" style.
         client = ArealOpenAI(
             engine=engine, tokenizer=self.tokenizer, tool_call_parser="qwen25"
         )
@@ -103,6 +129,9 @@ class OpenAIAgentWorkflow(RolloutWorkflow):
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Entry point: loads AgentRLConfig, tokenizer and datasets, and trains with
+    # OpenAIAgentWorkflow using identical kwargs for training and evaluation.
     config, _ = load_expr_config(args, AgentRLConfig)
 
     tokenizer = load_hf_tokenizer(config.tokenizer_path)

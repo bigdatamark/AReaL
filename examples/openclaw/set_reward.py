@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# CLI script: assigns a reward to the last (or specified) interaction of an active
+# OpenClaw RL session via POST <gateway>/rl/set_reward with the session API key. Uses
+# helpers from _fmt.
 """Set reward for the last interaction in an active session.
 
 Requires the session API key obtained from ``start_session.py``.
@@ -19,6 +23,11 @@ from _fmt import die, dim, header, info, show_request, show_response, success
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point: parses gateway_url, required --api-key, --reward (env REWARD, default
+    # 1.0) and optional --interaction-id; POSTs the reward body with Bearer auth (10s
+    # timeout), prints request/response, exits 1 on network error or non-200, else
+    # prints success.
     parser = argparse.ArgumentParser(
         description="Set reward for an interaction in an AReaL RL session"
     )

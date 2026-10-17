@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Standalone GSM8K evaluation script: starts remote rollout inference servers (SGLang or
+# vLLM) through a scheduler, submits every test-set item through RLVRWorkflow with the
+# GSM8K reward, waits for completion and logs aggregate stats.
 import sys
 
 from areal.api.alloc_mode import ModelAllocation
@@ -14,6 +18,15 @@ logger = logging.getLogger("GSM8KEval")
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Entry point. Loads GRPOConfig, sets up file logging to <fileroot>/eval.log, seeds
+    # RNG, parses the rollout allocation, and builds a Local/Ray/Slurm scheduler
+    # (ValueError for unknown type). Builds the test dataloader (rank 0, world size 1),
+    # disables staleness limits (max_head_offpolicyness huge), selects
+    # RemoteSGLangEngine or RemotevLLMEngine with matching server args (ValueError for
+    # other backends), creates a rollout controller, submits each item with group_size
+    # n_samples, waits for all with no timeout, logs tabulated stats, and always
+    # destroys the controller.
     config, _ = load_expr_config(args, GRPOConfig)
     logging.setup_file_logging(f"{config.cluster.fileroot}/eval.log")
 

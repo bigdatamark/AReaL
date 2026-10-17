@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# CLI script: interactive terminal chat against an already-running Hermes Agent Service
+# gateway. Each user line is POSTed as one turn to the gateway's /v1/responses endpoint;
+# optional inference-routing fields (inf_base_url, inf_model, session_api_key) are
+# attached so the turn's LLM calls are captured for RL training. Network I/O via httpx;
+# reads stdin, prints to stdout.
 # SPDX-License-Identifier: Apache-2.0
 
 """Interactive conversation loop against a running Hermes Agent Service.
@@ -38,6 +44,19 @@ async def interactive_loop(
     admin_key: str,
     inference: dict[str, str] | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Runs the REPL loop. Inputs: gateway_addr (base URL without trailing slash),
+    # admin_key (sent as Bearer token), inference (optional dict merged verbatim into
+    # every request payload). Creates a session id "hermes-<unix time>" used as the
+    # "user" field so all turns share one conversation. Loops reading input("You: ");
+    # stops on EOF/Ctrl-C or quit/exit/q; skips blank lines. Payload: input list with
+    # one message, model "hermes-agent", user=session id, plus inference fields. On
+    # status "completed" prints each output_text block of message items and "[tool]
+    # name" for function_call items; on an "error" key prints the first 200 chars of its
+    # message. Uses 120s timeout. Returns None.
+    # KNOWN ISSUE: Non-JSON responses (e.g. HTTP 5xx HTML) make resp.json() raise and
+    # abort the loop; HTTP status is never checked. Blocking input() is called inside
+    # the async function, blocking the event loop.
     session_key = f"hermes-{int(time.time())}"
     print(f"Session: {session_key}")
     if inference:
@@ -84,6 +103,12 @@ async def interactive_loop(
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point: parses CLI args (positional gateway_addr, required --admin-api-key,
+    # optional --inf-base-url, --inf-model, --session-api-key). If either inference URL
+    # or session key is given, both are required (otherwise raises SystemExit); builds
+    # the inference dict (URL trailing slash stripped). Runs interactive_loop via
+    # asyncio.run.
     parser = argparse.ArgumentParser(
         description="Interactive chat against a running Hermes Agent Service"
     )

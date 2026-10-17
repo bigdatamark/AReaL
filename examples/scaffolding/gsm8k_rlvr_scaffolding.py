@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# GSM8K RLVR training example built on the scaffolding framework: a ScaffoldingWorkflow
+# subclass composes a generation controller and an RLVR reward controller into a
+# pipeline, and main() runs PPOTrainer with it.
 """
 RLVR (Reinforcement Learning with Verifiable Rewards) Example using Scaffolding Framework.
 
@@ -31,6 +35,9 @@ from .workflow import ScaffoldingWorkflow
 
 
 class GSM8KScaffoldingWorkflow(ScaffoldingWorkflow):
+    # [CLASS DOC]
+    # ScaffoldingWorkflow subclass customizing how the ScaffoldingLlm is built for
+    # GSM8K.
     """ScaffoldingWorkflow customized for GSM8K RLVR training.
 
     Demonstrates overriding ``build_scaffolding_llm`` to control how the
@@ -38,6 +45,13 @@ class GSM8KScaffoldingWorkflow(ScaffoldingWorkflow):
     """
 
     def build_scaffolding_llm(self, engine: InferenceEngine) -> ScaffoldingLlm:
+        # [FUNCTION DOC]
+        # Creates (and stores on self) a NativeGenerationController with max_tokens =
+        # gconfig.max_new_tokens and temperature = gconfig.temperature (1.0 if falsy, so
+        # 0 is not honored), an RLVRRewardController over self.reward_fn and a
+        # PipelineTrajectoryMaker chaining them. Returns a ScaffoldingLlm using that
+        # maker with self.worker registered under the GENERATION worker tag. Relies on
+        # gconfig, reward_fn and worker set by the base workflow.
         sampling_params = {
             "max_tokens": self.gconfig.max_new_tokens,
             "temperature": self.gconfig.temperature or 1.0,
@@ -56,6 +70,10 @@ class GSM8KScaffoldingWorkflow(ScaffoldingWorkflow):
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Entry point: loads GRPOConfig and tokenizer, builds GSM8K train/test datasets, and
+    # trains with GSM8KScaffoldingWorkflow (GSM8K reward, thinking disabled), using
+    # temperature 0.6 for evaluation.
     """Main entry point for RLVR training with scaffolding."""
     config, _ = load_expr_config(args, GRPOConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)

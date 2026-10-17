@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# AReaL-specific scaffolding controllers and task collections that turn scaffolding
+# rollouts into RL training data: verifiable-reward and LLM-judge reward controllers, a
+# generate-then-reward pipeline (PipelineTrajectoryMaker), a multi-turn
+# chat-with-reflection controller, ChatTracer (records each ChatTask turn as an
+# InteractionWithTokenLogpReward), and TraceTrajectoryMaker (runs a rollout controller
+# under ChatTracer and rewards the traced interactions). Rewards are written onto
+# interaction objects that are exported as the ScaffoldingOutput data.
 """
 RLVR Controllers for Scaffolding Framework.
 
@@ -48,6 +56,12 @@ logger = logging.getLogger("RLVRControllers")
 
 
 class RLVRRewardController(Controller):
+    # [CLASS DOC]
+    # Reward controller for verifiable rewards. Computes reward_fn(prompt_str,
+    # completion_str, input_tokens, output_tokens, **task_data) for RLVRRewardTask (sets
+    # task.reward and interaction.reward) or GenerationTask (stores in
+    # customized_result_fields["reward"]), collecting all values in self.scores. Exposes
+    # a REWARD worker tag but computes locally.
     """Controller for computing RLVR (verifiable) rewards.
 
     This controller processes RLVRRewardTask objects and computes rewards
@@ -75,11 +89,16 @@ class RLVRRewardController(Controller):
     """
 
     class WorkerTag(Enum):
+        # [CLASS DOC]
+        # Enum with the worker tag REWARD = "rlvr_reward".
         """Worker tag for reward computation."""
 
         REWARD = "rlvr_reward"
 
     def __init__(self, reward_fn: Callable[..., Any]):
+        # [FUNCTION DOC]
+        # Stores reward_fn, wraps it in AsyncRewardWrapper for the async path, and sets
+        # scores to None.
         """Initialize the RLVR reward controller.
 
         Parameters
@@ -93,6 +112,10 @@ class RLVRRewardController(Controller):
         self.scores: list[float] | None = None
 
     def __deepcopy__(self, memo):
+        # [FUNCTION DOC]
+        # Deep-copy hook: returns a fresh RLVRRewardController with the same reward_fn
+        # (avoids copying the non-copyable wrapper state) and registers it in memo.
+        # Other state (scores, task_collections) is not copied.
         """Create a new RLVRRewardController with the same reward function.
 
         ``AsyncRewardWrapper`` contains ``ProcessPoolExecutor`` and
@@ -106,6 +129,13 @@ class RLVRRewardController(Controller):
         return new
 
     def process(self, tasks: list[Task], **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Generator. Tags every task with REWARD, resets scores, computes rewards
+        # synchronously (blocking the caller, possibly the scheduler's event loop) for
+        # RLVRRewardTask and GenerationTask instances as described in the class doc
+        # (kwargs forwarded to the generation-task path), then yields the task list
+        # once. Other task types are skipped (no score appended). Reward function
+        # exceptions propagate.
         """Process reward tasks and compute rewards.
 
         This method computes rewards for each task using the reward function.
@@ -151,6 +181,9 @@ class RLVRRewardController(Controller):
         yield tasks
 
     def _compute_reward(self, task: RLVRRewardTask) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Calls reward_fn with the task's prompt, completion, token lists and
+        # task_data kwargs; returns the result as float.
         """Compute reward for an RLVR reward task.
 
         Parameters
@@ -175,6 +208,10 @@ class RLVRRewardController(Controller):
     def _compute_reward_from_generation_task(
         self, task: GenerationTask, **kwargs
     ) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Calls reward_fn with kwargs["prompt_str"] (default task.input_str or
+        # ""), output_str or "", copies of input/output tokens and kwargs["task_data"]
+        # (default {}) as kwargs; returns float.
         """Compute reward from a generation task.
 
         Parameters
@@ -202,6 +239,11 @@ class RLVRRewardController(Controller):
         return float(reward)
 
     async def aprocess(self, tasks: list[Task], **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Async variant of process (a coroutine, not a generator): tags tasks, resets
+        # scores, awaits AsyncRewardWrapper for each RLVRRewardTask, sets task.reward /
+        # interaction.reward, and returns the task list. GenerationTasks are ignored
+        # here.
         """Process reward tasks asynchronously.
 
         This method computes rewards asynchronously using AsyncRewardWrapper.
@@ -237,6 +279,9 @@ class RLVRRewardController(Controller):
         return tasks
 
     async def _acompute_reward(self, task: RLVRRewardTask) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Awaits async_reward_fn with the same arguments as _compute_reward;
+        # returns float.
         """Compute reward asynchronously for an RLVR reward task.
 
         Parameters
@@ -260,6 +305,11 @@ class RLVRRewardController(Controller):
 
 
 class ChatTracer(TaskCollection):
+    # [CLASS DOC]
+    # TaskCollection that records every completed ChatTask turn. After each yield, for
+    # ChatTasks that carry a non-None completion attribute (set by the worker), builds
+    # an InteractionWithTokenLogpReward and stores it in an InteractionCache keyed by
+    # completion.id. get_trace_results exports them with reward discounting.
     """TaskCollection for tracing multi-turn chat conversations.
 
     This class traces ChatTask objects during the controller's process execution.
@@ -294,6 +344,10 @@ class ChatTracer(TaskCollection):
         reward_discount: float = 1.0,
         export_style: str = "individual",
     ):
+        # [FUNCTION DOC]
+        # Inputs: reward_discount (factor for backward reward propagation across turns
+        # at export, default 1.0), export_style ("individual" or "concat"). Creates an
+        # empty InteractionCache.
         super().__init__()
         self.reward_discount = reward_discount
         self.export_style = export_style
@@ -302,6 +356,8 @@ class ChatTracer(TaskCollection):
         self._cache = InteractionCache()
 
     def before_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # No-op hook before workers run.
         """Called before tasks are yielded to workers.
 
         Parameters
@@ -312,6 +368,10 @@ class ChatTracer(TaskCollection):
         pass
 
     def after_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # For each ChatTask with a completion, creates an interaction (see
+        # _create_interaction_from_chat_task) and caches it under completion.id (later
+        # turns of the same task produce new ids, so each turn is a separate entry).
         """Called after tasks return from workers.
 
         Creates InteractionWithTokenLogpReward objects for each ChatTask.
@@ -339,6 +399,15 @@ class ChatTracer(TaskCollection):
         self,
         task: ChatTask,
     ) -> InteractionWithTokenLogpReward:
+        # [FUNCTION DOC]
+        # HELPER: Builds an InteractionWithTokenLogpReward from a ChatTask: messages
+        # converted to dicts, ModelResponse with copies of input/output tokens, zero
+        # logprobs and version -1 per output token, reward None, empty
+        # output_message_list, the task's completion, and chat_template_type =
+        # export_style. Imports ModelResponse lazily.
+        # KNOWN ISSUE: chat_template_type receives the export style
+        # ("individual"/"concat") rather than a chat template type such as
+        # "hf"/"concat"; placeholder logprobs/versions are not real policy values.
         """Create an InteractionWithTokenLogpReward from a ChatTask.
 
         Parameters
@@ -385,6 +454,10 @@ class ChatTracer(TaskCollection):
         return interaction
 
     def get_trace_results(self) -> dict[str, InteractionWithTokenLogpReward]:
+        # [FUNCTION DOC]
+        # Returns {} if nothing was traced; otherwise the cache's export_interactions
+        # with this tracer's export_style and reward_discount (which may apply
+        # discounting/tree linking as implemented by InteractionCache).
         """Export traced interactions.
 
         Returns the traced interactions in the specified export style.
@@ -408,11 +481,17 @@ class ChatTracer(TaskCollection):
         )
 
     def clear(self) -> None:
+        # [FUNCTION DOC]
+        # Empties the interaction cache.
         """Clear all traced data."""
         self._cache.clear()
 
 
 class PipelineTrajectoryMaker(Controller):
+    # [CLASS DOC]
+    # Controller running generation then local reward computation for each task,
+    # attaching interaction objects. Per-episode inputs task_data, prompt_str and
+    # input_tokens are attributes set before generate().
     """Controller that composes generation and reward controllers into a pipeline.
 
     This controller orchestrates the full RLVR pipeline:
@@ -455,6 +534,9 @@ class PipelineTrajectoryMaker(Controller):
         prompt_str: str = "",
         input_tokens: list[int] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores the generation and reward controllers and per-episode task_data
+        # (default {}), prompt_str (default "") and input_tokens (default []).
         """Initialize the pipeline trajectory maker.
 
         Parameters
@@ -478,6 +560,13 @@ class PipelineTrajectoryMaker(Controller):
         self.input_tokens = input_tokens if input_tokens is not None else []
 
     def process(self, tasks: list[Task], **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Generator: delegates generation to generation_controller.process (yielding its
+        # task lists). Then, for each GenerationTask, builds an interaction (key
+        # "task_<index>") and an RLVRRewardTask (prompt_str falls back to
+        # task.input_str, task_data from self), drives the reward controller's generator
+        # to completion locally without yielding, and stores the shared interactions
+        # dict in every task's customized_result_fields["interactions"].
         """Process tasks through the generation and reward pipeline.
 
         Yields task lists only for generation (worker execution). Reward
@@ -529,6 +618,11 @@ class PipelineTrajectoryMaker(Controller):
             task.customized_result_fields["interactions"] = interactions
 
     def generate(self, prompt: str, **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Generator overriding Controller.generate: creates a GenerationTask from
+        # prompt, sets input_tokens from self if any, resets stop to None so sampling
+        # params apply, runs process, and returns the task's ScaffoldingOutput with data
+        # replaced by the interactions dict.
         """Generate with the full pipeline and return interactions in output.
 
         Overrides the base ``Controller.generate()`` to:
@@ -565,6 +659,11 @@ class PipelineTrajectoryMaker(Controller):
     def _create_interaction_from_task(
         self, task: GenerationTask
     ) -> InteractionWithTokenLogpReward:
+        # [FUNCTION DOC]
+        # HELPER: Builds an InteractionWithTokenLogpReward (reward None) whose
+        # ModelResponse holds copies of the task's input/output tokens and
+        # output_logprobs / output_versions from customized_result_fields, defaulting to
+        # zeros and -1 per output token when absent.
         """Create an InteractionWithTokenLogpReward from a generation task.
 
         Parameters
@@ -607,6 +706,11 @@ class PipelineTrajectoryMaker(Controller):
 
 
 class MultiTurnChatController(Controller):
+    # [CLASS DOC]
+    # Multi-turn chat controller: runs up to max_turns generations on one ChatTask built
+    # from self.messages, appending a reflection user message between turns. Per-episode
+    # messages and input_tokens are set as attributes before generate (the scheduler
+    # clones the controller per request).
     """Controller for multi-turn chat with reflection between turns.
 
     Handles the chat loop: for each turn, yields a ChatTask to the worker
@@ -641,6 +745,10 @@ class MultiTurnChatController(Controller):
         messages: list[dict] | None = None,
         input_tokens: list[int] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores generation_controller, max_turns (default 2), reflection_message,
+        # tokenizer (for encoding the final output), messages (default []) and
+        # input_tokens (default []).
         super().__init__()
         self.generation_controller = generation_controller
         self.max_turns = max_turns
@@ -650,6 +758,13 @@ class MultiTurnChatController(Controller):
         self.input_tokens = input_tokens if input_tokens is not None else []
 
     def process(self, tasks: list[Task], **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Generator ignoring incoming tasks: builds a ChatTask from self.messages (dicts
+        # -> RoleMessage, role/content only), clears stop so sampling params apply,
+        # attaches input_tokens if set, then for each of max_turns turns delegates one
+        # generation to generation_controller.process and, except after the last turn,
+        # appends a UserMessage with reflection_message. Always runs all turns (no early
+        # stop on correctness); results stay on the internal ChatTask.
         """Run multi-turn chat generation.
 
         Creates a ChatTask from the stored messages and yields it to the
@@ -683,6 +798,11 @@ class MultiTurnChatController(Controller):
 
 @with_task_collection("chat_tracer", ChatTracer)
 class TraceTrajectoryMaker(Controller):
+    # [CLASS DOC]
+    # Controller (decorated with with_task_collection, so each instance has a ChatTracer
+    # under "chat_tracer" observing every task list its process yields, including
+    # ParallelProcess branches) that runs a rollout controller, then rewards each traced
+    # interaction with a reward controller and returns the interactions.
     """Controller that traces ChatTask objects during rollout using ChatTracer.
 
     This controller uses the @with_task_collection decorator to automatically
@@ -729,6 +849,9 @@ class TraceTrajectoryMaker(Controller):
         rollout_controller: Controller,
         reward_controller: Controller,
     ):
+        # [FUNCTION DOC]
+        # Stores the rollout controller and reward controller (the decorator then
+        # registers the ChatTracer).
         """Initialize the trace trajectory maker.
 
         Parameters
@@ -743,6 +866,14 @@ class TraceTrajectoryMaker(Controller):
         self.reward_controller = reward_controller
 
     def process(self, tasks: list[Task], **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Generator. Takes tasks[0]; unwraps generation_task if it is a
+        # TraceGenerationTask. Delegates to rollout_controller.process on it (ChatTracer
+        # records each turn). Exports trace results, wraps each interaction in a
+        # ChatRewardTask, and if any, delegates to reward_controller.process (allowing
+        # judge LLM calls to be yielded), then copies non-None task rewards onto the
+        # interactions. Finally stores trace_results on the TraceGenerationTask. Only
+        # the first task is processed.
         """Process tasks through the rollout and reward pipeline with tracing.
 
         This method:
@@ -803,6 +934,10 @@ class TraceTrajectoryMaker(Controller):
             task.trace_results = trace_results
 
     def generate(self, prompt: str, **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Generator overriding Controller.generate: wraps prompt in a
+        # TraceGenerationTask, runs process and returns its ScaffoldingOutput (data =
+        # trace results dict).
         """Generate with tracing from a prompt string.
 
         Parameters
@@ -825,6 +960,14 @@ class TraceTrajectoryMaker(Controller):
 
 
 def _parse_judge_result(raw_response: str) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Parses a judge reply into a binary reward. Takes the text after the last
+    # "```json" and before the next "```", trying json.loads then ast.literal_eval; if
+    # both fail, falls back to substring checks for '"judgement": "incorrect"' then
+    # '"judgement": "correct"'; otherwise logs a WARNING and treats as unknown. Returns
+    # 1.0 only if the parsed object has judgement == "correct", else 0.0.
+    # KNOWN ISSUE: If parsing yields a non-container value (e.g. a number), the
+    # membership test raises TypeError.
     """Parse the LLM judge response and extract a binary reward.
 
     The judge is expected to return a JSON block with a ``"judgement"`` field
@@ -879,6 +1022,11 @@ _JUDGE_PROMPT_TEMPLATE = (
 
 
 class LLMJudgeController(Controller):
+    # [CLASS DOC]
+    # Reward controller that asks an LLM judge (sent as ChatTasks to the GENERATION
+    # worker) whether each prediction is equivalent to the ground truth. Per-episode
+    # question/answer for traced chat rewards come from self.task_data, set before
+    # generate.
     """Controller that uses an LLM to judge answer correctness.
 
     Instead of using a deterministic reward function, this controller sends
@@ -902,6 +1050,9 @@ class LLMJudgeController(Controller):
     """
 
     class WorkerTag(Enum):
+        # [CLASS DOC]
+        # Enum with JUDGE = "llm_judge" (declared but judge tasks actually use the
+        # GENERATION tag).
         JUDGE = "llm_judge"
 
     def __init__(
@@ -910,6 +1061,11 @@ class LLMJudgeController(Controller):
         max_pred_chars: int = 200,
         max_judge_tokens: int = 8192,
     ):
+        # [FUNCTION DOC]
+        # Inputs: judge_prompt_template (format string with {question}, {gt_answer},
+        # {pred_answer}; defaults to the module template), max_pred_chars (prediction
+        # truncation, default 200), max_judge_tokens (default 8192). Initializes scores
+        # None and task_data {}.
         super().__init__()
         self.judge_prompt_template = judge_prompt_template or _JUDGE_PROMPT_TEMPLATE
         self.max_pred_chars = max_pred_chars
@@ -924,6 +1080,9 @@ class LLMJudgeController(Controller):
         ground_truth: str,
         prediction: str,
     ) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Formats the judge template with question, ground truth and the
+        # prediction truncated to max_pred_chars.
         """Format the judge prompt with the given data.
 
         Parameters
@@ -947,6 +1106,14 @@ class LLMJudgeController(Controller):
         )
 
     def _extract_answer_and_data(self, task: Task) -> tuple[str, str, str] | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns (question, ground_truth, prediction) or None for unsupported
+        # task types. RLVRRewardTask: from its task_data (list answers -> first element)
+        # and the <answer> tag content of completion_str (whole completion if absent).
+        # ChatRewardTask: question/answer from self.task_data, prediction from the
+        # interaction's completion first-choice content, narrowed to the <answer> tag if
+        # present. GenerationTask: question/answer from customized_result_fields,
+        # prediction = output_str.
         """Extract (question, ground_truth, prediction) from a task.
 
         Supports ``RLVRRewardTask``, ``ChatRewardTask``, and
@@ -998,6 +1165,16 @@ class LLMJudgeController(Controller):
         return None
 
     def process(self, tasks: list[Task], **kwargs) -> Any:
+        # [FUNCTION DOC]
+        # Generator. Resets scores; for each task with extractable data where question
+        # or ground truth is non-empty, builds a single-user-message judge ChatTask
+        # (GENERATION tag, max_tokens = max_judge_tokens, temperature 1.0, stop None).
+        # Yields all judge tasks as one batch (if any). Then for every input task
+        # computes reward = parsed judge verdict from the last message if the worker
+        # appended a reply, else 0.0 (also 0.0 for skipped tasks), stores it on
+        # task.reward and task.interaction.reward (reward tasks) or
+        # customized_result_fields["reward"] (generation tasks), and appends it to
+        # scores.
         """Process tasks by sending judge prompts to the LLM worker.
 
         For each task, builds a judge prompt and yields a ``ChatTask`` to

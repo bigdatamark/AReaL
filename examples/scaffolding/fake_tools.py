@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# HELPER module: offline stand-ins for the search scaffolding example's web search and
+# page-visit tools, returning deterministic canned text so no API keys or network are
+# needed.
 """
 Fake search and visit tools for the search scaffolding example.
 
@@ -7,6 +11,10 @@ external API keys (no SERPER_KEY or JINA_API_KEYS required).
 
 
 async def fake_search(queries: list[str]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: For each query builds a fake 3-result Markdown search listing
+    # (Wikipedia/Britannica/arXiv links derived from the query) and returns them joined
+    # by "\n=======\n". Pure, no I/O.
     """Return fake search results for each query.
 
     Parameters
@@ -39,6 +47,9 @@ async def fake_search(queries: list[str]) -> str:
 
 
 async def fake_visit(urls: list[str], goal: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: For each URL builds a fake "useful information ... Evidence ... Summary"
+    # block mentioning url and goal; returns them joined by "\n=======\n". Pure, no I/O.
     """Return fake webpage content summaries.
 
     Parameters

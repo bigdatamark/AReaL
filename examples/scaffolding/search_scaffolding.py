@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Multi-turn search-agent RL example on the scaffolding framework:
+# SearchScaffoldingWorkflow wires SearchAgentController (tool-calling loop with real
+# Serper search / page visits) into TraceTrajectoryMaker with an LLMJudgeController
+# reward, and main() trains it with PPOTrainer. SYSTEM_PROMPT is the tongyi_deepresearch
+# prompt with search/visit tool schemas; the current date is appended per episode.
 """
 Search Agent Scaffolding Example.
 
@@ -84,6 +90,9 @@ SYSTEM_PROMPT = (
 
 
 class SearchScaffoldingWorkflow(ScaffoldingWorkflow):
+    # [CLASS DOC]
+    # ScaffoldingWorkflow subclass adding search-agent budgets (max_turns,
+    # max_total_tokens, max_judge_tokens) and its own episode logic.
     """ScaffoldingWorkflow for multi-turn search-agent RL training.
 
     The episode loop delegates to ``SearchAgentController`` (multi-turn
@@ -119,6 +128,10 @@ class SearchScaffoldingWorkflow(ScaffoldingWorkflow):
         max_total_tokens: int = 32768,
         max_judge_tokens: int = 8192,
     ):
+        # [FUNCTION DOC]
+        # Forwards reward_fn, gconfig, tokenizer and enable_thinking to
+        # ScaffoldingWorkflow and stores max_turns (default 20), max_total_tokens
+        # (32768) and max_judge_tokens (8192).
         super().__init__(
             reward_fn=reward_fn,
             gconfig=gconfig,
@@ -134,6 +147,13 @@ class SearchScaffoldingWorkflow(ScaffoldingWorkflow):
     # ------------------------------------------------------------------
 
     def build_scaffolding_llm(self, engine: InferenceEngine) -> ScaffoldingLlm:
+        # [FUNCTION DOC]
+        # Builds and stores on self: a NativeGenerationController (max_tokens =
+        # gconfig.max_new_tokens, temperature = gconfig.temperature or 1.0, stop at
+        # "<tool_response>"), an LLMJudgeController (max_judge_tokens), a
+        # SearchAgentController and a TraceTrajectoryMaker combining them. Returns a
+        # ScaffoldingLlm with self.worker under the GENERATION tag (judge calls
+        # therefore use the same engine).
         """Build ``ScaffoldingLlm`` with ``SearchAgentController`` + ``TraceTrajectoryMaker``.
 
         Uses ``LLMJudgeController`` as the reward controller so that
@@ -187,6 +207,22 @@ class SearchScaffoldingWorkflow(ScaffoldingWorkflow):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Runs one episode. Lazily initializes the worker/scaffolding LLM if needed.
+        # Builds messages (system prompt with today's date + data["question"]),
+        # tokenizes data["messages"] via the chat template as the prompt, sets
+        # per-episode messages/input_tokens on the search controller and task_data on
+        # the judge (the prototype is cloned synchronously by generate_async, isolating
+        # concurrent episodes), then awaits generate_async(prompt). From the traced
+        # interactions takes the last one's completion text and reward (0.0 if missing);
+        # without traces uses the output text and reward 0. Re-tokenizes the output text
+        # and returns a batch-of-1 dict: input_ids (prompt + output, int32), loss_mask
+        # (0 prompt / 1 output), logprobs (zeros), versions (-1), attention_mask (ones,
+        # bool), rewards (scalar float32), each unsqueezed to dim 0.
+        # KNOWN ISSUE: The trained prompt is data["messages"] while the agent actually
+        # ran with the custom system prompt + question; only the last turn's text is
+        # trained, re-tokenized, with placeholder zero logprobs and version -1, so the
+        # sequence does not match what was generated.
         """Run a single search-agent episode.
 
         Parameters
@@ -278,6 +314,11 @@ class SearchScaffoldingWorkflow(ScaffoldingWorkflow):
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Entry point: loads GRPOConfig, tokenizer and datasets, and trains
+    # SearchScaffoldingWorkflow with max_turns 10, max_total_tokens 8192,
+    # max_judge_tokens 2048 (search_reward_fn as fallback reward), evaluation at
+    # temperature 0.6.
     """Main entry point for search scaffolding training."""
     config, _ = load_expr_config(args, GRPOConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)

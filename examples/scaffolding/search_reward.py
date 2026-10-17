@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Simple rule-based reward for the search scaffolding example: checks an
+# <answer>...</answer> tag in the completion against the ground-truth answer by
+# case-insensitive containment.
 """
 Reward function for the search scaffolding example.
 
@@ -17,6 +21,16 @@ def search_reward_fn(
     output_tokens: list[int],
     **data,
 ) -> float:
+    # [FUNCTION DOC]
+    # Inputs: prompt_str, input_tokens, output_tokens (unused), completion_str (full
+    # model output), data kwargs with "answer" (str or list; first element used for
+    # lists). Extracts the first <answer> tag content (DOTALL). Returns 0.0 if there is
+    # no tag or its stripped content is empty; 1.0 if the ground truth is contained in
+    # the prediction or vice versa (case-insensitive); otherwise 0.1. Pure function.
+    # KNOWN ISSUE: Docstring describes only ground-truth-in-prediction matching and says
+    # an empty tag earns 0.1; the code also accepts prediction-in-ground-truth (so short
+    # partial answers score 1.0) and returns 0.0 for empty content. A missing/empty
+    # ground truth makes any non-empty answer score 1.0.
     """Compute reward for a search agent trajectory.
 
     The function extracts the text inside ``<answer>...</answer>`` from

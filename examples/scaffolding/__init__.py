@@ -1,3 +1,11 @@
+# [PACKAGE DOC]
+# Package for the Scaffolding example: plugs TensorRT-LLM-style scaffolding (controllers
+# that yield tasks, workers that execute them, ScaffoldingLlm that schedules them) into
+# AReaL RL rollouts. Re-exports the AReaL-specific controllers (ChatTracer,
+# PipelineTrajectoryMaker, RLVRRewardController, TraceTrajectoryMaker), tasks
+# (ChatRewardTask, RLVRRewardTask, TraceGenerationTask), workers
+# (CreateWorkerFromEngine, SGLangWorker) and ScaffoldingWorkflow. Importing it imports
+# those submodules (side effects of their imports only).
 """
 Scaffolding Framework Example for AReaL.
 

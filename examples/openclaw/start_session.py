@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# CLI script: starts or refreshes an RL session on the OpenClaw proxy gateway via POST
+# <gateway>/rl/start_session with the admin key, and prints the returned session API
+# key/id plus usage hints. Emits SESSION_API_KEY / SESSION_ID on stderr for scripting.
 """Start an RL session on the proxy gateway.
 
 Allocates a backend worker and prints the session API key that the user's
@@ -36,6 +40,14 @@ from _fmt import (
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point. Args: gateway_url; --admin-key (env ADMIN_KEY, default "areal-admin-
+    # key"); --task-id (env TASK_ID, default "demo-task"); --api-key (env
+    # SESSION_API_KEY; presence = refresh). POSTs {task_id, api_key} with admin Bearer
+    # auth (130s timeout on refresh, else 10s). Requires HTTP 200 (exits 1 otherwise,
+    # with a special message for 429 on refresh). Reads api_key and session_id from the
+    # JSON (exits 1 on parse failure), prints them, OpenAI SDK env hints (new sessions
+    # only) and the refresh command, then writes KEY=VALUE lines to stderr.
     parser = argparse.ArgumentParser(description="Start an AReaL RL session")
     parser.add_argument("gateway_url", help="Proxy gateway URL")
     parser.add_argument(

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# HELPER module: single import point that re-exports the vendored scaffolding primitives
+# from the local core package (controllers, ScaffoldingOutput, ScaffoldingLlm, task and
+# message types, TaskCollection helpers, workers). No logic of its own.
 """Scaffolding framework primitives vendored from TensorRT-LLM.
 
 This module re-exports the core scaffolding classes from the vendored copy

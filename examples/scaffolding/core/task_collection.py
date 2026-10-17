@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Vendored scaffolding TaskCollection mechanism: observers attached to controllers that
+# get before_yield / after_yield callbacks around each task list a controller yields
+# (i.e. around worker execution). Provides the with_task_collection class decorator and
+# built-in collections for token counting, timing and detailed per-task metrics.
+# Built-in collections accumulate into class-level (process-global) statistics dicts.
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 # Vendored from tensorrt_llm.scaffolding.task_collection
 
@@ -10,40 +16,79 @@ from .task import ChatTask, GenerationTask, Task
 
 
 class TaskCollection:
+    # [CLASS DOC]
+    # Base observer; subclasses override before_yield / after_yield (no-ops here) and
+    # optionally get_global_info.
     def __init__(self):
+        # [FUNCTION DOC]
+        # No-op constructor reserved for future use.
         # reserved for future use
         pass
 
     def before_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # Hook called with a yielded task list before workers run it; no-op.
         pass
 
     def after_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # Hook called with the task list after workers finished it; no-op.
         pass
 
     @staticmethod
     def get_global_info() -> Any:
+        # [FUNCTION DOC]
+        # Static hook returning global statistics; returns None in the base class.
         pass
 
 
 def with_task_collection(
     name: str, task_collection_cls: type[TaskCollection], **task_collection_kwargs
 ):
+    # [FUNCTION DOC]
+    # Class decorator factory. Returns a decorator that patches controller_cls in place
+    # so that (1) __init__ additionally stores
+    # task_collection_cls(**task_collection_kwargs) in self.task_collections[name] (one
+    # instance per controller instance), and (2) process returns a generator that
+    # forwards everything the original process yields, calling the collection's
+    # before_yield/after_yield around each task list and recursively wrapping each
+    # sub-generator of yielded ParallelProcess objects so their task lists are observed
+    # too. Returns the same (mutated) class.
     def decorator(controller_cls: type):
+        # [FUNCTION DOC]
+        # HELPER: Applies the init/process patch described above to controller_cls and
+        # returns it.
         original_init = controller_cls.__init__
         original_process = controller_cls.process
 
         # add task collection to controller
         def new_init(self, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Wrapped __init__: runs the original then registers the collection
+            # instance under name.
             original_init(self, *args, **kwargs)
             self.task_collections[name] = task_collection_cls(**task_collection_kwargs)
 
         def new_process(self, tasks: list[Task], **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Wrapped process: creates the original generator and returns the
+            # observing generator built by TaskCollectionWrapper.
             class TaskCollectionWrapper:
+                # [CLASS DOC]
+                # HELPER: Iterable adapter pairing one task collection with one
+                # generator.
                 def __init__(self, task_collection, gen):
+                    # [FUNCTION DOC]
+                    # Stores the task collection and the generator to observe.
                     self.task_collection = task_collection
                     self.gen = gen
 
                 def __call__(self):
+                    # [FUNCTION DOC]
+                    # Generator: iterates the wrapped generator; for ParallelProcess
+                    # items replaces sub_gens with wrapped adapters (mutating the
+                    # object) and yields it; for task lists calls before_yield, yields,
+                    # then after_yield once resumed.
                     for obj in self.gen:
                         if isinstance(obj, ParallelProcess):
                             new_sub_gens = []
@@ -61,6 +106,9 @@ def with_task_collection(
                             self.task_collection.after_yield(obj)
 
                 def __iter__(self):
+                    # [FUNCTION DOC]
+                    # Makes the adapter iterable by returning a fresh observing
+                    # generator.
                     return self.__call__()
 
             original_gen = original_process(self, tasks, **kwargs)
@@ -76,12 +124,20 @@ def with_task_collection(
 
 
 class GenerationTokenCounter(TaskCollection):
+    # [CLASS DOC]
+    # Counts tokens produced by workers for GenerationTasks: generation_token_count
+    # accumulates the increase in total len(output_tokens) across each yield.
     def __init__(self):
+        # [FUNCTION DOC]
+        # Initializes generation_token_count and pre_worker_token_sum to 0.
         super().__init__()
         self.generation_token_count = 0
         self.pre_worker_token_sum = 0
 
     def before_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # Records the total output_tokens length of GenerationTask instances (incl.
+        # subclasses) before execution.
         self.pre_worker_token_sum = 0
         for task in tasks:
             if isinstance(task, GenerationTask) or issubclass(
@@ -91,6 +147,9 @@ class GenerationTokenCounter(TaskCollection):
                     self.pre_worker_token_sum += len(task.output_tokens)
 
     def after_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # Adds (post-execution total output_tokens length) minus the recorded
+        # pre-execution total to generation_token_count.
         post_worker_token_sum = 0
         for task in tasks:
             if isinstance(task, GenerationTask) or issubclass(
@@ -102,22 +161,33 @@ class GenerationTokenCounter(TaskCollection):
 
 
 class ChatTokenCounter(TaskCollection):
+    # [CLASS DOC]
+    # Records (prompt_tokens_num, completion_tokens_num) for every ChatTask after
+    # execution into the class-level statistics dict under statistics_name.
     # prompt tokens, completion tokens
     statistics: dict[str, list[tuple[int, int]]] = {}
 
     def __init__(self, statistics_name: str):
+        # [FUNCTION DOC]
+        # Stores statistics_name and ensures a list exists for it in the global
+        # statistics.
         super().__init__()
         self.statistics_name = statistics_name
         if statistics_name not in ChatTokenCounter.statistics:
             ChatTokenCounter.statistics[statistics_name] = []
 
     def before_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # Enables token counting on every ChatTask before execution.
         for task in tasks:
             if not isinstance(task, ChatTask):
                 continue
             task.enable_token_counting = True
 
     def after_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # Appends (prompt_tokens_num, completion_tokens_num) of each ChatTask to the
+        # global list.
         for task in tasks:
             if not isinstance(task, ChatTask):
                 continue
@@ -126,13 +196,24 @@ class ChatTokenCounter(TaskCollection):
             )
 
     def get_global_info() -> Any:
+        # [FUNCTION DOC]
+        # Returns the global statistics dict.
+        # KNOWN ISSUE: Declared without self and without @staticmethod, so it only works
+        # when called on the class; calling on an instance raises TypeError.
         return ChatTokenCounter.statistics
 
 
 class TaskTimer(TaskCollection):
+    # [CLASS DOC]
+    # Measures wall-clock execution time of tasks whose exact type is in task_types,
+    # accumulating durations (seconds) in the class-level
+    # statistics[statistics_name][task_type].
     statistics: dict[str, dict[type, list[float]]] = {}
 
     def __init__(self, statistics_name: str, task_types: list[type[Task]]):
+        # [FUNCTION DOC]
+        # Stores name, task types and an id->start-time map; ensures global lists exist
+        # for each type.
         super().__init__()
         self.statistics_name = statistics_name
         self.task_types = task_types
@@ -144,6 +225,8 @@ class TaskTimer(TaskCollection):
                 TaskTimer.statistics[statistics_name][task_type] = []
 
     def before_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # Records time.time() keyed by id(task) for matching tasks.
         for task in tasks:
             if type(task) not in self.task_types:
                 continue
@@ -151,6 +234,9 @@ class TaskTimer(TaskCollection):
             self.start_time_map[id(task)] = time.time()
 
     def after_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # Appends elapsed time for matching tasks to the global stats and removes the
+        # start entry (KeyError if before_yield was not called for it).
         for task in tasks:
             if type(task) not in self.task_types:
                 continue
@@ -162,10 +248,20 @@ class TaskTimer(TaskCollection):
             del self.start_time_map[id(task)]
 
     def get_global_info() -> Any:
+        # [FUNCTION DOC]
+        # Returns the global statistics dict.
+        # KNOWN ISSUE: Same missing self/@staticmethod problem as
+        # ChatTokenCounter.get_global_info.
         return TaskTimer.statistics
 
 
 class TaskMetricsCollector(TaskCollection):
+    # [CLASS DOC]
+    # Detailed per-task profiler. For each task (optionally filtered by exact type)
+    # records duration, timestamp, and for ChatTasks token counts, finish reason, ids,
+    # perf_metrics and optionally message snapshots, into the class-level
+    # statistics[controller_name] list; optionally prints a one-line summary per task.
+    # Static helpers summarize, query, export and reset the global statistics.
     """Task profiler that captures tasks at yield points."""
 
     # Global statistics: controller_name -> List[task_info_dict]
@@ -178,6 +274,11 @@ class TaskMetricsCollector(TaskCollection):
         enable_print: bool = True,
         capture_messages: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Inputs: controller_name (key in global stats), task_types (None = all types),
+        # enable_print (print per-task lines to stdout), capture_messages (record
+        # message lists). Initializes per-task start-time and pre-message-count maps and
+        # ensures a global list for controller_name.
         super().__init__()
         self.controller_name = controller_name
         self.task_types = task_types
@@ -190,20 +291,34 @@ class TaskMetricsCollector(TaskCollection):
             TaskMetricsCollector.statistics[controller_name] = []
 
     def _should_process_task(self, task: Task) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if task_types is None or the task's exact type is in it.
         if self.task_types is not None and type(task) not in self.task_types:
             return False
         return True
 
     def _is_task_already_profiled(self, task: Task) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if the task carries a truthy _profiling_in_progress attribute
+        # (set by another collector).
         return getattr(task, "_profiling_in_progress", False)
 
     def _mark_task_profiling_start(self, task: Task):
+        # [FUNCTION DOC]
+        # HELPER: Sets task._profiling_in_progress = True (mutates the task).
         task._profiling_in_progress = True
 
     def _mark_task_profiling_end(self, task: Task):
+        # [FUNCTION DOC]
+        # HELPER: Sets task._profiling_in_progress = False.
         task._profiling_in_progress = False
 
     def before_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # For each matching task not already being profiled: marks it, records start
+        # time by id(task); for ChatTasks enables token counting and, if
+        # capture_messages, records the current message count. Nested collectors
+        # therefore skip tasks already profiled by an outer one.
         for task in tasks:
             if not self._should_process_task(task):
                 continue
@@ -220,6 +335,14 @@ class TaskMetricsCollector(TaskCollection):
                     self.pre_message_count_map[task_id] = len(task.messages)
 
     def after_yield(self, tasks: list[Task]):
+        # [FUNCTION DOC]
+        # For each task with a recorded start time: computes duration, clears the start
+        # entry and profiling mark, builds a record (controller, task_type name,
+        # duration_ms, timestamp) and for ChatTasks adds
+        # prompt/completion/reasoning/total tokens, finish_reason, unique_id,
+        # sub_request_markers, perf_metrics, and if capture_messages the before/after
+        # message counts plus serialized full and new messages. Appends to global stats
+        # and prints it if enable_print.
         for task in tasks:
             task_id = id(task)
             if task_id not in self.start_time_map:
@@ -277,6 +400,10 @@ class TaskMetricsCollector(TaskCollection):
                 self._print_task_info(task_info)
 
     def _serialize_message(self, message) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Converts a message object to a dict with role and content, plus
+        # reasoning, reasoning_content and stringified tool_calls when present and not
+        # None.
         """Serialize a RoleMessage to a dictionary."""
         result = {
             "role": getattr(message, "role", None),
@@ -294,6 +421,11 @@ class TaskMetricsCollector(TaskCollection):
         return result
 
     def _print_task_info(self, task_info: dict[str, Any]):
+        # [FUNCTION DOC]
+        # HELPER: Prints a " | "-joined line with controller, task type, duration, token
+        # counts (if present) and perf metrics (floats with 2 decimals); then, if there
+        # are new messages, prints the count change and each new message's role and
+        # content truncated to 200 chars.
         log_parts = [
             f"[{task_info['controller']}]",
             f"{task_info['task_type']}",
@@ -331,6 +463,9 @@ class TaskMetricsCollector(TaskCollection):
 
     @staticmethod
     def _compute_stats(values: list[float]) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # HELPER: Returns avg, median (mean of the two middle values for even counts),
+        # min, max and sum of values; all zeros for an empty list.
         """Compute avg, median, min, max, sum for a list of values."""
         if not values:
             return {"avg": 0, "median": 0, "min": 0, "max": 0, "sum": 0}
@@ -351,6 +486,9 @@ class TaskMetricsCollector(TaskCollection):
 
     @staticmethod
     def print_summary():
+        # [FUNCTION DOC]
+        # Prints to stdout, per controller and per task type, record counts and stats of
+        # duration, token counts (only if any total tokens) and numeric perf_metrics.
         """Print summary statistics for all controllers."""
         print("\n" + "=" * 80)
         print("TASK METRICS SUMMARY")
@@ -450,6 +588,9 @@ class TaskMetricsCollector(TaskCollection):
 
     @staticmethod
     def get_statistics(controller_name: str = None) -> dict[str, list[dict[str, Any]]]:
+        # [FUNCTION DOC]
+        # Returns {controller_name: its records (or [])} if a name is given, otherwise
+        # the whole global statistics dict (live reference).
         """Get statistics for a specific controller or all controllers."""
         if controller_name is not None:
             return {
@@ -461,6 +602,8 @@ class TaskMetricsCollector(TaskCollection):
 
     @staticmethod
     def get_all_records() -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Returns all records from all controllers as a new list sorted by timestamp.
         """Get all records across all controllers as a flat list."""
         all_records = []
         for records in TaskMetricsCollector.statistics.values():
@@ -470,6 +613,9 @@ class TaskMetricsCollector(TaskCollection):
 
     @staticmethod
     def export_to_json(file_path: str, controller_name: str = None):
+        # [FUNCTION DOC]
+        # Writes the records of one controller (list) or the whole statistics dict to
+        # file_path as indented JSON (non-serializable values via str).
         """Export metrics to a JSON file."""
         if controller_name is not None:
             data = TaskMetricsCollector.statistics.get(controller_name, [])
@@ -480,6 +626,9 @@ class TaskMetricsCollector(TaskCollection):
 
     @staticmethod
     def reset(controller_name: str = None):
+        # [FUNCTION DOC]
+        # Clears the records list for controller_name if present, or clears the whole
+        # statistics dict when no name is given.
         """Reset statistics for a specific controller or all controllers."""
         if controller_name is not None:
             if controller_name in TaskMetricsCollector.statistics:
@@ -489,4 +638,6 @@ class TaskMetricsCollector(TaskCollection):
 
     @staticmethod
     def get_global_info() -> Any:
+        # [FUNCTION DOC]
+        # Returns the global statistics dict.
         return TaskMetricsCollector.statistics

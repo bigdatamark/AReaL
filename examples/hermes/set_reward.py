@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# CLI script: assigns a scalar reward to the last (or a specified) interaction of an
+# active RL session by POSTing to <gateway>/rl/set_reward with the per-session sk-sess-*
+# key as Bearer auth. Includes small ANSI-colored print helpers.
 """Set reward for the last interaction in an active session.
 
 Requires the per-session ``sk-sess-*`` key minted by ``start_session.py``.
@@ -30,32 +34,49 @@ BLUE = "\033[0;34m"
 
 
 def info(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints an indented cyan info line. No return.
     print(f"  {CYAN}ℹ{RESET}  {msg}")
 
 
 def success(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints an indented green success line.
     print(f"  {GREEN}✔{RESET}  {msg}")
 
 
 def error(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints an indented red error line.
     print(f"  {RED}✘{RESET}  {msg}")
 
 
 def dim(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints an indented dimmed line.
     print(f"  {DIM}{msg}{RESET}")
 
 
 def die(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints msg as an error, then exits the process with status 1 (SystemExit).
     error(msg)
     sys.exit(1)
 
 
 def show_request(method: str, path: str, auth_label: str, gateway_url: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints the HTTP method plus "<gateway_url>/<path>" and an auth label,
+    # dimmed.
     print(f"  {DIM}{method} {gateway_url}/{path}{RESET}")
     print(f"  {DIM}Auth: {auth_label}{RESET}")
 
 
 def show_response(status_code: int, body: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints the HTTP status (green for 2xx, red otherwise) and the body;
+    # pretty-prints the body as indented JSON when parseable, else prints it raw line by
+    # line. Empty body prints nothing more.
     if 200 <= status_code < 300:
         print(f"  {GREEN}HTTP {status_code}{RESET}")
     else:
@@ -71,6 +92,9 @@ def show_response(status_code: int, body: str) -> None:
 
 
 def header(title: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints a blank line then a bold blue boxed title (rule lines above and
+    # below).
     """Print a boxed header."""
     print()
     print(
@@ -83,6 +107,12 @@ def header(title: str) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point: parses gateway_url, required --api-key, --reward (float, default from
+    # env REWARD or 1.0), optional --interaction-id. Builds a body with reward and
+    # optional interaction_id, POSTs it (10s timeout) with JSON content type and Bearer
+    # auth, prints request/response. Exits 1 via die() on network error or non-200
+    # status; otherwise prints success.
     parser = argparse.ArgumentParser(
         description="Set reward for an interaction in an AReaL RL session"
     )

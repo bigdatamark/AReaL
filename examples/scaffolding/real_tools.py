@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# HELPER module: real web tools for the search scaffolding example. real_search queries
+# Google through the Serper API (key read once at import from env SERPER_KEY_ID, empty
+# if unset); real_visit fetches pages with aiohttp and returns crudely tag-stripped,
+# truncated text (max 8000 chars). All errors are returned as text, never raised.
 """
 Real search and visit tools for the search scaffolding example.
 
@@ -19,6 +24,9 @@ _MAX_PAGE_CHARS = 8000
 
 
 async def real_search(queries: list[str]) -> str:
+    # [FUNCTION DOC]
+    # Runs _search_single for every query concurrently and returns the formatted results
+    # joined by "\n=======\n".
     """Perform Google searches via the Serper API.
 
     Parameters
@@ -37,9 +45,18 @@ async def real_search(queries: list[str]) -> str:
 
 
 async def _search_single(query: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: POSTs the query to https://google.serper.dev/search (locale China/zh-cn if
+    # the query contains CJK ideographs, else United States/en) with the API key header.
+    # Up to 5 attempts with 0.5s sleep on exceptions. Returns a Markdown list of organic
+    # results (index, title, link, optional date/source, snippet), or an explanatory
+    # string on unparseable JSON, missing "organic" key, or after all retries fail.
     """Search a single query via Serper and return formatted results."""
 
     def _contains_chinese(text: str) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if any character is in the CJK Unified Ideographs range
+        # U+4E00..U+9FFF.
         return any("\u4e00" <= ch <= "\u9fff" for ch in text)
 
     if _contains_chinese(query):
@@ -106,6 +123,9 @@ async def _search_single(query: str) -> str:
 
 
 def _html_to_text(html: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Removes script and style blocks, replaces remaining tags with spaces,
+    # collapses whitespace and strips. Regex-based, not a real HTML parser.
     """Very basic HTML tag stripping."""
     text = re.sub(r"<script[^>]*>[\s\S]*?</script>", "", html, flags=re.I)
     text = re.sub(r"<style[^>]*>[\s\S]*?</style>", "", text, flags=re.I)
@@ -115,6 +135,10 @@ def _html_to_text(html: str) -> str:
 
 
 async def real_visit(urls: list[str], goal: str) -> str:
+    # [FUNCTION DOC]
+    # Sequentially fetches each URL via _fetch_page and wraps the text in an "useful
+    # information / Evidence / Summary" template mentioning the goal (no actual
+    # summarization). Returns the blocks joined by "\n=======\n".
     """Fetch webpages and return truncated text content.
 
     Parameters
@@ -142,6 +166,10 @@ async def real_visit(urls: list[str], goal: str) -> str:
 
 
 async def _fetch_page(url: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: GETs url with a 30s total timeout. Returns an error message on non-200
+    # status or any exception; otherwise the stripped text truncated to _MAX_PAGE_CHARS
+    # (with a "[truncated]" marker) or a placeholder if empty.
     """Fetch a URL and return plain-text content (truncated)."""
     timeout = aiohttp.ClientTimeout(total=30)
     try:

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Interactive demo of the online-RL session lifecycle against the OpenClaw proxy
+# gateway: health check, then for N episodes start/refresh a session (reusing one API
+# key), send a chat completion and set a reward; prints a colorful step-by-step log and
+# a summary. All network I/O via requests.
 """AReaL Online Training — Multi-Episode Demo with Key Reuse.
 
 Demonstrates the single-key refresh mechanism:
@@ -43,6 +48,9 @@ _step_counter = 0
 
 
 def _step(title: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Increments the module-global step counter (mutates _step_counter) and
+    # prints a magenta boxed "Step N: title" banner.
     global _step_counter
     _step_counter += 1
     print()
@@ -56,6 +64,19 @@ def _step(title: str) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point. Args (with env fallbacks): gateway_url (default
+    # http://localhost:8090), --admin-key, --task-id, --reward (string, converted to
+    # float when sent), --model, --prompt, --episodes (int, default 2). GETs /health
+    # (exits 1 if unreachable or non-200; shows the "workers" count). Builds a fixed
+    # chat body (system tutor prompt + user prompt, temperature 0.7, max_tokens 512).
+    # For each episode: POST /rl/start_session with admin auth, including api_key after
+    # the first episode (refresh; 130s timeout), requiring 200 and reading
+    # api_key/session_id; POST /chat/completions with the session key (30s) and prints
+    # the assistant content; POST /rl/set_reward with the session key (10s). Any failure
+    # exits via die(). Finally prints a summary of episodes.
+    # KNOWN ISSUE: With --episodes 0 the summary slices session_api_key which is still
+    # None, raising TypeError.
     parser = argparse.ArgumentParser(
         description="AReaL Multi-Episode Demo (single-key with refresh)",
         formatter_class=argparse.RawDescriptionHelpFormatter,

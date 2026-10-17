@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Scaffolding Controller implementing a multi-turn ReAct-style search agent (port of
+# tongyi_deepresearch's MultiTurnReactAgent.run_agent). LLM calls are yielded as a
+# single evolving ChatTask through a generation controller; <tool_call> JSON in the
+# replies is executed locally with the real search/visit tools and fed back as
+# <tool_response> user messages until an <answer> tag, the turn limit, or the token
+# budget is reached.
 """
 SearchAgentController — multi-turn tool-calling loop as a scaffolding Controller.
 
@@ -37,6 +44,10 @@ OBS_END = "\n</tool_response>"
 
 
 class SearchAgentController(Controller):
+    # [CLASS DOC]
+    # Controller holding per-episode state (messages, input_tokens) plus the generation
+    # controller, tokenizer and budgets. WorkerTag aliases
+    # NativeGenerationController.WorkerTag so the same GENERATION worker is used.
     """Multi-turn search-agent controller for the scaffolding framework.
 
     Each call to :meth:`process` runs a loop of up to *max_turns* turns:
@@ -78,6 +89,13 @@ class SearchAgentController(Controller):
         messages: list[dict] | None = None,
         input_tokens: list[int] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Inputs: generation_controller (must expose sampling_params dict, e.g.
+        # NativeGenerationController), tokenizer (for token counting), max_turns (LLM
+        # calls, default 20), max_total_tokens (context budget, default 32768), messages
+        # (initial chat dicts, default []), input_tokens (default []). Also sets
+        # max_total_tokens_before_finishing (80% of budget; unused) and a 256-token
+        # safety margin.
         super().__init__()
         self.generation_controller = generation_controller
         self.tokenizer = tokenizer
@@ -96,6 +114,10 @@ class SearchAgentController(Controller):
     # ------------------------------------------------------------------
 
     def _count_tokens(self, messages: list[RoleMessage]) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Approximates prompt length by rendering messages (RoleMessage or dict)
+        # in a ChatML-like template plus an assistant header and returning the
+        # tokenizer-encoded length.
         """Approximate token count for a list of ``RoleMessage`` objects."""
         parts = []
         for msg in messages:
@@ -105,6 +127,10 @@ class SearchAgentController(Controller):
         return len(self.tokenizer.encode("".join(parts)))
 
     async def _execute_tool(self, tool_name: str, tool_args: dict) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Dispatches a parsed tool call: "search" -> real_search on "query" (str
+        # or list), "visit" -> real_visit on "url" (str or list) with "goal"; unknown
+        # tool names return an error string. Performs network I/O.
         """Dispatch a tool call to the appropriate tool."""
         if tool_name == "search":
             queries = tool_args.get("query", [])
@@ -124,6 +150,26 @@ class SearchAgentController(Controller):
     # ------------------------------------------------------------------
 
     def process(self, tasks: list[Task], **kwargs) -> Any:  # noqa: C901
+        # [FUNCTION DOC]
+        # Generator implementing the agent loop; incoming tasks are ignored. Builds a
+        # ChatTask from self.messages (stop strings at "<tool_response>"; input_tokens
+        # attached if set). Each turn: if counted tokens plus the generation
+        # controller's max_tokens (default 2048) exceed max_total_tokens, appends a "max
+        # context reached, answer now" user message, caps task.max_tokens to the
+        # remaining budget minus the safety margin (at least 256), yields one final
+        # generation and stops. Otherwise yields a generation, reads the last message
+        # content; if it contains a <tool_call>...</tool_call>, parses the first one
+        # with json5, runs the tool on a fresh private event loop, and appends the
+        # result wrapped in <tool_response> tags (errors become an error text). Stops
+        # when the reply contains <answer>...</answer>. If the last turn index was
+        # reached and the final message lacks <answer>, appends a "too many calls,
+        # answer now" message and yields one more capped generation. Results live in the
+        # ChatTask messages (not written back to tasks or self.messages).
+        # KNOWN ISSUE: With max_turns <= 0 the variable turn is undefined after the loop
+        # (NameError). Creating and running a new event loop inside the generator fails
+        # with RuntimeError if the generator is driven from a thread with a running loop
+        # (as ScaffoldingLlm does); the error would be reported to the model as a tool
+        # error.
         """Run the multi-turn search-agent loop.
 
         Parameters

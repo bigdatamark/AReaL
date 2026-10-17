@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# CLI script: starts (or refreshes) an RL session on AReaL's inference gateway by
+# POSTing to <gateway>/rl/start_session with the admin key, then prints the minted per-
+# session sk-sess-* key, session id and follow-up commands (hermes_loop.py,
+# set_reward.py, refresh). Also emits SESSION_API_KEY / SESSION_ID lines on stderr for
+# scripting.
 """Start an RL session on AReaL's inference gateway.
 
 Mints a per-session ``sk-sess-*`` key on the inference gateway that
@@ -43,32 +49,47 @@ BLUE = "\033[0;34m"
 
 
 def info(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints an indented cyan info line.
     print(f"  {CYAN}ℹ{RESET}  {msg}")
 
 
 def success(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints an indented green success line.
     print(f"  {GREEN}✔{RESET}  {msg}")
 
 
 def error(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints an indented red error line.
     print(f"  {RED}✘{RESET}  {msg}")
 
 
 def arrow(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints an indented yellow arrow line.
     print(f"  {YELLOW}→{RESET} {msg}")
 
 
 def die(msg: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints msg as error and exits with status 1.
     error(msg)
     sys.exit(1)
 
 
 def show_request(method: str, path: str, auth_label: str, gateway_url: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints the method, "<gateway_url>/<path>" and auth label, dimmed.
     print(f"  {DIM}{method} {gateway_url}/{path}{RESET}")
     print(f"  {DIM}Auth: {auth_label}{RESET}")
 
 
 def show_response(status_code: int, body: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints HTTP status (green 2xx, red otherwise) and body, pretty-printed as
+    # JSON when parseable, raw otherwise.
     if 200 <= status_code < 300:
         print(f"  {GREEN}HTTP {status_code}{RESET}")
     else:
@@ -84,6 +105,8 @@ def show_response(status_code: int, body: str) -> None:
 
 
 def header(title: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints a blank line and a bold blue boxed title.
     """Print a boxed header."""
     print()
     print(
@@ -96,6 +119,15 @@ def header(title: str) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Entry point. Args: gateway_url; --admin-key (env ADMIN_KEY, default "areal-admin-
+    # key"); --task-id (env TASK_ID, default "demo-task"); --api-key (env
+    # SESSION_API_KEY; presence means refresh mode). POSTs {task_id, api_key} with admin
+    # Bearer auth (timeout 130s for refresh, 10s otherwise). Requires HTTP 201, else
+    # exits 1 with a message (special message for 429 on refresh). Parses
+    # sessions[0].session_api_key and session_id from the JSON (exits 1 on parse
+    # failure), prints them and suggested next commands, and writes KEY=VALUE lines to
+    # stderr.
     parser = argparse.ArgumentParser(description="Start an AReaL RL session")
     parser.add_argument("gateway_url", help="Inference gateway URL")
     parser.add_argument(
