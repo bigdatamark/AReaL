@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Routing tests for all_gather_param in areal.engine.megatron_utils.megatron: a param is
+# returned as-is (no TP all-gather) when tensor_model_parallel is False or its name is
+# in duplicated_param_names, and gathered only when genuinely TP-sharded. The gather
+# helper and mpu accessors are stubbed, so no process group is needed; skipped if the
+# module (megatron.core) cannot be imported.
 # SPDX-License-Identifier: Apache-2.0
 
 """Routing tests for ``all_gather_param``.
@@ -22,6 +28,10 @@ megatron = pytest.importorskip("areal.engine.megatron_utils.megatron")
 
 
 def _make_param(tensor_model_parallel):
+    # [FUNCTION DOC]
+    # HELPER: Returns the weight of a bias-free 4x4 torch Linear; sets
+    # tensor_model_parallel when the argument is not None, and always sets
+    # partition_dim=0 and partition_stride=1.
     """A plain Linear weight with the attributes all_gather_param reads."""
     weight = torch.nn.Linear(4, 4, bias=False).weight
     if tensor_model_parallel is not None:
@@ -33,6 +43,10 @@ def _make_param(tensor_model_parallel):
 
 
 def test_returns_param_data_when_tensor_model_parallel_false(monkeypatch):
+    # [FUNCTION DOC]
+    # Stubs _all_gather_and_concat to record calls; with tensor_model_parallel=False
+    # asserts the result shares storage (same data_ptr and offset) with the param and
+    # the gather stub was never called.
     calls = []
     monkeypatch.setattr(
         megatron,
@@ -49,6 +63,9 @@ def test_returns_param_data_when_tensor_model_parallel_false(monkeypatch):
 
 
 def test_returns_param_data_when_name_in_duplicated_set(monkeypatch):
+    # [FUNCTION DOC]
+    # Same as above but the param is marked TP=True and its name is passed in
+    # duplicated_param_names; asserts it is still returned without gathering.
     calls = []
     monkeypatch.setattr(
         megatron,
@@ -67,10 +84,16 @@ def test_returns_param_data_when_name_in_duplicated_set(monkeypatch):
 
 
 def test_all_gathers_genuine_tp_sharded_param(monkeypatch):
+    # [FUNCTION DOC]
+    # Stubs the gather to return a sentinel tensor and mpu TP size 2 / group 'tp_group';
+    # asserts a TP-sharded param goes through the gather exactly once with positional
+    # args tp_size=2 and group='tp_group', returning the sentinel.
     sentinel = torch.arange(8)
     calls = []
 
     def fake_gather(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Records (args, kwargs) and returns the sentinel tensor.
         calls.append((args, kwargs))
         return sentinel
 

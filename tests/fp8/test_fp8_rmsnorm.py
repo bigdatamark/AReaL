@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Debugging utilities and a (skipped) test comparing Megatron q/k RMSNorm modules
+# between a BF16 Qwen3-0.6B engine and an FP8 Qwen3-0.6B-FP8 engine. Provides a
+# reference RMSNorm implementation with a hand-written autograd backward, helpers to run
+# an isolated forward/backward on a norm module, to load saved activation inputs from
+# .pt files, to swap a Megatron norm for the reference implementation with dequantized
+# weights, and to compute output and gradient differences (max/mean abs diff, cosine
+# similarity, norms). Requires megatron.core, GPUs and the model checkpoints (resolved
+# at import time via get_model_path). Logs via the module logger.
+# KNOWN ISSUE: The logger name 'FP8 BF16 RMSNorm Test' contains spaces, contrary to the
+# project's PascalCase logger naming convention.
 """RMSNorm testing utilities for FP8/BF16 comparison tests.
 
 This module contains RMSNorm-related classes, functions, and tests.
@@ -37,6 +48,10 @@ MODEL_PATH_FP8 = get_model_path(
 
 @pytest.fixture(scope="module")
 def engine_bf16():
+    # [FUNCTION DOC]
+    # Module-scoped fixture: creates a BF16 MegatronEngine for Qwen3-0.6B (fp8 disabled)
+    # on port 7777, yields it, and on teardown destroys the engine and the default
+    # process group if initialized.
     engine = create_engine(
         MODEL_PATH_BF16, fp8_enabled=False, fp8_param=False, port=7777
     )
@@ -50,6 +65,11 @@ def engine_bf16():
 
 @pytest.fixture(scope="module")
 def engine_fp8():
+    # [FUNCTION DOC]
+    # Module-scoped fixture: creates an FP8 MegatronEngine for Qwen3-0.6B-FP8 with
+    # fp8_enabled and fp8_param on port 7778; teardown mirrors engine_bf16.
+    # KNOWN ISSUE: Both fixtures destroy the global default process group, so whichever
+    # is torn down first can break the other engine's later destroy.
     engine = create_engine(MODEL_PATH_FP8, fp8_enabled=True, fp8_param=True, port=7778)
     try:
         yield engine
@@ -60,6 +80,10 @@ def engine_fp8():
 
 
 def dequantize_fp8_param(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns a bfloat16 copy of tensor: dequantizes Transformer Engine
+    # Float8Tensors via dequantize(dtype=bfloat16), otherwise logs at info and casts to
+    # bfloat16.
     """Dequantize FP8 tensor to bfloat16."""
     if is_float8tensor(tensor):
         return tensor.dequantize(dtype=torch.bfloat16)
@@ -69,10 +93,19 @@ def dequantize_fp8_param(tensor: torch.Tensor) -> torch.Tensor:
 
 
 class Qwen3RMSNormFunction(Function):
+    # [CLASS DOC]
+    # Reference RMSNorm as a torch.autograd.Function with explicit forward/backward
+    # computed in float32, matching HF Qwen3RMSNorm numerics.
     """Custom autograd Function for Qwen3RMSNorm backward."""
 
     @staticmethod
     def forward(ctx, hidden_states, weight, variance_epsilon):
+        # [FUNCTION DOC]
+        # Static forward. Inputs: hidden_states [..., hidden], weight [hidden],
+        # variance_epsilon float. Upcasts to float32, computes inv_std = rsqrt(mean(x^2
+        # over last dim) + eps), normalized = x * inv_std, output = weight * normalized
+        # cast back to the input dtype. Saves fp32 input, weight, inv_std and normalized
+        # plus eps and input dtype on ctx. Returns output.
         """
         Forward pass for RMSNorm.
 
@@ -106,6 +139,13 @@ class Qwen3RMSNormFunction(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC]
+        # Static backward. Given grad_output, computes in float32: grad_weight = sum
+        # over all leading dims of grad_output * normalized; grad_normalized =
+        # grad_output * weight; grad of the variance term = sum over last dim of
+        # grad_normalized * x * -0.5 * inv_std^3; grad_input = grad_normalized * inv_std
+        # + grad_variance * 2x / hidden_size. Casts grad_input and grad_weight to the
+        # input dtype and returns (grad_input, grad_weight, None).
         """
         Backward pass for RMSNorm.
 
@@ -155,19 +195,30 @@ class Qwen3RMSNormFunction(Function):
 
 
 class Qwen3RMSNorm(nn.Module):
+    # [CLASS DOC]
+    # nn.Module wrapper around Qwen3RMSNormFunction with a learnable weight initialized
+    # to ones.
     """Qwen3RMSNorm is equivalent to T5LayerNorm."""
 
     def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        # [FUNCTION DOC]
+        # Creates weight = ones(hidden_size) as a Parameter and stores eps (default
+        # 1e-6) as variance_epsilon.
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.variance_epsilon = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Applies Qwen3RMSNormFunction to hidden_states with this module's weight and
+        # eps; returns the normalized tensor.
         return Qwen3RMSNormFunction.apply(
             hidden_states, self.weight, self.variance_epsilon
         )
 
     def extra_repr(self):
+        # [FUNCTION DOC]
+        # Returns '(weight shape tuple), eps=<eps>' for module printing.
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
@@ -179,6 +230,18 @@ def forward_backward_rmsnorm_module(
     collect_gradients: bool = True,
     output_grad: torch.Tensor | None = None,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Runs one isolated forward/backward through a norm module. Puts the module in train
+    # mode, casts input to dtype (default bfloat16) and, when collect_gradients (default
+    # True), makes it a fresh leaf requiring grad. Computes output stats (norm, abs max,
+    # mean, std; each a GPU sync via item()). For gradients: zeros module grads,
+    # backprops output_grad (cast to dtype/device) if given, else the sum of the output;
+    # collects each trainable param's main_grad (Megatron) or grad as '<name>_grad',
+    # plus copies of input, output and output_grad. Logs a summary at info and per-grad
+    # stats at debug. Returns dict with output, the four stats, input/output shapes and
+    # gradients. Raises ValueError if a trainable param has no gradient.
+    # KNOWN ISSUE: gradients['input'] stores the input activation itself, not its
+    # gradient, despite living in the gradients dict and being compared as one.
     """Forward and backward a single RMSNorm module with given input activation.
 
     This function tests a RMSNorm module in isolation by:
@@ -279,6 +342,14 @@ def forward_backward_rmsnorm_module(
 
 
 def load_layernorm_inputs_from_file(file_path: str | Path) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Loads saved norm inputs from a .pt file onto CPU. A dict containing both
+    # 'bf16_inputs' and 'fp8_inputs' is returned as-is (combined file). Any other dict
+    # is treated as a single-precision file: wrapped as bf16_inputs or fp8_inputs
+    # depending on whether 'bf16' or 'fp8' appears in the filename (defaulting to BF16),
+    # with timestamp taken from the last '_'-separated part of the stem and empty
+    # layer_indices. Raises FileNotFoundError if missing and ValueError if the loaded
+    # object is not a dict.
     """Load layernorm activation inputs from saved file.
 
     Args:
@@ -338,6 +409,16 @@ def get_custom_rmsnorm(
     dtype: torch.dtype = torch.bfloat16,
     weight: torch.Tensor | None = None,
 ) -> torch.nn.Module:
+    # [FUNCTION DOC]
+    # Builds a reference Qwen3RMSNorm to replace a Megatron norm module. Finds the
+    # module's weight (attribute 'weight' or first named parameter containing 'weight';
+    # ValueError if none), dequantizes it to bfloat16, creates Qwen3RMSNorm sized
+    # hf_config.head_dim with eps hf_config.rms_norm_eps, sets its weight to the
+    # explicitly provided weight (moved to device/dtype) or the dequantized weight,
+    # moves the module to device/dtype, logs and returns it.
+    # KNOWN ISSUE: hidden_size is taken from hf_config.head_dim (correct only for per-
+    # head q/k norms) although the comment says it comes from the weight shape; using it
+    # on a hidden-size norm would mismatch the weight.
     """Create a custom RMSNorm module with dequantized FP8 params."""
     # Extract weight parameter
     if hasattr(layernorm_module, "weight"):
@@ -388,6 +469,21 @@ def compare_rmsnorm_bf16_fp8(
     use_custom_rmsnorm: bool = False,
     save_data: bool = False,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Compares BF16 vs FP8 RMSNorm behavior for one layer. Parses layer_path of the form
+    # 'layer_<i>.self_attention.(q_layernorm|k_layernorm)' (ValueError otherwise),
+    # fetches the corresponding norm from each engine's model decoder (ValueError if
+    # decoder/layer/norm missing), optionally replaces both with the reference
+    # implementation, then runs forward_backward_rmsnorm_module on each with its own
+    # input and optional output grad (FP8 module run inside Megatron's FP8 context
+    # unless using the reference norm). If save_data, writes inputs, weights and output
+    # grads for both to layernorm_inputs/layernorm_inputs_<layer_path>_<timestamp>.pt in
+    # the CWD. If output shapes differ, logs a warning and returns a shape_mismatch
+    # dict. Otherwise computes output max/mean abs diff and cosine similarity, and for
+    # every gradient key present in both results (with equal shapes) max/mean diff,
+    # cosine similarity and norms, logging a table and summary. Returns a dict with
+    # layer_path, output diff metrics, both output norms/maxes, both outputs and
+    # gradient_comparison.
     """Compare RMSNorm module outputs between BF16 and FP8 engines.
 
     This function extracts the q_layernorm module from both engines and compares
@@ -662,6 +758,15 @@ def test_rmsnorm_from_file(
     layer_path: str | None = None,
     save_data: bool = False,
 ):
+    # [FUNCTION DOC]
+    # Debug-only test (always skipped), parametrized over use_custom_rmsnorm and a hard-
+    # coded activation file. Loads inputs and optional output grads, intersects BF16/FP8
+    # input keys, optionally restricts to layer_path (converted to a '.input' key;
+    # returns early with a warning if absent), keeps only q_layernorm inputs, moves
+    # tensors to each engine's device, runs compare_rmsnorm_bf16_fp8 per layer and logs
+    # a summary of output and gradient metrics. Makes no assertions.
+    # KNOWN ISSUE: Filtering to q_layernorm keys makes the k_layernorm branch
+    # unreachable, and layer_path/save_data are function defaults pytest never varies.
     """Test RMSNorm modules using activation inputs loaded from file.
 
     This test loads previously saved activation inputs from file and tests

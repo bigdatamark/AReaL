@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Unit tests for the data service guard Flask app (areal.infra.data_service.guard.app):
+# health endpoint, port allocation, forking raw commands, killing a forked worker, and
+# cleanup of all forked children. Process and port helpers are patched at
+# areal.infra.rpc.guard.app, where the shared guard implementation lives.
 from __future__ import annotations
 
 import subprocess
@@ -14,6 +19,9 @@ from areal.infra.data_service.guard.app import (
 
 @pytest.fixture()
 def state() -> GuardState:
+    # [FUNCTION DOC]
+    # Fixture returning a GuardState with server_host 10.0.0.1, experiment/trial names,
+    # role 'test-role' and worker_index 0.
     s = GuardState()
     s.server_host = "10.0.0.1"
     s.experiment_name = "test-exp"
@@ -25,6 +33,9 @@ def state() -> GuardState:
 
 @pytest.fixture()
 def client(state: GuardState):
+    # [FUNCTION DOC]
+    # Fixture creating the guard app from state with TESTING enabled and yielding its
+    # test client.
     app = create_app(state)
     app.config["TESTING"] = True
     with app.test_client() as c:
@@ -32,6 +43,9 @@ def client(state: GuardState):
 
 
 def _make_mock_process(pid: int = 12345, running: bool = True) -> MagicMock:
+    # [FUNCTION DOC]
+    # HELPER: Returns a MagicMock spec'd as Popen with the given pid whose poll()
+    # returns None when running else 0.
     proc = MagicMock(spec=subprocess.Popen)
     proc.pid = pid
     proc.poll.return_value = None if running else 0
@@ -39,6 +53,8 @@ def _make_mock_process(pid: int = 12345, running: bool = True) -> MagicMock:
 
 
 def test_health_returns_200(client):
+    # [FUNCTION DOC]
+    # GET /health returns 200 with status 'healthy' and forked_children 0.
     resp = client.get("/health")
     assert resp.status_code == 200
     data = resp.get_json()
@@ -48,6 +64,9 @@ def test_health_returns_200(client):
 
 @patch("areal.infra.rpc.guard.app.find_free_ports")
 def test_alloc_ports_success(mock_find, client, state: GuardState):
+    # [FUNCTION DOC]
+    # With find_free_ports patched to [9001, 9002], POST /alloc_ports count=2 returns
+    # those ports and the host, and records them in state.allocated_ports.
     mock_find.return_value = [9001, 9002]
     resp = client.post("/alloc_ports", json={"count": 2})
     assert resp.status_code == 200
@@ -59,6 +78,10 @@ def test_alloc_ports_success(mock_find, client, state: GuardState):
 
 @patch("areal.infra.rpc.guard.app.run_with_streaming_logs")
 def test_fork_raw_command_success(mock_run, client, state: GuardState):
+    # [FUNCTION DOC]
+    # With run_with_streaming_logs patched to return a mock process (pid 42), POST /fork
+    # with a raw_cmd returns success, the host and pid, and registers ('worker', 1) in
+    # forked_children_map.
     mock_proc = _make_mock_process(pid=42)
     mock_run.return_value = mock_proc
 
@@ -80,6 +103,10 @@ def test_fork_raw_command_success(mock_run, client, state: GuardState):
 
 @patch("areal.infra.rpc.guard.app.kill_process_tree")
 def test_kill_known_worker(mock_kill, client, state: GuardState):
+    # [FUNCTION DOC]
+    # Registers a mock child under ('test', 0), POSTs /kill_forked_worker and asserts it
+    # is removed from the map and kill_process_tree was called with pid 123, timeout=3,
+    # graceful=True.
     mock_proc = _make_mock_process(pid=123)
     state.forked_children.append(mock_proc)
     state.forked_children_map[("test", 0)] = mock_proc
@@ -92,6 +119,9 @@ def test_kill_known_worker(mock_kill, client, state: GuardState):
 
 @patch("areal.infra.rpc.guard.app.kill_process_tree")
 def test_cleanup_kills_all_running_children(mock_kill, state: GuardState):
+    # [FUNCTION DOC]
+    # Registers two running mock children and asserts cleanup_forked_children kills both
+    # and empties forked_children and forked_children_map.
     proc1 = _make_mock_process(pid=100)
     proc2 = _make_mock_process(pid=200)
     state.forked_children = [proc1, proc2]

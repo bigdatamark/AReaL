@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# End-to-end SFT regression test. For each backend config it resolves local or
+# HuggingFace model/dataset paths, writes a resolved config YAML into tmp_path, runs
+# tests/sft/entrypoint.py as a subprocess, and compares the produced per-step losses
+# against stored reference losses. Requires GPUs and model/dataset access.
 import json
 import os
 import subprocess
@@ -28,6 +33,16 @@ from areal.api.cli_args import SFTConfig, load_expr_config
     ],
 )
 def test_sft(tmp_path: str, backend: str, v2: bool) -> None:
+    # [FUNCTION DOC]
+    # Parametrized over (backend, v2): fsdp/megatron/archon with v1 and fsdp with v2.
+    # Loads config_<backend>.yaml, rewrites actor/tokenizer path and train dataset path
+    # through get_model_path/get_dataset_path (preferring /storage/openpsi locations),
+    # dumps the config to tmp_path/config/config.yaml, runs the entrypoint with
+    # cluster.fileroot=tmp_path (plus actor._version=v2 when v2), asserts exit code 0,
+    # then loads losses.json and ref_losses_<backend>.json and asserts each loss
+    # approximately equals its reference (rel 1.6e-2, abs 1e-5).
+    # KNOWN ISSUE: zip truncates silently, so a run producing fewer (or zero) losses
+    # than the reference still passes.
     base_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(base_dir, f"config_{backend}.yaml")
     ref_losses_path = os.path.join(base_dir, f"ref_losses_{backend}.json")

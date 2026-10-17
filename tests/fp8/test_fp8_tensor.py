@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Unit tests for FP8BlockwiseTensorHelper (areal.engine.megatron_utils.fp8), a wrapper
+# pairing raw FP8 bytes (_rowwise_data, uint8 storage) with a blockwise inverse-scale
+# tensor (_rowwise_scale_inv, one float32 per block_size x block_size tile over the last
+# two dims; leading dims are kept as-is). Verifies that shape ops used during Megatron-
+# to-HF weight conversion (chunk, view, reshape, torch.split, torch.cat) transform data
+# and scales consistently, plus repr and conversion to torch.float8_e4m3fn. Runs on CUDA
+# if available, otherwise CPU; inputs are random bytes and random scales.
 import pytest
 import torch
 
@@ -6,11 +14,16 @@ from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
 
 @pytest.fixture(scope="module")
 def device():
+    # [FUNCTION DOC]
+    # Module-scoped fixture returning a CUDA device if available, else CPU.
     """Get CUDA device if available, otherwise CPU."""
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def test_creation(device):
+    # [FUNCTION DOC]
+    # Wraps a 1024x2048 uint8 tensor with a 8x16 scale and block size 128; asserts
+    # shape, stored data/scale shapes and block size.
     block_size = 128
     M, K = 1024, 2048
 
@@ -28,6 +41,8 @@ def test_creation(device):
 
 
 def test_repr(device):
+    # [FUNCTION DOC]
+    # repr contains the class name, 'data_shape' and 'scale_shape'.
     """Test FP8BlockwiseTensorHelper string representation."""
     data = torch.randint(0, 255, (256, 512), dtype=torch.uint8, device=device)
     scale_inv = torch.randn(2, 4, dtype=torch.float32, device=device)
@@ -41,6 +56,10 @@ def test_repr(device):
 
 
 def test_chunk_dim0(device):
+    # [FUNCTION DOC]
+    # chunk(2, dim=0) on a 1024x2048 tensor splits data into 512-row halves and scale
+    # rows into halves; data and scale contents match the corresponding slices of the
+    # originals (GLU gate/up split).
     """Test chunk along dimension 0 (GLU case: gate/up split)."""
     block_size = 128
     M, K = 1024, 2048  # M is divisible by 2 for chunk
@@ -75,6 +94,10 @@ def test_chunk_dim0(device):
 
 
 def test_view_2d_to_4d(device):
+    # [FUNCTION DOC]
+    # view of a 4096x4096 tensor to (8, 4, 128, 4096) yields data of that shape and a
+    # scale of shape (8, 4, 1, 32): leading dims kept, last two divided by block size
+    # (QKV reshape).
     """Test view from 2D to 4D (QKV reshape case).
 
     This mimics the QKV weight reshape:
@@ -121,6 +144,9 @@ def test_view_2d_to_4d(device):
 
 
 def test_view_4d_to_2d(device):
+    # [FUNCTION DOC]
+    # reshape(-1, hidden) of a 4D (8, 4, 128, 4096) tensor with matching 4D scale yields
+    # 4096x4096 data and a 32x32 scale.
     """Test view from 4D back to 2D (final reshape after QKV split)."""
     block_size = 128
     num_groups = 8
@@ -161,6 +187,10 @@ def test_view_4d_to_2d(device):
 
 
 def test_split_qkv(device):
+    # [FUNCTION DOC]
+    # torch.split along dim 1 of a (8, 6, 128, 4096) tensor into sections [4, 1, 1]
+    # yields Q/K/V helpers whose data and scale shapes are split along the same dim
+    # (allowed because dim 1 is not one of the blocked last two dims).
     """Test split for QKV separation.
 
     After view to [num_groups, heads_per_group + 2, head_dim, hidden],
@@ -227,6 +257,9 @@ def test_split_qkv(device):
 
 
 def test_cat_dim0(device):
+    # [FUNCTION DOC]
+    # torch.cat of two 512x2048 helpers along dim 0 gives 1024x2048 data and a 8x16
+    # scale whose halves equal the inputs' data and scales (gate/up to fc1).
     """Test concatenation along dim=0 (gate/up -> fc1 case)."""
     block_size = 128
     M, K = 512, 2048
@@ -262,6 +295,10 @@ def test_cat_dim0(device):
 
 
 def test_cat_dim1(device):
+    # [FUNCTION DOC]
+    # torch.cat of Q (4 heads), K and V (1 head each) 4D helpers along dim 1 yields
+    # total_heads=6 for data and scale, and the scale slices equal the inputs' scales.
+    # Prints shapes/devices for debugging; data content is not checked.
     """Test concatenation along dim=1 (Q, K, V -> QKV case)."""
     block_size = 128
     num_groups = 8
@@ -349,6 +386,9 @@ def test_cat_dim1(device):
 
 
 def test_to_pytorch_fp8_basic(device):
+    # [FUNCTION DOC]
+    # to_pytorch_fp8 returns a float8_e4m3fn tensor with the original shape whose bytes
+    # equal the input data, plus the scale tensor with shape (M/128, K/128).
     """Test basic conversion to PyTorch FP8 format."""
     block_size = 128
     M, K = 1024, 2048
@@ -374,6 +414,10 @@ def test_to_pytorch_fp8_basic(device):
 
 
 def test_qkv_conversion_flow(device):
+    # [FUNCTION DOC]
+    # End-to-end QKV conversion: view a (8*6*128)x4096 helper to 4D, split into Q/K/V
+    # along dim 1, reshape each back to 2D, asserting data and scale shapes at every
+    # step. Prints intermediate shapes.
     """Test the full QKV weight conversion flow.
 
     This simulates:
@@ -487,6 +531,10 @@ def test_qkv_conversion_flow(device):
 
 
 def test_glu_conversion_flow(device):
+    # [FUNCTION DOC]
+    # End-to-end GLU conversion: chunk a 4096x4096 fc1 helper into gate and up along dim
+    # 0, asserting shapes of data and scales and that data contents equal the original
+    # row halves. Prints shapes.
     """Test the GLU (gate/up) weight conversion flow.
 
     This simulates:

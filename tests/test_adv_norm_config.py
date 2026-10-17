@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Unit tests for NormConfig (areal.api.cli_args) and the Normalization callable
+# (areal.utils.data) used for reward/advantage normalization. Normalization(config)(x,
+# loss_mask=None, reduce_group=None) centers by a mean and scales by a std computed
+# either over the whole masked batch ('batch') or within consecutive groups of
+# group_size rows ('group'), or skips that step (None); options mean_leave1out (each
+# element's mean excludes itself) and std_unbiased (Bessel correction) and eps alter the
+# statistics, and masked positions are zeroed. Also checks PPOActorConfig warns about
+# singleton group reward centering. All tests are CPU-only on small hand-built tensors.
 import warnings
 from dataclasses import asdict
 from unittest.mock import patch
@@ -28,6 +37,11 @@ from areal.utils.data import Normalization
 def test_ppo_actor_warns_for_all_supported_singleton_reward_config_shapes(
     reward_norm,
 ):
+    # [FUNCTION DOC]
+    # Parametrized over a NormConfig, a plain dict and an OmegaConf DictConfig all
+    # specifying group mean/std with group_size 1; asserts
+    # PPOActorConfig(reward_norm=...) emits a UserWarning that singleton group centering
+    # erases the task reward.
     with pytest.warns(
         UserWarning, match="singleton group centering erases the task reward"
     ):
@@ -46,6 +60,10 @@ def test_ppo_actor_warns_for_all_supported_singleton_reward_config_shapes(
 def test_ppo_actor_does_not_warn_without_singleton_reward_group_centering(
     reward_norm,
 ):
+    # [FUNCTION DOC]
+    # Parametrized over reward_norm configs that are None, have no group mean,
+    # group_size 2, or batch-level; asserts constructing PPOActorConfig emits no
+    # singleton-centering warning.
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         PPOActorConfig(reward_norm=reward_norm)
@@ -57,6 +75,12 @@ def test_ppo_actor_does_not_warn_without_singleton_reward_group_centering(
 
 
 def test_adv_norm_config_inheritance():
+    # [FUNCTION DOC]
+    # Asserts a default NormConfig exposes mean_level, std_level, group_size,
+    # mean_leave1out, std_unbiased with defaults batch, batch, 1, False, True.
+    # KNOWN ISSUE: The docstring ('inherits ... from NormConfig') is meaningless, and
+    # the std_unbiased assertion message says the default should be False while
+    # asserting True.
     """Test that NormConfig inherits all properties from NormConfig."""
     adv_config = NormConfig()
 
@@ -86,6 +110,9 @@ def test_adv_norm_config_inheritance():
 
 
 def test_adv_norm_config_custom_values():
+    # [FUNCTION DOC]
+    # A NormConfig built with custom values (no mean, batch std, group 4, both options
+    # on) stores them.
     """Test NormConfig with custom values."""
     adv_config = NormConfig(
         mean_level=None,
@@ -103,6 +130,8 @@ def test_adv_norm_config_custom_values():
 
 
 def test_adv_norm_config_asdict():
+    # [FUNCTION DOC]
+    # dataclasses.asdict of a NormConfig reproduces all set field values.
     """Test conversion of NormConfig to dictionary."""
     adv_config = NormConfig(
         mean_level="batch",
@@ -129,6 +158,9 @@ def test_adv_norm_config_asdict():
 def test_adv_norm_config_parameterized(
     mean_level, std_level, group_size, mean_leave1out, std_unbiased
 ):
+    # [FUNCTION DOC]
+    # Parametrized over the full grid of mean_level, std_level, group_size,
+    # mean_leave1out and std_unbiased; asserts NormConfig stores each value unchanged.
     """Parameterized test for NormConfig with various combinations."""
     adv_config = NormConfig(
         mean_level=mean_level,
@@ -146,6 +178,9 @@ def test_adv_norm_config_parameterized(
 
 
 def test_adv_norm_config_equality():
+    # [FUNCTION DOC]
+    # NormConfigs with equal fields compare equal; differing mean_level compares
+    # unequal.
     """Test equality comparison between NormConfig instances."""
     adv_config1 = NormConfig(mean_level="batch", std_level="batch", group_size=1)
     adv_config2 = NormConfig(mean_level="batch", std_level="batch", group_size=1)
@@ -156,6 +191,9 @@ def test_adv_norm_config_equality():
 
 
 def test_adv_norm_initialization():
+    # [FUNCTION DOC]
+    # Normalization copies mean_level, std_level and group_size from the config for
+    # batch, group, mixed and disabled configurations.
     """Test Normalization initialization with various configurations."""
     # Test with batch normalization
     config = NormConfig(mean_level="batch", std_level="batch", group_size=1)
@@ -187,6 +225,10 @@ def test_adv_norm_initialization():
 
 
 def test_adv_norm_initialization_validation():
+    # [FUNCTION DOC]
+    # Invalid mean_level, invalid std_level, and group_size 0 with group normalization
+    # each raise ValueError with the expected message (construction of the NormConfig
+    # and Normalization is inside the raises block, so either may raise).
     """Test Normalization initialization validation."""
     # Test invalid mean_level
     with pytest.raises(ValueError, match="mean_level must be 'batch', 'group' or None"):
@@ -208,6 +250,9 @@ def test_adv_norm_initialization_validation():
 
 
 def test_adv_norm_batch_normalization():
+    # [FUNCTION DOC]
+    # Batch mean/std normalization with a partial mask returns the same shape and
+    # changes the values.
     """Test batch normalization functionality."""
     config = NormConfig(mean_level="batch", std_level="batch", group_size=1)
     adv_norm = Normalization(config)
@@ -227,6 +272,9 @@ def test_adv_norm_batch_normalization():
 
 
 def test_adv_norm_group_normalization():
+    # [FUNCTION DOC]
+    # Group normalization (group_size 2, four rows) returns the same shape and changes
+    # the values.
     """Test group normalization functionality."""
     config = NormConfig(mean_level="group", std_level="group", group_size=2)
     adv_norm = Normalization(config)
@@ -248,6 +296,9 @@ def test_adv_norm_group_normalization():
 
 
 def test_adv_norm_mixed_normalization():
+    # [FUNCTION DOC]
+    # Batch mean with group std (group_size 2) returns the same shape and changes the
+    # values.
     """Test mixed normalization (different mean and std levels)."""
     config = NormConfig(mean_level="batch", std_level="group", group_size=2)
     adv_norm = Normalization(config)
@@ -269,6 +320,8 @@ def test_adv_norm_mixed_normalization():
 
 
 def test_adv_norm_no_normalization():
+    # [FUNCTION DOC]
+    # With mean_level and std_level None, the output equals the input.
     """Test no normalization case."""
     config = NormConfig(mean_level=None, std_level=None, group_size=1)
     adv_norm = Normalization(config)
@@ -284,6 +337,8 @@ def test_adv_norm_no_normalization():
 
 
 def test_adv_norm_center_only():
+    # [FUNCTION DOC]
+    # Batch mean with no std scaling yields an output whose overall mean is about 0.
     """Test normalization with mean subtraction only (std_level='none')."""
     config = NormConfig(mean_level="batch", std_level=None, group_size=1)
     adv_norm = Normalization(config)
@@ -301,6 +356,8 @@ def test_adv_norm_center_only():
 
 
 def test_adv_norm_without_mask():
+    # [FUNCTION DOC]
+    # Calling without a loss mask still normalizes (shape kept, values changed).
     """Test normalization without providing a mask."""
     config = NormConfig(mean_level="batch", std_level="batch", group_size=1)
     adv_norm = Normalization(config)
@@ -316,6 +373,9 @@ def test_adv_norm_without_mask():
 
 
 def test_adv_norm_edge_cases():
+    # [FUNCTION DOC]
+    # All-zero input normalizes to zeros without division-by-zero; tiny values (1e-10)
+    # keep their shape.
     """Test edge cases for Normalization."""
     # Test with all zeros
     config = NormConfig(mean_level="batch", std_level="batch", group_size=1)
@@ -336,6 +396,8 @@ def test_adv_norm_edge_cases():
 
 
 def test_adv_norm_dtype_preservation():
+    # [FUNCTION DOC]
+    # float32 input yields float32 output.
     """Test that output dtype is preserved as float32."""
     config = NormConfig(mean_level="batch", std_level="batch", group_size=1)
     adv_norm = Normalization(config)
@@ -350,6 +412,10 @@ def test_adv_norm_dtype_preservation():
 @patch("torch.distributed.is_initialized")
 @patch("torch.distributed.all_reduce")
 def test_adv_norm_distributed(mock_all_reduce, mock_is_initialized):
+    # [FUNCTION DOC]
+    # With torch.distributed.is_initialized patched True and all_reduce patched to a no-
+    # op, passing reduce_group triggers all_reduce and returns the input shape. Inputs:
+    # the two patch mocks.
     """Test Normalization in distributed setting."""
     mock_is_initialized.return_value = True
     mock_all_reduce.return_value = None
@@ -380,6 +446,10 @@ def test_adv_norm_distributed(mock_all_reduce, mock_is_initialized):
     ],
 )
 def test_adv_norm_parameterized(mean_level, std_level):
+    # [FUNCTION DOC]
+    # Parametrized over mean/std level pairs (group_size 4 when any level is 'group');
+    # on a 4x4 tensor asserts shape and float32 dtype are kept and values change
+    # whenever any normalization is enabled.
     """Parameterized test for different normalization combinations."""
     config = NormConfig(
         mean_level=mean_level,
@@ -414,6 +484,9 @@ def test_adv_norm_parameterized(mean_level, std_level):
 
 
 def test_adv_norm_debug_cases():
+    # [FUNCTION DOC]
+    # Regression checks: batch mean with group std on a 4x3 tensor runs without shape
+    # errors and changes values; disabled normalization returns the input unchanged.
     """Debug test cases for mixed and no normalization scenarios."""
     # Test mixed normalization (batch mean, group std)
     config = NormConfig(mean_level="batch", std_level="group", group_size=2)
@@ -449,6 +522,10 @@ def test_adv_norm_debug_cases():
 
 
 def test_mean_leave1out_basic():
+    # [FUNCTION DOC]
+    # Leave-one-out batch centering on a 2x3 tensor: element [0,0] becomes 1 minus the
+    # mean of the other five values (4.0), and the result differs from regular
+    # centering.
     """Test basic functionality of mean_leave1out option."""
     # Test with mean_leave1out=True
     config = NormConfig(mean_level="batch", std_level=None, mean_leave1out=True)
@@ -480,6 +557,9 @@ def test_mean_leave1out_basic():
 
 
 def test_mean_leave1out_single_element():
+    # [FUNCTION DOC]
+    # With a single element and leave-one-out, there are no peers so the element is
+    # returned unchanged (5.0).
     """Test mean_leave1out with single element (edge case)."""
     config = NormConfig(mean_level="batch", std_level=None, mean_leave1out=True)
     adv_norm = Normalization(config)
@@ -497,6 +577,9 @@ def test_mean_leave1out_single_element():
 
 
 def test_mean_leave1out_with_mask():
+    # [FUNCTION DOC]
+    # Leave-one-out centering with a partial mask keeps the input shape (values not
+    # checked).
     """Test mean_leave1out with loss mask."""
     config = NormConfig(mean_level="batch", std_level=None, mean_leave1out=True)
     adv_norm = Normalization(config)
@@ -513,6 +596,9 @@ def test_mean_leave1out_with_mask():
 
 
 def test_mean_leave1out_group_level():
+    # [FUNCTION DOC]
+    # Group-level leave-one-out centering (group_size 2) keeps the shape and changes
+    # values.
     """Test mean_leave1out with group-level normalization."""
     config = NormConfig(
         mean_level="group", std_level=None, group_size=2, mean_leave1out=True
@@ -535,6 +621,9 @@ def test_mean_leave1out_group_level():
 
 @pytest.mark.parametrize("mean_leave1out", [True, False])
 def test_mean_leave1out_parameterized(mean_leave1out):
+    # [FUNCTION DOC]
+    # Parametrized over mean_leave1out; batch mean/std normalization keeps shape and
+    # float32 dtype and changes values.
     """Parameterized test for mean_leave1out option."""
     config = NormConfig(
         mean_level="batch", std_level="batch", mean_leave1out=mean_leave1out
@@ -560,6 +649,9 @@ def test_mean_leave1out_parameterized(mean_leave1out):
 
 
 def test_std_unbiased_basic():
+    # [FUNCTION DOC]
+    # Unbiased and biased batch std produce different normalized outputs of the same
+    # shape.
     """Test basic functionality of std_unbiased option."""
     # Test with std_unbiased=True
     config = NormConfig(mean_level="batch", std_level="batch", std_unbiased=True)
@@ -587,6 +679,8 @@ def test_std_unbiased_basic():
 
 
 def test_std_unbiased_single_element():
+    # [FUNCTION DOC]
+    # Unbiased std on a single element is handled gracefully: same shape, all finite.
     """Test std_unbiased with single element (edge case)."""
     config = NormConfig(mean_level="batch", std_level="batch", std_unbiased=True)
     adv_norm = Normalization(config)
@@ -603,6 +697,8 @@ def test_std_unbiased_single_element():
 
 
 def test_std_unbiased_with_mask():
+    # [FUNCTION DOC]
+    # Unbiased std with a partial mask yields finite values of the same shape.
     """Test std_unbiased with loss mask."""
     config = NormConfig(mean_level="batch", std_level="batch", std_unbiased=True)
     adv_norm = Normalization(config)
@@ -619,6 +715,8 @@ def test_std_unbiased_with_mask():
 
 
 def test_std_unbiased_group_level():
+    # [FUNCTION DOC]
+    # Group-level unbiased std (group_size 2) yields finite values of the same shape.
     """Test std_unbiased with group-level normalization."""
     config = NormConfig(
         mean_level="group", std_level="group", group_size=2, std_unbiased=True
@@ -640,6 +738,9 @@ def test_std_unbiased_group_level():
 
 @pytest.mark.parametrize("std_unbiased", [True, False])
 def test_std_unbiased_parameterized(std_unbiased):
+    # [FUNCTION DOC]
+    # Parametrized over std_unbiased; output keeps shape and float32 dtype, changes
+    # values and is finite.
     """Parameterized test for std_unbiased option."""
     config = NormConfig(
         mean_level="batch", std_level="batch", std_unbiased=std_unbiased
@@ -668,6 +769,9 @@ def test_std_unbiased_parameterized(std_unbiased):
 @pytest.mark.parametrize("mean_leave1out", [True, False])
 @pytest.mark.parametrize("std_unbiased", [True, False])
 def test_combined_mean_leave1out_std_unbiased(mean_leave1out, std_unbiased):
+    # [FUNCTION DOC]
+    # Parametrized over both mean_leave1out and std_unbiased; batch normalization of a
+    # 4x3 tensor keeps shape/dtype, changes values and is finite.
     """Test combined mean_leave1out and std_unbiased options."""
     config = NormConfig(
         mean_level="batch",
@@ -693,6 +797,9 @@ def test_combined_mean_leave1out_std_unbiased(mean_leave1out, std_unbiased):
 
 
 def test_normalization_initialization_with_new_options():
+    # [FUNCTION DOC]
+    # Normalization copies mean_leave1out and std_unbiased (plus levels and group_size)
+    # from the config for both enabled and disabled settings.
     """Test Normalization initialization with new options."""
     # Test with both new options enabled
     config = NormConfig(
@@ -728,6 +835,9 @@ def test_normalization_initialization_with_new_options():
 
 
 def test_mathematical_correctness_mean_leave1out():
+    # [FUNCTION DOC]
+    # Leave-one-out batch centering of a column [1, 2, 3, 4] yields exactly [-2, -2/3,
+    # 2/3, 2].
     """Test mathematical correctness of mean_leave1out implementation."""
     config = NormConfig(mean_level="batch", std_level=None, mean_leave1out=True)
     adv_norm = Normalization(config)
@@ -750,6 +860,9 @@ def test_mathematical_correctness_mean_leave1out():
 
 
 def test_mathematical_correctness_std_unbiased():
+    # [FUNCTION DOC]
+    # For [1, 2, 3], both biased and unbiased batch normalization have mean about 0, and
+    # the ratio of their output stds is sqrt(3/2).
     """Test mathematical correctness of std_unbiased implementation."""
     # Use a case where we can manually compute the expected result
     advantages = torch.tensor([[1.0], [2.0], [3.0]], dtype=torch.float32)
@@ -786,6 +899,9 @@ def test_mathematical_correctness_std_unbiased():
 
 
 def test_leave_one_out_edge_cases():
+    # [FUNCTION DOC]
+    # Leave-one-out centering keeps all-zero input at zero; with a single 1.0 among six
+    # entries, zeros become -0.2 and the 1.0 stays 1.0.
     """Test edge cases for leave-one-out mean computation."""
     # Test with all zeros - should handle gracefully
     config = NormConfig(mean_level="batch", std_level=None, mean_leave1out=True)
@@ -811,6 +927,9 @@ def test_leave_one_out_edge_cases():
 
 
 def test_unbiased_std_edge_cases():
+    # [FUNCTION DOC]
+    # Unbiased std on constant input yields finite all-zero output (zero variance
+    # handled by eps).
     """Test edge cases for unbiased standard deviation."""
     # Test with identical values - variance should be zero
     config = NormConfig(mean_level="batch", std_level="batch", std_unbiased=True)
@@ -827,6 +946,10 @@ def test_unbiased_std_edge_cases():
 
 
 def test_mask_edge_cases():
+    # [FUNCTION DOC]
+    # With leave-one-out and unbiased std and only one unmasked element, that element
+    # normalizes to its original value (mean 0, std treated as 1) and output is finite;
+    # with an all-zero mask the output equals the input.
     """Test edge cases with loss masks."""
     config = NormConfig(
         mean_level="batch", std_level="batch", mean_leave1out=True, std_unbiased=True
@@ -850,6 +973,10 @@ def test_mask_edge_cases():
 
 
 def test_mixed_normalization_with_new_options():
+    # [FUNCTION DOC]
+    # Batch mean + group std and group mean + batch std, both with leave-one-out and
+    # unbiased std, produce finite outputs of the input shape (the first also changes
+    # values).
     """Test mixed normalization levels with new options."""
     # Batch mean + Group std + both new options
     config = NormConfig(
@@ -887,6 +1014,10 @@ def test_mixed_normalization_with_new_options():
 
 
 def test_group_size_edge_cases():
+    # [FUNCTION DOC]
+    # With group_size equal to the batch, outputs are finite; with group_size 1 plus
+    # leave-one-out, every singleton group normalizes to zero (the sample is its own
+    # baseline).
     """Test edge cases with group sizes."""
     # Group size equals batch size
     config = NormConfig(
@@ -930,6 +1061,9 @@ def test_group_size_edge_cases():
 
 
 def test_precision_and_numerical_stability():
+    # [FUNCTION DOC]
+    # With leave-one-out and unbiased std, very large (1e6), very small (1e-6) and
+    # mixed-sign (1e3) inputs produce finite, non-NaN outputs.
     """Test numerical stability with extreme values."""
     config = NormConfig(
         mean_level="batch", std_level="batch", mean_leave1out=True, std_unbiased=True
@@ -957,6 +1091,9 @@ def test_precision_and_numerical_stability():
 
 
 def test_distributed_simulation():
+    # [FUNCTION DOC]
+    # Normalizes two per-worker tensors separately and their concatenation, asserting
+    # all results are finite. Purely local; no distributed calls.
     """Test behavior that simulates distributed training scenarios."""
     config = NormConfig(
         mean_level="batch", std_level="batch", mean_leave1out=True, std_unbiased=True
@@ -985,6 +1122,8 @@ def test_distributed_simulation():
 
 
 def test_leave_one_out_mathematical_consistency():
+    # [FUNCTION DOC]
+    # Leave-one-out centering of [10, 20, 30] yields [-15, 0, 15].
     """Test mathematical consistency of leave-one-out implementation."""
     config = NormConfig(mean_level="batch", std_level=None, mean_leave1out=True)
     adv_norm = Normalization(config)
@@ -1005,6 +1144,9 @@ def test_leave_one_out_mathematical_consistency():
 
 
 def test_unbiased_std_mathematical_consistency():
+    # [FUNCTION DOC]
+    # For [0, 1, 2], the ratio of output stds between biased and unbiased batch
+    # normalization is sqrt(3/2).
     """Test mathematical consistency of unbiased std implementation."""
     # Test with a simple case where we can verify the math
     advantages = torch.tensor([[0.0], [1.0], [2.0]], dtype=torch.float32)
@@ -1038,6 +1180,10 @@ def test_unbiased_std_mathematical_consistency():
 
 
 def test_comprehensive_option_combinations():
+    # [FUNCTION DOC]
+    # Loops over seven hand-picked combinations of levels, group size and options on a
+    # 4x2 tensor; each must return the input shape with finite values, otherwise
+    # pytest.fail reports the config.
     """Test all combinations of normalization options comprehensively."""
     test_cases = [
         # (mean_level, std_level, group_size, mean_leave1out, std_unbiased)
@@ -1075,6 +1221,9 @@ def test_comprehensive_option_combinations():
 
 
 def test_eps_parameter_behavior():
+    # [FUNCTION DOC]
+    # With eps 1e-8, leave-one-out and unbiased std, constant input normalizes to finite
+    # zeros.
     """Test the eps parameter behavior with new options."""
     # Test that eps prevents division by zero
     config = NormConfig(
@@ -1100,6 +1249,9 @@ def test_eps_parameter_behavior():
 
 
 def test_non_trivial_loss_mask_batch_normalization():
+    # [FUNCTION DOC]
+    # Batch normalization with a non-trivial 3x3 mask: masked positions become 0, and
+    # the unmasked values have mean about 0 and (unbiased sample) std about 1.
     """Test batch normalization with non-trivial loss mask and verify expected values."""
     config = NormConfig(mean_level="batch", std_level="batch", group_size=1)
     adv_norm = Normalization(config)
@@ -1153,6 +1305,13 @@ def test_non_trivial_loss_mask_batch_normalization():
 
 
 def test_non_trivial_loss_mask_leave_one_out():
+    # [FUNCTION DOC]
+    # Leave-one-out + unbiased std with a 3x2 mask: masked positions are 0, four
+    # unmasked values remain with loose mean/std bounds, and specific values match hard-
+    # coded expectations (-0.9258, -0.4629, 0.0, 1.3887 within 1e-3). Prints the tensor.
+    # KNOWN ISSUE: The in-code manual calculation (e.g. about -1.281 for the first
+    # element) disagrees with the asserted values, which were taken from observed
+    # output; also normalized[1, 0] is commented as masked although it is unmasked.
     """Test leave-one-out normalization with non-trivial loss mask and verify expected values."""
     config = NormConfig(
         mean_level="batch", std_level="batch", mean_leave1out=True, std_unbiased=True

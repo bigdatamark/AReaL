@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Epoch-crossing tests comparing the data service against a local StatefulDataLoader. A
+# local simulation (_local_dataloader_info) mirrors the service's sharding: each of
+# num_workers shards is read with a distributed sampler at batch_size 1 and the
+# controller concatenates samples into batches of batch_size (dropping the tail when
+# drop_last). Pure-math tests check step counts and completeness; slow tests start real
+# worker/router/gateway uvicorn servers in-process and compare per-epoch sample order of
+# an RDataset-backed dataloader against a local dataloader. Datasets are synthetic
+# ('idx', 'text') HuggingFace Datasets.
 """Epoch crossing comparison tests.
 
 Verifies that DatasetHandle (data service) produces the same iteration
@@ -42,12 +51,18 @@ ADMIN_KEY = "areal-data-admin"
 
 
 def _free_port() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns a free localhost TCP port by binding to port 0 and closing the
+    # socket (port may be reused by others before the server binds).
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
 
 
 def _start_uvicorn(app, host, port):
+    # [FUNCTION DOC]
+    # HELPER: Starts a uvicorn server for app on host:port (warning log level) in a
+    # daemon thread; returns (server, thread).
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
@@ -56,6 +71,10 @@ def _start_uvicorn(app, host, port):
 
 
 def _wait_healthy(base_url: str, timeout: float = 10.0):
+    # [FUNCTION DOC]
+    # HELPER: Polls GET <base_url>/health every 50 ms until a 200 or until timeout
+    # (default 10 s); raises TimeoutError otherwise. HTTP errors are ignored while
+    # polling.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -69,6 +88,9 @@ def _wait_healthy(base_url: str, timeout: float = 10.0):
 
 
 def _make_dataset(n_samples: int) -> Dataset:
+    # [FUNCTION DOC]
+    # HELPER: Returns an in-memory Dataset with n_samples rows: idx = 0..n-1 and text =
+    # 'sample_<i>'.
     return Dataset.from_dict(
         {
             "idx": list(range(n_samples)),
@@ -78,6 +100,8 @@ def _make_dataset(n_samples: int) -> Dataset:
 
 
 def _identity_collate(samples):
+    # [FUNCTION DOC]
+    # HELPER: Collate function returning the list of samples unchanged.
     return samples
 
 
@@ -88,6 +112,14 @@ def _local_dataloader_info(
     drop_last: bool = True,
     shuffle: bool = False,
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Simulates data service batching locally. For each rank in num_workers,
+    # builds a DistributedSampler (drop_last=True) or EvalDistributedSampler
+    # (drop_last=False) with the given shuffle, records its num_samples, and iterates a
+    # batch-size-1 StatefulDataLoader collecting unwrapped samples in rank order. Then
+    # chunks all samples into batches of batch_size, keeping a short final batch only
+    # when drop_last is False. Returns dict total_steps (floor or ceil of total_samples
+    # / batch_size), shard_sizes, all_batches and total_samples.
     """Simulate new data-service behavior: workers use batch_size=1,
     controller accumulates into batches of batch_size with drop_last.
     """
@@ -144,9 +176,15 @@ def _local_dataloader_info(
 
 
 class _DataServiceStack:
+    # [CLASS DOC]
+    # HELPER: Manages an in-process data service (N workers, a router, a gateway) on
+    # free localhost ports for a test.
     """Starts worker(s), router, gateway in-process for testing."""
 
     def __init__(self, num_workers: int, batch_size: int):
+        # [FUNCTION DOC]
+        # Stores num_workers and batch_size and initializes empty server list, worker
+        # URLs and router/gateway URLs.
         self.num_workers = num_workers
         self.batch_size = batch_size
         self.servers: list[uvicorn.Server] = []
@@ -155,6 +193,15 @@ class _DataServiceStack:
         self.gateway_url = ""
 
     def start(self):
+        # [FUNCTION DOC]
+        # Starts one worker app per rank (world_size = num_workers, no dataloader
+        # workers) and waits for each to be healthy; starts the router (admin key) and
+        # gateway (forward timeout 30 s, router timeout 5 s) and waits for health; then
+        # registers every worker with the router as admin, asserting 200. Raises
+        # TimeoutError/AssertionError on failure.
+        # KNOWN ISSUE: Worker configs are built without host/port, so the config's own
+        # host/port fields do not match the port uvicorn actually binds; harmless only
+        # if the worker never uses them.
         host = "127.0.0.1"
 
         for rank in range(self.num_workers):
@@ -212,6 +259,9 @@ class _DataServiceStack:
                 assert resp.status_code == 200
 
     def stop(self):
+        # [FUNCTION DOC]
+        # Signals all servers to exit (reverse order) by setting should_exit; does not
+        # join their threads.
         for server in reversed(self.servers):
             server.should_exit = True
 
@@ -223,6 +273,10 @@ class _DataServiceStack:
         dataset_type: str = "rl",
         shuffle: bool = False,
     ) -> dict:
+        # [FUNCTION DOC]
+        # Registers a dataset through the gateway as admin (dataset_id default 'test',
+        # type default 'rl', seed 42, shuffle default False); asserts 200 and returns
+        # the JSON response.
         resp = client.post(
             f"{self.gateway_url}/v1/datasets/register",
             json={
@@ -239,6 +293,9 @@ class _DataServiceStack:
         return resp.json()
 
     def advance_epoch(self, client: httpx.Client, api_key: str, epoch: int):
+        # [FUNCTION DOC]
+        # POSTs /v1/epochs/advance with the dataset api_key for the given epoch; asserts
+        # 200 and returns the JSON response.
         resp = client.post(
             f"{self.gateway_url}/v1/epochs/advance",
             json={"epoch": epoch},
@@ -250,7 +307,12 @@ class _DataServiceStack:
 
 
 class _GatewayControllerAdapter:
+    # [CLASS DOC]
+    # HELPER: Minimal stand-in for DataController that RDataset.connect can use, talking
+    # to the gateway over HTTP with fresh httpx Clients.
     def __init__(self, gateway_url: str, admin_key: str):
+        # [FUNCTION DOC]
+        # Stores the gateway URL and the admin key.
         self._gateway_url = gateway_url
         self._admin_key = admin_key
 
@@ -267,6 +329,11 @@ class _GatewayControllerAdapter:
         drop_last: bool = True,
         max_length: int | None = None,
     ) -> dict:
+        # [FUNCTION DOC]
+        # Registers a dataset through POST /v1/datasets/register as admin, forwarding
+        # all registration options (dataset_kwargs defaults to {}). Asserts 200, copies
+        # dataset_size into total_samples (the key RDataset expects) and returns the
+        # payload.
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(
                 f"{self._gateway_url}/v1/datasets/register",
@@ -290,6 +357,8 @@ class _GatewayControllerAdapter:
         return payload
 
     def unregister_dataset(self, dataset_id: str) -> None:
+        # [FUNCTION DOC]
+        # Unregisters a dataset id as admin; asserts 200.
         with httpx.Client(timeout=10.0) as client:
             resp = client.post(
                 f"{self._gateway_url}/v1/datasets/unregister",
@@ -299,6 +368,10 @@ class _GatewayControllerAdapter:
         assert resp.status_code == 200, resp.text
 
     def _gateway_post(self, endpoint: str, api_key: str, payload: dict):
+        # [FUNCTION DOC]
+        # POSTs payload to <gateway><endpoint> with the dataset api_key as bearer;
+        # asserts 200 and returns the JSON response (mirrors
+        # DataController._gateway_post).
         with httpx.Client(timeout=30.0) as client:
             resp = client.post(
                 f"{self._gateway_url}{endpoint}",
@@ -310,6 +383,9 @@ class _GatewayControllerAdapter:
 
 
 def _collect_epoch_indices(dl: StatefulDataLoader, epoch: int) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Calls dl.sampler.set_epoch(epoch) when available, iterates the dataloader
+    # and returns the flat list of int(item['idx']) over all batches.
     if hasattr(dl, "sampler") and hasattr(dl.sampler, "set_epoch"):
         dl.sampler.set_epoch(epoch)
     indices: list[int] = []
@@ -321,6 +397,10 @@ def _collect_epoch_indices(dl: StatefulDataLoader, epoch: int) -> list[int]:
 
 @pytest.fixture
 def gsm8k_path(tmp_path):
+    # [FUNCTION DOC]
+    # Fixture saving a 100-row synthetic dataset to tmp_path/test_dataset and returning
+    # the path.
+    # KNOWN ISSUE: Not used by any test in this module.
     """Create a minimal synthetic dataset mimicking GSM8K structure."""
     ds = _make_dataset(100)
     path = str(tmp_path / "test_dataset")
@@ -344,6 +424,9 @@ def gsm8k_path(tmp_path):
 def test_steps_per_epoch_matches_local(
     n_samples: int, batch_size: int, num_workers: int
 ):
+    # [FUNCTION DOC]
+    # Pure math: for the simulated service, total_steps equals total_samples //
+    # batch_size and equals the number of produced batches (drop_last=True).
     """steps_per_epoch = total_samples // batch_size (drop_last=True default)."""
     dataset = _make_dataset(n_samples)
     local_info = _local_dataloader_info(dataset, batch_size, num_workers)
@@ -364,6 +447,9 @@ def test_steps_per_epoch_matches_local(
 def test_local_dataloader_epoch_iteration(
     n_samples: int, batch_size: int, num_workers: int
 ):
+    # [FUNCTION DOC]
+    # Pure math: every simulated batch has exactly batch_size samples and the batch
+    # count equals total_steps.
     """Local DataLoader yields exactly len(dl) batches per epoch across all shards."""
 
     dataset = _make_dataset(n_samples)
@@ -386,6 +472,15 @@ def test_local_dataloader_epoch_iteration(
 def test_data_service_epoch_matches_local(
     tmp_path, n_samples: int, batch_size: int, num_workers: int
 ):
+    # [FUNCTION DOC]
+    # Slow: saves a dataset, starts a stack with num_workers workers, builds a local
+    # dataloader and an RDataset-backed dataloader (connected via the gateway adapter,
+    # no shuffle, drop_last) with the same config, and asserts the epoch-0 remote idx
+    # sequence equals the prefix of the local one. Closes the RDataset and stops the
+    # stack in finally blocks.
+    # KNOWN ISSUE: Only a prefix comparison is done, so a remote loader yielding fewer
+    # samples (even zero) still passes; also stack.start() is outside the try, so a
+    # startup failure leaks started servers.
     dataset = _make_dataset(n_samples)
     ds_path = str(tmp_path / "ds")
     dataset.save_to_disk(ds_path)
@@ -436,6 +531,10 @@ def test_data_service_epoch_matches_local(
 def test_data_service_multi_epoch(
     tmp_path, n_samples: int, batch_size: int, num_workers: int, num_epochs: int
 ):
+    # [FUNCTION DOC]
+    # Slow: like the single-epoch test but with shuffle=True and multiple epochs;
+    # asserts the remote and local idx sequences are identical for each epoch (both call
+    # set_epoch when available).
     dataset = _make_dataset(n_samples)
     ds_path = str(tmp_path / "ds")
     dataset.save_to_disk(ds_path)
@@ -497,6 +596,8 @@ def test_data_service_multi_epoch(
 def test_train_drop_last_no_incomplete_batches(
     n_samples: int, batch_size: int, num_workers: int
 ):
+    # [FUNCTION DOC]
+    # With drop_last=True, every simulated batch has exactly batch_size samples.
     """With drop_last=True, every batch has exactly batch_size samples."""
     dataset = _make_dataset(n_samples)
     info = _local_dataloader_info(dataset, batch_size, num_workers, drop_last=True)
@@ -521,6 +622,9 @@ def test_train_drop_last_no_incomplete_batches(
 def test_valid_drop_last_false_preserves_all_data(
     n_samples: int, batch_size: int, num_workers: int
 ):
+    # [FUNCTION DOC]
+    # With drop_last=False, the simulated batches contain all n_samples samples
+    # (EvalDistributedSampler does not pad or drop).
     """With drop_last=False, ALL samples appear in the output batches."""
     dataset = _make_dataset(n_samples)
     info = _local_dataloader_info(dataset, batch_size, num_workers, drop_last=False)
@@ -544,6 +648,9 @@ def test_valid_drop_last_false_preserves_all_data(
 def test_uneven_shard_steps_sum_is_correct(
     n_samples: int, batch_size: int, num_workers: int
 ):
+    # [FUNCTION DOC]
+    # For both drop_last values, the computed total_steps equals the number of simulated
+    # batches, even with uneven shards.
     """Computed total_steps == actual number of batches yielded."""
     dataset = _make_dataset(n_samples)
     for drop_last in (True, False):
@@ -562,6 +669,9 @@ def test_uneven_shard_steps_sum_is_correct(
 def test_single_worker_matches_single_process_dataloader(
     n_samples: int, batch_size: int
 ):
+    # [FUNCTION DOC]
+    # With one worker and both drop_last values, simulated total_steps equals len() of a
+    # single-process StatefulDataLoader with the same batch_size and drop_last.
     """With 1 worker, data service steps == single-process DataLoader steps."""
     dataset = _make_dataset(n_samples)
     for drop_last in (True, False):
@@ -593,6 +703,9 @@ def test_single_worker_matches_single_process_dataloader(
 def test_multi_worker_matches_single_process(
     n_samples: int, batch_size: int, num_workers: int
 ):
+    # [FUNCTION DOC]
+    # With several workers and both drop_last values, simulated total_steps equals len()
+    # of a single-process StatefulDataLoader with the same batch_size and drop_last.
     """Multi-worker data service yields same steps as single-process DataLoader."""
     dataset = _make_dataset(n_samples)
     for drop_last in (True, False):

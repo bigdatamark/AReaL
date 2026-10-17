@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# End-to-end GRPO regression test across training backends (fsdp/megatron/archon) and
+# inference backends (sglang/vllm). Resolves model/dataset paths, writes a resolved
+# config into tmp_path, runs tests/grpo/entrypoint.py as a subprocess with backend
+# overrides, and checks the final average task reward. Requires GPUs and model/dataset
+# access.
 import json
 import os
 import subprocess
@@ -33,6 +39,14 @@ _MEGATRON_OVERRIDES = [
 
 @pytest.mark.parametrize(("backend", "inference"), _SGLANG_CASES + _VLLM_CASES)
 def test_grpo(tmp_path: Path, backend: str, inference: str) -> None:
+    # [FUNCTION DOC]
+    # Parametrized over (backend, inference) from the SGLang and vLLM case lists. Loads
+    # config.yaml, points actor/ref/tokenizer/sglang/vllm model paths and the dataset
+    # path to resolved local-or-hub paths, dumps the config, builds CLI overrides
+    # rollout.backend='<inference>:d1' and actor.backend='<backend>:d1' (plus a lower lr
+    # and weight decay for megatron), runs the entrypoint with
+    # cluster.fileroot=tmp_path, asserts exit code 0, and asserts the last value in
+    # rewards.json exceeds 0.6.
     base_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(base_dir, "config.yaml")
 

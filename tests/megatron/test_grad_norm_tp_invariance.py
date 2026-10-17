@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Multi-GPU end-to-end test that MegatronEngine's global grad norm is invariant to
+# tensor-parallel degree. Spawns the worker script
+# tests/megatron/torchrun/run_grad_norm_tp.py via torchrun at TP=1 and TP=2, reads each
+# run's JSON result, and compares grad norms; also checks that duplicated params were
+# demoted from tensor_model_parallel at TP=2. Skipped without CUDA or with fewer than 2
+# devices.
 # SPDX-License-Identifier: Apache-2.0
 
 """End-to-end check that duplicated params do not inflate the TP grad norm.
@@ -36,6 +43,13 @@ _WORKER = "tests/megatron/torchrun/run_grad_norm_tp.py"
 
 
 def _run_tp(tp: int, output: str) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Launches torchrun on a free port with nproc_per_node=tp running the worker
+    # script with --tp and --output, PYTHONPATH prefixed with the project root,
+    # stdout/stderr forwarded to the current stdout. Waits for it; on any exception
+    # (including KeyboardInterrupt) kills the process tree and re-raises. Calls
+    # pytest.fail on nonzero exit. Returns the parsed JSON dict written to output (keys
+    # grad_norm, num_duplicated, structural_ok).
     port = find_free_ports(1)[0]
     env = os.environ.copy()
     env["PYTHONPATH"] = _PROJECT_ROOT + os.pathsep + env.get("PYTHONPATH", "")
@@ -70,6 +84,10 @@ def _run_tp(tp: int, output: str) -> dict:
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_grad_norm_is_tp_invariant(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips if fewer than 2 devices. Runs TP=1 and TP=2 into a temp dir, asserts TP=2
+    # result is structural_ok with num_duplicated > 0, and that the two grad norms match
+    # within 2% relative tolerance.
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
 

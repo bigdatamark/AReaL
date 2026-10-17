@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Coarse performance tests for the data service worker app
+# (areal.infra.data_service.worker.app). The worker FastAPI app is driven in-process
+# through httpx.ASGITransport with a small in-memory HuggingFace Dataset substituted for
+# the real dataset loader and the tokenizer loader stubbed out. Module constants:
+# DATASET_ID and a single-rank DataWorkerConfig with no dataloader workers.
 from __future__ import annotations
 
 import time
@@ -20,6 +26,9 @@ WORKER_CONFIG = DataWorkerConfig(
 
 
 def _make_mock_dataset(n: int):
+    # [FUNCTION DOC]
+    # HELPER: Builds an in-memory datasets.Dataset with n rows of columns 'text'
+    # ('sample_<i>') and 'label' (i). Imports datasets lazily.
     from datasets import Dataset
 
     return Dataset.from_dict(
@@ -28,6 +37,9 @@ def _make_mock_dataset(n: int):
 
 
 def _load_payload(**overrides: object) -> dict[str, object]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the JSON body for POST /datasets/load (dataset_id, a dummy path,
+    # type 'rl', seed 42, shuffle False) updated with any keyword overrides.
     payload: dict[str, object] = {
         "dataset_id": DATASET_ID,
         "dataset_path": "test/dataset",
@@ -41,7 +53,13 @@ def _load_payload(**overrides: object) -> dict[str, object]:
 
 @pytest.mark.asyncio
 class TestWorkerSampleFetchPerformance:
+    # [CLASS DOC]
+    # Async throughput checks for /v1/samples/fetch on a mocked 'rl' dataset.
     async def test_sample_fetch_throughput(self):
+        # [FUNCTION DOC]
+        # Loads a 100-row mock dataset, fetches it in batches of 10 indices, asserts
+        # each response returns exactly the requested number of samples, and asserts
+        # mean latency per item is under 50 ms.
         n = 100
         with (
             patch(
@@ -81,6 +99,9 @@ class TestWorkerSampleFetchPerformance:
         )
 
     async def test_single_large_sample_fetch(self):
+        # [FUNCTION DOC]
+        # Loads a 50-row mock dataset and fetches all indices in one request; asserts
+        # success, 50 samples returned, and total time under 5 s.
         n = 50
         with (
             patch(
