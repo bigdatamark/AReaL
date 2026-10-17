@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Standalone CLI profiler for Archon-engine models on a single GPU. Builds a random
+# packed (varlen, cu_seqlens) batch, runs warmup and torch.profiler over forward or
+# forward+backward iterations, prints op tables, average CUDA time and peak memory, and
+# exports a Chrome trace JSON. Mirrors profile_fsdp for side-by-side comparison.
 # SPDX-License-Identifier: Apache-2.0
 
 """Profiling tool for Archon models (forward + backward).
@@ -42,6 +47,15 @@ from areal.infra import current_platform
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Defines and parses CLI options: --model-path (None -> MODEL_PATHS["qwen2"]),
+    # --mode forward/backward/both (default both), --batch-size (4), --seq-lens (comma
+    # list), --total-len (10240), --warmup-iters (3), --profile-iters (5), --dtype
+    # bf16/fp16/fp32, --output, --no-memory, --gradient-checkpointing. Returns the
+    # Namespace.
+    # KNOWN ISSUE: --output help says default is profile_archon_<timestamp>.json, but
+    # the mode is also inserted; --model-path help names Qwen2.5-0.5B-Instruct while the
+    # real default is whatever MODEL_PATHS["qwen2"] holds.
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Profile Archon model forward/backward to identify performance bottlenecks.",
@@ -127,6 +141,8 @@ Examples:
 
 
 def get_dtype(dtype_str: str) -> torch.dtype:
+    # [FUNCTION DOC]
+    # HELPER: Maps "bf16"/"fp16"/"fp32" to the torch dtype; KeyError otherwise.
     """Convert string dtype to torch.dtype."""
     dtype_map = {
         "bf16": torch.bfloat16,
@@ -137,6 +153,9 @@ def get_dtype(dtype_str: str) -> torch.dtype:
 
 
 def get_output_path(output: str | None, mode: str) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Returns Path(output) if given, else
+    # ./profile_archon_{mode}_{YYYYmmdd_HHMMSS}.json.
     """Get output path for Chrome trace."""
     if output:
         return Path(output)
@@ -151,6 +170,12 @@ def create_packed_input(
     vocab_size: int,
     device: torch.device,
 ) -> dict:
+    # [FUNCTION DOC]
+    # Builds a packed batch on device. If seq_lens is None, draws them with
+    # generate_random_seq_lens(batch_size, total_len). input_ids is [1, sum(seq_lens)]
+    # random ids in [100, vocab_size-100); cu_seqlens is int32 prefix sums starting at
+    # 0; max_seqlen is the longest length. Returns dict with input_ids, cu_seqlens,
+    # max_seqlen, seq_lens.
     """Create variable-length packed input with cu_seqlens.
 
     Args:
@@ -190,6 +215,9 @@ def create_packed_input(
 
 
 def run_forward(model: torch.nn.Module, inputs: dict) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Calls the Archon model under no_grad with input_ids, positions=None, cu_seqlens
+    # and max_seqlen; returns logits.
     """Run forward pass only."""
     with torch.no_grad():
         logits = model(
@@ -202,6 +230,9 @@ def run_forward(model: torch.nn.Module, inputs: dict) -> torch.Tensor:
 
 
 def run_forward_backward(model: torch.nn.Module, inputs: dict) -> None:
+    # [FUNCTION DOC]
+    # Same forward call with grad, backpropagates the logits sum, then zeroes grads
+    # (set_to_none). Returns None.
     """Run forward + backward pass."""
     # Forward
     logits = model(
@@ -220,6 +251,18 @@ def run_forward_backward(model: torch.nn.Module, inputs: dict) -> None:
 
 
 def run_profile(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC]
+    # Full profiling flow: sets CUDA device 0 when LOCAL_RANK is unset; model path from
+    # args or MODEL_PATHS["qwen2"] (KeyError if absent); explicit seq_lens override
+    # batch_size; prints configuration; loads the model with load_archon_model;
+    # optionally applies full activation checkpointing; reads vocab_size from the HF
+    # AutoConfig; seeds torch/random with 42 and builds packed inputs; warmup with CUDA
+    # sync; resets peak memory; profiles profile_iters iterations (CPU+CUDA, shapes,
+    # optional memory); prints a top-30 table by CUDA time, average per-iteration CUDA
+    # time, peak memory; exports Chrome trace; optionally prints top-10 by self CUDA
+    # memory.
+    # KNOWN ISSUE: mode "backward" is identical to "both". Average CUDA time sums
+    # device_time_total across all aggregated ops, double-counting nested ops.
     """Run profiling with given configuration."""
     # Setup environment
     if "LOCAL_RANK" not in os.environ:
@@ -302,6 +345,9 @@ def run_profile(args: argparse.Namespace) -> None:
 
     # Select run function based on mode
     def run_fn():
+        # [FUNCTION DOC]
+        # HELPER: Closure dispatching to run_forward for mode forward, else
+        # run_forward_backward.
         if args.mode == "forward":
             return run_forward(model, inputs)
         else:
@@ -377,6 +423,8 @@ def run_profile(args: argparse.Namespace) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # [FUNCTION DOC]
+    # Parses args, runs run_profile, returns 0.
     """Main entry point."""
     args = parse_args(argv)
     run_profile(args)

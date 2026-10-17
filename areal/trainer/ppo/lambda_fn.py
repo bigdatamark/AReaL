@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Per-sample GAE lambda functions and resolution. A lambda function receives a
+# GAELambdaContext (per-trajectory lengths, [bs] tensors) plus keyword hyperparameters
+# and returns a float32 [bs] lambda tensor. Provides constant, VAPO length-adaptive and
+# relative-position lambdas, and a resolver turning a config value (number or dotted
+# import path) into a callable. GAELambdaFn is an alias for any callable returning a
+# tensor.
 # SPDX-License-Identifier: Apache-2.0
 
 """Built-in functions and resolution helpers for per-sample GAE lambda."""
@@ -24,6 +31,11 @@ __all__ = [
 
 
 class GAELambdaContext(TypedDict):
+    # [CLASS DOC]
+    # TypedDict of [bs] tensors: effective_token_lengths (active loss tokens per
+    # sample), turn_counts (active turns per sample, zeros if turn metadata is missing)
+    # and timestep_lengths (whichever of the two matches the configured GAE timestep
+    # unit).
     """Batch-local trajectory lengths available to a GAE lambda function."""
 
     effective_token_lengths: torch.Tensor
@@ -39,6 +51,9 @@ def constant_gae_lambda(
     *,
     value: float,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Returns a float32 tensor shaped like context["timestep_lengths"] filled with value
+    # (keyword-only). No validation of value's range.
     """Return one constant lambda value for every local trajectory."""
     return torch.full_like(
         context["timestep_lengths"],
@@ -52,6 +67,11 @@ def vapo_length_adaptive_gae(
     *,
     alpha: float,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # VAPO length-adaptive lambda: per sample lambda = max(0, 1 - 1/(alpha*L)) where L =
+    # timestep_lengths clamped to >=1 for the division; samples with L == 0 get 0.
+    # Raises ValueError unless alpha is a positive int/float (bools rejected). Returns
+    # float32 [bs].
     r"""Compute VAPO's length-adaptive ``lambda = 1 - 1 / (alpha * length)``.
 
     ``length`` is selected by ``gae_timestep_unit`` before this function is called:
@@ -74,6 +94,12 @@ def relative_position_gae_lambda(
     *,
     q: float,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Returns per-sample lambda = q ** (1/(L-1)) for L >= 2 (computed as exp(log q /
+    # (L-1))), 1.0 for L == 1, 0.0 for L == 0, where L = timestep_lengths; makes a
+    # terminal reward's retained fraction depend only on relative position. q is
+    # keyword-only and must be a finite non-bool number in (0, 1], else ValueError.
+    # Returns float32 [bs].
     r"""Keep terminal-reward decay invariant at equal relative positions.
 
     For a trajectory with ``L >= 2`` effective timesteps, this function returns
@@ -113,6 +139,12 @@ def relative_position_gae_lambda(
 
 
 def resolve_gae_lambda_fn(gae_lambda: float | str) -> tuple[GAELambdaFn, bool]:
+    # [FUNCTION DOC]
+    # Converts a config gae_lambda into (callable, is_custom). Number (int/float, not
+    # bool) -> (partial of constant_gae_lambda with that value, False). Non-empty string
+    # -> dynamically imported object via import_from_string (side effect: imports a
+    # module), returned with True; TypeError if the import is not callable. Bools, empty
+    # strings and other types raise TypeError. Import errors propagate.
     """Resolve a static value or dotted function path to a worker-local callable.
 
     Returns the callable and whether it came from a custom import path so callers can

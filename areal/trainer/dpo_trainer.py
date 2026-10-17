@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# DPO training entry point. Defines the collate function that turns preference items
+# into chosen/rejected sequence dicts, and DPOTrainer, which builds an actor (trainable
+# policy) and a reference model engine on the configured backend (fsdp, megatron or
+# archon), the dataloaders, evaluator, saver, recover handler and stats logger, then
+# runs the training loop. Works in SPMD mode (one trainer per rank, torch.distributed)
+# or single-controller mode (one process that drives remote workers through a
+# scheduler). Logger "DPOTrainer".
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -52,6 +60,12 @@ logger = logging.getLogger("DPOTrainer")
 
 
 def dpo_modeling_collate_fn(items):
+    # [FUNCTION DOC]
+    # Collate function for DPO dataloaders. For each item emits two dicts, chosen first
+    # then rejected, each with input_ids [1, L] (list inputs converted to tensors), an
+    # all-True bool attention_mask [1, L] and loss_mask [1, L] from {prefix}_loss_mask.
+    # Returns a flat list of 2*len(items) dicts, so consecutive entries form a pair.
+    # Raises KeyError if fields are missing.
     """Collate DPO items into per-sequence tensor dicts.
 
     Each dataset item has ``chosen_ids``, ``rejected_ids``, ``chosen_loss_mask``,
@@ -82,12 +96,34 @@ def dpo_modeling_collate_fn(items):
 
 
 class DPOTrainer:
+    # [CLASS DOC]
+    # Orchestrates DPO training: owns config, tokenizer/processor, optional scheduler,
+    # actor and ref engines (or their controllers), dataloaders, optional data-service
+    # controller for remote RDatasets, Evaluator, Saver, RecoverHandler and StatsLogger.
+    # Usable as a context manager that calls close() on exit.
     def __init__(
         self,
         config: DPOConfig,
         train_dataset: Dataset,
         valid_dataset: Dataset | None = None,
     ):
+        # [FUNCTION DOC]
+        # Builds all training components. Steps: read RANK env (default 0); in single-
+        # controller mode enable file logging to the stats-logger path and create the
+        # scheduler; load HF processor/tokenizer; seed RNGs with key "trainer{rank}";
+        # parse actor and ref allocations from their backend strings and create both
+        # engines (with process groups); remember config.ref.offload. If single-
+        # controller and train_dataset is an RDataset, start a DataController (role
+        # "data") and connect the dataset (and later the valid dataset) under ids
+        # "{experiment}_{trial}_train/valid". Creates the train dataloader sharded by
+        # the actor's DP rank/world size, a FinetuneSpec (dataset_size = n_batches *
+        # batch_size), initializes actor (role "actor") and ref (role "ref"), builds the
+        # optional valid dataloader only when both valid config and dataset are given,
+        # creates Evaluator, Saver, RecoverHandler, StatsLogger, loads recover state
+        # into actor/saver/evaluator/logger/ dataloader, and configures the perf tracer.
+        # Side effects: process/worker launch, model loading, file I/O.
+        # KNOWN ISSUE: _should_offload_ref is stored but never used in this class, so
+        # ref offload is not applied by the trainer.
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
@@ -189,6 +225,17 @@ class DPOTrainer:
         self._config_perf_tracer()
 
     def train(self):
+        # [FUNCTION DOC]
+        # Main loop. Starts at the step after the recovered one (or 0); runs to
+        # total_train_epochs * steps_per_epoch, stopping early at total_train_steps if
+        # set. Each step (with timing and perf-trace scopes): load and broadcast a
+        # batch; wait for async checkpoint staging; compute ref log-probs and attach
+        # them as ref_logprobs per sequence (1-D outputs get a leading dim);
+        # actor.train_dpo, step LR scheduler, log device stats; set actor version to
+        # step+1; save HF model, recover checkpoint and run evaluation per their
+        # frequency controllers; in single-controller mode clear cached batches on
+        # actor, ref and data controller; export and commit stats; save perf trace.
+        # Returns None.
         config = self.config
         start_step = (
             self.recover_info.last_step_info.next().global_step
@@ -321,6 +368,10 @@ class DPOTrainer:
             self._save_perf_tracer(step=global_step)
 
     def close(self):
+        # [FUNCTION DOC]
+        # Releases resources: finalizes saver, closes train/valid RDatasets and destroys
+        # data controller if present (hasattr guards allow partial init), closes stats
+        # logger, destroys actor and ref engines, and force-saves the perf tracer.
         self.saver.finalize()
         if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
             self._train_rdataset.close()
@@ -334,6 +385,10 @@ class DPOTrainer:
         perf_tracer.save(force=True)
 
     def _config_perf_tracer(self):
+        # [FUNCTION DOC]
+        # HELPER: If config.perf_tracer is set, configures the local tracer for this
+        # rank with role "master"; in single-controller mode also configures the actor
+        # workers' tracers. The ref engine is not configured.
         rank = int(os.getenv("RANK", "0"))
         if self.config.perf_tracer is None:
             return
@@ -343,12 +398,18 @@ class DPOTrainer:
         self.actor.config_perf_tracer(self.config.perf_tracer, role="actor")
 
     def _save_perf_tracer(self, step: int):
+        # [FUNCTION DOC]
+        # HELPER: If perf tracing is enabled, saves actor worker traces and the local
+        # trace for the given step.
         if self.config.perf_tracer is None:
             return
         self.actor.save_perf_tracer(step=step)
         perf_tracer.save(step=step)
 
     def _init_scheduler(self) -> Scheduler:
+        # [FUNCTION DOC]
+        # HELPER: Returns a Local/Ray/SlurmScheduler from config.scheduler.type; raises
+        # NotImplementedError for any other type.
         cfg = self.config.scheduler
         if cfg.type == "local":
             return LocalScheduler(exp_config=self.config)
@@ -365,6 +426,9 @@ class DPOTrainer:
         rank: int,
         world_size: int,
     ) -> StatefulDataLoader:
+        # [FUNCTION DOC]
+        # HELPER: Creates a StatefulDataLoader via create_dataloader for the given
+        # rank/world size and dataset config, using dpo_modeling_collate_fn.
         return create_dataloader(
             dataset,
             rank=rank,
@@ -376,6 +440,12 @@ class DPOTrainer:
     def _create_actor(
         self, actor_config: DPOEngineConfig
     ) -> FSDPDPOEngine | MegatronDPOEngine | ArchonDPOEngine | DPOController:
+        # [FUNCTION DOC]
+        # HELPER: Chooses the DPO engine class from the actor allocation backend (fsdp
+        # -> FSDPDPOEngine, megatron -> MegatronDPOEngine, archon -> ArchonDPOEngine;
+        # lazy imports), raising ValueError otherwise. In single-controller mode wraps
+        # it as a controller with the scheduler; else instantiates locally. Creates its
+        # process group with the allocation's parallel strategy and returns it.
         if self.actor_alloc.backend == "fsdp":
             from areal.engine import FSDPDPOEngine
 
@@ -403,6 +473,9 @@ class DPOTrainer:
     def _create_ref(
         self, ref_config: DPOEngineConfig, alloc: ModelAllocation
     ) -> FSDPDPOEngine | MegatronDPOEngine | ArchonDPOEngine | DPOController:
+        # [FUNCTION DOC]
+        # HELPER: Same as _create_actor but for the reference model, using the given ref
+        # config and allocation.
         if alloc.backend == "fsdp":
             from areal.engine import FSDPDPOEngine
 
@@ -427,6 +500,11 @@ class DPOTrainer:
         return ref
 
     def _load_bcast_from(self, data_generator):
+        # [FUNCTION DOC]
+        # HELPER: Pulls the next batch from the generator. In single-controller mode
+        # returns it as is; otherwise moves it to the current device and broadcasts it
+        # from the DP head across the context+model parallel group so all ranks in that
+        # group see identical data.
         batch = next(data_generator)
 
         if is_single_controller():
@@ -442,6 +520,10 @@ class DPOTrainer:
         return batch
 
     def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Asks the saver to save the actor as an HF model (with
+        # tokenizer/processor) if due. For synchronous savers, then does a barrier on
+        # the actor CPU group and a device sync.
         self.saver.save(
             self.actor,
             epoch,
@@ -456,6 +538,11 @@ class DPOTrainer:
             current_platform.synchronize()
 
     def _save_recover_checkpoint(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Dumps a recover checkpoint (actor under key "default", StepInfo,
+        # saver/evaluator/ logger/dataloader state, tokenizer/processor) via the recover
+        # handler when due, then barrier and device sync. The ref model is not
+        # checkpointed (frozen).
         to_save: dict = dict(default=self.actor)
         step_info = StepInfo(
             global_step=global_step,
@@ -478,6 +565,11 @@ class DPOTrainer:
         current_platform.synchronize()
 
     def _evaluate_fn(self):
+        # [FUNCTION DOC]
+        # HELPER: One validation pass: iterates the valid dataloader once,
+        # loading/broadcasting each batch, attaching ref log-probs and calling
+        # actor.evaluate_dpo (stats recorded in the "dpo-eval" scope); then barrier and
+        # device sync.
         data_generator = cycle_dataloader(self.valid_dataloader, num_cycles=1)
         for _ in range(len(self.valid_dataloader)):
             data = self._load_bcast_from(data_generator)
@@ -495,6 +587,9 @@ class DPOTrainer:
         epoch_step: int,
         global_step: int,
     ):
+        # [FUNCTION DOC]
+        # HELPER: No-op without a valid dataloader; otherwise lets the Evaluator decide
+        # by frequency whether to run _evaluate_fn, then barrier and device sync.
         if self.valid_dataloader is None:
             return
         self.evaluator.evaluate(
@@ -507,6 +602,9 @@ class DPOTrainer:
         current_platform.synchronize()
 
     def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Exports the actor's aggregated stats and commits them to the stats
+        # logger for this step, then barrier and device sync.
         stats = self.actor.export_stats()
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
@@ -514,9 +612,14 @@ class DPOTrainer:
         current_platform.synchronize()
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Returns self for use in a with-statement.
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Logs the exception (with traceback) if one occurred, calls close(), and
+        # returns False so exceptions propagate.
         if exc_type is not None:
             logger.error(f"Training failed with exception: {exc_value}", exc_info=True)
         self.close()

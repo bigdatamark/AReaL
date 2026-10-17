@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# CLI script validating the AReaL Docker image. Extends BaseInstallationValidator
+# (imported as top-level module validation_base, so run with areal/tools on sys.path)
+# with packages built in the Dockerfile (flash-attn, grouped_gemm, apex,
+# transformer_engine, flash_attn_3, Megatron stack, DeepSeek-V3 kernels, fla,
+# causal_conv1d), detection of the sglang-vs-vllm image variant, and extra CUDA smoke
+# tests. Exits 0 on success, 1 on failure.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -22,6 +29,13 @@ from validation_base import BaseInstallationValidator
 
 
 class DockerInstallationValidator(BaseInstallationValidator):
+    # [CLASS DOC]
+    # Docker-specific validator. Extends CUDA_SUBMODULES with Docker packages' extension
+    # modules and CRITICAL_PACKAGES with Docker build packages. sglang/vllm criticality
+    # is decided at runtime in parse_pyproject.
+    # KNOWN ISSUE: CRITICAL_PACKAGES entries use underscores (e.g. grouped_gemm) while
+    # the base class compares against dash-normalized names; this only matters for
+    # pyproject deps, since additional packages use their own required flag.
     """Validates installation in Docker environment with additional packages."""
 
     # Extend CUDA sub-modules with Docker-specific packages
@@ -61,10 +75,15 @@ class DockerInstallationValidator(BaseInstallationValidator):
     }
 
     def __init__(self, pyproject_path: Path | None = None):
+        # [FUNCTION DOC]
+        # Delegates to the base constructor with the pyproject path.
         super().__init__(pyproject_path)
 
     @staticmethod
     def _is_package_importable(name: str) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Static; returns True if importing name succeeds, False on ImportError.
+        # Side effect: actually imports the package. Non-import exceptions propagate.
         """Check if a package can be actually imported (not just spec-found)."""
         try:
             __import__(name)
@@ -73,6 +92,19 @@ class DockerInstallationValidator(BaseInstallationValidator):
             return False
 
     def parse_pyproject(self):
+        # [FUNCTION DOC]
+        # Runs the base parse, then registers additional packages with version pins
+        # taken from optional-dependencies where available: flash-attn (default ==2.8.3,
+        # required), grouped_gemm/apex/transformer_engine (required), flash_attn_3
+        # (optional). Detects the inference backend by importing sglang and vllm: both
+        # present or neither present appends a critical failure; the present one is
+        # added as required and added to an instance-level CRITICAL_PACKAGES copy
+        # (sglang also adds optional nvidia-cudnn-cu12); the absent one is added as
+        # optional. Then adds megatron-core, mbridge, megatron-bridge, kernels
+        # (required), torch_memory_saver, flash_mla, deep_gemm, deep_ep (optional), fla
+        # (required) and causal_conv1d ==1.6.0 (required, hardcoded pin). Prints notes.
+        # KNOWN ISSUE: flash-attn may also appear in pyproject dependencies, in which
+        # case it is validated twice (once as dependency, once as additional package).
         """Parse pyproject.toml and add Docker-specific packages."""
         super().parse_pyproject()
 
@@ -174,6 +206,14 @@ class DockerInstallationValidator(BaseInstallationValidator):
         self.add_additional_package("causal_conv1d", "==1.6.0", required=True)
 
     def test_cuda_functionality(self):
+        # [FUNCTION DOC]
+        # Runs the base CUDA tests, then (returning early if CUDA unavailable) a
+        # Transformer Engine FP8 Linear forward/backward under DelayedScaling E4M3, an
+        # Apex FusedAdam step on a small Linear, import checks for flash_attn_3,
+        # grouped_gemm, causal_conv1d_cuda, flash_mla, deep_gemm (prints SM count) and
+        # deep_ep, and an fla MultiScaleRetention bf16 forward on cuda:0 checking output
+        # shape (import-only if no CUDA). All failures are printed only and not recorded
+        # as failures or warnings. Uses GPU memory.
         """Run CUDA functionality tests including Docker-specific packages."""
         super().test_cuda_functionality()
 
@@ -328,11 +368,17 @@ class DockerInstallationValidator(BaseInstallationValidator):
             print(f"⚠ flash-linear-attention (fla) test failed: {e}")
 
     def get_validation_title(self) -> str:
+        # [FUNCTION DOC]
+        # Returns "AReaL Docker Installation Validation".
         """Get the title for validation output."""
         return "AReaL Docker Installation Validation"
 
 
 def _detect_pyproject(project_root: Path) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Returns project_root/pyproject.vllm.toml if vllm is importable and that
+    # file exists, otherwise project_root/pyproject.toml (existence not checked). Side
+    # effect: imports vllm.
     """Auto-detect the correct pyproject file based on installed variant."""
     vllm_path = project_root / "pyproject.vllm.toml"
     default_path = project_root / "pyproject.toml"
@@ -348,6 +394,10 @@ def _detect_pyproject(project_root: Path) -> Path:
 
 
 def main():
+    # [FUNCTION DOC]
+    # Entry point: resolves the repo root two levels above this script, picks the
+    # pyproject file via _detect_pyproject, exits 1 if it is missing, prints its name,
+    # runs the Docker validator and exits 0/1 by result.
     """Main entry point."""
     script_dir = Path(__file__).parent
     project_root = script_dir.parent.parent

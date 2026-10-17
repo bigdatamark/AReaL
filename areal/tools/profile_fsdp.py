@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Standalone CLI profiler for HuggingFace causal LMs loaded like the FSDP engine (no
+# FSDP wrapping, single GPU). Builds a random padded batch, runs warmup then
+# torch.profiler over forward or forward+backward iterations, prints op tables, average
+# CUDA time and peak memory, and exports a Chrome trace JSON. Intended for comparison
+# with profile_archon.
 # SPDX-License-Identifier: Apache-2.0
 
 """Profiling tool for FSDP/HuggingFace models (forward + backward).
@@ -49,6 +55,15 @@ from areal.infra import current_platform
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Defines and parses CLI options: --model-path (default None -> resolved later),
+    # --mode forward/backward/both (default both), --batch-size (4), --seq-lens (comma
+    # list, overrides batch size), --total-len (10240), --warmup-iters (3), --profile-
+    # iters (5), --dtype bf16/fp16/fp32, --output, --no-memory, --gradient-
+    # checkpointing, --attn-impl (default sdpa). Exits via parser.error if attn-impl
+    # fails is_valid_attn_impl. Returns the Namespace.
+    # KNOWN ISSUE: the --output help says the default is profile_fsdp_<timestamp>.json,
+    # but get_output_path also inserts the mode.
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Profile FSDP/HuggingFace model forward/backward to identify performance bottlenecks.",
@@ -143,6 +158,8 @@ Examples:
 
 
 def get_dtype(dtype_str: str) -> torch.dtype:
+    # [FUNCTION DOC]
+    # HELPER: Maps "bf16"/"fp16"/"fp32" to the torch dtype; KeyError otherwise.
     """Convert string dtype to torch.dtype."""
     dtype_map = {
         "bf16": torch.bfloat16,
@@ -153,6 +170,9 @@ def get_dtype(dtype_str: str) -> torch.dtype:
 
 
 def get_output_path(output: str | None, mode: str) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Returns Path(output) if given, else
+    # ./profile_fsdp_{mode}_{YYYYmmdd_HHMMSS}.json.
     """Get output path for Chrome trace."""
     if output:
         return Path(output)
@@ -166,6 +186,11 @@ def load_hf_model(
     attn_impl: str = "sdpa",
     gradient_checkpointing: bool = False,
 ) -> tuple[torch.nn.Module, AutoConfig]:
+    # [FUNCTION DOC]
+    # Loads AutoConfig and AutoModelForCausalLM (trust_remote_code, given dtype and
+    # attention implementation), optionally enables non-reentrant gradient
+    # checkpointing, moves the model to CUDA and returns (model, config). Network/disk
+    # I/O for weights.
     """Load HuggingFace model (same as FSDP engine).
 
     Args:
@@ -202,6 +227,15 @@ def create_padded_input(
     vocab_size: int,
     device: torch.device,
 ) -> dict:
+    # [FUNCTION DOC]
+    # Builds a right-padded batch on device. If seq_lens is None, draws them with
+    # generate_random_seq_lens(batch_size, total_len). Creates zero
+    # input_ids/attention_mask of shape [batch_size, max_len] (long) and fills each
+    # row's prefix with random token ids in [100, vocab_size-100) and mask ones. Returns
+    # dict with input_ids, attention_mask, seq_lens (list) and max_seqlen.
+    # KNOWN ISSUE: tensors are sized by batch_size, so explicit seq_lens longer than
+    # batch_size would index out of range (run_profile avoids this by resetting
+    # batch_size).
     """Create padded batch input (HuggingFace style).
 
     Args:
@@ -242,6 +276,8 @@ def create_padded_input(
 
 
 def run_forward(model: torch.nn.Module, inputs: dict) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Runs the model under no_grad on input_ids/attention_mask and returns the logits.
     """Run forward pass only."""
     with torch.no_grad():
         outputs = model(
@@ -252,6 +288,9 @@ def run_forward(model: torch.nn.Module, inputs: dict) -> torch.Tensor:
 
 
 def run_forward_backward(model: torch.nn.Module, inputs: dict) -> None:
+    # [FUNCTION DOC]
+    # Runs a forward pass, backpropagates the sum of logits as a dummy loss, then zeroes
+    # grads (set_to_none). Returns None.
     """Run forward + backward pass."""
     # Forward
     outputs = model(
@@ -268,6 +307,19 @@ def run_forward_backward(model: torch.nn.Module, inputs: dict) -> None:
 
 
 def run_profile(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC]
+    # Full profiling flow. Sets CUDA device 0 when LOCAL_RANK is unset; resolves model
+    # path (arg, else MODEL_PATHS["qwen2"] from testing utils, else
+    # Qwen/Qwen2.5-0.5B-Instruct); parses explicit seq_lens and overrides batch_size;
+    # prints the configuration; loads the model; seeds torch and random with 42 and
+    # builds inputs; runs warmup iterations with CUDA sync; resets peak memory; profiles
+    # profile_iters iterations (CPU+CUDA, shapes, optional memory). Prints a top-30
+    # table by CUDA time, average per-iteration CUDA time and peak allocated memory,
+    # exports the Chrome trace and, if memory profiling, a top-10 table by self CUDA
+    # memory. Writes a file and stdout.
+    # KNOWN ISSUE: mode "backward" runs the same forward+backward as "both" (no
+    # backward-only isolation). Average CUDA time sums device_time_total over all
+    # aggregated ops, which double-counts nested ops and overstates iteration time.
     """Run profiling with given configuration."""
     # Setup environment
     if "LOCAL_RANK" not in os.environ:
@@ -344,6 +396,9 @@ def run_profile(args: argparse.Namespace) -> None:
 
     # Select run function based on mode
     def run_fn():
+        # [FUNCTION DOC]
+        # HELPER: Closure that runs run_forward when mode is forward, else
+        # run_forward_backward, on the captured model and inputs.
         if args.mode == "forward":
             return run_forward(model, inputs)
         else:
@@ -419,6 +474,8 @@ def run_profile(args: argparse.Namespace) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # [FUNCTION DOC]
+    # Parses args, runs run_profile, returns 0 (used as process exit code).
     """Main entry point."""
     args = parse_args(argv)
     run_profile(args)

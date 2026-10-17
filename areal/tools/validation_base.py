@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Shared installation-validation logic used by validate_installation.py and
+# validate_docker_installation.py. Loads tomllib (or tomli fallback; prints an error and
+# exits 1 at import time if neither exists) and packaging. BaseInstallationValidator
+# parses pyproject.toml dependencies, imports each package in-process, checks installed
+# versions against specifiers, probes CUDA submodules, runs small CUDA/flash-attn smoke
+# tests and prints a summary. All output goes to stdout via print.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -27,6 +34,16 @@ from packaging.version import Version
 
 
 class BaseInstallationValidator:
+    # [CLASS DOC]
+    # Template validator. Class attributes: PACKAGE_IMPORT_MAP (distribution name ->
+    # import name when they differ), CUDA_SUBMODULES (distribution -> extra modules to
+    # import, with "torch.cuda" special-cased to an availability check),
+    # CRITICAL_PACKAGES (normalized names whose failure is fatal; sglang/vllm
+    # deliberately excluded since they are mutually exclusive). Instance state:
+    # pyproject_path, dependencies and additional_packages (name -> info dict with raw,
+    # extras, operator, version, spec[, required]), results (name -> status/error),
+    # critical_failures and warnings (message lists). Subclasses override hooks such as
+    # get_validation_title and test_cuda_functionality.
     """Base class for validating installation dependencies.
 
     Note: sglang and vllm are intentionally excluded from CRITICAL_PACKAGES
@@ -90,6 +107,9 @@ class BaseInstallationValidator:
     }
 
     def __init__(self, pyproject_path: Path | None = None):
+        # [FUNCTION DOC]
+        # Stores the optional pyproject path and initializes empty
+        # dependency/result/failure/ warning containers. No I/O.
         self.pyproject_path = pyproject_path
         self.dependencies = {}
         self.additional_packages = {}  # For packages not in pyproject.toml
@@ -98,6 +118,14 @@ class BaseInstallationValidator:
         self.warnings = []
 
     def parse_pyproject(self):
+        # [FUNCTION DOC]
+        # Reads [project].dependencies from pyproject.toml. Skips with a message if no
+        # path. Each entry is parsed as a PEP 508 Requirement; entries whose environment
+        # marker evaluates false are skipped; extras become a sorted "[a,b]" string;
+        # operator/version are filled only when there is exactly one specifier; full
+        # specifier string kept as spec. Stores into self.dependencies keyed by
+        # requirement name; invalid entries print a warning. Prints the count. Missing
+        # file or any other error prints a message and exits the process with 1.
         """Parse pyproject.toml and extract dependencies."""
         if self.pyproject_path is None:
             print("No pyproject.toml path provided, skipping dependency parsing")
@@ -159,6 +187,11 @@ class BaseInstallationValidator:
             sys.exit(1)
 
     def _get_optional_dep_versions(self) -> dict[str, str]:
+        # [FUNCTION DOC]
+        # HELPER: Scans all [project.optional-dependencies] groups and returns
+        # {requirement name: specifier string} for the first non-empty specifier seen
+        # per package, skipping self-references to the project and marker mismatches.
+        # Returns {} when no path or on any error (swallowed).
         """Extract version specifiers from [project.optional-dependencies].
 
         Returns a dict mapping normalized package names to specifier strings
@@ -198,6 +231,12 @@ class BaseInstallationValidator:
     def add_additional_package(
         self, pkg_name: str, version_spec: str = "", required: bool = True
     ):
+        # [FUNCTION DOC]
+        # Registers a package not in pyproject.toml for validation. Parses
+        # name+version_spec as a Requirement and stores the same info dict as
+        # parse_pyproject plus required (default True). On InvalidRequirement prints a
+        # warning and stores the raw strings with spec = version_spec. Mutates
+        # self.additional_packages.
         """Add a package that's not in pyproject.toml for validation."""
         # Construct requirement string and parse using packaging.requirements
         req_string = f"{pkg_name}{version_spec}"
@@ -242,11 +281,18 @@ class BaseInstallationValidator:
             }
 
     def normalize_package_name(self, pkg_name: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Lowercases and replaces underscores with dashes. (Does not collapse
+        # dots or runs like full PEP 503 normalization.)
         """Normalize package name (handle dash/underscore differences)."""
         # PyPI normalizes package names: replace _ with - and lowercase
         return pkg_name.lower().replace("_", "-")
 
     def get_installed_version(self, pkg_name: str) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns the installed distribution version via importlib.metadata,
+        # trying the name as given, with dashes->underscores and underscores->dashes
+        # (and "flash-linear-attention" for "fla"). Returns None if none is found.
         """Get installed version of a package."""
         # Try both dash and underscore variants
         variants = [
@@ -266,6 +312,10 @@ class BaseInstallationValidator:
         return None
 
     def check_version(self, pkg_name: str, spec_str: str) -> tuple[bool, str]:
+        # [FUNCTION DOC]
+        # Compares the installed version with spec_str. Returns (False, message) if not
+        # installed, (True, ...) if spec is empty, else (installed in SpecifierSet,
+        # message). Any parsing error returns (False, "Version check error: ...").
         """
         Check if installed version matches the specification.
 
@@ -296,6 +346,11 @@ class BaseInstallationValidator:
             return False, f"Version check error: {e}"
 
     def _test_import_direct(self, import_name: str) -> tuple[bool, str | None]:
+        # [FUNCTION DOC]
+        # HELPER: Imports import_name in the current process (side effect: module import
+        # and its initialization). Returns (True, None) on success, (False, error
+        # string) on ImportError or any other exception (prefixed with the exception
+        # type).
         """Test importing a package directly in the current process.
 
         Args:
@@ -315,6 +370,9 @@ class BaseInstallationValidator:
     def _run_import_tests(
         self, packages: list[tuple[str, str]]
     ) -> dict[str, tuple[bool, str | None]]:
+        # [FUNCTION DOC]
+        # HELPER: Runs _test_import_direct sequentially for each (pkg_name, import_name)
+        # pair and returns {pkg_name: (ok, error)}.
         """Run import tests sequentially in the current process.
 
         Args:
@@ -331,6 +389,11 @@ class BaseInstallationValidator:
         return results
 
     def test_cuda_submodules(self, pkg_name: str, module):
+        # [FUNCTION DOC]
+        # Checks CUDA_SUBMODULES for pkg_name using the already-imported module. For
+        # "torch.cuda" raises (internally) if CUDA unavailable, else prints device count
+        # and CUDA version; other entries are imported. Each failure prints a cross and
+        # appends a warning (never a critical failure). Returns None.
         """Test CUDA sub-modules for packages with CUDA dependencies."""
         submodules = self.CUDA_SUBMODULES.get(pkg_name, [])
 
@@ -356,6 +419,13 @@ class BaseInstallationValidator:
                 )
 
     def validate_all_dependencies(self):
+        # [FUNCTION DOC]
+        # Prints a header with get_validation_title, builds the list of packages from
+        # dependencies (import name via PACKAGE_IMPORT_MAP or dashes->underscores) and
+        # additional packages, imports them all, then reports: critical pyproject deps
+        # (required=True), other pyproject deps (required=False, failures become
+        # warnings) and additional packages (their own required flag), each via
+        # _process_import_result. Mutates results, failures and warnings.
         """Validate all dependencies from pyproject.toml."""
         print("\n" + "=" * 70)
         print(self.get_validation_title())
@@ -430,6 +500,15 @@ class BaseInstallationValidator:
         import_result: tuple[bool, str | None] | None,
         required: bool = True,
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Interprets one package's import result. Missing result is treated as
+        # failed. Import failure -> status IMPORT_FAILED, appended to critical_failures
+        # if required else warnings, returns False. Otherwise checks version against
+        # dep_info spec; mismatch -> VERSION_MISMATCH handled the same way. On success,
+        # re-imports the module and runs test_cuda_submodules if listed (errors
+        # swallowed), records SUCCESS, prints, returns True.
+        # KNOWN ISSUE: docstring mentions a "parallel" import test but imports are run
+        # sequentially in-process.
         """Process the result of a parallel import test."""
         import_name = self.PACKAGE_IMPORT_MAP.get(pkg_name, pkg_name.replace("-", "_"))
 
@@ -480,6 +559,11 @@ class BaseInstallationValidator:
         return True
 
     def test_cuda_functionality(self):
+        # [FUNCTION DOC]
+        # Smoke tests CUDA: skips with a warning if torch is missing or CUDA
+        # unavailable; otherwise adds two random tensors on cuda:0 and runs
+        # flash_attn_func on small fp16 q/k/v [1, 32, 4, 64]. Failures are only printed
+        # (not recorded as failures or warnings).
         """Run basic CUDA functionality tests. Can be overridden by subclasses."""
         print("\n=== CUDA Functionality Tests ===")
 
@@ -538,6 +622,10 @@ class BaseInstallationValidator:
             print("⚠ PyTorch not available - skipping CUDA tests")
 
     def print_summary(self):
+        # [FUNCTION DOC]
+        # Prints totals (tested, successful, failed), lists critical failures and
+        # warnings, and an overall verdict. Returns False if any critical failure
+        # exists, else True.
         """Print validation summary."""
         print("\n" + "=" * 70)
         print("VALIDATION SUMMARY")
@@ -577,10 +665,15 @@ class BaseInstallationValidator:
             return True
 
     def get_validation_title(self) -> str:
+        # [FUNCTION DOC]
+        # Returns the default title "AReaL Installation Validation"; overridable.
         """Get the title for validation output. Can be overridden by subclasses."""
         return "AReaL Installation Validation"
 
     def run(self):
+        # [FUNCTION DOC]
+        # Runs parse_pyproject, validate_all_dependencies, test_cuda_functionality and
+        # print_summary in order; returns the summary's bool.
         """Run the complete validation process."""
         self.parse_pyproject()
         self.validate_all_dependencies()

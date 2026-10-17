@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Small statistics helpers for PPO training logging (token-count denominators).
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -11,6 +13,16 @@ def infer_token_denominator(
     input_data: dict[str, Any],
     fallback: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Builds an all-True bool mask representing every token of the full logical micro-
+    # batch, used as the n_tokens denominator in stats so results match with/without
+    # context parallelism. Inputs: input_data (micro-batch dict), fallback (a stat
+    # tensor whose device is used and whose shape is the last resort). Priority: (1)
+    # attention_mask tensor -> ones of its shape; (2) non-empty cu_seqlens tensor -> 1-D
+    # ones of length cu_seqlens[-1] (calls .item(), a GPU-CPU sync); (3) input_ids
+    # tensor only if its shape equals fallback's (tree-packed batches pad input_ids);
+    # (4) ones like fallback. Returns a bool tensor on fallback's device. No other side
+    # effects.
     """Infer the full token mask for stats logging.
 
     Context parallelism may slice intermediate tensors such as ``loss_mask`` or

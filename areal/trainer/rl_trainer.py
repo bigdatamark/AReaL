@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# PPO-family RL training entry point (PPOTrainer, exported as the trainer package's
+# PPOTrainer). Builds actor, optional critic, reference and teacher models on
+# fsdp/megatron/ archon backends, SGLang or vLLM rollout engines (train and eval),
+# dataloaders (or an empty loader for online agent mode), weight-update transport,
+# evaluator, saver, recover handler and stats logger, and runs the asynchronous rollout
+# -> logp/values -> advantages -> PPO update -> weight sync loop. Handles GPU
+# offload/onload when actor and rollout are colocated, v1 AWEX colocated weight
+# handover, LoRA, proxy workers for agent workflows and both SPMD and single-controller
+# modes. Logger "RLTrainer".
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -77,6 +87,11 @@ logger = logging.getLogger("RLTrainer")
 
 
 class _EmptyDataLoader:
+    # [CLASS DOC]
+    # HELPER: Stand-in dataloader for online mode (no dataset). Infinite iterator
+    # yielding lists of batch_size empty dicts; len() is steps_per_epoch so epoch-based
+    # frequency controls work; state_dict/load_state_dict are no-ops for checkpoint
+    # compatibility.
     """Minimal dataloader for online mode that yields empty dicts.
 
     Compatible with ``cycle_dataloader()`` and ``len()`` expectations.
@@ -86,30 +101,54 @@ class _EmptyDataLoader:
     """
 
     def __init__(self, batch_size: int = 1, steps_per_epoch: int = 1):
+        # [FUNCTION DOC]
+        # Stores batch_size (default 1) and steps_per_epoch (default 1).
         self.batch_size = batch_size
         self._steps_per_epoch = steps_per_epoch
 
     def __len__(self) -> int:
+        # [FUNCTION DOC]
+        # Returns steps_per_epoch.
         return self._steps_per_epoch
 
     def __iter__(self):
+        # [FUNCTION DOC]
+        # Infinite generator yielding a list of batch_size empty dicts each time.
         while True:
             yield [{} for _ in range(self.batch_size)]
 
     def state_dict(self) -> dict:
+        # [FUNCTION DOC]
+        # Returns an empty dict (no state).
         return {}
 
     def load_state_dict(self, state_dict: dict) -> None:  # noqa: ARG002
+        # [FUNCTION DOC]
+        # No-op; ignores the given state.
         pass
 
 
 class PPOTrainer:
+    # [CLASS DOC]
+    # Orchestrator of PPO/GRPO training. Owns config, tokenizer/processor, optional
+    # scheduler, allocations, actor/critic/ref/teacher engines or controllers, rollout
+    # and eval_rollout engines, dataloaders, optional DataController,
+    # weight_update_meta, Evaluator, Saver, RecoverHandler, StatsLogger and offload
+    # flags. Context manager that closes on exit.
     def __init__(
         self,
         config: PPOConfig,
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
     ):
+        # [FUNCTION DOC]
+        # Runs _init_impl; on any exception logs it, calls close() to tear down
+        # partially created workers and re-raises.
+        # KNOWN ISSUE: close() accesses attributes (saver, stats_logger, rollout,
+        # eval_rollout, teacher, ref, critic, actor) without existence guards, so a
+        # failure early in _init_impl makes close() raise AttributeError, which replaces
+        # the original exception as the error seen by the caller (the original is only
+        # chained).
         try:
             self._init_impl(config, train_dataset, valid_dataset)
         except Exception:
@@ -127,6 +166,32 @@ class PPOTrainer:
         train_dataset: Dataset | None = None,
         valid_dataset: Dataset | None = None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Full construction. Reads RANK; in single-controller mode enables file
+        # logging and creates the scheduler; applies DTE env vars; loads
+        # tokenizer/processor; seeds RNGs; parses actor and rollout allocations; derives
+        # offload flags (rollout offload when actor and rollout are colocated, actor
+        # offload if that or actor.offload, critic/ref/teacher from their configs; both
+        # rollout/actor flags cleared for v1 AWEX colocate); validates config; sets NCCL
+        # and deterministic env vars on scheduling specs. Online mode
+        # (rollout.agent.mode == "online") forbids a valid dataset; otherwise
+        # train_dataset is required (ValueError). Creates actor, critic (if configured),
+        # ref (only if kl_ctl > 0 and ref configured) and teacher allocation (deprecated
+        # train-engine teacher warns). Builds the train dataloader: an _EmptyDataLoader
+        # with steps_per_epoch = total_train_steps // total_train_epochs in online mode
+        # (ValueError if steps unset or < 1), else a real loader, connecting RDatasets
+        # to a new DataController in single-controller mode; same for the optional valid
+        # loader. Creates FinetuneSpec, initializes actor/critic/ref (and train-type
+        # teacher), saves initial LoRA weights, offloads the actor if needed, starts the
+        # AWEX meta server and adapter for v1 AWEX colocate, initializes rollout and
+        # (non-online) eval rollout and rollout-type teacher. Chooses
+        # weight_update_meta: v2 -> disk (LoRA, keeping max_head_offpolicyness+2 adapter
+        # versions) or awex; v1 -> disk, xccl (megatron or fsdp variant, with LoRA
+        # fields) or awex; else ValueError. Connects actor to rollout, creates
+        # Evaluator, Saver, RecoverHandler, StatsLogger, loads recover state (also
+        # restoring inference weights), informs the staleness manager of the recovered
+        # version, configures perf tracing and applies the initial offload policy. Side
+        # effects: launches workers, servers and processes, loads models, file I/O.
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             # Set up file logging for controller process
@@ -491,6 +556,9 @@ class PPOTrainer:
 
     @staticmethod
     def _is_colocation(strategy: SchedulingStrategy | None) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Static; True if the scheduling strategy type is colocation (enum or
+        # string).
         if strategy is None:
             return False
         return strategy.type in (
@@ -500,6 +568,9 @@ class PPOTrainer:
         )
 
     def _is_actor_rollout_colocated(self, config: PPOConfig) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if the actor strategy colocates with target "rollout" or the
+        # rollout strategy colocates with target "actor".
         actor_s = config.actor.scheduling_strategy
         rollout_s = config.rollout.scheduling_strategy
         return (self._is_colocation(actor_s) and actor_s.target == "rollout") or (
@@ -507,6 +578,10 @@ class PPOTrainer:
         )
 
     def _is_v1_awex_colocate(self, config: PPOConfig) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True iff actor._version is "v1" and weight_update_mode is "awex" (v1
+        # AWEX is always a colocated handover; scheduling strategy deliberately not
+        # checked).
         """Whether this run is the v1 AWEX colocated actor-rollout setup.
 
         ``weight_update_mode`` alone is not enough: controller v2 selects AWEX
@@ -526,6 +601,9 @@ class PPOTrainer:
         )
 
     def _onload_model(self, engine, role: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls engine.onload() inside timing and perf-trace scopes named after
+        # the role.
         with (
             stats_tracker.record_timing(f"{role}_onload"),
             perf_tracer.trace_scope(
@@ -536,6 +614,9 @@ class PPOTrainer:
             engine.onload()
 
     def _offload_model(self, engine, role: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls engine.offload() inside timing and perf-trace scopes named after
+        # the role.
         with (
             stats_tracker.record_timing(f"{role}_offload"),
             perf_tracer.trace_scope(
@@ -546,6 +627,10 @@ class PPOTrainer:
             engine.offload()
 
     def _offload_rollout(self, is_eval: bool = False):
+        # [FUNCTION DOC]
+        # HELPER: For the train or eval rollout (no-op if None): pause request
+        # submission, pause generation (sync or async callable) and offload the
+        # inference engine, each timed and traced.
         rollout = self.rollout if not is_eval else self.eval_rollout
         if rollout is None:
             return
@@ -578,6 +663,10 @@ class PPOTrainer:
             rollout.offload()
 
     def _onload_rollout(self, is_eval: bool = False) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For the train or eval rollout (no-op if None): onload, continue
+        # generation and resume, each attempted even if an earlier step failed; the
+        # first exception encountered is re-raised at the end.
         cleanup_error: Exception | None = None
 
         rollout = self.rollout if not is_eval else self.eval_rollout
@@ -626,6 +715,9 @@ class PPOTrainer:
             raise cleanup_error
 
     def _apply_initial_offload_policy(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: After construction offloads, according to the flags, rollout, ref,
+        # critic, teacher and actor so the GPU starts free for the first step.
         if self._should_offload_rollout:
             self._offload_rollout()
         if self._should_offload_ref:
@@ -646,6 +738,28 @@ class PPOTrainer:
         dynamic_filter_fn: Callable[[dict[str, Any]], bool] | str | None = None,
         total_epochs: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Main RL loop. Resumes after the recovered step; total_epochs defaults to
+        # config (ValueError if <= 0); loop runs to epochs * len(train_dataloader),
+        # stopping at total_train_steps. workflow None is allowed only in online mode
+        # (starts proxy workers); non-RolloutWorkflow workflows also start proxies. Per
+        # step: (onload rollout if colocated) actor.prepare_batch collects rollouts with
+        # group size n_samples, dynamic batch, reward normalization, incomplete-group
+        # dropping and optional dynamic_filter_fn, then offload rollout; critic values
+        # -> traj["values"]; ref logp -> traj["ref_logp"]; teacher logp plus rl/distill
+        # loss weights; for v1 AWEX colocate, pause rollout, release SGLang KV cache and
+        # weights and onload actor; onload actor if needed; recompute prox_logp when
+        # config requires; compute advantages; wait for checkpoint staging; optional
+        # CUDA memory profiling snapshots under the log dir; actor PPO update and LR
+        # step; critic update and LR step (then offload critic); for AWEX save before
+        # weight update; pause rollout, push weights with version step+1 and set
+        # versions on all engines; save HF/recover checkpoints (non-AWEX); offload
+        # actor; evaluate with the eval rollout (onloading/offloading it when
+        # colocated); in single-controller mode clear cached batches on actor, critic,
+        # ref and data controller; commit stats; resume rollout; save perf traces. Each
+        # phase is timed and traced. Returns None.
+        # KNOWN ISSUE: the teacher's cached batches are not cleared in single-controller
+        # mode, unlike the other roles.
         config = self.config
         start_step = (
             self.recover_info.last_step_info.next().global_step
@@ -972,6 +1086,9 @@ class PPOTrainer:
         epoch_step: int,
         global_step: int,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Runs _save_hf then _save_recover_checkpoint within timing/trace
+        # scopes.
         with (
             stats_tracker.record_timing("save"),
             perf_tracer.trace_scope(
@@ -997,6 +1114,10 @@ class PPOTrainer:
             )
 
     def close(self):
+        # [FUNCTION DOC]
+        # Finalizes the saver, closes RDatasets and destroys the data controller
+        # (guarded), closes the stats logger, destroys eval rollout, rollout, teacher,
+        # ref, critic and actor, and force-saves the perf trace.
         self.saver.finalize()
         if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
             self._train_rdataset.close()
@@ -1018,6 +1139,10 @@ class PPOTrainer:
         perf_tracer.save(force=True)
 
     def _config_perf_tracer(self):
+        # [FUNCTION DOC]
+        # HELPER: If perf tracing is configured, configures the local tracer (role
+        # "master") and in single-controller mode the actor, critic, ref, rollout and
+        # eval-rollout workers. The teacher is not configured.
         rank = int(os.getenv("RANK", "0"))
         if self.config.perf_tracer is None:
             return
@@ -1038,6 +1163,12 @@ class PPOTrainer:
             )
 
     def _save_perf_tracer(self, step: int):
+        # [FUNCTION DOC]
+        # HELPER: Saves perf traces for actor, ref, critic, eval rollout, rollout and
+        # locally for the given step.
+        # KNOWN ISSUE: unlike _config_perf_tracer (and DPOTrainer) it does not return
+        # early when config.perf_tracer is None, so it issues save calls to every worker
+        # each step even with tracing disabled.
         self.actor.save_perf_tracer(step=step)
         if self.ref is not None:
             self.ref.save_perf_tracer(step=step)
@@ -1049,6 +1180,9 @@ class PPOTrainer:
         perf_tracer.save(step=step)
 
     def _init_scheduler(self) -> Scheduler:
+        # [FUNCTION DOC]
+        # HELPER: Returns a Local/Ray/SlurmScheduler from config.scheduler.type; raises
+        # NotImplementedError otherwise.
         cfg = self.config.scheduler
         if cfg.type == "local":
             return LocalScheduler(exp_config=self.config)
@@ -1059,6 +1193,9 @@ class PPOTrainer:
         raise NotImplementedError(f"Unknown scheduler type: {cfg.type}")
 
     def _apply_dte_config_envvars(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Exports delta weight-transfer config as runtime env switches via
+        # apply_dte_config_envvars.
         """Export delta weight-transfer config to worker runtime switches."""
         apply_dte_config_envvars(self.config)
 
@@ -1069,6 +1206,9 @@ class PPOTrainer:
         rank: int,
         world_size: int,
     ) -> StatefulDataLoader:
+        # [FUNCTION DOC]
+        # HELPER: Creates a StatefulDataLoader for the dataset sharded by rank/world
+        # size using the default collate.
         return create_dataloader(
             dataset,
             rank=rank,
@@ -1077,6 +1217,10 @@ class PPOTrainer:
         )
 
     def _amend_xccl_weight_update_envvar(self):
+        # [FUNCTION DOC]
+        # HELPER: Single-controller with SGLang rollout only: sets NCCL_CUMEM_ENABLE=0
+        # and NCCL_NVLS_ENABLE=0 in every actor scheduling spec (needed for NCCL weight
+        # updates). In SPMD mode the launcher sets these.
         if not is_single_controller():
             # These environs are set by the launcher in the SPMD mode.
             return
@@ -1089,6 +1233,10 @@ class PPOTrainer:
             spec.env_vars["NCCL_NVLS_ENABLE"] = "0"
 
     def _amend_deterministic_envvar(self):
+        # [FUNCTION DOC]
+        # HELPER: Single-controller only: for Megatron actor/critic/ref engines with
+        # use_deterministic_algorithms, sets NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 in their
+        # scheduling specs so TransformerEngine sees it at worker launch.
         if not is_single_controller():
             # This environ is set by the launcher in the SPMD mode.
             return
@@ -1123,6 +1271,11 @@ class PPOTrainer:
     def _create_train_engine(
         self, actor_config: PPOActorConfig, alloc: ModelAllocation
     ) -> FSDPPPOActor | MegatronPPOActor | ArchonPPOActor | PPOActorController:
+        # [FUNCTION DOC]
+        # HELPER: Instantiates a PPO actor-type engine (used for actor, ref and train-
+        # type teacher) for the allocation backend (FSDPPPOActor, MegatronPPOActor,
+        # ArchonPPOActor; ValueError otherwise), as a controller in single-controller
+        # mode or locally in SPMD, creates its process group and returns it.
         """Create a training engine (actor or ref) based on the allocation backend."""
         if alloc.backend == "fsdp":
             from areal.engine import FSDPPPOActor
@@ -1150,6 +1303,9 @@ class PPOTrainer:
     def _create_critic(
         self, critic_config: PPOCriticConfig, alloc: ModelAllocation
     ) -> FSDPPPOCritic | MegatronPPOCritic | ArchonPPOCritic | PPOCriticController:
+        # [FUNCTION DOC]
+        # HELPER: Same as _create_train_engine for critic classes (FSDP/Megatron/Archon
+        # PPO critic).
         """Create a critic engine based on the allocation backend."""
         if alloc.backend == "fsdp":
             from areal.engine import FSDPPPOCritic
@@ -1180,6 +1336,19 @@ class PPOTrainer:
         is_eval: bool = False,
         lora_path: str | None = None,
     ) -> InferenceEngine | RolloutController:
+        # [FUNCTION DOC]
+        # HELPER: Creates the train or eval inference engine. LoRA path in SPMD mode ->
+        # ValueError. Works on a deep copy of the rollout config; eval disables
+        # staleness limits, colocates with the rollout servers and requests 0 GPUs.
+        # SGLang: enables routed-expert return if requested, registers the initial LoRA
+        # adapter as "{lora_name}-v0", builds server args (plus AWEX colocate flags for
+        # v1 AWEX). vLLM: rejects routed experts, registers LoRA modules, builds server
+        # args. Other backends -> ValueError. SPMD: constructs and initializes the local
+        # client engine. Single-controller: RolloutControllerV2 for v2 configs else the
+        # engine's controller; eval reuses the train rollout's server_infos with role
+        # "eval-rollout". Returns the engine/controller.
+        # KNOWN ISSUE: mutates the shared self.config.sglang / self.config.vllm
+        # (lora_paths, lora_modules, enable_return_routed_experts) rather than a copy.
         if lora_path is not None and not is_single_controller():
             raise ValueError(
                 "LoRA is only supported in single-controller mode. "
@@ -1267,6 +1436,12 @@ class PPOTrainer:
     def _init_teacher_rollout(
         self, rollout_config: InferenceEngineConfig
     ) -> InferenceEngine | RolloutController:
+        # [FUNCTION DOC]
+        # HELPER: Creates the teacher inference engine from teacher_alloc (RuntimeError
+        # if unset): copies sglang/vllm config, swaps in teacher.path as the model (and
+        # vLLM tokenizer path if unset), builds server args, and returns a local engine
+        # (SPMD) or a controller initialized with role "teacher". ValueError for other
+        # backends.
         if self.teacher_alloc is None:
             raise RuntimeError("teacher_alloc is not initialized")
         rollout_alloc = self.teacher_alloc
@@ -1309,6 +1484,11 @@ class PPOTrainer:
         return controller
 
     def _save_initial_lora_weights(self) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: If LoRA is enabled, saves the actor's initial adapter (HF format, no
+        # optimizer, with tokenizer/processor) to <model save root>/initial_lora unless
+        # adapter_config.json already exists there, and returns that path; returns None
+        # without LoRA. Logs progress.
         """Save initial LoRA weights for inference server pre-loading.
 
         Returns path to saved LoRA weights, or None if LoRA is disabled.
@@ -1347,6 +1527,10 @@ class PPOTrainer:
         return path
 
     def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Lets the saver export actor (and critic under name "critic") HF
+        # checkpoints when due; in synchronous SPMD mode then barriers on the actor CPU
+        # group and syncs the device.
         # Save as HF models for evaluation
         self.saver.save(
             self.actor,
@@ -1372,6 +1556,10 @@ class PPOTrainer:
             current_platform.synchronize()
 
     def _save_recover_checkpoint(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Dumps a recover checkpoint (actor as "default", critic if present,
+        # StepInfo, saver/evaluator/logger/dataloader state, tokenizer/processor) when
+        # due; SPMD barrier and sync afterwards. Ref and teacher are not saved.
         # Save recoverable checkpoints
         to_save: dict = dict(default=self.actor)
         if self.critic is not None:
@@ -1402,6 +1590,11 @@ class PPOTrainer:
         eval_workflow: WorkflowLike,
         eval_workflow_kwargs,
     ):
+        # [FUNCTION DOC]
+        # HELPER: On the data-parallel head, submits every validation item to the eval
+        # rollout with eval n_samples (no reward normalization, keep incomplete groups)
+        # and waits for all results without timeout (stats recorded by the workflow);
+        # SPMD barrier and sync.
         if self.actor.is_data_parallel_head():
             cnt = 0
             for data in self.valid_dataloader:
@@ -1430,6 +1623,10 @@ class PPOTrainer:
         epoch_step: int,
         global_step: int,
     ):
+        # [FUNCTION DOC]
+        # HELPER: No-op without eval rollout, valid dataloader or eval workflow;
+        # otherwise lets the Evaluator decide by frequency whether to run _evaluate_fn;
+        # SPMD barrier and sync.
         if (
             self.eval_rollout is None
             or self.valid_dataloader is None
@@ -1451,6 +1648,9 @@ class PPOTrainer:
             current_platform.synchronize()
 
     def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Merges exported stats from actor, rollout and eval rollout and commits
+        # them to the stats logger; SPMD barrier and sync.
         # Upload statistics to the logger (e.g., wandb)
         stats = self.actor.export_stats()
         stats.update(self.rollout.export_stats())
@@ -1463,6 +1663,12 @@ class PPOTrainer:
             current_platform.synchronize()
 
     def _validate_cfg(self):
+        # [FUNCTION DOC]
+        # HELPER: Fails fast (ValueError) before launching workers if: any offload is
+        # needed but enable_offload is False; actor/rollout colocated without disk or
+        # awex weight updates; v1 AWEX without Megatron actor or SGLang rollout; vLLM
+        # with return_routed_experts; Megatron actor + LoRA + SGLang rollout; actor and
+        # rollout controller versions differ.
         """validate config for incompatible settings before weight initialization, to avoid wasted resources on spawning workers and loading models."""
         rollout_backend = self.rollout_alloc.backend
         actor_backend = self.actor_alloc.backend
@@ -1529,6 +1735,10 @@ class PPOTrainer:
             )
 
     def _requires_proxy_workflow(self, workflow: WorkflowLike | None) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Returns False for None, RolloutWorkflow instances/subclasses, or
+        # import strings resolving to them; True for anything else, including strings
+        # whose import fails (fail-safe). Side effect: may import modules.
         """Check if workflow requires proxy workers (i.e., not a RolloutWorkflow).
 
         Returns True if:
@@ -1573,6 +1783,11 @@ class PPOTrainer:
         return True
 
     def _ensure_proxy_started(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Idempotently starts proxy workers for agent workflows. SPMD mode ->
+        # NotImplementedError. If the rollout is not a v1 RolloutController just marks
+        # started. Otherwise starts proxies on rollout and eval rollout and, in online
+        # mode, the proxy gateway (logging its address).
         """Lazily initialize proxy workers when agent workflows are used.
 
         This method is called before training when a non-RolloutWorkflow is detected
@@ -1610,9 +1825,14 @@ class PPOTrainer:
         self._proxy_started = True
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Returns self.
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Logs any exception with traceback, calls close(), returns False so exceptions
+        # propagate.
         if exc_type is not None:
             logger.error(f"Training failed with exception: {exc_value}", exc_info=True)
         self.close()

@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# CLI that visualizes PerfTracer session-trace JSONL (one record per rollout session
+# with rank, task_id, session_id, role, status, submit_ts/finalized_ts,
+# total_s/generate_s/ reward_s/toolcall_s durations and a nested phases dict of
+# {start_ts, end_ts} spans) as standalone Plotly HTML reports: overall duration
+# histograms, per-training-step histograms with a step dropdown, a latency scatter with
+# step boundaries and p50/p95 toggles, and optional per-rank lifecycle Gantt timelines.
+# Step boundaries are inferred from accepted sessions and the consumer batch size.
+# Module constants define timestamp and duration columns, phase order, colors/styles and
+# the minimum step gap (unused).
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -45,6 +55,9 @@ SEGMENT_OUTLINE = {"color": "#1f1f1f", "width": 0.7}
 
 
 def _compute_bar_width(num_sessions: int) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Bar thickness for timeline rows: 0.95 for <=0 sessions, otherwise 60/n
+    # clamped to [0.5, 0.95].
     """Shrink bars when many sessions are rendered to avoid cluttering visuals."""
     if num_sessions <= 0:
         return 0.95
@@ -65,6 +78,14 @@ MIN_STEP_GAP = 0.5
 def _compute_histogram_bins(
     values: pd.Series, *, max_bins: int = 120, min_bins: int = 0
 ) -> dict[str, float] | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns a Plotly xbins dict {start, end, size} for a numeric Series.
+    # Empty, all NaN/non-finite input -> {0, 1, 0.1}. One value -> a small bin around it
+    # (width = 1/8 of max(span, 5% of magnitude or 1), min 1e-3). Otherwise width from
+    # the Freedman-Diaconis rule (2*IQR/n^(1/3)); if IQR is zero, span / min(max_bins,
+    # max(40, n//2)). Width is at least max(span/max_bins, 1e-3), and when min_bins > 0
+    # is capped at span/min_bins (still not below the minimum). Range is [min, max +
+    # width]. The return is never None despite the Optional type hint.
     """Derive x-axis bin settings to avoid overly coarse histograms."""
     if values.empty:
         return {
@@ -76,6 +97,8 @@ def _compute_histogram_bins(
     min_bins = max(0, min_bins)
 
     def _isfinite(value: Any) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if the value converts to a finite float, False otherwise.
         try:
             return math.isfinite(float(value))
         except (TypeError, ValueError):
@@ -130,6 +153,9 @@ def _compute_histogram_bins(
 
 
 def _format_index_label(value: Any) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Formats a numeric id as an integer string, or "NA" if not convertible or
+    # not finite.
     try:
         numeric = float(value)
     except (TypeError, ValueError):
@@ -140,6 +166,11 @@ def _format_index_label(value: Any) -> str:
 
 
 def _resolve_record_files(source: str | Path) -> list[Path]:
+    # [FUNCTION DOC]
+    # HELPER: Expands ~ and resolves the input into JSONL files: an existing file ->
+    # [it]; an existing directory -> its sorted *.jsonl files (non-recursive); otherwise
+    # treats it as a recursive glob and returns the sorted matching files. May return
+    # [].
     """Resolve an input path, directory, or glob into concrete JSONL files."""
     source_path = Path(source).expanduser()
     if source_path.exists():
@@ -152,6 +183,9 @@ def _resolve_record_files(source: str | Path) -> list[Path]:
 
 
 def _load_records(path: Path) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # HELPER: Reads a JSONL file (UTF-8), skipping blank lines, and returns the parsed
+    # objects. Raises ValueError naming the line on invalid JSON.
     records: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as fin:
         for lineno, raw_line in enumerate(fin, 1):
@@ -170,6 +204,9 @@ def _load_records(path: Path) -> list[dict[str, Any]]:
 
 
 def _ensure_numeric(df: pd.DataFrame) -> None:
+    # [FUNCTION DOC]
+    # HELPER: In place, coerces timestamp columns, rank, task_id, session_id and
+    # duration columns (when present) to numeric, turning invalid values into NaN.
     for column in TIMESTAMP_COLUMNS + ["rank", "task_id", "session_id"]:
         if column in df.columns:
             df[column] = pd.to_numeric(df[column], errors="coerce")
@@ -179,6 +216,9 @@ def _ensure_numeric(df: pd.DataFrame) -> None:
 
 
 def _maybe_compute_durations(df: pd.DataFrame) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Backward compatibility: if total_s is missing but both timestamps exist,
+    # sets total_s = finalized_ts - submit_ts in place.
     """Compute derived duration columns if not present.
 
     For new session format, durations are pre-computed in the trace data.
@@ -194,6 +234,10 @@ def _maybe_compute_durations(df: pd.DataFrame) -> None:
 
 
 def _extract_phase_timestamps(df: pd.DataFrame) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Adds a _phases_data column holding each record's phases dict (None when
+    # missing, NaN or not a dict); if there is no phases column it is all None. Despite
+    # the docstring, nothing is flattened into separate columns.
     """Extract phase timestamps from nested phases structure.
 
     Converts the nested phases dict structure into flattened columns for easier
@@ -214,6 +258,8 @@ def _extract_phase_timestamps(df: pd.DataFrame) -> None:
     """
 
     def parse_phases(phases_data):
+        # [FUNCTION DOC]
+        # HELPER: Returns the value if it is a dict, else None (including None/NaN).
         if phases_data is None or (
             isinstance(phases_data, float) and math.isnan(phases_data)
         ):
@@ -229,6 +275,9 @@ def _extract_phase_timestamps(df: pd.DataFrame) -> None:
 
 
 def _compute_offsets(df: pd.DataFrame) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Base time = min submit_ts (0.0 if absent/non-finite); adds {col}_offset
+    # columns for each timestamp column in place. Returns the base time.
     """Compute time offsets relative to earliest submit timestamp."""
     base_time = (
         float(df["submit_ts"].min(skipna=True)) if "submit_ts" in df else math.nan
@@ -245,6 +294,18 @@ def _determine_step_timepoints(
     df: pd.DataFrame,
     consumer_batch_size: int,
 ) -> tuple[list[float], str | None]:
+    # [FUNCTION DOC]
+    # HELPER: Infers global training-step end times. Requires rank, task_id,
+    # finalized_ts_offset and status; drops rows missing any, keeps only accepted
+    # sessions (prints how many were filtered). per_rank_quota = consumer_batch_size //
+    # num_ranks (error message if < 1). Per rank: each task's completion = max finalized
+    # offset of its sessions, sorted; step k ends at the completion of the (k+1)*quota-
+    # th task; incomplete tails are dropped. Global step k = max over ranks of their
+    # k-th boundary, for k up to the smallest rank step count. Returns (timepoints,
+    # description); on failure returns ([], reason).
+    # KNOWN ISSUE: the "all rejected" message is also printed when sessions are
+    # failed/dropped rather than rejected; the quota uses integer division so leftover
+    # batch slots are ignored.
     """Determine step boundaries based on per-rank task completion with global synchronization.
 
     Args:
@@ -359,6 +420,14 @@ def _determine_step_timepoints(
 def _apply_step_assignments(
     df: pd.DataFrame, step_timepoints: Sequence[float] | None
 ) -> pd.Series:
+    # [FUNCTION DOC]
+    # HELPER: Sets df["step_id"] (nullable Int64) in place: each session's finalized
+    # offset is binned into intervals (-inf, t1], (t1, t2], ... over the sorted unique
+    # timepoints, sessions after the last timepoint stay NA. With no timepoints, no
+    # offsets, or non-finite timepoints, step_id is all NA and an empty Series is
+    # returned. Returns counts per step index 0..n-1 (zeros filled).
+    # KNOWN ISSUE: duplicate timepoints are de-duplicated, so step indices can shift
+    # relative to the original timepoint list used by callers when printing.
     """Assign step IDs to sessions based on global step timepoints.
 
     Args:
@@ -415,6 +484,15 @@ def _apply_step_assignments(
 def _build_timeline(
     fig: go.Figure, df: pd.DataFrame, *, base_time: float, row: int = 1, col: int = 1
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Adds a horizontal Gantt row per session (rows with submit_ts, sorted by
+    # it) to the given subplot. Row label is "[role]r{rank}-t{task}-s{session}". Phase
+    # spans are taken from _phases_data in default order then any extra phases (sorted),
+    # converted to offsets from base_time and sorted by start. Draws idle segments for
+    # gaps > 1us from submit to the first phase, between phases and from last phase to
+    # finalized, plus each phase bar colored by SEGMENT_STYLES; legend entries appear
+    # once per segment label. Reverses the y axis and sets axis titles. Sessions with
+    # non-finite submit offset are skipped.
     """Build timeline visualization showing session lifecycle with phases.
 
     For the new session format, displays:
@@ -496,6 +574,12 @@ def _build_timeline(
             segment_key: str,
             segment_label: str | None = None,
         ) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Adds one go.Bar segment (skipped if duration <= 0) at the given
+            # start with style/color from SEGMENT_STYLES (idle drawn faded without
+            # outline), a hover text with session, segment and timing, and shows it in
+            # the legend only the first time its label appears (updates the enclosing
+            # legend_seen set).
             if duration <= 0:
                 return
 
@@ -580,6 +664,12 @@ def _build_timeline(
 def _build_latency_scatter(
     fig: go.Figure, df: pd.DataFrame, *, row: int = 1, col: int = 1
 ) -> dict[str, float]:
+    # [FUNCTION DOC]
+    # HELPER: Scatter of total_s vs finalized offset, one trace per rank (palette
+    # colors), sessions above p95 drawn as diamonds. Hover includes task/session/status,
+    # optional role and phase durations via customdata. Sets the legend and axis titles.
+    # Returns {} if no usable rows, else {p95, p50, x_min, x_max, y_min, y_max}. Raises
+    # ValueError if any row has NA rank (KeyError if the rank column is missing).
     """Build scatter plot showing total session duration over time."""
     scatter_df = df.dropna(subset=["finalized_ts_offset", "total_s"]).copy()
     if scatter_df.empty:
@@ -603,6 +693,8 @@ def _build_latency_scatter(
         rank_colors[value] = palette[idx % len(palette)]
 
     def _subset_rank_label(value: Any) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Wraps _format_index_label for rank labels.
         return _format_index_label(value)
 
     grouped = []
@@ -696,6 +788,10 @@ def _build_latency_scatter(
 def _add_overall_histogram(
     fig: go.Figure, df: pd.DataFrame, metric: str, row: int
 ) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Adds a histogram of a HISTOGRAM_METRICS column (non-NaN values) at the
+    # given row with bins from _compute_histogram_bins (min_bins between 96 and 120) and
+    # axis titles. Returns False if the column is missing/empty, else True.
     if metric not in df.columns:
         return False
     values = df[metric].dropna()
@@ -737,6 +833,11 @@ def _add_step_histograms(
     step_ids: Sequence[int],
     default_step: int,
 ) -> dict[int, list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: For each step id adds a histogram of the metric for sessions in that step
+    # (fine binning: max 800 bins, min_bins between 200 and 500), visible only for
+    # default_step. Returns {step: [trace indices]} for the dropdown; {} if step_id or
+    # metric is missing or no session has a step.
     if "step_id" not in df.columns or metric not in df.columns:
         return {}
     step_df = df.dropna(subset=["step_id"])
@@ -780,6 +881,10 @@ def _add_step_histograms(
 
 
 def build_overall_distribution_figure(df: pd.DataFrame) -> go.Figure:
+    # [FUNCTION DOC]
+    # Builds a figure with one overall histogram row per duration metric that has data;
+    # if none, returns a single-panel figure with a "No distribution metrics available"
+    # note. Height grows by 220px per extra metric (base 420).
     metrics_with_data = [
         metric
         for metric in HISTOGRAM_METRICS
@@ -848,6 +953,10 @@ def build_overall_distribution_figure(df: pd.DataFrame) -> go.Figure:
 def build_step_distribution_figure(
     df: pd.DataFrame, step_counts: pd.Series | None
 ) -> go.Figure | None:
+    # [FUNCTION DOC]
+    # Builds per-step histograms (one row per metric with data) and a dropdown whose
+    # buttons show only the chosen step's traces. Returns None if step_counts is
+    # None/empty or no metric has data. Height base 440 plus 240 per extra metric.
     if step_counts is None or step_counts.empty:
         return None
 
@@ -952,6 +1061,13 @@ def build_step_distribution_figure(
 def build_timeline_figures(
     df: pd.DataFrame, max_sessions: int | None = None
 ) -> dict[str, go.Figure]:
+    # [FUNCTION DOC]
+    # Builds lifecycle timeline figures. Keeps rows with submit_ts; if max_sessions > 0
+    # and exceeded, keeps the earliest-finalized max_sessions sessions; sorts by
+    # submit_ts. Raises ValueError if any rank is NA. Uses one global base time (min
+    # submit_ts). Returns {"all": fig} when there are no ranks (only possible for empty
+    # data), else {"r{rank}": fig} per rank, with height scaled by session count
+    # (320..1200px).
     """Build timeline visualization showing session lifecycle with phases.
 
     Args:
@@ -1058,6 +1174,12 @@ def build_timeline_figures(
 def build_latency_figure(
     df: pd.DataFrame, step_timepoints: Sequence[float] | None = None
 ) -> go.Figure:
+    # [FUNCTION DOC]
+    # Builds the execution-duration figure via _build_latency_scatter, then, when step
+    # timepoints and data exist, adds dashed vertical lines and "Step k" labels and a
+    # Steps On/Off button pair toggling them; adds hidden p50/p95 horizontal lines with
+    # a Percentiles On/Off toggle; shows a "No execution data" note if there are no
+    # traces. Returns the figure.
     fig = make_subplots(
         rows=1,
         cols=1,
@@ -1229,6 +1351,9 @@ def build_latency_figure(
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Parses CLI: positional input (file, dir or glob), --output (HTML path), required
+    # -B/--consumer-batch-size, -L/--enable-lifecycle, -N/--max-lifecycle-sessions.
     parser = argparse.ArgumentParser(
         description="Visualize session-trace JSONL produced by PerfTracer.",
     )
@@ -1267,6 +1392,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _default_output_path(input_arg: str, sources: Sequence[Path]) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Derives a default HTML path: for a single source file,
+    # <stem>-distribution.html beside it; for an existing directory, dir/sessions-
+    # distribution.html; for an existing file input, <stem>-distribution.html; otherwise
+    # a sanitized stem (alnum, - and _ kept) suffixed with -distribution in the glob's
+    # parent (or cwd if that is '.', empty or missing).
     if sources:
         if len(sources) == 1:
             base = sources[0]
@@ -1295,6 +1426,21 @@ def _default_output_path(input_arg: str, sources: Sequence[Path]) -> Path:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # [FUNCTION DOC]
+    # CLI flow: resolves and loads records (FileNotFoundError if no files, ValueError if
+    # no records), builds a DataFrame, normalizes numerics, derives durations, phase
+    # data and offsets, infers step timepoints and assigns step ids (printing per-step
+    # counts), builds overall and step distribution figures and writes them as HTML
+    # (plotly.js from CDN). With --output, files are <output> and <stem>-step<suffix>;
+    # otherwise fixed names sessions-distribution-overall.html / -step.html beside the
+    # default path. With --enable-lifecycle also writes sessions-lifecycle-r{rank}.html
+    # per rank and prints a summary. Always writes sessions-latency.html beside the
+    # overall report. Creates parent directories as needed and prints written paths.
+    # Returns 0.
+    # KNOWN ISSUE: when --output is not given, the derived default path only contributes
+    # its directory; the file names are fixed, so the computed stem is ignored. Latency
+    # and lifecycle files also ignore the --output stem and can overwrite reports from
+    # other runs in the same directory.
     args = parse_args(argv)
     sources = _resolve_record_files(args.input)
     if not sources:

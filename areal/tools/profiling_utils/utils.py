@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Shared helpers for profiling scripts; currently only random sequence-length generation
+# for synthetic packed batches. Uses the global `random` module state.
 # SPDX-License-Identifier: Apache-2.0
 
 """Shared utilities for profiling tools."""
@@ -10,6 +13,16 @@ def generate_random_seq_lens(
     total_len: int,
     min_seq_len: int = 64,
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # Splits total_len into batch_size random integer lengths summing exactly to
+    # total_len. For each of the first batch_size-1 items: avg = remaining //
+    # items_left; lower bound = max(min_seq_len, avg//2); upper bound = min(remaining -
+    # min_seq_len*(items_still_after), 2*avg); draw uniformly (inclusive) with
+    # random.randint and subtract from remaining. The last item gets whatever remains.
+    # Returns list[int]. Side effect: consumes global RNG.
+    # KNOWN ISSUE: if total_len < batch_size*min_seq_len (or avg//2 exceeds the upper
+    # bound) the lower bound can exceed the upper bound and random.randint raises
+    # ValueError; no input validation, and batch_size<=0 is not handled.
     """Generate random sequence lengths that sum to total_len.
 
     Generates variable-length sequences for profiling with packed/padded batches.

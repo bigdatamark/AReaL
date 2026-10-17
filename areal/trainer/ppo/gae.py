@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Generalized Advantage Estimation (GAE) kernels for PPO in two timestep granularities:
+# token-level (each loss token is a step) and turn-level (each generated turn,
+# identified by token-aligned turn_ids, is a step), plus validation of turn_ids and
+# construction of the GAELambdaContext (per-sample trajectory lengths) consumed by per-
+# sample lambda functions. All tensors are padded [batch, seq_len]; gae_lambda may be a
+# scalar or a per-sample [batch] tensor.
 # SPDX-License-Identifier: Apache-2.0
 
 """Generalized advantage estimation kernels and turn metadata helpers."""
@@ -15,6 +22,17 @@ def _compute_token_level_gae(
     discount: float,
     gae_lambda: float | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Token-level GAE. Inputs: rewards, values, loss_mask ([bs, T]),
+    # seq_no_eos_mask ([bs], 1 when the sequence was truncated without EOS so the last
+    # value bootstraps), discount, gae_lambda (float or [bs] tensor). Iterates t from
+    # T-2 down to 0: delta = r_t + discount*nextvalue - V_t; candidate = delta +
+    # discount*lambda*lastgae. Where loss_mask[t] is 0 the running nextvalue/lastgae are
+    # carried through unchanged (masked tokens are skipped, not reset); where 1 they are
+    # replaced by V_t / candidate. Initial nextvalue is V[T-1]*seq_no_eos_mask, the
+    # advantage at the final position is fixed to 0. Returns (advantages float32 [bs,
+    # T], returns = advantages + values). Note masked positions receive the carried
+    # lastgae value, not zero; caller is expected to apply the mask.
     """Compute GAE with each generated token treated as one timestep."""
     bs, max_seqlen = rewards.shape
     advantages_reversed = [torch.zeros(bs, dtype=torch.float32, device=values.device)]
@@ -37,6 +55,13 @@ def _compute_token_level_gae(
 
 
 def _validate_turn_ids(loss_mask: torch.Tensor, turn_ids: torch.Tensor) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Checks turn_ids against loss_mask. Synchronously raises ValueError if
+    # shapes or devices differ or dtype is not an integer type (uint8/int8/16/32/64).
+    # Then issues asynchronous device asserts (torch._assert_async, no host sync) that
+    # at every active loss token turn_ids are >= 0, < seq_len, and non-decreasing along
+    # the sequence (compared to the cumulative max of active ids, inactive positions
+    # treated as -1). Returns None.
     """Validate token-aligned turn IDs without synchronizing GPU hot paths."""
     if turn_ids.shape != loss_mask.shape:
         raise ValueError(
@@ -88,6 +113,17 @@ def _compute_turn_level_gae(
     discount: float,
     gae_lambda: float | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Turn-level GAE. Validates turn_ids, clamps them to [0, T-1] as slot
+    # indices. Per-turn reward = scatter-sum of rewards over active tokens of that turn;
+    # per-turn value = value at the turn's first active token (found via scatter amin
+    # over positions), zeroed for slots with no active tokens. Runs the backward GAE
+    # recursion over turn slots (inactive slots get advantage 0 and do not update the
+    # running nextvalue/lastgae); bootstrap nextvalue is V[T-1]*seq_no_eos_mask. On CPU
+    # input the loop length is limited to max active turn id + 1 (one .item() call); on
+    # accelerators it loops over all T slots to avoid host sync. Broadcasts each turn's
+    # advantage/return back to its tokens via gather. Returns (advantages*loss_mask,
+    # returns where loss tokens get turn return and others keep their original value).
     """Compute GAE with each generated turn treated as one timestep."""
     _validate_turn_ids(loss_mask, turn_ids)
     bs, max_seqlen = rewards.shape
@@ -169,6 +205,14 @@ def _build_gae_lambda_context(
     *,
     gae_timestep_unit: str,
 ) -> GAELambdaContext:
+    # [FUNCTION DOC]
+    # HELPER: Builds a GAELambdaContext dict from loss_mask and optional turn_ids.
+    # effective_token_lengths = count of active loss tokens per sample. If turn_ids
+    # given, validates them and turn_counts = number of distinct turn slots containing
+    # at least one active token; otherwise raises ValueError when gae_timestep_unit ==
+    # "turn", else turn_counts is zero-filled. timestep_lengths =
+    # effective_token_lengths for unit "token", else turn_counts (any non-"token" value
+    # is treated as turn). Returns the three [bs] integer tensors in a dict.
     """Build stable per-sample lengths from the canonical GAE eligibility mask.
 
     Token-level custom lambda functions can operate on legacy rollout data that does

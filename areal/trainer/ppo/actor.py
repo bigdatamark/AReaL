@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# PPO/GRPO actor (policy) training logic. PPOActor runs on a training worker and wraps a
+# TrainEngine to (1) compute per-token log-probs, (2) shape rewards (overlong penalty,
+# bias/scale/clip, optional normalization, KL penalty to a reference policy) and compute
+# GAE advantages/returns at token or turn granularity with static or per-sample lambda,
+# and (3) run minibatched policy updates with grpo_loss_fn. Supports standard PPO,
+# decoupled (off-policy) PPO with a proximal policy that is recomputed, reused from the
+# training forward pass, or approximated from policy versions, plus M2PO masking, CISPO,
+# SAPO, dual clipping, rejection sampling and joint knowledge distillation. Also
+# provides controller proxies (RPC and HTTP gateway) and many stats_tracker logging
+# helpers. All batch tensors are padded [batch, seq_len]. Logger "PPOActor".
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
@@ -52,6 +63,11 @@ logger = logging.getLogger("PPOActor")
 def _infer_prompt_lens(
     attention_mask: torch.Tensor, loss_mask: torch.Tensor
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Per-sequence prompt length = index of the first generated token. Because
+    # loss_mask is already shifted left by one (next-token convention), it is rolled
+    # right by one first, then argmax finds the first 1. Sequences without any generated
+    # token fall back to their attention-mask length. Returns a long [batch] tensor.
     """Return the index of the first generated token for each trajectory.
 
     ``loss_mask`` arrives rolled left by one (see ``_compute_advantages``), so it
@@ -65,7 +81,18 @@ def _infer_prompt_lens(
 
 
 class PPOActor:
+    # [CLASS DOC]
+    # Worker-side policy wrapper. Caches from PPOActorConfig: reward bias/scaling/clip,
+    # KL coefficient and estimator, optional advantage and reward Normalization objects,
+    # discount, gae_lambda (resolved into a callable plus custom flag and kwargs),
+    # gae_timestep_unit, mask_no_eos_with_zero, temperature and m2_threshold. Holds the
+    # TrainEngine used for forward/training.
     def __init__(self, config: PPOActorConfig, engine: TrainEngine):
+        # [FUNCTION DOC]
+        # Stores config/engine, builds KLEstimator and Normalization helpers, resolves
+        # the gae_lambda function (custom functions get gae_lambda_kwargs, static values
+        # none), copies the other scalars and logs the configuration. Raises from
+        # resolve_gae_lambda_fn for bad lambda configs.
         self.config = config
         self.engine = engine
 
@@ -100,6 +127,12 @@ class PPOActor:
         self._log_configuration()
 
     def _log_configuration(self):
+        # [FUNCTION DOC]
+        # HELPER: Logs (INFO) the PPO mode (standard: whether old logp is recomputed or
+        # taken from inference; decoupled: proximal-logp method description and
+        # rejection sampling settings) and key training parameters
+        # (importance_sampling_level, adv/reward norm, gae_lambda, gae_timestep_unit,
+        # eps_clip). No return value.
         """Log PPO configuration including how proximal policy is computed."""
         config = self.config
 
@@ -162,9 +195,16 @@ class PPOActor:
     @trace_perf("ppo_actor.compute_logp", category="compute")
     @torch.no_grad()
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # No-grad per-token log-prob computation for a batch list (or single dict) via
+        # _compute_logp; used for recomputing old/proximal log-probs. Perf traced.
+        # Returns tensor(s) per input, possibly None on non-output ranks.
         return batched_call(self._compute_logp, data)
 
     def _compute_logp(self, data: dict[str, Any]) -> torch.Tensor | None:
+        # [FUNCTION DOC]
+        # HELPER: Sets eval mode and calls engine.forward, concatenating micro-batch
+        # outputs on the last dim. Returns the log-prob tensor (or None).
         self.engine.eval()
         return self.engine.forward(
             input_=data,
@@ -173,11 +213,35 @@ class PPOActor:
 
     @trace_perf("ppo_actor.compute_advantages", category="compute")
     def compute_advantages(self, data: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Runs _compute_advantages on each batch via batched_call, passing trajectory
+        # batch metadata (group sizes). Returns the updated batch dict(s). Perf traced.
         return batched_call(self._compute_advantages, data, pass_meta=True)
 
     def _compute_advantages(
         self, data: dict[str, Any], meta: TrajBatchMeta | None = None
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Mutates and returns the batch dict with advantages, returns,
+        # kl_rewards, tot_rewards, shifted loss_mask and logprobs. Steps: optional
+        # overlong-length reward penalty; reward = clip((rewards + bias) * scaling,
+        # +/-reward_clip), then optional reward normalization using meta
+        # traj_group_sizes. loss_mask (and turn_ids, last set to -1) are rolled left by
+        # one to the next-token convention; missing turn_ids with turn unit ->
+        # ValueError. old logp: in standard PPO with recompute_logprob it is prox_logp
+        # (ValueError if None) and overwrites data["logprobs"]; otherwise the rolled
+        # inference logprobs, also used as prox_logp in standard PPO. ref_logp (zeros if
+        # absent) and old logp are masked in place. KL reward = -kl_ctl * estimator(old,
+        # ref), zeroed at position seqlen-1. Outcome reward is placed at index seqlen-2
+        # (zeroed for truncated no-EOS sequences when mask_no_eos_with_zero). GAE
+        # rewards: outcome only for turn unit, KL + outcome for token unit. Values
+        # default to zeros (no critic). Lambda: per-sample via _compute_gae_lambda for
+        # custom functions, else static float (ValueError if non-finite). Runs turn-
+        # level GAE (then adds per-token KL rewards to the advantages) or token-level
+        # GAE, then optional advantage normalization with loss_mask and group sizes.
+        # KNOWN ISSUE: in-place masking of ref_logp/old_logp also mutates the tensors
+        # stored under data["ref_logp"] and data["prox_logp"] (they alias), which
+        # callers may not expect.
         bs = data["input_ids"].shape[0]
         batch_indices = torch.arange(
             bs, device=data["input_ids"].device, dtype=torch.long
@@ -327,6 +391,12 @@ class PPOActor:
         loss_mask: torch.Tensor,
         turn_ids: torch.Tensor | None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Builds the GAELambdaContext from loss_mask/turn_ids, calls the custom
+        # lambda function with the configured kwargs and validates its output: must be a
+        # floating tensor (TypeError otherwise) of shape [batch] on loss_mask's device
+        # (ValueError otherwise); finiteness is checked by an async device assert.
+        # Returns it detached as float32.
         """Resolve one lambda value per local trajectory without changing masks."""
         context = _build_gae_lambda_context(
             loss_mask,
@@ -364,9 +434,25 @@ class PPOActor:
     @trace_perf("ppo_actor.ppo_update", category="compute")
     @stats_tracker.scope_func_wrapper("ppo_actor")
     def ppo_update(self, data: list[dict[str, Any]]) -> None:
+        # [FUNCTION DOC]
+        # Runs _ppo_update once on the given data (no unpacking) inside the "ppo_actor"
+        # stats scope with perf tracing. Returns None.
         batched_call(self._ppo_update, data, unpack=False)
 
     def _ppo_update(self, data: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Logs stats then trains. Logging: denominators n_seqs, n_tokens,
+        # n_valid_tokens, correct/incorrect sequences (task reward > 0 using
+        # original_rewards if present) and, with log_agent_stats, "agent" from
+        # begin_of_trajectory (RuntimeError if missing or keys empty); token stats
+        # (advantages, kl_rewards, final_reward), sequence stats (no-EOS ratio, task
+        # reward, prompt length, sequence length), config scalars (eps_clip, dual clip,
+        # rejection sampling bounds) and agent stats keys. Then drops
+        # rewards/tot_rewards/ kl_rewards from data, sets train mode, splits into
+        # ppo_n_minibatches and, inside an "update" stats scope, calls
+        # engine.train_batch per minibatch with grpo_loss_fn bound to all loss settings
+        # and the engine's current version, weighting by the count of loss tokens; logs
+        # returned train stats. Performs optimizer steps.
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
@@ -485,24 +571,37 @@ class PPOActor:
 
 
 class PPOActorController(TrainController):
+    # [CLASS DOC]
+    # TrainController proxy broadcasting the PPOActor methods to workers via RPC.
     def compute_logp(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Broadcasts compute_logp and returns its result.
         return self._custom_function_call(
             "compute_logp", *args, rpc_meta={"broadcast": True}, **kwargs
         )
 
     def compute_advantages(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Broadcasts compute_advantages and returns its result.
         return self._custom_function_call(
             "compute_advantages", *args, rpc_meta={"broadcast": True}, **kwargs
         )
 
     def ppo_update(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Broadcasts ppo_update; returns None.
         self._custom_function_call(
             "ppo_update", *args, rpc_meta={"broadcast": True}, **kwargs
         )
 
 
 class PPOActorControllerV2(GatewayTrainController):
+    # [CLASS DOC]
+    # Gateway (v2 training service) controller forwarding actor calls as HTTP POSTs with
+    # serialized args/kwargs.
     def compute_logp(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # POSTs to /ppo/actor/compute_logp and returns the result.
         payload = {
             "args": serialize_value(list(args)),
             "kwargs": serialize_value(kwargs),
@@ -510,6 +609,8 @@ class PPOActorControllerV2(GatewayTrainController):
         return self._gateway_post_result("/ppo/actor/compute_logp", payload)
 
     def compute_advantages(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # POSTs to /ppo/actor/compute_advantages and returns the result.
         payload = {
             "args": serialize_value(list(args)),
             "kwargs": serialize_value(kwargs),
@@ -517,6 +618,8 @@ class PPOActorControllerV2(GatewayTrainController):
         return self._gateway_post_result("/ppo/actor/compute_advantages", payload)
 
     def ppo_update(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # POSTs to /ppo/actor/update; returns None.
         payload = {
             "args": serialize_value(list(args)),
             "kwargs": serialize_value(kwargs),
@@ -546,6 +649,26 @@ def grpo_loss_fn(
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
 ):
+    # [FUNCTION DOC]
+    # Per-micro-batch actor loss. Inputs: logprobs (current policy, with grad), entropy,
+    # input_data (logprobs = behavior/old logp, advantages, loss_mask, optional
+    # prox_logp, versions, cu_seqlens, teacher_logp, rl/distill loss weights) and loss
+    # settings. Proximal logp: training logprobs (detached) for the reuse-train-logp
+    # method, otherwise resolved by _resolve_proximal_logp. Optional M2PO masking.
+    # Surrogate: CISPO (token level only; mutually exclusive with SAPO; ValueError
+    # otherwise), SAPO (incompatible with decoupled loss), or clipped PPO (dual clip
+    # c_clip, decoupled proximal logp, rejection sampling, token/sequence importance
+    # sampling). If teacher_logp is present: with rl_loss_weight 0, the loss becomes
+    # pure reverse-KL distillation with importance weights (coefficient
+    # -distill_loss_weight, default 0.005); otherwise loss = rl_weight*loss +
+    # distill_weight * mean(logprobs - teacher_logp). Logs denominators, importance
+    # weight, approx KL, logp diffs, entropy, clip ratios, behavior-policy stats,
+    # rejection-sampling scalars, vocab logit ranges, SAPO gates or clipped logps,
+    # proximal-approximation metrics and version staleness. Returns the scalar loss.
+    # KNOWN ISSUE: docstring says it returns loss and logging stats; only the loss is
+    # returned. vocab_mean_logits/vocab_norm_logits are accepted but unused. If
+    # rl_loss_weight is provided as a multi-element tensor the equality test with 0
+    # would be ambiguous.
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
     old_logp = input_data["logprobs"]
@@ -772,6 +895,13 @@ def compute_prox_logp_approximations(
     current_version: int,
     method: str | None = None,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Approximates proximal-policy log-probs without a forward pass. Proximal version is
+    # current_version - 1. alpha = (v_prox - v_behave)/(v_theta - v_behave) clamped to
+    # [0, 1], set to 0 for prompt tokens (version < 0) and where v_theta <= v_behave.
+    # Methods: loglinear = old + alpha*(new - old); linear = log((1-alpha)*exp(old) +
+    # alpha*exp(new) + 1e-10); rollout = copy of old. Computes only the given method, or
+    # all PROX_APPROX_METHODS_ALL when method is None. Returns {method name: tensor}.
     """
     Compute approximation(s) for proximal policy log-probabilities.
 
@@ -856,6 +986,13 @@ def _resolve_proximal_logp(
     versions: torch.Tensor | None,
     current_version: int | None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Chooses the proximal log-probs. If ground truth is None the method must
+    # skip the forward pass and versions must be present (ValueError otherwise). For the
+    # loglinear method with missing ground truth (and known current_version) uses the
+    # loglinear approximation; recompute and metrics methods use the ground truth.
+    # Raises RuntimeError if the result is still None or contains NaN/Inf (the check
+    # forces a host sync). Returns the tensor.
     """
     Resolve the proximal policy log-probabilities based on the method.
 
@@ -936,6 +1073,12 @@ def _apply_m2po_masking(
     loss_mask: torch.Tensor,
     m2_threshold: float,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: M2PO filtering. Computes per-token second moment m2 = (old - prox)^2 over
+    # masked-in tokens, sorts descending, gets a keep mask from _get_m2po_loss_mask,
+    # restores the original order and scatters back into a full bool mask shaped like
+    # loss_mask. Returns loss_mask unchanged if no tokens are active. Assumes loss_mask
+    # is bool and contiguous (uses view).
     """
     Apply M2PO (Second-Momentum PPO) masking to filter high-variance tokens.
 
@@ -978,6 +1121,12 @@ def _get_m2po_loss_mask(
     sorted_m2: torch.Tensor,
     m2_threshold: float,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Given m2 values sorted descending, finds the smallest k such that the mean
+    # of the remaining values (suffix from k) is below m2_threshold, and masks out the
+    # first k (largest) entries; if no suffix qualifies, masks all but the last
+    # (smallest) one. Returns a bool keep mask (all True for empty input). Raises
+    # RuntimeError if everything is masked. Uses .item() (host sync).
     """
     Get the mask for M2PO loss based on the second-momentum threshold.
     Mask the tokens whose second-momentum is the largest, until the average second-momentum is below the threshold.
@@ -1025,6 +1174,8 @@ def _compute_importance_weight(
     logp_numerator: torch.Tensor,
     logp_denominator: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns exp(numerator - denominator) as float32.
     """Compute importance weight as exp(logp_num - logp_denom)."""
     return torch.exp(logp_numerator - logp_denominator).float()
 
@@ -1033,6 +1184,9 @@ def _compute_approximation_errors(
     ground_truth: torch.Tensor,
     approximation: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Returns float32 abs_error, rel_error (abs diff over |ground truth| + 1e-8)
+    # and squared_error tensors between ground truth and approximation.
     """
     Compute error metrics between ground truth and approximation.
 
@@ -1051,6 +1205,9 @@ def _compute_approximation_errors(
 
 
 def _tensor_scalar_stats(tensor: torch.Tensor) -> dict[str, float]:
+    # [FUNCTION DOC]
+    # HELPER: Returns Python floats avg, max, min of a tensor (three .item() host syncs;
+    # raises on empty tensors).
     """
     Compute scalar statistics (avg, max, min) for a tensor.
 
@@ -1075,6 +1232,12 @@ def _log_approximation_metrics_for_method(
     logprobs: torch.Tensor,
     prox_logp_gt: torch.Tensor | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Logs under "{method}/..." the approximated logp, behave importance weight
+    # (approx vs old) and importance weight (new vs approx); with ground truth also logs
+    # abs/rel/squared logp errors and abs/rel errors of both importance weights versus
+    # the ground-truth weights. Uses the "n_valid_tokens" denominator of the current
+    # scope.
     """
     Log metrics for a single approximation method.
 
@@ -1144,6 +1307,16 @@ def _log_proximal_approximation_stats(
     current_version: int | None,
     compute_logp_mask: torch.Tensor,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: In the "compute_logp" stats scope, sets n_valid_tokens from
+    # compute_logp_mask, logs ground-truth prox logp when available, and returns early
+    # if versions or current_version are missing. Loglinear method: logs the loglinear
+    # approximation metrics without errors; metrics method (with ground truth): logs all
+    # approximations with errors. Then logs three KL estimators of new vs old logp
+    # (direct -r, Taylor r^2/2, dual exp(r)-1-r).
+    # KNOWN ISSUE: the "if logprobs is not None" guard is always true for the declared
+    # type, and KL drift stats are skipped entirely when versions are unavailable
+    # because of the earlier return.
     """
     Log proximal policy approximation metrics based on the method.
 
@@ -1231,6 +1404,11 @@ def _log_version_staleness_stats(
     current_version: int,
     version_metrics_mask: torch.Tensor,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: In the "version_stats" scope, for masked generated tokens (version >= 0)
+    # logs scalar avg/max/min staleness relative to the proximal version (current-1) and
+    # to the current version, plus v_theta, v_proximal and the token count. Returns
+    # early if no such tokens. Uses several host syncs (.any(), .item()).
     """
     Log sample staleness metrics based on policy versions.
 

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# CLI that profiles the same model with the Archon engine (packed varlen input) and the
+# FSDP/HF path (padded input) under identical settings on one GPU, then prints a side-
+# by-side comparison (CUDA time, peak memory, top ops, verdict) and writes one Chrome
+# trace per engine. Reuses input/run helpers from profile_archon and profile_fsdp.
 # SPDX-License-Identifier: Apache-2.0
 
 """Compare profiling results between Archon and FSDP/HuggingFace engines.
@@ -38,6 +43,10 @@ from areal.infra import current_platform
 
 @dataclass
 class EngineResult:
+    # [CLASS DOC]
+    # Dataclass holding one engine's profiling summary: name, total_cuda_time_ms (per
+    # iteration), peak_memory_mb, and top_ops as a list of (op key, CUDA ms per
+    # iteration).
     """Container for engine profiling results."""
 
     name: str
@@ -47,6 +56,11 @@ class EngineResult:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    # [FUNCTION DOC]
+    # Parses CLI options: --model-path, --mode forward/backward/both (default both),
+    # --batch-size (4), --seq-lens, --total-len (10240), --warmup-iters (3), --profile-
+    # iters (5), --dtype bf16/fp16/fp32, --output-dir (default cwd), --gradient-
+    # checkpointing, --top-ops (10). Returns the Namespace.
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Compare Archon vs FSDP/HuggingFace engine performance.",
@@ -131,6 +145,8 @@ Examples:
 
 
 def get_dtype(dtype_str: str) -> torch.dtype:
+    # [FUNCTION DOC]
+    # HELPER: Maps "bf16"/"fp16"/"fp32" to the torch dtype; KeyError otherwise.
     """Convert string dtype to torch.dtype."""
     dtype_map = {
         "bf16": torch.bfloat16,
@@ -150,6 +166,17 @@ def profile_archon(
     gradient_checkpointing: bool,
     output_path: Path | None,
 ) -> EngineResult:
+    # [FUNCTION DOC]
+    # Loads the Archon model (optional full activation checkpointing), builds packed
+    # inputs from inputs_config (batch_size, seq_lens, total_len, vocab_size), selects
+    # forward or forward+backward, runs warmup_iters with CUDA sync, resets peak memory,
+    # profiles profile_iters iterations (memory profiling always on), computes per-
+    # iteration CUDA time (sum of device_time_total over ops), peak allocated MB and the
+    # 20 ops with the largest device time; exports a Chrome trace if output_path is set;
+    # deletes the model and empties the CUDA cache. Returns EngineResult named "Archon".
+    # KNOWN ISSUE: the total sums nested ops (overcounts); the run_fn partial still
+    # references the model after del, so memory is not actually freed until the function
+    # returns; mode "backward" equals "both".
     """Profile Archon engine."""
     # Import functions for packed input creation
     from areal.tools.profile_archon import (
@@ -255,6 +282,13 @@ def profile_fsdp(
     gradient_checkpointing: bool,
     output_path: Path | None,
 ) -> EngineResult:
+    # [FUNCTION DOC]
+    # Same flow as profile_archon but loads the HF model via load_hf_model (sdpa
+    # attention, optional gradient checkpointing) and builds padded inputs. Returns
+    # EngineResult named "FSDP/HF". Same KNOWN ISSUE caveats as profile_archon apply.
+    # KNOWN ISSUE: random token ids are generated differently (one packed row vs per-
+    # row), so the two engines do not see identical token values, only identical
+    # lengths.
     """Profile FSDP/HuggingFace engine."""
     from areal.tools.profile_fsdp import (
         create_padded_input,
@@ -351,6 +385,13 @@ def print_comparison(
     fsdp_result: EngineResult,
     top_n: int = 10,
 ) -> None:
+    # [FUNCTION DOC]
+    # Prints a summary table of CUDA time and peak memory for both engines with absolute
+    # difference and Archon/FSDP ratio, a ranked table of the top min(top_n, available)
+    # ops of each (names truncated to 35 chars), and verdicts with a +/-5% equivalence
+    # band for time and memory. Returns None.
+    # KNOWN ISSUE: divides by FSDP time/memory without a zero guard; top_ops lists hold
+    # only 20 entries so --top-ops above 20 is silently capped.
     """Print comparison report between two engines."""
     print("\n" + "=" * 80)
     print("COMPARISON REPORT: ARCHON vs FSDP/HF")
@@ -415,6 +456,13 @@ def print_comparison(
 
 
 def run_comparison(args: argparse.Namespace) -> None:
+    # [FUNCTION DOC]
+    # Sets device 0 when LOCAL_RANK is unset, resolves dtype and model path (arg, else
+    # MODEL_PATHS["qwen2"], else Qwen/Qwen2.5-0.5B-Instruct), loads its AutoConfig for
+    # vocab_size, parses or generates (seeded 42) seq_lens once so both engines share
+    # them, prints the configuration, builds timestamped trace paths in output_dir,
+    # reseeds and runs profile_archon then reseeds and runs profile_fsdp, prints the
+    # comparison and trace paths.
     """Run comparison profiling."""
     # Setup environment
     if "LOCAL_RANK" not in os.environ:
@@ -525,6 +573,8 @@ def run_comparison(args: argparse.Namespace) -> None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # [FUNCTION DOC]
+    # Parses args, runs run_comparison, returns 0.
     """Main entry point."""
     args = parse_args(argv)
     run_comparison(args)

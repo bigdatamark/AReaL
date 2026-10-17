@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Trainer package: top-level entry points for the training loops. Re-exports DPOTrainer,
+# PPOTrainer (from rl_trainer), RWTrainer and SFTTrainer. Importing it imports all four
+# trainer modules (and their heavy engine dependencies).
 # SPDX-License-Identifier: Apache-2.0
 
 from .dpo_trainer import DPOTrainer
