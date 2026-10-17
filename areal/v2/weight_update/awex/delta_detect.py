@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# AdamW-inversion change detector for awex separation (separate-GPU) delta weight
+# transfer with Megatron training. Per weight-update version it determines which
+# elements of the converted HF payload changed since the last synced version, by
+# reconstructing pre-step weights from the resident AdamW moments (inverting the
+# decoupled AdamW update with bias corrections), pushing them through the adapter's HF
+# conversion path, and bitwise-comparing with the live payload (plus a conservative bf16
+# rounding-boundary check). Output is a dict hf_name -> bool mask or int32/int64 flat
+# index tensor for DeltaTracker.encode, or None to force a dense transfer. Many
+# behaviors are tunable via DTE_* env vars (with AWEX_*/PYQ_* legacy fallbacks). All
+# ranks must run the same collectives in the same order; ambiguous situations are turned
+# into rank-consistent dense fallbacks.
 # SPDX-License-Identifier: Apache-2.0
 """AdamW inversion detector for AWEX separation delta weight transfer.
 
@@ -76,6 +88,9 @@ _DTE_FALSY_VALUES = ("0", "false", "no", "off")
 
 
 def _dte_bool_env(name: str, legacy_name: str, default: bool = False) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Reads a boolean env var name (legacy fallback name) accepting
+    # 1/true/yes/on and 0/false/no/off with whitespace stripped; default as given.
     return get_bool_env_var(
         name,
         "true" if default else "false",
@@ -87,10 +102,16 @@ def _dte_bool_env(name: str, legacy_name: str, default: bool = False) -> bool:
 
 
 def _inversion_debug_enabled() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if DTE_DELTA_INVERSION_DEBUG (or AWEX_ legacy) is set; enables
+    # verbose per-param logging.
     return _dte_bool_env("DTE_DELTA_INVERSION_DEBUG", "AWEX_DELTA_INVERSION_DEBUG")
 
 
 def _streaming_reconstruct_enabled() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if DTE_STREAMING_RECONSTRUCT (legacy PYQ_STREAMING_RECONSTRUCT) is
+    # set; enables lazy reconstruction interleaved with HF conversion.
     """Whether to reconstruct pre-step tensors lazily during HF conversion."""
     return _dte_bool_env(
         "DTE_STREAMING_RECONSTRUCT", "PYQ_STREAMING_RECONSTRUCT", False
@@ -98,6 +119,10 @@ def _streaming_reconstruct_enabled() -> bool:
 
 
 def _inversion_allreduce_window_bytes() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the in-flight byte budget for pipelined async all-reduces from
+    # DTE_INVERSION_ALLREDUCE_WINDOW_MB (default 512 MB; non-positive gives 0 meaning
+    # fully synchronous per-param reduces). Non-numeric values raise ValueError.
     """In-flight byte budget for pipelined inversion all-reduces.
 
     The reconstruct loop posts per-param correction/status all-reduces with
@@ -115,6 +140,10 @@ def _inversion_allreduce_window_bytes() -> int:
 
 
 def _inversion_compute_device(flat_t: torch.Tensor) -> torch.device:
+    # [FUNCTION DOC]
+    # HELPER: Device for inversion math: CPU if DTE_INVERSION_COMPUTE_ON_CPU is set,
+    # otherwise the device of the visible payload tensor (offloaded operands are staged
+    # there).
     """Device used for the AdamW-inversion elementwise math.
 
     Colocate offloads the fp32 main shards and AdamW moments to CPU before the
@@ -131,6 +160,9 @@ def _inversion_compute_device(flat_t: torch.Tensor) -> torch.device:
 
 
 def _inversion_bf16_margin_rel() -> float:
+    # [FUNCTION DOC]
+    # HELPER: Relative safety margin (DTE_DELTA_INVERSION_BF16_MARGIN_REL, default 1e-4)
+    # that shrinks the half-ulp threshold of the bf16 boundary check.
     return float(
         get_env_var(
             "DTE_DELTA_INVERSION_BF16_MARGIN_REL",
@@ -141,6 +173,10 @@ def _inversion_bf16_margin_rel() -> float:
 
 
 def _inversion_dense_param_suffixes() -> tuple[str, ...]:
+    # [FUNCTION DOC]
+    # HELPER: HF name suffixes always sent dense under inversion, from
+    # DTE_DELTA_INVERSION_DENSE_PARAM_SUFFIXES (comma-separated, default
+    # ".mlp.gate.weight", empty disables).
     """HF parameter suffixes to send dense under AdamW inversion.
 
     Qwen3 MoE router/gate weights have repeatedly shown one-element BF16 false
@@ -159,6 +195,9 @@ def _inversion_dense_param_suffixes() -> tuple[str, ...]:
 
 
 def _cuda_mem_stats_mb(reset_peak: bool = True) -> tuple[float, float]:
+    # [FUNCTION DOC]
+    # HELPER: Returns (allocated MB, peak MB) of CUDA memory and optionally resets the
+    # peak counter; returns (-1, -1) without CUDA.
     """Return current and peak CUDA allocation, or CPU sentinels."""
     if not torch.cuda.is_available():
         return -1.0, -1.0
@@ -170,10 +209,16 @@ def _cuda_mem_stats_mb(reset_peak: bool = True) -> tuple[float, float]:
 
 
 def _inversion_force_dense_param(name: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if name ends with any configured dense suffix (re-reads env each
+    # call).
     return any(name.endswith(suffix) for suffix in _inversion_dense_param_suffixes())
 
 
 def _dist_rank(group=None) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Rank in group (default world) or -1 if torch.distributed is unavailable,
+    # uninitialized or the query fails.
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return -1
     try:
@@ -183,6 +228,9 @@ def _dist_rank(group=None) -> int:
 
 
 def _dist_world_size(group=None) -> int:
+    # [FUNCTION DOC]
+    # HELPER: World size of group, or 1 when distributed is unavailable/uninitialized or
+    # the query fails.
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return 1
     try:
@@ -194,6 +242,12 @@ def _dist_world_size(group=None) -> int:
 def _adamw_hparams(
     param_group: dict,
 ) -> tuple[float, float, float, float, float] | None:
+    # [FUNCTION DOC]
+    # HELPER: Extracts (lr, weight_decay, beta1, beta2, eps) from an optimizer
+    # param_group, using the "_areal_last_step_lr" field recorded by AReaL at the last
+    # step (returns None if absent, since the current lr may already have moved).
+    # Defaults: betas (0.9, 0.999), wd 0, eps 1e-8. If bias_correction is disabled,
+    # betas are reported as 0 so bias-correction factors become 1.
     """Extract (lr, weight_decay, beta1, beta2, eps) from a torch param_group."""
     last_step_lr = param_group.get("_areal_last_step_lr")
     if last_step_lr is None:
@@ -219,6 +273,10 @@ def _adamw_hparams(
 def _resolve_offloaded_state_value(
     state: dict, offloaded_state: dict, key: str
 ) -> object | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns state[key], but if it is an empty tensor (storage released by the
+    # Megatron adapter's offload) and offloaded_state holds the key, returns the
+    # offloaded copy instead.
     """Return optimizer state value, following AwexMegatronAdapter offload slots."""
     val = state.get(key)
     if isinstance(val, torch.Tensor) and val.numel() == 0 and key in offloaded_state:
@@ -227,15 +285,24 @@ def _resolve_offloaded_state_value(
 
 
 def _state_step_value(state: dict, offloaded_state: dict) -> float | None:
+    # [FUNCTION DOC]
+    # HELPER: Step count from per-param optimizer state (following offload slots) as
+    # float, or None.
     step_val = _resolve_offloaded_state_value(state, offloaded_state, "step")
     return _step_to_float(step_val)
 
 
 def _param_group_step_value(param_group: dict) -> float | None:
+    # [FUNCTION DOC]
+    # HELPER: Step count stored on a param_group (Apex FusedAdam style) as float or
+    # None.
     return _step_to_float(param_group.get("step"))
 
 
 def _step_to_float(step_val: object | None) -> float | None:
+    # [FUNCTION DOC]
+    # HELPER: Converts a step (number or tensor) to float; None or empty tensor gives
+    # None. Tensor inputs cause a device sync.
     if step_val is None:
         return None
     if isinstance(step_val, torch.Tensor):
@@ -247,6 +314,12 @@ def _step_to_float(step_val: object | None) -> float | None:
 
 @torch.no_grad()
 def _tensor_fingerprint(tensor: torch.Tensor) -> tuple:
+    # [FUNCTION DOC]
+    # HELPER: Cheap content fingerprint of a tensor (not a snapshot): views the bytes as
+    # uint8 and returns (dtype string, byte count, total byte sum, position-weighted sum
+    # over up to 4096 bins plus tail, weighted hash of 16 evenly spaced sample bytes,
+    # first byte, last byte). Empty tensors give a shorter all-zero tuple. Used to
+    # detect whether a shard/payload changed since last sync. Causes several GPU syncs.
     """Small value fingerprint for a tensor slice, not a stored snapshot.
 
     The detector uses this as a no-full-copy guard to decide whether a local
@@ -301,6 +374,13 @@ def _tensor_fingerprint(tensor: torch.Tensor) -> tuple:
 def _bf16_rounding_boundary_mask(
     old_fp32: torch.Tensor, cur_bf16: torch.Tensor
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Given the reconstructed old value in fp32 and the current bf16 value,
+    # returns a bool mask of elements whose old value lies within (margin-reduced) half
+    # a bf16 ulp of a rounding boundary in the direction of change (uses the asymmetric
+    # lower/upper neighbor spacing) and both values are finite. Such elements might have
+    # changed even though rounding the reconstructed value matched, so they are
+    # conservatively marked changed.
     """Conservatively include values near a BF16 rounding boundary."""
     cur_fp32 = cur_bf16.to(torch.float32)
     old_fp32 = old_fp32.to(torch.float32)
@@ -324,6 +404,10 @@ def _bf16_rounding_boundary_mask(
 def _bf16_rounding_boundary_mask_chunked(
     old_fp32: torch.Tensor, cur_bf16: torch.Tensor
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Same as the boundary mask but processes flat chunks of
+    # DTE_BOUNDARY_CHUNK_ELEMS elements (default 50M; non-positive disables chunking) to
+    # bound temporary memory; returns a mask shaped like cur_bf16.
     """Bound boundary-check temporaries by processing large tensors in chunks."""
     chunk_elems = int(
         get_env_var(
@@ -347,6 +431,9 @@ def _bf16_rounding_boundary_mask_chunked(
 
 
 class _ReconstructionAborted(Exception):
+    # [CLASS DOC]
+    # Internal exception signalling that lazy reconstruction reached a rank-consistent
+    # dense-fallback verdict.
     """Lazy reconstruction reached a rank-consistent dense fallback verdict."""
 
 
@@ -354,6 +441,12 @@ _NO_RECONSTRUCTION = object()
 
 
 class _LazyReconstructDict:
+    # [CLASS DOC]
+    # Dict-like lazy view over the reconstruction generator yielding (id(param), tensor
+    # or the no-reconstruction sentinel). Megatron converters call get(id) then pop(id);
+    # get advances the producer until the key appears (buffering earlier items), pop
+    # only discards. Tracks time spent in the producer, number of real reconstructions,
+    # and whether the producer aborted.
     """Dict-like lazy view over reconstructed pre-step tensors.
 
     Current Megatron converters call ``get(id(param), param)`` and, after
@@ -364,6 +457,9 @@ class _LazyReconstructDict:
     """
 
     def __init__(self, producer: Iterator[tuple[int, torch.Tensor | object]]) -> None:
+        # [FUNCTION DOC]
+        # Stores the producer and initializes buffer, consumed-key set,
+        # exhausted/aborted flags, producer time and reconstructed count.
         self._producer = producer
         self._buffer: dict[int, torch.Tensor | object] = {}
         self._consumed: set[int] = set()
@@ -373,6 +469,10 @@ class _LazyReconstructDict:
         self._reconstructed_count = 0
 
     def _pull_one(self) -> tuple[int, torch.Tensor | object] | None:
+        # [FUNCTION DOC]
+        # HELPER: Advances the producer once, timing it. On StopIteration marks
+        # exhausted; on _ReconstructionAborted marks aborted and exhausted; returns None
+        # then. Counts items that carry a real tensor. Returns (key, value).
         if self._exhausted:
             return None
         started = time.monotonic()
@@ -392,6 +492,8 @@ class _LazyReconstructDict:
         return item
 
     def _fill(self, key: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Pulls items into the buffer until key is present or the producer ends.
         while key not in self._buffer and not self._exhausted:
             item = self._pull_one()
             if item is None:
@@ -400,6 +502,10 @@ class _LazyReconstructDict:
             self._buffer[item_key] = value
 
     def get(self, key: int, default=None):
+        # [FUNCTION DOC]
+        # Returns the reconstructed tensor for key or default (sentinel or missing). A
+        # key can be served only once; later gets return default. Marks the key consumed
+        # but keeps it buffered for pop.
         if key in self._consumed:
             return default
         self._fill(key)
@@ -410,6 +516,10 @@ class _LazyReconstructDict:
         return value
 
     def pop(self, key: int, default=None):
+        # [FUNCTION DOC]
+        # Removes and returns the buffered value for key (or default); fills first if
+        # the key was never requested. Never advances the producer for an already
+        # consumed key.
         if key in self._consumed:
             value = self._buffer.pop(key, _NO_RECONSTRUCTION)
             return default if value is _NO_RECONSTRUCTION else value
@@ -419,6 +529,9 @@ class _LazyReconstructDict:
         return default if value is _NO_RECONSTRUCTION else value
 
     def finish(self) -> None:
+        # [FUNCTION DOC]
+        # Drains the remaining producer items (discarding them) so trailing collectives
+        # and a possible abort verdict run on every rank.
         """Drain the producer so trailing collectives and aborts always run."""
         while not self._exhausted:
             item = self._pull_one()
@@ -429,23 +542,39 @@ class _LazyReconstructDict:
             del item
 
     def clear(self) -> None:
+        # [FUNCTION DOC]
+        # Drops the buffer and consumed-key set.
         self._buffer.clear()
         self._consumed.clear()
 
     @property
     def aborted(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: whether the producer raised _ReconstructionAborted.
         return self._aborted
 
     @property
     def producer_seconds(self) -> float:
+        # [FUNCTION DOC]
+        # Property: cumulative wall time spent inside the producer.
         return self._producer_seconds
 
     @property
     def reconstructed_count(self) -> int:
+        # [FUNCTION DOC]
+        # Property: number of produced items that carried a reconstructed tensor.
         return self._reconstructed_count
 
 
 class AdamWInversionDetector:
+    # [CLASS DOC]
+    # Detector bound to an AwexMegatronAdapter (uses its engine, inner optimizers,
+    # offloaded optimizer states and HF conversion hooks). Keeps per-param "watermarks"
+    # from the last successful sync keyed by stable mcore param name: optimizer steps,
+    # fingerprints of optimizer-owned visible shards, full model-param fingerprints and
+    # HF payload fingerprints. A one-step AdamW transition since the watermark is
+    # reconstructed; unchanged steps are skipped; anything ambiguous yields None
+    # (dense). Class attribute name = "inversion".
     """Compute change masks by inverting the resident AdamW moments.
 
     Bound to ``AwexMegatronAdapter`` (needs ``_get_inner_optimizers`` for the
@@ -458,6 +587,9 @@ class AdamWInversionDetector:
     name = "inversion"
 
     def __init__(self, adapter):
+        # [FUNCTION DOC]
+        # Stores the adapter, creates empty watermark maps and an empty single-slot
+        # precomputed-mask cache.
         self._adapter = adapter
         # All watermark/fingerprint maps are keyed by the mcore param NAME, not
         # id(param): on EP topologies the optimizer can hold different param
@@ -476,11 +608,18 @@ class AdamWInversionDetector:
         ) = None
 
     def has_synced_watermark(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns True if step watermarks were recorded by a previous successful sync.
         """Whether a successful full/delta payload sync recorded optimizer steps."""
         return bool(self._last_synced_steps)
 
     # -- gating ------------------------------------------------------------
     def _inversion_feasible(self, inner_optimizers) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Hard gates, logging a warning and returning False on: no inner
+        # optimizers; FusedAdam with adam_w_mode 0 (L2 Adam); precision-aware optimizer
+        # config; non decoupled weight decay; more than one distributed-optimizer
+        # instance. Otherwise True.
         """All hard gates from the design; any failure -> dense fallback."""
         if not inner_optimizers:
             logger.warning("Inversion: no inner optimizers; falling back to dense.")
@@ -521,6 +660,12 @@ class AdamWInversionDetector:
     def _module_param_key_maps(
         self,
     ) -> tuple[dict[int, str], dict[tuple[int, tuple], str]]:
+        # [FUNCTION DOC]
+        # HELPER: Walks the engine's named Megatron parameters (expert-aware) and
+        # returns two maps to the param name: by object id and by (data_ptr, shape) for
+        # params with resident storage. The pointer map bridges optimizer-held objects
+        # that differ from module objects; it is only valid within one call. Returns
+        # empty maps if the adapter has no engine/model.
         """Map live module params to stable name keys, by id and (data_ptr, shape).
 
         The (data_ptr, shape) index bridges optimizer-held param objects to the
@@ -552,6 +697,10 @@ class AdamWInversionDetector:
 
     @staticmethod
     def _param_key(param, id2key, ptr2key) -> str | int | None:
+        # [FUNCTION DOC]
+        # HELPER: Static. Resolves a param to its name via the id map, then the pointer
+        # map; if both maps are empty returns id(param) as a fallback key; otherwise
+        # None.
         key = id2key.get(id(param))
         if key is not None:
             return key
@@ -567,6 +716,11 @@ class AdamWInversionDetector:
         return None
 
     def _collect_current_steps(self, inner_optimizers) -> dict[str, float | None]:
+        # [FUNCTION DOC]
+        # HELPER: For each optimizer-owned (fp32 main shard, model param) pair returns
+        # name -> current step (per-param state step, else the owning param group's step
+        # via the group index map, else None when there is no local state). First
+        # occurrence per name wins.
         """Return optimizer step watermarks keyed by mcore param name.
 
         A value of ``None`` means this param had no local optimizer state when the
@@ -610,6 +764,10 @@ class AdamWInversionDetector:
         return steps
 
     def _collect_current_fingerprints(self, inner_optimizers) -> dict[str, tuple]:
+        # [FUNCTION DOC]
+        # HELPER: Returns name -> fingerprint of the slice of the bf16 model param that
+        # this rank's optimizer shard owns (range from the optimizer's param range map);
+        # params whose range lookup fails are skipped.
         """Record compact fingerprints of model-visible local shards.
 
         This is intentionally not a snapshot: it stores a few scalar values per
@@ -641,6 +799,10 @@ class AdamWInversionDetector:
         return fingerprints
 
     def _ordered_model_params(self, fallback_order: list[torch.Tensor]):
+        # [FUNCTION DOC]
+        # HELPER: Returns model params in a rank-invariant order: the adapter's
+        # _iter_model_params_for_delta if it yields anything, else the engine's named
+        # parameters deduplicated by id, else fallback_order.
         iter_fn = getattr(self._adapter, "_iter_model_params_for_delta", None)
         if iter_fn is not None:
             params = list(iter_fn())
@@ -669,6 +831,8 @@ class AdamWInversionDetector:
     def _collect_current_model_fingerprints(
         self, fallback_order: list[torch.Tensor] | None = None
     ) -> dict[str, tuple]:
+        # [FUNCTION DOC]
+        # HELPER: Returns name -> fingerprint of each full model param in ordered order.
         fingerprints: dict[str, tuple] = {}
         id2key, ptr2key = self._module_param_key_maps()
         for model_param in self._ordered_model_params(fallback_order or []):
@@ -681,6 +845,8 @@ class AdamWInversionDetector:
     def _collect_payload_fingerprints(
         self, payload_params: dict[str, torch.Tensor] | None = None
     ) -> dict[str, tuple]:
+        # [FUNCTION DOC]
+        # HELPER: Returns HF name -> fingerprint for each payload tensor, or {} if none.
         if not payload_params:
             return {}
         return {
@@ -689,6 +855,9 @@ class AdamWInversionDetector:
 
     @staticmethod
     def _mask_to_index_mask(mask: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Static. Converts a flat bool mask to flat indices of true elements,
+        # int32 when the mask length fits, else int64.
         """Convert a temporary bool mask into compact external flat indices."""
         indices = mask.nonzero(as_tuple=False).squeeze(1)
         if mask.numel() <= torch.iinfo(torch.int32).max:
@@ -698,6 +867,10 @@ class AdamWInversionDetector:
     def capture_synced_state(
         self, payload_params: dict[str, torch.Tensor] | None = None
     ):
+        # [FUNCTION DOC]
+        # Captures post-step watermarks while weights are resident: returns (steps,
+        # shard fingerprints, model fingerprints, payload fingerprints) or None if
+        # inversion is infeasible.
         """Capture post-step watermarks while model weights are still resident."""
         inner = self._adapter._get_inner_optimizers()
         if not self._inversion_feasible(inner):
@@ -710,6 +883,11 @@ class AdamWInversionDetector:
         )
 
     def mark_synced(self, version: int, captured_state=None) -> None:
+        # [FUNCTION DOC]
+        # Called after a successful payload sync for version: drops any precomputed-mask
+        # cache and stores the captured state (capturing now if not given; accepts
+        # legacy 3-tuples without payload fingerprints). If capture is infeasible,
+        # clears all watermarks so the next step falls back to dense. Logs a summary.
         """Record optimizer step watermarks after a successful payload sync.
 
         AdamW inversion only reconstructs the most recent optimizer step. Without
@@ -767,6 +945,29 @@ class AdamWInversionDetector:
     def _iter_reconstruct_pre_step_mcore(
         self, inner_optimizers
     ) -> Iterator[tuple[int, torch.Tensor | object]]:
+        # [FUNCTION DOC]
+        # HELPER: Generator yielding exactly one (id(model param), pre-step fp32 tensor
+        # or the no-reconstruction sentinel) per model param in rank-invariant order;
+        # raises _ReconstructionAborted at the start for unusable optimizer structure
+        # and at the end if any param forced a dense verdict. Steps:
+        # - Index optimizer entries by param name and collect DP groups, canonicalized
+        # by member ranks. One group: use it; two: the regular DP group is dense, the
+        # other is the expert group (used for names containing ".experts."); more:
+        # abort.
+        # - For each param, build a zero fp32 correction over the full flattened param.
+        # If this rank owns an optimizer shard with step >= 1 and a watermark: step
+        # unchanged checks the shard fingerprint (changed -> dense); step jump != 1 ->
+        # dense; one step with valid fp32 exp_avg/exp_avg_sq and recorded last-step lr
+        # inverts AdamW on the main shard (on the compute device) and writes (theta_old
+        # - visible bf16) into its owned slice. Missing watermark, fingerprint or last
+        # lr forces dense.
+        # - All-reduce (SUM) the correction and a status vector (contributors, dense
+        # flag, covered elements) over the param's DP group, synchronously or pipelined
+        # within the byte window (drained fully before yielding a batch), then finalize.
+        # - Logs skip statistics; returns normally (possibly reconstructing nothing)
+        # when consistent.
+        # KNOWN ISSUE: the skipped_tracked_unchanged counter is never incremented and
+        # always logs 0.
         """Yield theta_{t-1} overrides in model-parameter order.
 
         Every model parameter produces exactly one item. Parameters without a
@@ -969,6 +1170,14 @@ class AdamWInversionDetector:
         # classification happens here so draining order can never diverge
         # across ranks.
         def _finalize_reduced(ctx) -> tuple[int, torch.Tensor | object]:
+            # [FUNCTION DOC]
+            # HELPER: After reduction for one param: any rank's dense flag -> mark dense
+            # and yield the sentinel; no contributors -> for params without local
+            # optimizer entry compare the model fingerprint with the watermark (changed
+            # -> dense), otherwise dense only if a one-step transition was expected;
+            # partial coverage (covered elements != numel) -> dense; else returns the
+            # full pre-step param as current fp32 plus correction. Updates the enclosing
+            # counters and force_dense flag.
             nonlocal force_dense
             nonlocal reconstructed_count
             nonlocal skipped_no_state, skipped_global_no_state
@@ -1074,6 +1283,9 @@ class AdamWInversionDetector:
         pending_bytes = 0
 
         def _drain_one_pending() -> tuple[int, torch.Tensor | object]:
+            # [FUNCTION DOC]
+            # HELPER: Waits for the oldest pending async all-reduce pair, updates in-
+            # flight bytes and finalizes it.
             nonlocal pending_bytes
             ctx, work_c, work_s = pending.pop(0)
             correction = ctx[9]
@@ -1083,6 +1295,10 @@ class AdamWInversionDetector:
             return _finalize_reduced(ctx)
 
         def _drain_pending_batch() -> list[tuple[int, torch.Tensor | object]]:
+            # [FUNCTION DOC]
+            # HELPER: Drains all pending reduces in order and returns their results, so
+            # no async collective is in flight while the consumer (HF converter) runs
+            # its own collectives.
             # Never yield into the HF converter while a DP async collective is
             # still in flight. The converter may issue all-gathers on another
             # communicator, and interleaving those with this batch can deadlock
@@ -1365,6 +1581,9 @@ class AdamWInversionDetector:
     def _reconstruct_pre_step_mcore(
         self, inner_optimizers
     ) -> dict[int, torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # HELPER: Eager wrapper: consumes the generator into a dict id(param) -> pre-
+        # step tensor (skipping sentinels); returns None if reconstruction aborted.
         """Eager compatibility wrapper around streaming reconstruction."""
         theta_old_by_id: dict[int, torch.Tensor] = {}
         try:
@@ -1380,6 +1599,11 @@ class AdamWInversionDetector:
     # -- entry point -------------------------------------------------------
     @torch.no_grad()
     def precompute_masks(self, names, tensors, version) -> bool:
+        # [FUNCTION DOC]
+        # Computes masks for (names, tensors, version) via compute_masks while the
+        # optimizer is still GPU-resident (before colocate offload) and caches (version,
+        # names, masks) for the next compute_masks call. Returns True if masks are
+        # available (not dense). Collective: all training ranks must call it together.
         """Compute and cache masks while optimizer state is still GPU-resident.
 
         The colocate gateway offloads the optimizer (fp32 main shards + AdamW
@@ -1399,6 +1623,12 @@ class AdamWInversionDetector:
         return masks is not None
 
     def _pop_precomputed_masks(self, names, version):
+        # [FUNCTION DOC]
+        # HELPER: Consumes the cache and returns (hit, masks). A local hit requires
+        # matching version and names (stale caches are logged and dropped). When
+        # distributed with world size > 1, all-reduces the hit flag with MIN over the
+        # default group so any rank's miss forces everyone to recompute (keeps
+        # collectives aligned).
         """Return ``(hit, masks)`` consuming the precompute cache if valid.
 
         The hit decision must be rank-invariant: a cache hit skips the DP/TP
@@ -1451,6 +1681,20 @@ class AdamWInversionDetector:
         return (local_hit, masks) if local_hit else (False, None)
 
     def compute_masks(self, names, tensors, version):
+        # [FUNCTION DOC]
+        # Main entry. Returns cached masks on a global cache hit. Otherwise checks
+        # feasibility (None if infeasible), then reconstructs pre-step params, eagerly
+        # or lazily when streaming is enabled and the adapter supports
+        # _iter_hf_with_overrides (None if eager reconstruction aborts). Converts them
+        # to HF via the adapter (streaming iterator or full dict) and for each HF name
+        # present in the current payload: forced dense suffixes and missing/shape-
+        # mismatched old tensors get an all-true bool mask; otherwise a bitwise changed
+        # mask (dte), widened for bf16 payloads by the rounding boundary mask, stored as
+        # flat indices. An empty mask whose payload fingerprint is missing or differs
+        # from the watermark triggers a dense verdict. After the loop the lazy producer
+        # is drained (abort -> dense verdict); payload names never produced get all-true
+        # masks. Returns None on any dense verdict, else the mask dict. Logs timing and
+        # memory statistics. Collective across training ranks.
         """Return sparse index masks or ``None`` to force a dense step."""
         hit, cached_masks = self._pop_precomputed_masks(names, version)
         if hit:

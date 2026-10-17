@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# FastAPI application factory for the inference router: a stateful service that never
+# proxies traffic but answers routing queries for the gateway. It owns in-memory
+# registries (workers, sessions, models, session groups), polls worker /health in the
+# background, and selects workers via a pluggable strategy. Every endpoint except
+# /health requires the admin key as bearer token. Also defines the pydantic
+# request/response schemas of the router API.
 # SPDX-License-Identifier: Apache-2.0
 
 """Router service — stateful routing, session pinning, worker registry.
@@ -40,6 +47,10 @@ logger = logging.getLogger("InferenceRouter")
 
 
 def _extract_bearer_token(request: Request) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the token from an "Authorization: Bearer" header (prefix case-
+    # insensitive); raises HTTPException 401 otherwise. Unlike the gateway helper it
+    # does not accept x-api-key.
     """Extract API token from Authorization header."""
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
@@ -51,6 +62,9 @@ def _extract_bearer_token(request: Request) -> str:
 
 
 def _require_admin_key(request: Request, admin_key: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Extracts the bearer token and constant-time compares it with admin_key;
+    # raises 403 on mismatch, returns the token on success.
     """Validate that the request carries the admin API key."""
     token = _extract_bearer_token(request)
     if not hmac.compare_digest(token, admin_key):
@@ -64,15 +78,21 @@ def _require_admin_key(request: Request, admin_key: str) -> str:
 
 
 class RegisterWorkerRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of /register: worker_addr (data proxy base URL).
     worker_addr: str
 
 
 class UnregisterWorkerRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of /unregister: worker_id or worker_addr (id takes precedence).
     worker_addr: str | None = None
     worker_id: str | None = None
 
 
 class RouteRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of /route: optional api_key, path (informational, unused), session_id, model.
     api_key: str | None = None
     path: str | None = None
     session_id: str | None = None
@@ -80,21 +100,30 @@ class RouteRequest(BaseModel):
 
 
 class SessionEntry(BaseModel):
+    # [CLASS DOC]
+    # One session to pin: session_api_key and session_id.
     session_api_key: str
     session_id: str
 
 
 class RegisterSessionRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of /register_session: session entries, target worker_addr and group_id.
     sessions: list[SessionEntry]
     worker_addr: str
     group_id: str
 
 
 class RemoveSessionRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of /remove_session: group_id whose sessions should be unpinned.
     group_id: str
 
 
 class RegisterModelRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of /register_model: model name, url (empty for internal), api_key and
+    # data_proxy_addrs (empty means all healthy workers).
     model: str
     url: str = ""
     api_key: str | None = None
@@ -102,6 +131,8 @@ class RegisterModelRequest(BaseModel):
 
 
 class RemoveModelRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of /remove_model: model name.
     name: str
 
 
@@ -111,10 +142,14 @@ class RemoveModelRequest(BaseModel):
 
 
 class StatusResponse(BaseModel):
+    # [CLASS DOC]
+    # Generic {status} response.
     status: str
 
 
 class HealthResponse(BaseModel):
+    # [CLASS DOC]
+    # Health payload: status, worker count, session-key count and strategy name.
     status: str
     workers: int
     sessions: int
@@ -122,27 +157,38 @@ class HealthResponse(BaseModel):
 
 
 class RegisterWorkerResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of /register: status and assigned worker_id.
     status: str
     worker_id: str
 
 
 class UnregisterWorkerResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of /unregister: status and number of sessions revoked.
     status: str
     sessions_revoked: int
 
 
 class RouteResponse(BaseModel):
+    # [CLASS DOC]
+    # Routing answer: worker_addr plus optional model url and api_key (external models).
     worker_addr: str
     url: str | None = None
     api_key: str | None = None
 
 
 class RemoveSessionResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of /remove_session: status and whether any session was removed.
     status: str
     removed: bool
 
 
 class WorkerInfo(BaseModel):
+    # [CLASS DOC]
+    # API view of a worker: id, addr, healthy flag, active_requests. Distinct from the
+    # state.WorkerInfo dataclass of the same name.
     worker_id: str
     addr: str
     healthy: bool
@@ -150,25 +196,35 @@ class WorkerInfo(BaseModel):
 
 
 class WorkersResponse(BaseModel):
+    # [CLASS DOC]
+    # List of WorkerInfo for /workers.
     workers: list[WorkerInfo]
 
 
 class RegisterModelResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of /register_model: status, model and the resolved data_proxy_addrs.
     status: str
     model: str
     data_proxy_addrs: list[str]
 
 
 class ModelsResponse(BaseModel):
+    # [CLASS DOC]
+    # List of registered model names.
     models: list[str]
 
 
 class RemoveModelResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of /remove_model: status and removed name.
     status: str
     name: str
 
 
 class ResolveWorkerResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of /resolve_worker: worker_id and worker_addr.
     worker_id: str
     worker_addr: str
 
@@ -179,6 +235,12 @@ class ResolveWorkerResponse(BaseModel):
 
 
 def create_app(config: RouterConfig) -> FastAPI:
+    # [FUNCTION DOC]
+    # Builds the router app: creates fresh registries and the strategy from
+    # config.routing_strategy (may raise for unknown/unimplemented names), registers a
+    # lifespan that starts the health poller, exposes registries/strategy on app.state
+    # (also set eagerly for tests), and defines all endpoints as closures. Returns the
+    # app.
     """Factory that creates the router FastAPI app."""
 
     worker_registry = WorkerRegistry()
@@ -188,11 +250,17 @@ def create_app(config: RouterConfig) -> FastAPI:
     strategy = get_strategy(config.routing_strategy)
 
     async def _poll_workers() -> None:
+        # [FUNCTION DOC]
+        # HELPER: Infinite background loop: concurrently GETs /health on every
+        # registered worker via app.state.http_client and marks each healthy iff status
+        # is 200 (any exception marks unhealthy), then sleeps poll_interval seconds.
         """Background task: periodically poll worker /health endpoints."""
         while True:
             workers = await worker_registry.get_all_workers()
 
             async def _check(w):
+                # [FUNCTION DOC]
+                # HELPER: Health-checks one worker and updates its flag.
                 try:
                     resp = await app.state.http_client.get(f"{w.worker_addr}/health")
                     await worker_registry.update_health(
@@ -206,6 +274,10 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # [FUNCTION DOC]
+        # HELPER: Logs startup, creates an httpx client with worker_health_timeout,
+        # starts the poll task and publishes registries on app.state; on shutdown
+        # cancels and awaits the poller, closes the client and logs.
         logger.info(
             "Router starting — strategy=%s, poll_interval=%.1fs",
             config.routing_strategy,
@@ -244,6 +316,9 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.get("/health", response_model=HealthResponse)
     async def health():
+        # [FUNCTION DOC]
+        # GET /health (no auth): returns status, number of workers, number of session
+        # keys and strategy name.
         all_workers = await worker_registry.get_all_workers()
         session_count = await session_registry.count()
         return HealthResponse(
@@ -259,6 +334,8 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/register", response_model=RegisterWorkerResponse)
     async def register(body: RegisterWorkerRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /register (admin): idempotently registers worker_addr and returns its id.
         _require_admin_key(request, config.admin_api_key)
         worker_id = await worker_registry.register(body.worker_addr)
         logger.info("Worker registered: %s (id=%s)", body.worker_addr, worker_id)
@@ -266,6 +343,11 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/unregister", response_model=UnregisterWorkerResponse)
     async def unregister(body: UnregisterWorkerRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /unregister (admin). By worker_id: removes the worker (404 if unknown)
+        # and cascades session revocation for its address. Else by worker_addr: removes
+        # it (no-op if unknown) and revokes its sessions. Neither given: 422. Returns
+        # the number of revoked session keys. Group entries are not cleaned up.
         _require_admin_key(request, config.admin_api_key)
         if body.worker_id is not None:
             worker_addr = await worker_registry.deregister_by_id(body.worker_id)
@@ -302,6 +384,29 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/route", response_model=RouteResponse)
     async def route(body: RouteRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /route (admin). Resolution order:
+        # - Candidate addrs: data proxies of body.model if registered, else of the first
+        # registered model, else None (meaning all workers).
+        # - session_id given: return its pinned worker; if unknown and no candidate
+        # addrs, 404; otherwise falls through.
+        # - No api_key but candidate addrs exist: pick among registered workers in the
+        # candidate list via the strategy (503 if none) and return it with the model's
+        # url and api_key.
+        # - No api_key, model given but unknown with no models: 404; no api_key
+        # otherwise: 422.
+        # - api_key pinned to a session: return that worker.
+        # - api_key equals the admin key: pick a candidate worker (503 if none) and pin
+        # the admin key to it under the pseudo session id "__hitl__" (human-in-the-loop)
+        # so later admin calls stick to the same worker.
+        # - Otherwise 404 "Unknown API key".
+        # KNOWN ISSUE: worker health is ignored when picking (all registered workers are
+        # candidates), so unhealthy workers can be selected.
+        # KNOWN ISSUE: an unknown session_id silently falls through to model-only
+        # routing whenever any model is registered, returning an arbitrary worker
+        # instead of 404.
+        # KNOWN ISSUE: after the first admin-key route, the admin key stays pinned to
+        # one worker forever, so admin-routed traffic is never load balanced.
         _require_admin_key(request, config.admin_api_key)
 
         # Step A: resolve model → candidate worker addrs
@@ -316,6 +421,9 @@ def create_app(config: RouterConfig) -> FastAPI:
                 model_addrs = first.data_proxy_addrs
 
         def _filter_by_model(workers: list, addrs: list[str] | None) -> list:
+            # [FUNCTION DOC]
+            # HELPER: Returns the workers whose address is in addrs (deduplicated, in
+            # addrs order); returns all workers when addrs is None.
             if addrs is None:
                 return workers
             workers_by_addr = {w.worker_addr: w for w in workers}
@@ -394,6 +502,10 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/register_session", response_model=StatusResponse)
     async def register_session(body: RegisterSessionRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /register_session (admin): pins each session key and id to worker_addr,
+        # then records the group. Duplicate group_id raises ValueError from the
+        # registry, giving a 500 after sessions were already pinned.
         _require_admin_key(request, config.admin_api_key)
 
         for entry in body.sessions:
@@ -414,6 +526,9 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/remove_session", response_model=RemoveSessionResponse)
     async def remove_session(body: RemoveSessionRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /remove_session (admin): revokes the group and each member session;
+        # returns removed True iff the group had sessions.
         _require_admin_key(request, config.admin_api_key)
 
         session_ids = await group_registry.revoke(body.group_id)
@@ -430,6 +545,9 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.get("/workers", response_model=WorkersResponse)
     async def list_workers(request: Request):
+        # [FUNCTION DOC]
+        # GET /workers (admin): returns every registered worker with id, addr, health
+        # and active_requests.
         _require_admin_key(request, config.admin_api_key)
         all_workers = await worker_registry.get_all_workers()
         return WorkersResponse(
@@ -446,6 +564,10 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/register_model", response_model=RegisterModelResponse)
     async def register_model(body: RegisterModelRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /register_model (admin): uses the given data_proxy_addrs, or all
+        # currently healthy workers (503 if none); upserts the model and returns the
+        # resolved addrs.
         _require_admin_key(request, config.admin_api_key)
         addrs = body.data_proxy_addrs
         if not addrs:
@@ -473,12 +595,16 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.get("/models", response_model=ModelsResponse)
     async def list_models(request: Request):
+        # [FUNCTION DOC]
+        # GET /models (admin): returns registered model names.
         _require_admin_key(request, config.admin_api_key)
         names = await model_registry.list_names()
         return ModelsResponse(models=names)
 
     @app.post("/remove_model", response_model=RemoveModelResponse)
     async def remove_model(body: RemoveModelRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /remove_model (admin): removes a model by name; 404 if absent.
         _require_admin_key(request, config.admin_api_key)
         removed = await model_registry.remove(body.name)
         if not removed:
@@ -495,6 +621,9 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.get("/resolve_worker/{worker_id}", response_model=ResolveWorkerResponse)
     async def resolve_worker(worker_id: str, request: Request):
+        # [FUNCTION DOC]
+        # GET /resolve_worker/{worker_id} (admin): returns the worker id and address, or
+        # 404.
         """Resolve a worker_id to its address."""
         _require_admin_key(request, config.admin_api_key)
         worker = await worker_registry.get_by_id(worker_id)

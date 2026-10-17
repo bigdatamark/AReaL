@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Creates the module-level GuardState and shared guard app for the training service and
+# registers the "TrainRPCGuard" logger.
 # SPDX-License-Identifier: Apache-2.0
 
 """Training service guard backed by the shared RPC guard."""
@@ -16,4 +19,7 @@ app = create_app(_state)
 
 
 def cleanup_forked_children() -> None:
+    # [FUNCTION DOC]
+    # Terminates/cleans up processes forked by this guard via the shared implementation
+    # using the module-level state.
     _cleanup_impl(_state)

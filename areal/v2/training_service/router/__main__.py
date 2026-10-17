@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# CLI entrypoint for the training router (python -m areal.v2.training_service.router).
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -7,6 +9,11 @@ import importlib
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses args (host, port default 9081, admin key, poll interval, health timeout,
+    # log level; unknown args ignored), validates the admin key for the bind host,
+    # builds RouterConfig, silences HTTP loggers, creates the app and runs uvicorn
+    # (imported dynamically) blocking without access logs.
     parser = argparse.ArgumentParser(description="AReaL Train Router")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=9081, help="Bind port")

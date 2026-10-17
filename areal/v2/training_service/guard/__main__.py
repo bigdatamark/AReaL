@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# CLI entrypoint for the training RPC guard (python -m areal.v2.training_service.guard).
 # SPDX-License-Identifier: Apache-2.0
 
 """CLI entrypoint: ``python -m areal.v2.training_service.guard``"""
@@ -13,6 +15,9 @@ from areal.v2.training_service.guard.app import _state, app
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Builds the shared guard parser, parses known args, configures the module-level
+    # guard state (returns bind host) and runs the guard server blocking on args.port.
     parser = make_base_parser(
         description="AReaL Train RPCGuard — HTTP gateway for coordinating forked workers"
     )

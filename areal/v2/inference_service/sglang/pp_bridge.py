@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# PPSchedulerBridge: adds per-pipeline-stage routing of NCCL weight-update groups to an
+# SGLang scheduler when pp_size > 1, by replacing methods on the scheduler's TpWorker
+# and ModelRunner instances (no module-level monkey-patching). The target pp rank is the
+# numeric suffix of the group name; workers at other pp ranks record a None sentinel and
+# skip update/destroy calls for that group.
+# KNOWN ISSUE: uses stdlib logging with __name__ instead of areal's getLogger, contrary
+# to project conventions.
 # SPDX-License-Identifier: Apache-2.0
 
 """PPSchedulerBridge: compose per-PP-rank weight-update routing onto SGLang Scheduler.
@@ -34,6 +42,9 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_pp_rank_from_group_name(group_name: str) -> int | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns the integer after the last underscore of group_name, or None if it
+    # is not an integer.
     """Extract pp_rank from group name suffix (e.g. ``update_weight_group_0`` -> 0).
 
     Returns None if the group name does not end with ``_{digit}``.
@@ -46,6 +57,8 @@ def _extract_pp_rank_from_group_name(group_name: str) -> int | None:
 
 
 class PPSchedulerBridge:
+    # [CLASS DOC]
+    # Holds the scheduler and pp_size; bind installs the wrappers.
     """Compose per-PP-rank weight-update capabilities onto a Scheduler instance.
 
     This bridge wraps the TpWorker's ``init_weights_update_group`` method and
@@ -57,10 +70,16 @@ class PPSchedulerBridge:
     """
 
     def __init__(self, scheduler: Any, server_args: Any) -> None:
+        # [FUNCTION DOC]
+        # Stores scheduler and server_args.pp_size.
         self._scheduler = scheduler
         self._pp_size = server_args.pp_size
 
     def bind(self) -> None:
+        # [FUNCTION DOC]
+        # No-op when pp_size <= 1. Otherwise looks up scheduler.tp_worker and its
+        # model_runner (warns and returns if missing), installs the tp_worker and
+        # model_runner wrappers, and logs pp/tp ranks.
         """Attach per-PP-rank wrapped methods to the scheduler's tp_worker and model_runner.
 
         When pp_size == 1, this method is a no-op.
@@ -96,10 +115,20 @@ class PPSchedulerBridge:
         )
 
     def _bind_tp_worker(self, tp_worker: Any, model_runner: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Replaces tp_worker.init_weights_update_group with a wrapper (see
+        # nested).
         """Wrap ``tp_worker.init_weights_update_group`` for per-PP-rank routing."""
         _orig_tp_init = tp_worker.init_weights_update_group
 
         def _pp_init_weights_update_group(recv_req):
+            # [FUNCTION DOC]
+            # HELPER: If the group name's pp suffix differs from this worker's pp_rank,
+            # stores a None sentinel in model_runner's update-group map and returns
+            # (True, skip message) without joining. Otherwise starts a daemon watchdog
+            # thread that warns after 30s, 90s and 210s cumulative if still blocked,
+            # calls the original init, stops the watchdog, logs duration (or logs and
+            # re-raises on exception) and returns the original result.
             group_name = recv_req.group_name
             pp_rank_from_name = _extract_pp_rank_from_group_name(group_name)
 
@@ -134,6 +163,10 @@ class PPSchedulerBridge:
             _stop = threading.Event()
 
             def _wd():
+                # [FUNCTION DOC]
+                # HELPER: Watchdog loop waiting 30, 60, then 120 seconds on the stop
+                # event, logging a "BLOCKED" warning with elapsed time after each
+                # unsignaled wait.
                 for s in [30, 60, 120]:
                     if _stop.wait(s):
                         return
@@ -180,6 +213,9 @@ class PPSchedulerBridge:
         tp_worker.init_weights_update_group = _pp_init_weights_update_group
 
     def _bind_model_runner(self, model_runner: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Replaces model_runner.update_weights_from_distributed and
+        # destroy_weights_update_group with sentinel-aware wrappers.
         """Wrap ModelRunner's update and destroy methods for per-PP-rank routing."""
 
         # ---- update_weights_from_distributed ----
@@ -192,6 +228,9 @@ class PPSchedulerBridge:
             group_name,
             load_format=None,
         ):
+            # [FUNCTION DOC]
+            # HELPER: Returns (True, skip message) if this worker holds a None sentinel
+            # for group_name; otherwise calls the original with the same args.
             """Skip broadcast receive if this worker did not join *group_name*."""
             pg = model_runner._model_update_group.get(group_name)
             if pg is None and group_name in model_runner._model_update_group:
@@ -216,6 +255,9 @@ class PPSchedulerBridge:
         _orig_destroy = model_runner.destroy_weights_update_group
 
         def _pp_destroy_weights_update_group(group_name):
+            # [FUNCTION DOC]
+            # HELPER: If a None sentinel exists for group_name, removes it and returns
+            # (True, skip message); otherwise calls the original destroy.
             """Skip destruction if this worker holds a None sentinel."""
             pg = model_runner._model_update_group.get(group_name)
             if pg is None and group_name in model_runner._model_update_group:

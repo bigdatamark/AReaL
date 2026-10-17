@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Configuration dataclass for the training data proxy.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -7,6 +9,10 @@ from dataclasses import dataclass, field
 
 @dataclass
 class TrainDataProxyConfig:
+    # [CLASS DOC]
+    # Settings: bind host/port, worker_addrs (all ranks of one parallel group in rank
+    # order), admin_api_key, uvicorn log_level, request_timeout (seconds per worker
+    # call) and warmup_timeout (currently unused).
     host: str = "0.0.0.0"
     port: int = 9082
     worker_addrs: list[str] = field(default_factory=list)

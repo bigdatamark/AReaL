@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Configuration dataclass for the inference router service.
 # SPDX-License-Identifier: Apache-2.0
 
 """Configuration for the Router service."""
@@ -9,6 +11,10 @@ from dataclasses import dataclass
 
 @dataclass
 class RouterConfig:
+    # [CLASS DOC]
+    # Router settings: bind host/port, admin_api_key, poll_interval (seconds between
+    # worker health polls), worker_health_timeout (per-check timeout), routing_strategy
+    # name (only "round_robin" works) and uvicorn log_level.
     """Configuration for the routing service.
 
     The router owns worker registry, session pinning, and routing

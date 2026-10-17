@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Scheduler-side AReaL extensions for SGLang: AwexSchedulerBridge (binds awex_* RPC
+# handlers onto a Scheduler instance), a copy of SGLang's run_scheduler_process that
+# binds the awex and PP bridges, and creation of the result IPC address shared via the
+# AREAL_AWEX_RESULT_IPC environment variable.
 # SPDX-License-Identifier: Apache-2.0
 """AwexSchedulerBridge + PPSchedulerBridge: compose weight-update methods onto SGLang Scheduler."""
 
@@ -18,6 +23,11 @@ RESULT_IPC_ENV = "AREAL_AWEX_RESULT_IPC"
 
 
 class AwexSchedulerBridge:
+    # [CLASS DOC]
+    # Attaches awex_* methods to a plain SGLang Scheduler so its handle_rpc_request can
+    # dispatch them by name. Work is delegated to a lazily created AwexSGLangAdapter;
+    # data-returning methods push pickled results over ZMQ PUSH, only from tp_rank 0 and
+    # dp_rank 0 (or no dp rank).
     """Compose awex weight-update capabilities onto a plain Scheduler instance.
 
     Lifecycle:
@@ -32,6 +42,9 @@ class AwexSchedulerBridge:
     """
 
     def __init__(self, scheduler: Any) -> None:
+        # [FUNCTION DOC]
+        # Stores the scheduler. If the result IPC env var is set and this is tp 0 / dp
+        # 0, creates a ZMQ PUSH socket connected to it (context never terminated).
         self._scheduler = scheduler
         self._adapter: Any | None = None
         self._result_push: zmq.Socket | None = None
@@ -49,6 +62,8 @@ class AwexSchedulerBridge:
             self._result_push.connect(result_ipc)
 
     def bind(self) -> None:
+        # [FUNCTION DOC]
+        # Sets each of the eleven awex_* bound methods as attributes on the scheduler.
         """Attach ``awex_*`` methods to the scheduler instance.
 
         After this call, ``handle_rpc_request`` can dispatch to them via
@@ -71,6 +86,9 @@ class AwexSchedulerBridge:
             setattr(self._scheduler, name, getattr(self, name))
 
     def _require_adapter(self) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: Lazily imports and constructs AwexSGLangAdapter(scheduler) and returns
+        # it.
         if self._adapter is None:
             from areal.v2.weight_update.awex.sglang_adapter import (
                 AwexSGLangAdapter,
@@ -80,10 +98,17 @@ class AwexSchedulerBridge:
         return self._adapter
 
     def _push_result(self, result: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sends result as a pickled object on the PUSH socket if this rank has
+        # one.
         if self._result_push is not None:
             self._result_push.send_pyobj(result)
 
     def awex_report_weight_meta(self) -> None:
+        # [FUNCTION DOC]
+        # Gets local weight metadata from the adapter; when tp_size > 1 all-gathers it
+        # over the TP CPU group (collective: all TP ranks must call) and flattens.
+        # Pushes the serialized list (only rank 0 actually sends).
         adapter = self._require_adapter()
         local_meta = adapter.get_weight_metadata()
         s = self._scheduler
@@ -100,37 +125,58 @@ class AwexSchedulerBridge:
             self._push_result(serialize_value(local_meta))
 
     def awex_report_parallelism(self) -> None:
+        # [FUNCTION DOC]
+        # Pushes the adapter's parallelism_strategy.
         self._push_result(self._require_adapter().parallelism_strategy)
 
     def awex_init_weights_update_group(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC]
+        # Delegates kwargs to adapter.init_weight_update_group.
         self._require_adapter().init_weight_update_group(**kwargs)
 
     def awex_execute_weight_update(self, version: int = 0) -> None:
+        # [FUNCTION DOC]
+        # Delegates to adapter.execute_weight_update(version).
         self._require_adapter().execute_weight_update(version)
 
     def awex_batch_isend_irecv(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC]
+        # Delegates kwargs to adapter.batch_isend_irecv.
         self._require_adapter().batch_isend_irecv(**kwargs)
 
     def awex_get_parameters(
         self, save_path: str, names: list[str] | None = None
     ) -> None:
+        # [FUNCTION DOC]
+        # On tp_rank 0 only, saves parameters (optionally filtered by names) to
+        # save_path.
         adapter = self._require_adapter()
         if self._scheduler.tp_rank == 0:
             adapter.save_parameters(save_path, names)
 
     def awex_randomize_parameters(self) -> None:
+        # [FUNCTION DOC]
+        # Delegates to adapter.randomize_parameters (debug).
         self._require_adapter().randomize_parameters()
 
     def awex_init_colocate_weight_update(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC]
+        # Delegates kwargs to adapter.init_colocate_weight_update.
         self._require_adapter().init_colocate_weight_update(**kwargs)
 
     def awex_execute_colocate_weight_update(self, version: int = 0) -> None:
+        # [FUNCTION DOC]
+        # Delegates to adapter.execute_colocate_weight_update(version).
         self._require_adapter().execute_colocate_weight_update(version)
 
     def awex_release_memory(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Delegates to adapter.release_memory(tags).
         self._require_adapter().release_memory(tags)
 
     def awex_resume_memory(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Delegates to adapter.resume_memory(tags).
         self._require_adapter().resume_memory(tags)
 
 
@@ -157,6 +203,13 @@ def areal_run_scheduler_process(
     dp_rank: int | None,
     pipe_writer,
 ) -> None:
+    # [FUNCTION DOC]
+    # Drop-in replacement for SGLang's run_scheduler_process run in each scheduler
+    # subprocess: configures scheduler env/ranks, dies with the parent, optionally sets
+    # CPU affinity and NUMA binding, sets up tracing, constructs the Scheduler, binds
+    # AwexSchedulerBridge and PPSchedulerBridge, sends init info through pipe_writer and
+    # runs the event loop forever. On any exception logs the traceback and sends SIGQUIT
+    # to the parent process.
     """Drop-in for ``sglang.srt.managers.scheduler.run_scheduler_process``.
 
     Duplicated from SGLang source.  AReaL additions are between
@@ -246,6 +299,10 @@ def areal_run_scheduler_process(
 
 
 def create_result_ipc() -> str:
+    # [FUNCTION DOC]
+    # Generates a unique ipc:// path from a temp file name, exports it in the
+    # AREAL_AWEX_RESULT_IPC env var (inherited by subprocesses) and returns it.
+    # KNOWN ISSUE: uses tempfile.mktemp, which is race-prone/insecure.
     path = f"ipc://{tempfile.mktemp(prefix='areal_result_')}"
     os.environ[RESULT_IPC_ENV] = path
     return path

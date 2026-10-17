@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Backward-compatibility shim: creates one module-level GuardState and the shared guard
+# Flask app bound to it (both from areal.infra.rpc.guard.app) and registers the
+# "RPCGuard" logger.
 # SPDX-License-Identifier: Apache-2.0
 
 """RPCGuard — inference service guard backed by the shared guard.
@@ -26,4 +30,7 @@ app = create_app(_state)
 
 
 def cleanup_forked_children() -> None:
+    # [FUNCTION DOC]
+    # Kills/cleans up child processes forked by this guard by delegating to the shared
+    # implementation with the module-level state. Side effects: process termination.
     _cleanup_impl(_state)

@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# CLI entrypoint for the training gateway (python -m areal.v2.training_service.gateway).
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -6,6 +8,11 @@ import argparse
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses args (host, port default 9080, admin key, router addr, router timeout 2s,
+    # forward timeout 600s, log level; unknown args ignored), validates the admin key
+    # for the bind host, builds GatewayConfig, silences HTTP loggers, creates the app
+    # and runs uvicorn blocking without access logs.
     parser = argparse.ArgumentParser(description="AReaL Training Gateway")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=9080, help="Bind port")

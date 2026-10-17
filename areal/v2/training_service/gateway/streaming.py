@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Router lookup and request forwarding helpers for the training gateway (simpler, non-
+# retrying counterparts of the inference gateway helpers).
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -10,11 +13,19 @@ logger = logging.getLogger("TrainGateway")
 
 
 class RouterUnreachableError(Exception):
+    # [CLASS DOC]
+    # Raised when the router cannot be reached, times out or returns an unexpected HTTP
+    # error.
     pass
 
 
 class RouterKeyRejectedError(Exception):
+    # [CLASS DOC]
+    # Raised when the router returns 404 (unknown key) or 503; carries detail and
+    # status_code.
     def __init__(self, detail: str, status_code: int = 404):
+        # [FUNCTION DOC]
+        # Stores detail (also the message) and status_code (default 404).
         super().__init__(detail)
         self.detail = detail
         self.status_code = status_code
@@ -28,6 +39,13 @@ async def query_router(
     admin_api_key: str | None = None,
     client: httpx.AsyncClient,
 ) -> str:
+    # [FUNCTION DOC]
+    # POSTs {"api_key": api_key} to router /route with optional admin bearer using the
+    # given client. 404/503 raise RouterKeyRejectedError with the JSON detail/error or
+    # raw text; connect/timeout errors and other HTTP error statuses raise
+    # RouterUnreachableError. Returns the "model_addr" field (data proxy address).
+    # KNOWN ISSUE: other transport errors (e.g. read errors) propagate as raw httpx
+    # exceptions, which callers do not catch.
     payload = {"api_key": api_key}
     try:
         headers = {}
@@ -59,6 +77,9 @@ async def query_router(
 
 
 def _forwarding_headers(raw_headers: dict[str, str]) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # HELPER: Copies headers without host, content-length and transfer-encoding (case-
+    # insensitive).
     skip = {"host", "content-length", "transfer-encoding"}
     return {k: v for k, v in raw_headers.items() if k.lower() not in skip}
 
@@ -71,6 +92,9 @@ async def forward_request(
     *,
     client: httpx.AsyncClient,
 ) -> httpx.Response:
+    # [FUNCTION DOC]
+    # POSTs body with filtered headers to upstream_url using the given client and
+    # timeout (default 600s) and returns the httpx response regardless of status.
     fwd_headers = _forwarding_headers(headers)
     resp = await client.post(
         upstream_url,

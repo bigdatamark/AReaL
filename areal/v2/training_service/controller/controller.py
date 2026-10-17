@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# GatewayTrainController: client-side controller (v2) that stands up the serverless
+# training service through a Scheduler and then mimics the TrainController / train
+# engine interface by calling the gateway over HTTP. Launch sequence: one RPC guard per
+# GPU rank via the scheduler, NCCL env on each guard, one forked train worker per guard,
+# engine creation/process group/initialize on every worker, then router, data proxy and
+# gateway forked on guard 0, and finally registration of the data proxy in the router
+# under a generated API key. Also wires RL weight updates to a v2 rollout controller
+# through a WeightUpdateController.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -29,6 +38,15 @@ logger = logging.getLogger("GatewayTrainController")
 
 
 class GatewayTrainController:
+    # [CLASS DOC]
+    # Controller holding: engine class (type or import path), TrainEngineConfig,
+    # scheduler, parsed ModelAllocation (parallel strategy, world size), service
+    # addresses (gateway, router, data proxy "model", workers, guards), forked-service
+    # and scheduler role lists for cleanup, the generated api_key, a locally tracked
+    # weight version, an optional rollout controller and weight-update controller, a
+    # lazily created per-event-loop httpx client, and background-initialization state
+    # (future, lock, workers-ready and shutdown events). Exposes duck-typed train-engine
+    # properties reporting a single DP rank with no CPU group.
     _GUARD_SUFFIX = "-guard"
 
     def __init__(
@@ -37,6 +55,9 @@ class GatewayTrainController:
         config: TrainEngineConfig,
         scheduler: Scheduler,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores arguments, parses config.backend into a ModelAllocation and initializes
+        # all state described in the class doc (no I/O).
         from areal.api.alloc_mode import ModelAllocation
 
         self.train_engine = train_engine
@@ -81,6 +102,14 @@ class GatewayTrainController:
         wait: bool = False,
         **kwargs: Any,
     ) -> concurrent.futures.Future | None:
+        # [FUNCTION DOC]
+        # Starts background initialization for role on the "ctrl_init" executor and
+        # blocks until guards are ready (TimeoutError after
+        # config.workers_ready_timeout). Re-raises a background failure if the future
+        # already finished. With wait=True blocks until full initialization completes
+        # and returns None; otherwise returns the future. Raises RuntimeError if a
+        # previous initialization future is still pending. Extra kwargs (e.g. addr) are
+        # forwarded to engine initialize.
         if self._init_future is not None:
             raise RuntimeError(
                 "initialize() called while a previous initialization is in progress"
@@ -106,6 +135,9 @@ class GatewayTrainController:
         return self._init_future
 
     def _guarded_bg_initialize(self, *args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Runs _bg_initialize and, on any exception, sets the workers-ready
+        # event before re-raising so initialize() does not wait for the full timeout.
         """Ensure _workers_ready is signaled even if _bg_initialize fails."""
         try:
             self._bg_initialize(*args, **kwargs)
@@ -116,6 +148,11 @@ class GatewayTrainController:
     def _bg_initialize(
         self, role: str, ft_spec: FinetuneSpec | None = None, **kwargs: Any
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Runs the async initialization to completion via run_async_task and
+        # logs the resulting role, api_key and gateway address unless shutdown was
+        # requested.
+        # KNOWN ISSUE: logs the generated API key in clear text.
         run_async_task(self._async_initialize, role, ft_spec, **kwargs)
         if self._shutdown_requested.is_set():
             return
@@ -127,6 +164,9 @@ class GatewayTrainController:
         )
 
     def _ensure_initialized(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If a background initialization is pending, waits for it (up to
+        # setup_timeout, re-raising its exception) under a lock and clears the future.
         if self._init_future is None:
             return
         with self._init_lock:
@@ -137,6 +177,10 @@ class GatewayTrainController:
             self._init_future = None
 
     async def _get_async_client(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns an httpx async client bound to the current event loop (timeout
+        # setup_timeout), recreating it (and closing the old one best-effort) when
+        # called from a different loop.
         current_loop = asyncio.get_running_loop()
         if self._async_client is None or self._async_client_loop is not current_loop:
             old = self._async_client
@@ -155,6 +199,20 @@ class GatewayTrainController:
         ft_spec: FinetuneSpec | None = None,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Performs the full launch sequence. Requires exactly one
+        # scheduling_spec (ValueError otherwise). Creates world_size guard workers under
+        # role "<role>-guard" running the training guard module, waits for them, sets
+        # the workers-ready event; allocates the NCCL master port on guard 0 and sets
+        # RANK/LOCAL_RANK=0/WORLD_SIZE/ MASTER_ADDR/MASTER_PORT on every guard; forks
+        # one train worker per guard; creates the engine (config passed as init kwarg)
+        # on all workers, then calls create_process_group with the parallel strategy and
+        # initialize with addr and ft_spec; forks router, data proxy (all worker addrs)
+        # and gateway (router addr, request_timeout as forward timeout) on guard 0,
+        # waiting for each /health; generates api_key "ak-<role>-<12 hex>" and registers
+        # the data proxy in the router. Checks the shutdown flag between stages and
+        # returns early if set. On any exception logs, rolls back via
+        # _cleanup_runtime_state and re-raises.
         from dataclasses import asdict
 
         from areal.api.cli_args import SchedulingSpec
@@ -210,6 +268,9 @@ class GatewayTrainController:
             # Persist guard addresses so connect_engine() can allocate
             # ports later (e.g. for the weight-update NCCL group).
             def _guard_addr(worker: Worker) -> str:
+                # [FUNCTION DOC]
+                # HELPER: Builds the http URL of a guard worker from its IP and first
+                # port.
                 return (
                     f"http://{format_hostport(worker.ip, int(worker.worker_ports[0]))}"
                 )
@@ -239,6 +300,9 @@ class GatewayTrainController:
             # Step 2: Fork one train worker per guard
             # ==============================================================
             async def _fork_worker(rank: int) -> str:
+                # [FUNCTION DOC]
+                # HELPER: Forks a training worker (admin key and log level args) on the
+                # guard for rank and returns its http address.
                 guard = _guard_addr(guard_workers[rank])
                 worker_cmd = [
                     sys.executable,
@@ -423,9 +487,15 @@ class GatewayTrainController:
         master_addr: str,
         master_port: int,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Concurrently POSTs the distributed env (RANK, LOCAL_RANK 0,
+        # WORLD_SIZE, MASTER_ADDR, MASTER_PORT) to /set_env on every guard so forked
+        # workers inherit it; raises on HTTP errors.
         client = await self._get_async_client()
 
         async def _set_env(rank: int) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Sets the env for one guard rank.
             addr = guard_addr_fn(guard_workers[rank])
             env = {
                 "RANK": str(rank),
@@ -447,6 +517,9 @@ class GatewayTrainController:
         init_args: list[Any],
         init_kwargs: dict[str, Any],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /create_engine with the engine class path and serialized init
+        # args to a worker; raises RuntimeError on HTTP >= 400.
         from areal.infra.rpc.serialization import serialize_value
 
         payload = {
@@ -472,6 +545,9 @@ class GatewayTrainController:
         kwargs: dict[str, Any] | None = None,
         timeout: float,
     ) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: POSTs serialized args/kwargs to worker_addr+path and returns the
+        # deserialized "result"; raises RuntimeError on HTTP >= 400.
         from areal.infra.rpc.serialization import deserialize_value, serialize_value
 
         payload = {
@@ -492,6 +568,9 @@ class GatewayTrainController:
     async def _register_in_router(
         self, router_addr: str, model_addr: str, api_key: str
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs {model_addr, api_key, name=role} to router /register with the
+        # admin bearer; raises on HTTP errors.
         client = await self._get_async_client()
         resp = await client.post(
             f"{router_addr}/register",
@@ -516,6 +595,11 @@ class GatewayTrainController:
         env: dict[str, str] | None = None,
         health_path: str = "/health",
     ) -> tuple[str, int]:
+        # [FUNCTION DOC]
+        # HELPER: Synchronous variant of guard forking using requests: allocates a port
+        # on the guard, appends --host/--port to the command, POSTs /fork (role,
+        # worker_index, cmd, optional env), records the service for cleanup, waits for
+        # its health path and returns (host, port). Not used by the async launch path.
         import requests
 
         resp = requests.post(f"{guard_addr}/alloc_ports", json={"count": 1}, timeout=30)
@@ -553,6 +637,8 @@ class GatewayTrainController:
         env: dict[str, str] | None = None,
         health_path: str = "/health",
     ) -> tuple[str, int]:
+        # [FUNCTION DOC]
+        # HELPER: Async version of _fork_on_guard using the shared httpx client.
         client = await self._get_async_client()
         resp = await client.post(
             f"{guard_addr}/alloc_ports", json={"count": 1}, timeout=30.0
@@ -584,6 +670,9 @@ class GatewayTrainController:
     def _kill_forked_service(
         self, guard_addr: str, role: str, worker_index: int
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /kill_forked_worker (role, worker_index) to the guard; logs
+        # success, failure or exceptions and never raises.
         import requests
 
         try:
@@ -606,6 +695,9 @@ class GatewayTrainController:
     def _wait_for_service(
         self, url: str, name: str, timeout: float | None = None
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Polls url every 0.1s with requests (2s timeout) until HTTP 200 or
+        # until timeout (default setup_timeout) elapses, then raises TimeoutError.
         import requests as _requests
 
         timeout = timeout or self.config.setup_timeout
@@ -624,6 +716,8 @@ class GatewayTrainController:
     async def _async_wait_for_service(
         self, url: str, name: str, timeout: float | None = None
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Async equivalent of _wait_for_service using the shared httpx client.
         timeout = timeout or self.config.setup_timeout
         deadline = time.monotonic() + timeout
         client = await self._get_async_client()
@@ -641,6 +735,10 @@ class GatewayTrainController:
     # -- Gateway HTTP helpers (duck-type TrainController interface) ---------
 
     def _gateway_post(self, path: str, payload: Any = None) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: Waits for initialization, POSTs JSON payload to gateway+path with the
+        # controller's api_key as bearer (request_timeout), raises RuntimeError on HTTP
+        # >= 400 and returns the decoded JSON.
         import requests
 
         self._ensure_initialized()
@@ -658,6 +756,8 @@ class GatewayTrainController:
         return resp.json()
 
     def _gateway_get(self, path: str) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: Same as _gateway_post but issues a GET without body.
         import requests
 
         self._ensure_initialized()
@@ -674,6 +774,9 @@ class GatewayTrainController:
         return resp.json()
 
     def _gateway_post_result(self, path: str, payload: Any = None) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: POSTs and returns the deserialized "result" field; RuntimeError if the
+        # response is not a dict with "result".
         from areal.infra.rpc.serialization import deserialize_value
 
         data = self._gateway_post(path, payload)
@@ -682,6 +785,8 @@ class GatewayTrainController:
         return deserialize_value(data["result"])
 
     def _gateway_get_result(self, path: str) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: GET counterpart of _gateway_post_result.
         from areal.infra.rpc.serialization import deserialize_value
 
         data = self._gateway_get(path)
@@ -693,6 +798,9 @@ class GatewayTrainController:
 
     @staticmethod
     def _require_list_batch(input_: Any, method_name: str) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # HELPER: Static. Returns input_ if it is a list, else raises TypeError naming
+        # the method (training-service dispatch requires list-of-dict batches).
         if not isinstance(input_, list):
             raise TypeError(
                 f"{method_name} expects `input_` as list[dict[str, Any]] for training-service dispatch; "
@@ -706,6 +814,10 @@ class GatewayTrainController:
         loss_fn: Any = None,
         loss_weight_fn: Any = None,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Sends a list-of-dict batch with loss_fn and loss_weight_fn to /train_batch
+        # (data proxy partitions it over DP) and returns the deserialized result.
+        # TypeError for None or non-list input.
         from areal.infra.rpc.serialization import serialize_value
 
         if input_ is None:
@@ -723,6 +835,9 @@ class GatewayTrainController:
     def forward_batch(
         self, input_: list[dict[str, Any]] | None = None, **kwargs: Any
     ) -> Any:
+        # [FUNCTION DOC]
+        # Sends a list-of-dict batch plus extra kwargs to /forward_batch and returns the
+        # deserialized merged result. TypeError for None or non-list input.
         from areal.infra.rpc.serialization import serialize_value
 
         if input_ is None:
@@ -743,6 +858,9 @@ class GatewayTrainController:
         loss_fn: Any = None,
         loss_weight_fn: Any = None,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Sends a batch with loss functions to /eval_batch (padded across DP) and
+        # returns the result. TypeError for None or non-list input.
         from areal.infra.rpc.serialization import serialize_value
 
         if input_ is None:
@@ -758,6 +876,8 @@ class GatewayTrainController:
         return self._gateway_post_result("/eval_batch", payload)
 
     def train(self, mode: bool = True) -> GatewayTrainController:
+        # [FUNCTION DOC]
+        # Broadcasts train(mode) to all workers via the gateway; returns self.
         from areal.infra.rpc.serialization import serialize_value
 
         self._gateway_post(
@@ -770,10 +890,15 @@ class GatewayTrainController:
         return self
 
     def eval(self) -> GatewayTrainController:
+        # [FUNCTION DOC]
+        # Broadcasts eval mode to all workers; returns self.
         self._gateway_post("/eval")
         return self
 
     def set_version(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # Records version locally (under lock) and broadcasts set_version to all
+        # workers.
         from areal.infra.rpc.serialization import serialize_value
 
         with self._version_lock:
@@ -788,10 +913,14 @@ class GatewayTrainController:
         )
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the locally tracked version (no remote call).
         with self._version_lock:
             return self._version
 
     def save(self, meta: Any) -> None:
+        # [FUNCTION DOC]
+        # Broadcasts save(meta) (checkpoint/HF save) to all workers.
         from areal.infra.rpc.serialization import serialize_value
 
         self._gateway_post(
@@ -803,6 +932,8 @@ class GatewayTrainController:
         )
 
     def load(self, meta: Any) -> None:
+        # [FUNCTION DOC]
+        # Broadcasts load(meta) to all workers.
         from areal.infra.rpc.serialization import serialize_value
 
         self._gateway_post(
@@ -814,21 +945,34 @@ class GatewayTrainController:
         )
 
     def offload(self) -> None:
+        # [FUNCTION DOC]
+        # Broadcasts offload (engine memory to CPU) to all workers.
         self._gateway_post("/offload")
 
     def onload(self) -> None:
+        # [FUNCTION DOC]
+        # Broadcasts onload to all workers.
         self._gateway_post("/onload")
 
     def step_lr_scheduler(self) -> None:
+        # [FUNCTION DOC]
+        # Broadcasts an LR scheduler step to all workers.
         self._gateway_post("/step_lr_scheduler")
 
     def optimizer_zero_grad(self) -> None:
+        # [FUNCTION DOC]
+        # Broadcasts optimizer zero_grad to all workers.
         self._gateway_post("/optimizer_zero_grad")
 
     def optimizer_step(self) -> Any:
+        # [FUNCTION DOC]
+        # Broadcasts optimizer step and returns the first worker's deserialized result.
         return self._gateway_post_result("/optimizer_step")
 
     def export_stats(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns local stats_tracker.export_all() merged with (overridden by) the first
+        # worker's exported stats fetched through the gateway.
         from areal.utils import stats_tracker
 
         stats = stats_tracker.export_all()
@@ -836,6 +980,8 @@ class GatewayTrainController:
         return stats
 
     def get_device_stats(self) -> Any:
+        # [FUNCTION DOC]
+        # Returns the first worker's device stats through the gateway.
         from areal.infra.rpc.serialization import serialize_value
 
         payload = {
@@ -845,9 +991,14 @@ class GatewayTrainController:
         return self._gateway_post_result("/get_device_stats", payload)
 
     def config_perf_tracer(self, config: Any, role: str) -> None:
+        # [FUNCTION DOC]
+        # Waits for initialization, then calls /config_perf_tracer directly on every
+        # worker (bypassing the gateway) with config, its rank and role, concurrently.
         self._ensure_initialized()
 
         async def _call() -> None:
+            # [FUNCTION DOC]
+            # HELPER: Async fan-out of the per-rank perf tracer configuration.
             tasks = [
                 self._call_worker_engine_endpoint(
                     addr,
@@ -863,6 +1014,8 @@ class GatewayTrainController:
         run_async_task(_call)
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Broadcasts save_perf_tracer(step, force) to all workers.
         from areal.infra.rpc.serialization import serialize_value
 
         payload = {
@@ -872,6 +1025,11 @@ class GatewayTrainController:
         self._gateway_post("/save_perf_tracer", payload)
 
     def clear_batches(self, *targets: Any) -> None:
+        # [FUNCTION DOC]
+        # Frees remote batch storage for the given RTensor targets: concurrently sends
+        # storage-clear requests to every node holding shards (errors ignored), then, if
+        # any shard ids exist, broadcasts clear_batches(shard_ids) to workers through
+        # the gateway.
         from areal.infra.rpc.rtensor import RTensor, flatten_shard_ids
         from areal.infra.rpc.serialization import serialize_value
 
@@ -881,6 +1039,8 @@ class GatewayTrainController:
         if shards_by_node:
 
             async def _clear_storage():
+                # [FUNCTION DOC]
+                # HELPER: Async fan-out of per-node shard deletion.
                 await asyncio.gather(
                     *[
                         RTensor.clear_node(addr, sids)
@@ -902,37 +1062,60 @@ class GatewayTrainController:
         self._gateway_post("/clear_batches", payload)
 
     def current_data_parallel_head(self) -> int:
+        # [FUNCTION DOC]
+        # Duck-type compat: always 0.
         return 0
 
     @property
     def context_and_model_parallel_group(self):
+        # [FUNCTION DOC]
+        # Property: duck-type compat, returns cpu_group (None).
         return self.cpu_group
 
     @property
     def parallel_strategy(self):
+        # [FUNCTION DOC]
+        # Property: the current parallel strategy.
         return self._parallel_strategy
 
     @property
     def data_parallel_world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: duck-type compat, always 1 (the controller acts as a single DP
+        # rank).
         return 1
 
     @property
     def data_parallel_rank(self) -> int:
+        # [FUNCTION DOC]
+        # Property: always 0.
         return 0
 
     # -- Properties (duck-type compat) -------------------------------------
 
     @property
     def cpu_group(self):
+        # [FUNCTION DOC]
+        # Property: always None.
         return None
 
     @property
     def train_worker_urls(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Property: copy of the train worker addresses.
         return list(self._worker_addrs)
 
     # -- RL parity methods (connect_engine / update_weights / batch) --------
 
     def connect_engine(self, rollout: Any, meta: Any) -> None:
+        # [FUNCTION DOC]
+        # Waits for initialization and connects to a v2 rollout controller for weight
+        # updates. Raises TypeError unless rollout is a RolloutControllerV2 and
+        # ValueError unless meta.type is "awex" or "disk". Starts a
+        # WeightUpdateController bound to this host's IP, and connects pair
+        # "<role>-rollout" between train workers and inference workers: for awex,
+        # allocates the NCCL master port on inference guard 0 (rank 0 lives there); for
+        # disk, passes save path and LoRA settings. Stores the rollout and controller.
         self._ensure_initialized()
         import requests
 
@@ -1016,6 +1199,12 @@ class GatewayTrainController:
         )
 
     def update_weights(self, meta: Any) -> None:
+        # [FUNCTION DOC]
+        # Requires connect_engine (RuntimeError otherwise). Pauses generation, asserts
+        # meta.version is a positive int, runs the weight update for that version,
+        # resumes generation and logs status/duration.
+        # KNOWN ISSUE: no try/finally, so a failed assertion or update leaves rollout
+        # generation paused.
         if self._weight_update_ctrl is None or self.rollout is None:
             raise RuntimeError(
                 "connect_engine() must be called before update_weights()"
@@ -1044,6 +1233,9 @@ class GatewayTrainController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Delegates to rollout.prepare_batch with the same arguments (RuntimeError
+        # before connect_engine).
         if self.rollout is None:
             raise RuntimeError("connect_engine() must be called before prepare_batch()")
         return self.rollout.prepare_batch(
@@ -1067,6 +1259,9 @@ class GatewayTrainController:
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Delegates to rollout.rollout_batch with the same arguments (RuntimeError
+        # before connect_engine).
         if self.rollout is None:
             raise RuntimeError("connect_engine() must be called before rollout_batch()")
         return self.rollout.rollout_batch(
@@ -1080,6 +1275,11 @@ class GatewayTrainController:
         )
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
+        # [FUNCTION DOC]
+        # Stores parallel_strategy and, if torch.distributed is not initialized, creates
+        # a local single-rank gloo process group on a free port and marks it owned.
+        # KNOWN ISSUE: overwrites the stored parallel strategy even when called with
+        # None.
         self._parallel_strategy = parallel_strategy
         import torch.distributed as dist
 
@@ -1096,11 +1296,17 @@ class GatewayTrainController:
             self._own_process_group = True
 
     def is_data_parallel_head(self) -> bool:
+        # [FUNCTION DOC]
+        # Duck-type compat: always True.
         return True
 
     # -- Destroy -----------------------------------------------------------
 
     def _graceful_shutdown_workers(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Concurrently POSTs /awex/teardown and then /destroy_engine to every
+        # worker (30s total timeout), logging warnings on failures, so all ranks tear
+        # down NCCL before any process exits.
         """Destroy engines on all training workers before killing processes.
 
         ``dist.destroy_process_group()`` is a local operation
@@ -1113,6 +1319,8 @@ class GatewayTrainController:
             return
 
         async def _shutdown_all() -> None:
+            # [FUNCTION DOC]
+            # HELPER: Opens an aiohttp session and shuts down all workers concurrently.
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 tasks = []
@@ -1121,6 +1329,9 @@ class GatewayTrainController:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
         async def _shutdown_one(session: aiohttp.ClientSession, addr: str) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Calls teardown then destroy_engine on one worker, logging
+            # failures.
             try:
                 async with session.post(f"{addr}/awex/teardown") as resp:
                     resp.raise_for_status()
@@ -1144,6 +1355,12 @@ class GatewayTrainController:
         logger.info("All training worker engines destroyed gracefully")
 
     def _cleanup_runtime_state(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Best-effort teardown: unregisters the data proxy from the router,
+        # gracefully shuts down workers, kills forked services in reverse order, deletes
+        # scheduler workers for each recorded role, clears addresses and api_key, closes
+        # the async client, and destroys the owned gloo process group. Errors are
+        # logged, not raised.
         if self._router_addr and self._model_addr:
             try:
                 import requests
@@ -1208,6 +1425,11 @@ class GatewayTrainController:
                 self._own_process_group = False
 
     def destroy(self) -> None:
+        # [FUNCTION DOC]
+        # Sets the shutdown flag, cancels the pending init future (cannot interrupt one
+        # that is running) and cleans up all runtime state.
+        # KNOWN ISSUE: if background initialization is still running, cleanup races with
+        # it and services forked afterwards may be left behind.
         self._shutdown_requested.set()
         future = self._init_future
         self._init_future = None

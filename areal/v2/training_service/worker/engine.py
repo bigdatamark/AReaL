@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Builds the training worker's engine Flask blueprint. Dependencies (flask module,
+# engine accessors, engine-thread submitter, parsing and execution helpers) are injected
+# by app.py. Compute routes localize incoming RTensor references, run the engine method
+# with DP-head broadcast and return results as RTensor references owned by this node;
+# other routes call an engine method directly on the engine thread.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -29,6 +35,18 @@ def create_engine_module(
     execute_compute: Callable[..., Any],
     get_node_addr: Callable[[], str],
 ) -> Any:
+    # [FUNCTION DOC]
+    # Creates blueprint "worker_engine" with: GET /health, POST /create_engine, POST
+    # /configure, GET /topology, GET /get_param_info, POST /destroy_engine; plain engine
+    # routes /train and /eval (no result), /create_process_group, /initialize,
+    # /set_version, /save, /load, /offload, /onload, /optimizer_zero_grad,
+    # /optimizer_step, /step_lr_scheduler, /get_device_stats, /config_perf_tracer,
+    # /save_perf_tracer, /clear_batches (POST) and /get_version, /export_stats (GET);
+    # and compute routes /train_batch, /forward_batch, /eval_batch, /sft/train
+    # (train_lm), /sft/evaluate (evaluate_lm), /ppo/actor/compute_logp,
+    # /ppo/actor/compute_advantages, /ppo/actor/update (ppo_update),
+    # /ppo/critic/compute_values, /ppo/critic/update (ppo_update), /rw/train (train_rw),
+    # /rw/evaluate (evaluate_rw). Returns the blueprint.
     Blueprint = flask_module.Blueprint
     jsonify = flask_module.jsonify
     request = flask_module.request
@@ -39,6 +57,9 @@ def create_engine_module(
 
     @bp.route("/health", methods=["GET"])
     def health_check():
+        # [FUNCTION DOC]
+        # GET /health: returns status healthy, RANK and ROLE env values (defaults 0 and
+        # "train_worker") and ready = whether an engine exists.
         rank = int(os.environ.get("RANK", 0))
         role = os.environ.get("ROLE", "train_worker")
         ready = get_engine() is not None
@@ -53,6 +74,12 @@ def create_engine_module(
 
     @bp.route("/create_engine", methods=["POST"])
     def create_engine():
+        # [FUNCTION DOC]
+        # POST /create_engine. Body: engine_class (or legacy "engine") import path,
+        # serialized init_args and init_kwargs. 400 for invalid JSON, missing class,
+        # existing engine, import failure or a class that is not a TrainEngine subclass.
+        # Instantiates the engine on the engine thread, stores it globally and returns
+        # success; unexpected errors give 500.
         try:
             data = request.get_json(silent=True)
             if data is None:
@@ -93,6 +120,9 @@ def create_engine_module(
                 return jsonify({"error": str(e)}), 400
 
             def create_in_engine_thread():
+                # [FUNCTION DOC]
+                # HELPER: Constructs the engine instance with the deserialized init
+                # args.
                 return engine_class(*init_args, **init_kwargs)
 
             engine = submit_to_engine_thread("create_engine", create_in_engine_thread)
@@ -112,10 +142,17 @@ def create_engine_module(
 
     @bp.route("/configure", methods=["POST"])
     def configure():
+        # [FUNCTION DOC]
+        # POST /configure: calls engine.configure(*args, **kwargs) on the engine thread
+        # if the engine has it (else returns None) and returns the serialized result.
+        # KNOWN ISSUE: args are parsed outside the error wrapper, so an invalid JSON
+        # body raises ValueError as an unhandled Flask 500 instead of 400.
         data = request.get_json(silent=True)
         raw_args, raw_kwargs = parse_args_kwargs(data)
 
         def action():
+            # [FUNCTION DOC]
+            # HELPER: Engine-thread call of the optional configure method.
             engine = require_engine()
             configure_fn = getattr(engine, "configure", None)
             if callable(configure_fn):
@@ -129,6 +166,10 @@ def create_engine_module(
 
     @bp.route("/topology", methods=["GET"])
     def topology():
+        # [FUNCTION DOC]
+        # GET /topology: returns rank/world_size/local_rank from env and dp_rank,
+        # dp_size, is_dp_head from the engine; 400 if no engine, 500 on other errors.
+        # Runs on the request thread, not the engine thread.
         try:
             engine = require_engine()
             return jsonify(
@@ -149,7 +190,12 @@ def create_engine_module(
 
     @bp.route("/get_param_info", methods=["GET"])
     def get_param_info():
+        # [FUNCTION DOC]
+        # GET /get_param_info: returns engine.get_param_info() or, as fallback,
+        # get_parameter_info(), or None, executed on the engine thread.
         def action():
+            # [FUNCTION DOC]
+            # HELPER: Engine-thread lookup of the parameter-info method.
             engine = require_engine()
             get_param_info_fn = getattr(engine, "get_param_info", None)
             if callable(get_param_info_fn):
@@ -169,7 +215,14 @@ def create_engine_module(
     def _register_compute_route(
         path: str, method_name: str, *, endpoint_prefix: str = ""
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Registers POST path whose handler parses args/kwargs, localizes
+        # RTensors, executes method_name with require_broadcast and converts the result
+        # to RTensor references for this node, wrapped by run_endpoint. Endpoint name
+        # uses endpoint_prefix when given to keep names unique.
         def handler():
+            # [FUNCTION DOC]
+            # HELPER: Request handler implementing the compute flow described above.
             data = request.get_json(silent=True)
             raw_args, raw_kwargs = parse_args_kwargs(data)
             args = RTensor.localize(raw_args)
@@ -201,9 +254,15 @@ def create_engine_module(
         methods: list[str] | None = None,
         return_result: bool = True,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Registers path (default POST) calling engine.method_name on the engine
+        # thread; GET requests pass no args, POST bodies are parsed (missing body means
+        # no args). return_result False suppresses the result in the response.
         http_methods = methods or ["POST"]
 
         def handler():
+            # [FUNCTION DOC]
+            # HELPER: Request handler implementing the direct-call flow described above.
             if request.method == "GET":
                 args, kwargs = [], {}
             else:
@@ -225,6 +284,11 @@ def create_engine_module(
 
     @bp.route("/destroy_engine", methods=["POST"])
     def destroy_engine():
+        # [FUNCTION DOC]
+        # POST /destroy_engine: if an engine exists, calls engine.destroy() on the
+        # engine thread (tears down the process group; must be called on all ranks
+        # before exit); returns success, or a "No engine to destroy" message. The global
+        # engine reference is not cleared.
         """Gracefully destroy the engine and release distributed resources.
 
         Calls ``engine.destroy()`` which runs
@@ -238,6 +302,8 @@ def create_engine_module(
             return jsonify({"status": "success", "message": "No engine to destroy"})
 
         def action():
+            # [FUNCTION DOC]
+            # HELPER: Engine-thread call of engine.destroy.
             engine.destroy()
 
         return run_endpoint(

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# FastAPI app factory for the training router. Each registered data proxy (model_addr)
+# is pinned to one API key; /route resolves a key to its address. A background task
+# polls each model's /health and marks it unhealthy after consecutive failures. All
+# endpoints except /health require the admin bearer key. httpx/fastapi/pydantic are
+# imported via importlib at module load.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -28,6 +34,9 @@ async def _probe_model_health(
     model_addr: str,
     client: Any,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: GETs model_addr/health with the given client; healthy iff status 200 (any
+    # exception counts as failure); records the result in the registry.
     try:
         resp = await client.get(f"{model_addr}/health")
         healthy = resp.status_code == 200
@@ -37,6 +46,9 @@ async def _probe_model_health(
 
 
 def _extract_bearer_token(request: Request) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the "Authorization: Bearer" token (case-insensitive prefix) or
+    # raises HTTPException 401.
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
@@ -47,6 +59,9 @@ def _extract_bearer_token(request: Request) -> str:
 
 
 def _require_admin_key(request: Request, admin_key: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Constant-time compares the bearer token with admin_key; 403 on mismatch;
+    # returns the token.
     token = _extract_bearer_token(request)
     if not hmac.compare_digest(token, admin_key):
         raise HTTPException(status_code=403, detail="Invalid admin API key.")
@@ -54,23 +69,36 @@ def _require_admin_key(request: Request, admin_key: str) -> str:
 
 
 class RouteRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of /route: api_key to resolve (optional; required at runtime).
     api_key: str | None = None
 
 
 class RegisterRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of /register: model_addr, api_key and optional display name.
     model_addr: str
     api_key: str
     name: str = ""
 
 
 class UnregisterRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of /unregister: model_addr.
     model_addr: str
 
 
 def create_app(config: RouterConfig) -> FastAPI:
+    # [FUNCTION DOC]
+    # Creates the registry and app; the lifespan starts a health client
+    # (worker_health_timeout) and a poll task, and on shutdown cancels it and closes the
+    # client. Registers the endpoints below and exposes the registry on app.state.
     model_registry = ModelRegistry()
 
     async def _poll_models(client: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Infinite loop probing every registered model sequentially, then
+        # sleeping poll_interval seconds.
         while True:
             models = await model_registry.get_all()
             for model in models:
@@ -79,6 +107,8 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # [FUNCTION DOC]
+        # HELPER: Startup/shutdown of the health client and poll task described above.
         logger.info(
             "Train router starting — poll_interval=%.1fs",
             config.poll_interval,
@@ -103,6 +133,8 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.get("/health")
     async def health():
+        # [FUNCTION DOC]
+        # GET /health (no auth): status ok and number of registered models.
         model_count = await model_registry.count()
         return {
             "status": "ok",
@@ -111,6 +143,10 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/route")
     async def route(body: RouteRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /route (admin). 422 if api_key missing; 400 if api_key equals the admin
+        # key (not usable for data-plane routing); 404 if the key is unknown; 503 if the
+        # pinned model is unhealthy; otherwise returns {"model_addr"}.
         _require_admin_key(request, config.admin_api_key)
         if body.api_key is None:
             raise HTTPException(status_code=422, detail="api_key required")
@@ -128,6 +164,9 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/register")
     async def register(body: RegisterRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /register (admin): registers/updates the model_addr <-> api_key pinning
+        # and returns status ok.
         _require_admin_key(request, config.admin_api_key)
         await model_registry.register(body.model_addr, body.api_key, body.name)
         logger.info(
@@ -138,6 +177,9 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.post("/unregister")
     async def unregister(body: UnregisterRequest, request: Request):
+        # [FUNCTION DOC]
+        # POST /unregister (admin): removes a model by address (no-op if unknown);
+        # status ok.
         _require_admin_key(request, config.admin_api_key)
         await model_registry.deregister(body.model_addr)
         logger.info(
@@ -148,6 +190,9 @@ def create_app(config: RouterConfig) -> FastAPI:
 
     @app.get("/models")
     async def list_models(request: Request):
+        # [FUNCTION DOC]
+        # GET /models (admin): lists every model with address, api_key (exposed in clear
+        # text), name, health flag and registration time.
         _require_admin_key(request, config.admin_api_key)
         models = await model_registry.get_all()
         return {

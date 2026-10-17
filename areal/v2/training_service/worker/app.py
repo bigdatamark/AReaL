@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Flask app factory and process-global engine state for a training worker. All engine
+# operations run serially on a single daemon "EngineWorker" thread (so CUDA/NCCL work
+# happens on one thread), fed through a queue with futures; HTTP handler threads block
+# until their work completes. Holds the global engine instance and this node's address
+# used for remote-tensor (RTensor) references.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -30,6 +36,10 @@ _engine_thread_lock = Lock()
 
 
 def _init_engine_thread() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Idempotently starts the engine thread under a lock: returns if it is
+    # alive, raises RuntimeError if it exists but died, else creates the work queue and
+    # starts the daemon thread.
     global _engine_thread, _engine_work_queue
 
     with _engine_thread_lock:
@@ -42,6 +52,11 @@ def _init_engine_thread() -> None:
         _engine_work_queue = Queue()
 
         def engine_worker():
+            # [FUNCTION DOC]
+            # HELPER: Engine thread loop: takes (func, args, kwargs, future, name) items
+            # from the queue; a None item stops the loop. Runs func, setting the result
+            # or exception on the future (exceptions are logged with traceback), and
+            # marks the item done.
             logger.info("Engine thread started")
             work_queue = _engine_work_queue
             if work_queue is None:
@@ -83,6 +98,10 @@ def _init_engine_thread() -> None:
 def _submit_to_engine_thread(
     func_name: str, func: Callable, *args: Any, **kwargs: Any
 ) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Ensures the engine thread is running, enqueues func with args/kwargs and a
+    # new Future, and blocks until it completes, returning the result or re-raising the
+    # exception from the engine thread.
     global _engine_work_queue
 
     _init_engine_thread()
@@ -95,6 +114,8 @@ def _submit_to_engine_thread(
 
 
 def _require_engine() -> TrainEngine:
+    # [FUNCTION DOC]
+    # HELPER: Returns the global engine or raises RuntimeError if none was created.
     if _engine is None:
         raise RuntimeError("Engine not created. Call /create_engine first.")
     return _engine
@@ -107,12 +128,21 @@ def _execute_compute(
     *,
     require_broadcast: bool = False,
 ) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Runs engine.method_name(*args, **kwargs) on the engine thread;
+    # RuntimeError if the method does not exist. With require_broadcast, first moves
+    # args/kwargs to the current device and broadcasts them from the DP head over the
+    # engine's context-and-model-parallel group so non-head ranks (which received empty
+    # payloads) get the real inputs; if that group is None it raises when DP world size
+    # > 1 and otherwise uses local inputs. Returns the method result.
     engine = _require_engine()
     method = getattr(engine, method_name, None)
     if not callable(method):
         raise RuntimeError(f"Engine does not implement method '{method_name}'")
 
     def execute():
+        # [FUNCTION DOC]
+        # HELPER: Engine-thread closure performing the optional broadcast and the call.
         nonlocal args, kwargs
         if require_broadcast:
             group = engine.context_and_model_parallel_group
@@ -139,6 +169,9 @@ def _execute_compute(
 
 
 def _parse_args_kwargs(data: dict[str, Any] | None) -> tuple[Any, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Deserializes "args" (default empty list) and "kwargs" (default empty dict)
+    # from a request JSON dict; raises ValueError if data is None.
     if data is None:
         raise ValueError("Invalid JSON in request body")
     raw_args = deserialize_value(data.get("args", []))
@@ -147,6 +180,11 @@ def _parse_args_kwargs(data: dict[str, Any] | None) -> tuple[Any, Any]:
 
 
 def create_app(config: TrainWorkerConfig):
+    # [FUNCTION DOC]
+    # Records this node's address as host:port, builds a Flask app (flask imported
+    # dynamically) and registers the engine blueprint, the awex blueprint (both wired
+    # through the callbacks below) and the shared RPC guard data blueprint. Returns the
+    # app.
     global _node_addr
     _node_addr = f"{config.host}:{config.port}"
 
@@ -160,6 +198,10 @@ def create_app(config: TrainWorkerConfig):
         action: Callable[[], Any],
         return_result: bool = True,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Runs action and returns JSON {"status": "success", "result":
+        # serialized result or None}; RuntimeError/ValueError -> 400 with error; other
+        # exceptions are logged and return 500.
         try:
             result = action()
             if return_result:
@@ -174,13 +216,19 @@ def create_app(config: TrainWorkerConfig):
             return jsonify({"error": f"Internal server error: {str(e)}"}), 500
 
     def _get_engine() -> TrainEngine | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns the global engine or None.
         return _engine
 
     def _set_engine(engine: TrainEngine) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sets the global engine instance.
         global _engine
         _engine = engine
 
     def _get_node_addr() -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns this node's host:port address.
         return _node_addr
 
     app.register_blueprint(

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# vLLM implementation of the InfBridgeBackend protocol: builds OpenAI-compatible
+# completion / chat-completion payloads with token-id outputs, parses responses and
+# supplies AReaL pause/continue and sleep/wake_up control endpoints.
 # SPDX-License-Identifier: Apache-2.0
 
 """vLLM-specific inference bridge backend."""
@@ -19,6 +23,9 @@ if TYPE_CHECKING:
 
 
 class VLLMBridgeBackend:
+    # [CLASS DOC]
+    # Stateless backend object mirroring the relevant subset of the remote vLLM engine
+    # backend.
     """vLLM-specific backend for :class:`InfBridge`.
 
     Mirrors the relevant subset of
@@ -31,6 +38,19 @@ class VLLMBridgeBackend:
         with_lora: bool,
         version: int = -1,
     ) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Builds an HttpRequest. max_tokens = min(max_tokens - input length,
+        # max_new_tokens). Payload: top_p, top_k, max_tokens, temperature (0 when
+        # greedy), stop_token_ids, ignore_eos, skip_special_tokens,
+        # return_tokens_as_token_ids, logprobs 0, use_beam_search, stream false,
+        # optional seed. With with_lora, requires lora_name (ValueError otherwise) and
+        # sets "model" to the versioned LoRA name. If the request carries vision
+        # messages, fills each image_url content item in order with a data URL built
+        # from req.image_data (MIME sniffed; ValueError if too few images), sets
+        # messages and logprobs true, and targets /v1/chat/completions; otherwise sets
+        # prompt to the input ids and targets /v1/completions.
+        # KNOWN ISSUE: image_url entries of req.vision_msg_vllm are mutated in place
+        # (only a shallow copy of the list is stored in the payload).
         """Build a ``/v1/completions`` or ``/v1/chat/completions`` request."""
         gconfig = req.gconfig
 
@@ -92,19 +112,30 @@ class VLLMBridgeBackend:
         self,
         response: dict[str, Any],
     ) -> HttpGenerationResult:
+        # [FUNCTION DOC]
+        # Delegates to areal.utils.vllm_response.parse_vllm_generation_response.
         """Parse vLLM JSON into :class:`HttpGenerationResult`."""
         return parse_vllm_generation_response(response)
 
     def get_pause_request(self) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Returns POST /areal_pause_generation with empty payload.
         return HttpRequest(endpoint="/areal_pause_generation", payload={})
 
     def get_resume_request(self) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Returns POST /areal_continue_generation with empty payload.
         return HttpRequest(endpoint="/areal_continue_generation", payload={})
 
     def get_offload_request(self) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Returns POST /sleep with empty payload.
         return HttpRequest(endpoint="/sleep", payload={}, method="POST")
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Returns POST /wake_up, with tags url-encoded as repeated query params when
+        # given.
         if tags is not None:
             from urllib.parse import urlencode
 
@@ -115,6 +146,8 @@ class VLLMBridgeBackend:
         return HttpRequest(endpoint=endpoint, payload={}, method="POST")
 
     def get_generation_max_new_tokens(self, http_req: HttpRequest) -> int:
+        # [FUNCTION DOC]
+        # Reads payload max_tokens as int.
         return int(http_req.payload["max_tokens"])
 
     def patch_generation_request(
@@ -124,6 +157,12 @@ class VLLMBridgeBackend:
         accumulated_tokens: list[int],
         remaining_tokens: int,
     ) -> None:
+        # [FUNCTION DOC]
+        # Sets max_tokens to remaining_tokens and, for completion requests only, sets
+        # prompt to original input ids plus accumulated tokens.
+        # KNOWN ISSUE: chat (vision) requests are not extended with accumulated tokens,
+        # so a resubmit after abort regenerates from scratch while InfBridge keeps the
+        # earlier partial output, producing inconsistent token sequences.
         http_req.payload["max_tokens"] = remaining_tokens
         if "prompt" in http_req.payload:
             http_req.payload["prompt"] = list(req.input_ids) + accumulated_tokens

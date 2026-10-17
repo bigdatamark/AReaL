@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# FastAPI application factory for the inference gateway: a stateless HTTP proxy. Each
+# request is authenticated (admin key or session/bearer key), the router service is
+# asked which data proxy (worker) should serve it, and the request is forwarded there
+# (non-streaming via a shared httpx client, streaming via SSE pass-through). Also
+# exposes admin control endpoints (model registration, session start, pause/continue,
+# memory release/resume, version get/set, trajectory export) and /v1 + /callback
+# aliases. Router errors are mapped to HTTP responses by a shared helper.
 # SPDX-License-Identifier: Apache-2.0
 
 """Inference Gateway — thin HTTP proxy with auth, routing, and forwarding.
@@ -50,15 +58,22 @@ logger = logging.getLogger("InferenceGateway")
 
 
 class GatewayHealthResponse(BaseModel):
+    # [CLASS DOC]
+    # Pydantic response for health: status string and configured router_addr.
     status: str
     router_addr: str
 
 
 class GatewayModelsResponse(BaseModel):
+    # [CLASS DOC]
+    # Pydantic response listing registered model names.
     models: list[str]
 
 
 class BroadcastResultItem(BaseModel):
+    # [CLASS DOC]
+    # Pydantic per-worker result of a control call: worker_addr, HTTP status, ok flag,
+    # optional error text.
     worker_addr: str
     status: int
     ok: bool
@@ -66,10 +81,16 @@ class BroadcastResultItem(BaseModel):
 
 
 class BroadcastResponse(BaseModel):
+    # [CLASS DOC]
+    # Pydantic wrapper holding a list of BroadcastResultItem.
     results: list[BroadcastResultItem]
 
 
 def _router_error_response(exc: Exception) -> JSONResponse:
+    # [FUNCTION DOC]
+    # HELPER: Maps a router exception to a JSONResponse with an "error" field:
+    # RouterUnreachableError -> 502; RouterKeyRejectedError -> its status code, except
+    # 404 which becomes 401 (unknown key treated as unauthorized); anything else -> 500.
     """Convert router exceptions to HTTP responses."""
     if isinstance(exc, RouterUnreachableError):
         return JSONResponse({"error": str(exc)}, status_code=502)
@@ -80,10 +101,19 @@ def _router_error_response(exc: Exception) -> JSONResponse:
 
 
 def create_app(config: GatewayConfig) -> FastAPI:
+    # [FUNCTION DOC]
+    # Builds and returns the gateway FastAPI app bound to config. Registers a lifespan
+    # that creates a shared httpx client (timeout = router_timeout) and closes it (plus
+    # any lazily created fallback client) on shutdown, all route handlers below as
+    # closures over config, and alias routes: /callback/pause_generation/{id},
+    # /callback/continue_generation/{id}, /v1/chat/completions and /v1/models.
     """Factory that creates the inference gateway FastAPI app."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # [FUNCTION DOC]
+        # HELPER: Async context manager lifespan: stores a new httpx client on app.state
+        # on startup; on shutdown closes it and the fallback client if one was created.
         app.state.http_client = create_httpx_client(timeout=config.router_timeout)
         try:
             yield
@@ -102,6 +132,11 @@ def create_app(config: GatewayConfig) -> FastAPI:
     _fallback_client: httpx.AsyncClient | None = None
 
     def _client() -> httpx.AsyncClient:
+        # [FUNCTION DOC]
+        # HELPER: Returns app.state.http_client, or (when lifespan has not run, e.g.
+        # tests) lazily creates and caches a fallback httpx client in the enclosing
+        # scope.
+        # KNOWN ISSUE: the fallback client is only closed if the lifespan later runs.
         nonlocal _fallback_client
         try:
             return app.state.http_client
@@ -116,9 +151,20 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.get("/health", response_model=GatewayHealthResponse)
     async def health():
+        # [FUNCTION DOC]
+        # GET /health: returns status "ok" and router_addr. No auth, no router call.
         return GatewayHealthResponse(status="ok", router_addr=config.router_addr)
 
     async def _forward_generation_request(request: Request, path: str) -> Response:
+        # [FUNCTION DOC]
+        # HELPER: Shared logic for generation endpoints. Extracts bearer token (401 if
+        # missing), reads raw body, strips hop-by-hop headers, best-effort parses JSON
+        # to read "model" and "stream". Queries the router with token, path, model and
+        # admin key for a worker address (router errors mapped via
+        # _router_error_response). If stream is true, returns a StreamingResponse
+        # (text/event-stream, no-cache, no proxy buffering) that relays SSE bytes from
+        # worker+path using forward_timeout; otherwise forwards the body, and returns
+        # the upstream content, status and content-type unchanged.
         token = extract_bearer_token(request)
         body = await request.body()
         headers = _forwarding_headers(dict(request.headers))
@@ -176,14 +222,26 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.post("/chat/completions")
     async def chat_completions(request: Request):
+        # [FUNCTION DOC]
+        # POST /chat/completions (OpenAI style): delegates to the generation forwarder.
         return await _forward_generation_request(request, "/chat/completions")
 
     @app.post("/v1/messages")
     async def anthropic_messages(request: Request):
+        # [FUNCTION DOC]
+        # POST /v1/messages (Anthropic style): delegates to the generation forwarder.
         return await _forward_generation_request(request, "/v1/messages")
 
     @app.post("/register_model")
     async def register_model(request: Request):
+        # [FUNCTION DOC]
+        # POST /register_model (admin only). Body: model (required, else 400), url,
+        # api_key, data_proxy_addrs. Registers the model in the router (which may
+        # resolve the data proxy list), then concurrently POSTs {name, url, model,
+        # api_key} to /register_model on every resolved data proxy. If any proxy raises
+        # or returns non-200, errors are logged, the model is removed from the router
+        # (best-effort rollback) and 502 with details is returned; otherwise returns the
+        # router's JSON result.
         require_admin_key(request, config.admin_api_key)
         body = await request.json()
         model = body.get("model")
@@ -211,6 +269,9 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
         # Phase 3: parallelize data proxy registration
         async def _register_one(addr: str) -> httpx.Response:
+            # [FUNCTION DOC]
+            # HELPER: Forwards the model registration JSON to one data proxy address and
+            # returns its httpx response.
             return await forward_request(
                 f"{addr}/register_model",
                 json.dumps(
@@ -262,6 +323,9 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.get("/models")
     async def list_models(request: Request):
+        # [FUNCTION DOC]
+        # GET /models (admin only; also /v1/models): fetches model names from the router
+        # and returns GatewayModelsResponse; router errors mapped to HTTP errors.
         require_admin_key(request, config.admin_api_key)
         try:
             names = await list_models_from_router(
@@ -280,6 +344,13 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.post("/rl/start_session")
     async def start_session(request: Request):
+        # [FUNCTION DOC]
+        # POST /rl/start_session (admin only). Asks the router for a worker (no api
+        # key), then forwards the body there. On 201, reads group_id and sessions from
+        # the response and registers them in the router pinned to that worker, returning
+        # the worker's JSON with 201; if that registration (or parsing) fails it logs,
+        # prints a traceback and returns 502. Non-201 worker responses are passed
+        # through unchanged.
         require_admin_key(request, config.admin_api_key)
 
         try:
@@ -344,6 +415,10 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.post("/rl/set_reward")
     async def set_reward(request: Request):
+        # [FUNCTION DOC]
+        # POST /rl/set_reward (session or admin key). Extracts token, best-effort reads
+        # "model" from the body, routes via the router using the token, forwards the
+        # body to the worker and passes the response through.
         token = extract_bearer_token(request)
         body = await request.body()
         headers = _forwarding_headers(dict(request.headers))
@@ -387,6 +462,10 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.post("/pause_generation/{worker_id}", response_model=BroadcastResponse)
     async def pause_generation(worker_id: str, request: Request):
+        # [FUNCTION DOC]
+        # POST /pause_generation/{worker_id} (admin only; also /callback/...). Resolves
+        # the worker id to an address via the router and forwards the body to that
+        # worker's /pause_generation, returning a BroadcastResponse with one item.
         require_admin_key(request, config.admin_api_key)
         try:
             worker_addr = await resolve_worker_addr(
@@ -412,6 +491,9 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.post("/continue_generation/{worker_id}", response_model=BroadcastResponse)
     async def continue_generation(worker_id: str, request: Request):
+        # [FUNCTION DOC]
+        # POST /continue_generation/{worker_id} (admin only; also /callback/...). Same
+        # as pause_generation but targets /continue_generation.
         require_admin_key(request, config.admin_api_key)
         try:
             worker_addr = await resolve_worker_addr(
@@ -439,6 +521,10 @@ def create_app(config: GatewayConfig) -> FastAPI:
         "/release_memory_occupation/{worker_id}", response_model=BroadcastResponse
     )
     async def release_memory_occupation(worker_id: str, request: Request):
+        # [FUNCTION DOC]
+        # POST /release_memory_occupation/{worker_id} (admin only). Resolves the worker
+        # and forwards to its /release_memory_occupation, returning a single-item
+        # BroadcastResponse.
         require_admin_key(request, config.admin_api_key)
         try:
             worker_addr = await resolve_worker_addr(
@@ -464,6 +550,9 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.post("/resume_memory_occupation/{worker_id}", response_model=BroadcastResponse)
     async def resume_memory_occupation(worker_id: str, request: Request):
+        # [FUNCTION DOC]
+        # POST /resume_memory_occupation/{worker_id} (admin only). Same pattern,
+        # targeting /resume_memory_occupation.
         require_admin_key(request, config.admin_api_key)
         try:
             worker_addr = await resolve_worker_addr(
@@ -489,6 +578,13 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.post("/export_trajectories")
     async def export_trajectories(request: Request):
+        # [FUNCTION DOC]
+        # POST /export_trajectories (admin only). Requires a JSON body (400 if invalid)
+        # with a non-empty session_ids list (400 otherwise) and optional group_id.
+        # Routes by the first session id (all sessions assumed pinned to the same
+        # worker), forwards the body and, when the worker returns 200 and group_id is
+        # given, best-effort revokes the session group in the router. Returns the worker
+        # response unchanged.
         require_admin_key(request, config.admin_api_key)
         body = await request.body()
 
@@ -544,6 +640,9 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.post("/set_version/{worker_id}")
     async def set_version(worker_id: str, request: Request):
+        # [FUNCTION DOC]
+        # POST /set_version/{worker_id} (admin only): resolves the worker and forwards
+        # the body to its /set_version, passing the response through.
         require_admin_key(request, config.admin_api_key)
         try:
             worker_addr = await resolve_worker_addr(
@@ -577,6 +676,10 @@ def create_app(config: GatewayConfig) -> FastAPI:
 
     @app.get("/get_version/{worker_id}")
     async def get_version(worker_id: str, request: Request):
+        # [FUNCTION DOC]
+        # GET /get_version/{worker_id} (admin only): resolves the worker and issues a
+        # GET to its /get_version with forwarded headers; passes the response through,
+        # or returns 502 with the error text on any request exception.
         require_admin_key(request, config.admin_api_key)
         try:
             worker_addr = await resolve_worker_addr(

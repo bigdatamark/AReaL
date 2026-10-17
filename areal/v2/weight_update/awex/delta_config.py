@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Runtime configuration helpers for "separation" (separate-GPU) AdamW delta weight
+# transfer implemented by the optional external dte package: world-size validation,
+# wire-dtype agreement across ranks, and an env-derived config that lazily creates the
+# sender-side DeltaTracker.
 # SPDX-License-Identifier: Apache-2.0
 """Runtime configuration for separation AdamW delta transfer.
 
@@ -32,6 +37,10 @@ def validate_dte_world_size(
     infer_world_size: int,
     train_world_size: int,
 ) -> None:
+    # [FUNCTION DOC]
+    # Returns silently only if both inference and training world sizes are positive, sum
+    # to the combined size, and the combined size is a power of two; otherwise raises
+    # ValueError (requirement of awex 0.8.0's recursive sparse scheduler).
     """Reject group sizes unsupported by AWEX's recursive sparse scheduler."""
     if (
         infer_world_size > 0
@@ -49,6 +58,9 @@ def validate_dte_world_size(
 
 
 def _wire_dtype_from_name(name: str) -> torch.dtype:
+    # [FUNCTION DOC]
+    # HELPER: Converts a string such as "torch.bfloat16" to the torch dtype; raises
+    # ValueError if it lacks the "torch." prefix or does not name a dtype.
     prefix = "torch."
     dtype = (
         getattr(torch, name.removeprefix(prefix), None)
@@ -66,6 +78,11 @@ def synchronize_wire_dtypes(
     transfer_plan: Any,
     process_group: Any,
 ) -> tuple[torch.dtype, ...]:
+    # [FUNCTION DOC]
+    # Collects the sorted set of receive-shard dtype names from all operations in
+    # transfer_plan, all-gathers them across process_group (collective; every rank must
+    # call), and returns the sorted union as a tuple of torch dtypes so all ranks agree
+    # on order. Raises ValueError if the union is empty or a name is invalid.
     """Build one stable wire-dtype union shared by every transfer rank."""
     local_dtype_names = sorted(
         {
@@ -98,6 +115,9 @@ def synchronize_wire_dtypes(
 
 @dataclass(frozen=True)
 class DTERuntimeConfig:
+    # [CLASS DOC]
+    # Frozen dataclass of worker-local delta-transfer settings: delta_transfer flag,
+    # separation_weight_update flag and anchor_interval (full-weight anchor period).
     """Worker-local runtime settings for separation delta transfer."""
 
     delta_transfer: bool
@@ -106,6 +126,12 @@ class DTERuntimeConfig:
 
     @classmethod
     def from_env(cls) -> DTERuntimeConfig:
+        # [FUNCTION DOC]
+        # Classmethod snapshotting env: DTE_DELTA_ANCHOR_INTERVAL (fallback
+        # AWEX_DELTA_ANCHOR_INTERVAL, default 0, parsed as int), DTE_DELTA_TRANSFER and
+        # DTE_SEPARATION_WEIGHT_UPDATE (AWEX_* fallbacks) parsed as booleans from
+        # 1/true/yes/on vs 0/false/no/off with whitespace stripped. Invalid values raise
+        # from the env helpers or int parsing.
         """Snapshot DTE runtime settings from the worker environment."""
         anchor_value = get_env_var(
             "DTE_DELTA_ANCHOR_INTERVAL",
@@ -134,10 +160,16 @@ class DTERuntimeConfig:
 
     @property
     def enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: true only when both separation_weight_update and delta_transfer are
+        # set.
         """Whether sparse separated-card transfer is explicitly enabled."""
         return self.separation_weight_update and self.delta_transfer
 
     def create_delta_tracker(self):
+        # [FUNCTION DOC]
+        # Lazily imports dte.core.DeltaTracker (ImportError with install hint if
+        # missing) and returns a new tracker with anchor_interval.
         """Create the sender-side tracker without making DTE a base dependency."""
         try:
             from dte.core import DeltaTracker

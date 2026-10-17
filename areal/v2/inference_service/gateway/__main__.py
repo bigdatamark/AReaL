@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# CLI entrypoint for running the inference gateway as a uvicorn server (python -m
+# areal.v2.inference_service.gateway).
 # SPDX-License-Identifier: Apache-2.0
 
 """CLI entrypoint for the inference gateway: ``python -m areal.v2.inference_service.gateway``."""
@@ -8,6 +11,12 @@ import argparse
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses CLI args (host, port, admin-api-key, router-addr, router-timeout, forward-
+    # timeout, log-level; unknown args ignored), validates the admin key for the bind
+    # host (validate_admin_api_key may reject the default key on public binds), builds a
+    # GatewayConfig, silences noisy HTTP loggers, creates the FastAPI app and runs
+    # uvicorn blocking with access log disabled plus areal's default uvicorn kwargs.
     parser = argparse.ArgumentParser(description="AReaL Inference Gateway")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=8080, help="Bind port")

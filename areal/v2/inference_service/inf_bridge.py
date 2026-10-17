@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# InfBridge: backend-agnostic async HTTP client that implements the async generate
+# engine protocol on top of an inference server (SGLang, vLLM, ...). The backend object
+# (InfBridgeBackend) builds/patches/parses endpoint-specific payloads; this module owns
+# HTTP transport, pause/resume coordination through a shared PauseState, the abort ->
+# resubmit loop with token accumulation, and weight-version tagging.
 # SPDX-License-Identifier: Apache-2.0
 
 """InfBridge -- HTTP client implementing _AsyncGenerateEngine protocol.
@@ -30,6 +36,11 @@ logger = logging.getLogger("InferenceInfBridge")
 
 
 class InfBridge:
+    # [CLASS DOC]
+    # Client bound to one inference server. Attributes: backend, backend_addr (trailing
+    # slash stripped), pause_state, request_timeout, max_resubmit_retries,
+    # resubmit_wait, the current weight version, and a private long-lived
+    # httpx.AsyncClient.
     """Backend-agnostic HTTP client implementing ``_AsyncGenerateEngine`` protocol.
 
     All inference-server specifics are delegated to *backend*
@@ -68,6 +79,9 @@ class InfBridge:
         resubmit_wait: float = 0.5,
         version: int = 0,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores the constructor arguments (see class doc; version is the initial weight
+        # version, default 0) and creates an httpx.AsyncClient with request_timeout.
         self.backend = backend
         self.backend_addr = backend_addr.rstrip("/")
         self.pause_state = pause_state
@@ -78,20 +92,30 @@ class InfBridge:
         self._client = httpx.AsyncClient(timeout=request_timeout)
 
     async def aclose(self) -> None:
+        # [FUNCTION DOC]
+        # Closes the underlying httpx client.
         """Close the underlying HTTP client."""
         await self._client.aclose()
 
     # -- version tracking ---------------------------------------------------
 
     def set_version(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # Sets the weight version used to tag subsequently generated tokens.
         self._version = version
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the current weight version.
         return self._version
 
     # -- pause / resume -----------------------------------------------------
 
     async def pause(self) -> None:
+        # [FUNCTION DOC]
+        # Sets the shared pause flag first (so new/resubmitted requests wait), then
+        # sends the backend's pause request with a 10s timeout and logs. HTTP errors
+        # propagate.
         """Pause generation by setting pause_state and calling the backend."""
         await self.pause_state.set_paused(True)
         http_req = self.backend.get_pause_request()
@@ -99,6 +123,9 @@ class InfBridge:
         logger.info("Pause request sent to %s", self.backend_addr)
 
     async def resume(self) -> None:
+        # [FUNCTION DOC]
+        # Sends the backend's resume request (10s timeout), then clears the pause flag
+        # and logs. HTTP errors propagate (flag remains set in that case).
         """Resume generation by calling the backend and clearing pause_state."""
         http_req = self.backend.get_resume_request()
         await self._send_request(http_req, timeout=10.0)
@@ -106,12 +133,17 @@ class InfBridge:
         logger.info("Resume request sent to %s", self.backend_addr)
 
     async def offload(self) -> None:
+        # [FUNCTION DOC]
+        # Sends the backend's memory-offload request (30s timeout) and logs.
         """Offload model memory on the backend inference server."""
         http_req = self.backend.get_offload_request()
         await self._send_request(http_req, timeout=30.0)
         logger.info("Offload request sent to %s", self.backend_addr)
 
     async def onload(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Sends the backend's memory-onload request for optional tags (30s timeout) and
+        # logs.
         """Reload model memory on the backend inference server."""
         http_req = self.backend.get_onload_request(tags=tags)
         await self._send_request(http_req, timeout=30.0)
@@ -125,6 +157,11 @@ class InfBridge:
         *,
         timeout: float | None = None,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Sends an HttpRequest to backend_addr + endpoint: GET without body when
+        # the method is GET, else POST with the JSON payload. Timeout is the override or
+        # request_timeout. Logs status and first 500 chars of body on >=400, raises
+        # httpx.HTTPStatusError for non-2xx, and returns the parsed JSON body.
         """Send an :class:`HttpRequest` and return the parsed JSON body.
 
         Parameters
@@ -160,6 +197,20 @@ class InfBridge:
     # -- main generation with pause/abort/resubmit --------------------------
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
+        # [FUNCTION DOC]
+        # Generates a completion for a ModelRequest. Raises ValueError unless
+        # gconfig.n_samples is 1 or if the backend-derived max_new_tokens is <= 0.
+        # Builds the request via the backend (no LoRA, current version), then loops up
+        # to max_resubmit_retries times: waits (polling every resubmit_wait s) while
+        # paused; computes remaining budget (stops with "length" if exhausted); lets the
+        # backend patch the payload to append accumulated tokens to the input and shrink
+        # the budget; sends it; appends returned tokens, logprobs, and the current
+        # version per token; concatenates routed_experts arrays along axis 0 when
+        # present. Breaks on stop, tool_calls or length, or when the budget is reached;
+        # an "abort" (from a pause) causes resubmission. A final abort or no attempt is
+        # reported as "length". Returns a ModelResponse with input tokens, accumulated
+        # outputs, versions, stop reason, tokenizer, wall-clock latency and routed
+        # experts.
         """Generate a response for *req* via the configured backend.
 
         Implements the ``_AsyncGenerateEngine`` protocol.

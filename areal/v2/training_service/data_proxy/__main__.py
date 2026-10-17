@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# CLI entrypoint for the training data proxy (python -m
+# areal.v2.training_service.data_proxy).
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -16,6 +19,14 @@ from areal.v2.training_service.data_proxy.config import TrainDataProxyConfig
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses args (host, port default 9082, required comma-separated --worker-addrs,
+    # admin key, idle/warmup/request timeouts, log level; unknown args ignored),
+    # validates the admin key for the bind host, builds TrainDataProxyConfig with
+    # stripped non-empty worker addresses, silences HTTP loggers and runs uvicorn
+    # blocking.
+    # KNOWN ISSUE: --idle-timeout is parsed but never used; warmup_timeout is stored in
+    # the config but nothing reads it.
     parser = argparse.ArgumentParser(description="AReaL Train Data Proxy")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=9082)

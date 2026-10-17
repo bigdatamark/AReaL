@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Copy of SGLang's http_server launch_server flow with AReaL additions (marked blocks):
+# a custom scheduler process function that binds awex/PP bridges, a result IPC channel,
+# an RpcProxy and /awex endpoints. Run as a script, it parses SGLang server args from
+# argv, launches the server and finally kills all child processes.
 # SPDX-License-Identifier: Apache-2.0
 
 # ---------------------------------------------------------------------------
@@ -15,6 +20,13 @@ import sys
 
 
 def areal_launch_server(server_args) -> None:
+    # [FUNCTION DOC]
+    # Launches a full SGLang server: creates the awex result IPC path (exported via env
+    # so scheduler subprocesses inherit it), spawns tokenizer/scheduler/detokenizer
+    # subprocesses using areal_run_scheduler_process, returns early on non-head nodes
+    # (no tokenizer manager), creates an RpcProxy and registers /awex endpoints on
+    # SGLang's app, then runs the HTTP server (with warmup) blocking; closes the proxy
+    # on exit.
     from sglang.srt.entrypoints.engine import Engine, init_tokenizer_manager
     from sglang.srt.entrypoints.http_server import (
         _execute_server_warmup,

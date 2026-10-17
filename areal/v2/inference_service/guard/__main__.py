@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# CLI entrypoint for the inference RPC guard (python -m
+# areal.v2.inference_service.guard).
 # SPDX-License-Identifier: Apache-2.0
 
 """CLI entrypoint: ``python -m areal.v2.inference_service.guard``"""
@@ -16,6 +19,10 @@ from areal.v2.inference_service.guard.app import (
 
 
 def main():
+    # [FUNCTION DOC]
+    # Builds the shared guard base argument parser, parses known args, configures the
+    # module-level guard state from them (returns the bind host) and runs the guard HTTP
+    # server blocking on args.port.
     parser = make_base_parser(
         description=("AReaL RPCGuard — HTTP gateway for coordinating forked workers")
     )

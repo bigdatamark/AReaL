@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Router communication and request forwarding helpers for the inference gateway. Each
+# router call POSTs/GETs JSON to the router service with the admin key as bearer token,
+# optionally reusing a shared httpx client, and most are wrapped by async_httpx_retry
+# (retries transient httpx failures). Defines the two router error types consumed by the
+# gateway app.
 # SPDX-License-Identifier: Apache-2.0
 
 """Router communication and request forwarding utilities for the gateway."""
@@ -18,15 +24,23 @@ logger = logging.getLogger("InferenceGateway")
 
 
 class RouterUnreachableError(Exception):
+    # [CLASS DOC]
+    # Raised when the router cannot be reached, times out, or returns an unexpected HTTP
+    # error.
     """Router service is unreachable or returned an error."""
 
     pass
 
 
 class RouterKeyRejectedError(Exception):
+    # [CLASS DOC]
+    # Raised when the router rejects the lookup: unknown key/session/model/worker (404)
+    # or no healthy workers (503). Carries detail and status_code.
     """Router rejected the API key (unknown key) or has no healthy workers."""
 
     def __init__(self, detail: str, status_code: int = 404):
+        # [FUNCTION DOC]
+        # Stores detail (also the exception message) and status_code (default 404).
         super().__init__(detail)
         self.detail = detail
         self.status_code = status_code
@@ -36,6 +50,9 @@ class RouterKeyRejectedError(Exception):
 async def _use_client(
     client: httpx.AsyncClient | None, timeout: float
 ) -> AsyncGenerator[httpx.AsyncClient, None]:
+    # [FUNCTION DOC]
+    # HELPER: Async context manager yielding the given shared client unchanged, or a
+    # temporary client created with the given timeout that is closed on exit.
     """Yield the shared *client* if provided, otherwise create a temporary one."""
     if client is not None:
         yield client
@@ -56,6 +73,14 @@ async def query_router(
     model: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> str:
+    # [FUNCTION DOC]
+    # POSTs to router /route to get a worker address. Payload: "model" if given; then
+    # "session_id" if given (session pinning, api_key/path ignored), else "api_key" and
+    # "path" when provided. Sends the admin key as bearer if given. 404 or 503 responses
+    # raise RouterKeyRejectedError with the router's "detail"/"error" text; connect,
+    # timeout, transport errors and other HTTP error statuses raise
+    # RouterUnreachableError. Returns the "worker_addr" string from the JSON body.
+    # Retried by async_httpx_retry.
     """Ask the Router for a worker address.
 
     POST ``{router_addr}/route`` with ``{"api_key": ..., "path": ...}``
@@ -137,6 +162,11 @@ async def register_session_in_router(
     group_id: str,
     client: httpx.AsyncClient | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # POSTs {sessions, worker_addr, group_id} to router /register_session with optional
+    # admin bearer so the router pins the sessions/group to the worker. Any failure
+    # (transport, HTTP status, other) is logged and re-raised as RouterUnreachableError.
+    # Returns None.
     """Register session(s) and their group in the Router atomically."""
     try:
         headers = {}
@@ -174,6 +204,9 @@ async def revoke_session_in_router(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Best-effort POST of {group_id} to router /remove_session with admin bearer. Logs a
+    # warning on non-200 responses or exceptions; never raises. Not retried.
     """Best-effort removal of a session group from the Router's registry."""
     try:
         async with _use_client(client, timeout) as c:
@@ -199,6 +232,9 @@ async def get_all_worker_addrs(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> list[str]:
+    # [FUNCTION DOC]
+    # GETs router /workers with admin bearer and returns the list of each worker's
+    # "addr". Any failure is wrapped in RouterUnreachableError. Not used by app.py.
     """Fetch all worker addresses from the Router (for broadcast).
 
     GET ``{router_addr}/workers`` with admin key auth.
@@ -229,6 +265,13 @@ async def register_model_in_router(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> dict:
+    # [FUNCTION DOC]
+    # POSTs {model, url, api_key, data_proxy_addrs} to router /register_model with admin
+    # bearer and returns the router's JSON dict (expected to include resolved
+    # data_proxy_addrs). 503 raises RouterKeyRejectedError; connect errors raise
+    # RouterUnreachableError.
+    # KNOWN ISSUE: other HTTP error statuses and timeouts propagate as raw httpx
+    # exceptions, which the gateway does not catch (results in a 500).
     try:
         async with _use_client(client, timeout) as c:
             resp = await c.post(
@@ -259,6 +302,10 @@ async def route_external_model(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> dict:
+    # [FUNCTION DOC]
+    # POSTs {model: name} to router /route with admin bearer and returns the full JSON
+    # dict. 404/503 raise RouterKeyRejectedError; connect errors raise
+    # RouterUnreachableError; other HTTP errors propagate as httpx exceptions.
     try:
         async with _use_client(client, timeout) as c:
             resp = await c.post(
@@ -287,6 +334,10 @@ async def list_models_from_router(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> list[str]:
+    # [FUNCTION DOC]
+    # GETs router /models with admin bearer and returns the "models" list (empty if
+    # absent). Connect errors raise RouterUnreachableError; other HTTP errors propagate
+    # as httpx exceptions.
     try:
         async with _use_client(client, timeout) as c:
             resp = await c.get(
@@ -309,6 +360,10 @@ async def remove_model_from_router(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Best-effort POST of {name} to router /remove_model with admin bearer, used to roll
+    # back a failed registration. Swallows every exception, so the retry decorator never
+    # sees failures.
     """Remove an external model from the router registry (best-effort rollback)."""
     try:
         async with _use_client(client, timeout) as c:
@@ -332,6 +387,10 @@ async def resolve_worker_addr(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> str:
+    # [FUNCTION DOC]
+    # GETs router /resolve_worker/{worker_id} with admin bearer and returns the
+    # "worker_addr". 404 raises RouterKeyRejectedError (router detail or a default
+    # message); any other failure is wrapped in RouterUnreachableError.
     """Resolve a worker_id to its address via the Router.
 
     GET ``{router_addr}/resolve_worker/{worker_id}`` with admin key auth.
@@ -374,6 +433,9 @@ async def resolve_worker_addr(
 
 
 def _forwarding_headers(raw_headers: dict[str, str]) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns a copy of the header dict without hop-by-hop headers host,
+    # content-length and transfer-encoding (case-insensitive).
     """Build headers to forward to data proxy.
 
     Strips hop-by-hop headers (``host``, ``content-length``,
@@ -391,6 +453,13 @@ async def forward_sse_stream(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> AsyncGenerator[bytes, None]:
+    # [FUNCTION DOC]
+    # Async generator relaying a streaming POST to upstream_url. Always opens its own
+    # client (timeout from the argument; None means no timeout) and yields raw upstream
+    # byte chunks as they arrive. If upstream status is not 200, reads the body (JSON or
+    # decoded text) and yields one SSE "data:" event with error and status_code, then
+    # stops. Transport or other exceptions are logged and yielded as an SSE error event.
+    # The client argument is accepted but unused.
     """True SSE streaming proxy — yields bytes as they arrive from upstream.
 
     Uses ``httpx.AsyncClient.stream()`` so the client sees tokens
@@ -444,6 +513,10 @@ async def forward_request(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> httpx.Response:
+    # [FUNCTION DOC]
+    # POSTs the raw body with filtered headers to upstream_url (shared or temporary
+    # client, given timeout) and returns the full httpx response regardless of status.
+    # Retried on transient errors by async_httpx_retry.
     """Forward a non-streaming request to upstream, return full response."""
     fwd_headers = _forwarding_headers(headers)
     async with _use_client(client, timeout) as c:
@@ -461,6 +534,10 @@ async def broadcast_to_workers(
     *,
     client: httpx.AsyncClient | None = None,
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Concurrently POSTs the body to addr+path for every worker address (default timeout
+    # 10s) and returns a list of dicts with worker_addr, status and ok (status < 400).
+    # Exceptions become status 502, ok False and an error string. Never raises.
     """Broadcast a request to all workers (best-effort).
 
     Returns a list of per-worker result dicts::
@@ -471,6 +548,8 @@ async def broadcast_to_workers(
     """
 
     async def _call(addr: str) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Performs the POST for one worker and builds its result dict.
         try:
             async with _use_client(client, timeout) as c:
                 resp = await c.post(

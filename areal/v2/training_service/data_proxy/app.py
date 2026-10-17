@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# FastAPI app factory for the training data proxy. Topology discovery and dispatcher
+# creation happen in the lifespan; engine routes come from engine.py.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -17,12 +20,24 @@ logger = logging.getLogger("TrainDataProxy")
 
 
 def _raw_json_response(content: bytes) -> RawResponse:
+    # [FUNCTION DOC]
+    # HELPER: Wraps already-serialized JSON bytes in a raw Response with
+    # application/json media type (no re-encoding).
     return RawResponse(content=content, media_type="application/json")
 
 
 def create_app(config: TrainDataProxyConfig) -> FastAPI:
+    # [FUNCTION DOC]
+    # Creates the app with a lifespan that logs, discovers the worker topology (timeout
+    # min(request_timeout, 30s); failure aborts startup), builds a Dispatcher, stores
+    # config/topology/dispatcher on app.state, and on shutdown closes the dispatcher.
+    # Registers engine routes and returns the app.
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # [FUNCTION DOC]
+        # HELPER: Startup/shutdown logic described above.
+        # KNOWN ISSUE: dispatcher.close is not in a finally block, so it is skipped if
+        # the server exits via an exception.
         logger.info(
             "Train data proxy starting with %d workers", len(config.worker_addrs)
         )

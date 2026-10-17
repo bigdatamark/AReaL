@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# CLI entrypoint for a training worker (python -m areal.v2.training_service.worker).
 # SPDX-License-Identifier: Apache-2.0
 
 """CLI entrypoint for the train worker."""
@@ -8,6 +10,12 @@ import argparse
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses args (host, port default 30000, admin key, log level; unknown args
+    # ignored), validates the admin key for the bind host, builds TrainWorkerConfig,
+    # silences HTTP loggers, creates the Flask app and runs Flask's built-in threaded
+    # server (blocking).
+    # KNOWN ISSUE: log_level is accepted but never applied to the server.
     parser = argparse.ArgumentParser(description="AReaL Train Worker")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=30000, help="Bind port")

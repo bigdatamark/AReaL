@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Partitioned HTTP dispatcher for one 5D-parallel worker group, mirroring
+# TrainController semantics: tensor-batch inputs are partitioned across DP groups with
+# balanced greedy partitioning, DP heads receive their slice while non-head ranks
+# receive an empty envelope (so they still enter the endpoint and join NCCL
+# collectives), DP-head results are merged back to original order, and eval batches can
+# be padded. Request bodies are JSON with serialized "args"/"kwargs" (areal RPC
+# serialization).
 # SPDX-License-Identifier: Apache-2.0
 
 """Partitioned HTTP dispatcher for one 5D-parallel worker group.
@@ -49,6 +57,8 @@ logger = logging.getLogger("TrainDataProxy")
 
 @dataclass
 class _WorkerResponse:
+    # [CLASS DOC]
+    # Internal record of a worker HTTP response: addr, status code, raw content bytes.
     """Internal container for a validated worker HTTP response."""
 
     addr: str
@@ -57,6 +67,9 @@ class _WorkerResponse:
 
 
 class Dispatcher:
+    # [CLASS DOC]
+    # Holds the topology, request timeout and a shared aiohttp session; provides fluent
+    # dispatch(path) and broadcast(path) builders plus raw HTTP helpers.
     """Partitioned HTTP dispatcher for one 5D-parallel worker group."""
 
     def __init__(
@@ -66,6 +79,9 @@ class Dispatcher:
         *,
         _session: Any | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores topology and timeout; uses the injected _session (tests) or creates an
+        # aiohttp ClientSession with a total timeout of request_timeout.
         self._topology = topology
         self._request_timeout = request_timeout
         self._session = _session or aiohttp.ClientSession(
@@ -73,6 +89,8 @@ class Dispatcher:
         )
 
     async def close(self) -> None:
+        # [FUNCTION DOC]
+        # Closes the aiohttp session.
         """Close the underlying HTTP session."""
         await self._session.close()
 
@@ -81,6 +99,8 @@ class Dispatcher:
     # ------------------------------------------------------------------
 
     def dispatch(self, path: str, *, pad_eval_batch: bool = False) -> DispatchRequest:
+        # [FUNCTION DOC]
+        # Returns a DispatchRequest for path; pad_eval_batch enables eval padding.
         """Return a dispatch builder for *path*.
 
         Dispatch operations route tensors via DP-aware partitioning
@@ -93,6 +113,8 @@ class Dispatcher:
         return DispatchRequest(self, path, pad_eval_batch=pad_eval_batch)
 
     def broadcast(self, path: str) -> BroadcastRequest:
+        # [FUNCTION DOC]
+        # Returns a BroadcastRequest for path.
         """Return a broadcast builder for *path*.
 
         Broadcast operations send the same request to every worker
@@ -105,11 +127,16 @@ class Dispatcher:
     # ------------------------------------------------------------------
 
     async def _do_get(self, addr: str, path: str) -> _WorkerResponse:
+        # [FUNCTION DOC]
+        # HELPER: GETs addr+path and returns a _WorkerResponse with full body.
         async with self._session.get(f"{addr}{path}") as resp:
             content = await resp.read()
             return _WorkerResponse(addr=addr, status=resp.status, content=content)
 
     async def _do_post(self, addr: str, path: str, body: bytes) -> _WorkerResponse:
+        # [FUNCTION DOC]
+        # HELPER: POSTs body bytes as JSON content type to addr+path and returns a
+        # _WorkerResponse.
         async with self._session.post(
             f"{addr}{path}",
             data=body,
@@ -123,6 +150,10 @@ class Dispatcher:
         tasks: Sequence[Awaitable[_WorkerResponse]],
         addrs: list[str],
     ) -> list[_WorkerResponse]:
+        # [FUNCTION DOC]
+        # HELPER: Awaits all tasks concurrently; raises RuntimeError for the first task
+        # that raised (by index) or the first response with status >= 400; otherwise
+        # returns responses in task order.
         """Run *tasks* concurrently and validate every response."""
         raw = await asyncio.gather(*tasks, return_exceptions=True)
         validated: list[_WorkerResponse] = []
@@ -135,6 +166,8 @@ class Dispatcher:
 
 
 class DispatchRequest:
+    # [CLASS DOC]
+    # Builder for DP-aware dispatch on one path (slots: dispatcher, path, pad flag).
     """Builder for DP-aware dispatch operations.
 
     Tensor payloads are partitioned across DP groups.  Non-partitionable
@@ -151,11 +184,16 @@ class DispatchRequest:
     def __init__(
         self, dispatcher: Dispatcher, path: str, *, pad_eval_batch: bool = False
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores dispatcher, path and pad_eval_batch.
         self._dispatcher = dispatcher
         self._path = path
         self._pad_eval_batch = pad_eval_batch
 
     async def get(self) -> bytes:
+        # [FUNCTION DOC]
+        # GETs path from all DP heads and returns the first head's body. Raises on any
+        # error.
         """GET from all DP heads, return the first response."""
         d = self._dispatcher
         dp_head_addrs = [d._topology.workers[i].addr for i in d._topology.dp_heads]
@@ -164,6 +202,12 @@ class DispatchRequest:
         return responses[0].content
 
     async def post(self, body: bytes) -> bytes:
+        # [FUNCTION DOC]
+        # Parses body JSON, deserializes args (default empty list) and kwargs (default
+        # empty dict), pops "group_size" (default 1) from kwargs. If the args/kwargs
+        # contain a non-empty list of tensor-like items, performs partitioned tensor
+        # dispatch; otherwise does a scalar fan-out of the original body. Returns
+        # response bytes.
         """POST with tensor-aware dispatch.
 
         If the payload contains partitionable tensor batches, it is split
@@ -195,6 +239,11 @@ class DispatchRequest:
         return await self._scalar_fan_out(body)
 
     async def _scalar_fan_out(self, body: bytes) -> bytes:
+        # [FUNCTION DOC]
+        # HELPER: POSTs the original body to every DP head and an empty envelope to all
+        # other workers (every rank must enter the endpoint for collectives), validates
+        # all, and returns the first DP head's response body. Raises RuntimeError if no
+        # DP heads.
         """POST to all workers; DP heads get *body*, non-heads get empty.
 
         Compute routes on the worker side use ``require_broadcast=True``,
@@ -230,6 +279,12 @@ class DispatchRequest:
         *,
         pad_eval_batch: bool,
     ) -> bytes:
+        # [FUNCTION DOC]
+        # HELPER: Optionally pads positional args to a multiple of dp_size times
+        # group_size, partitions inputs, fans out to workers, merges the DP-head results
+        # back into original order and returns JSON bytes {"status": "success",
+        # "result": serialized}.
+        # KNOWN ISSUE: padding is applied only to positional args, not kwargs.
         d = self._dispatcher
         dp_size = d._topology.dp_size
 
@@ -257,10 +312,20 @@ class DispatchRequest:
         kwargs: dict[str, Any],
         group_size: int,
     ) -> tuple[list[list[Any]], dict[str, list[Any]], list[list[int]]]:
+        # [FUNCTION DOC]
+        # HELPER: Splits each arg/kwarg into dp_size pieces. The first tensor-like item
+        # is partitioned with _dispatch_tensors (respecting group_size), which also
+        # fixes the group index lists; later tensor-like items are split with the same
+        # indices; other values are replicated per DP rank. Raises RuntimeError if no
+        # tensor-like item was found. Returns (per-arg splits, per-kwarg splits, group
+        # indices).
         dp_size = self._dispatcher._topology.dp_size
         group_indices: list[list[int]] | None = None
 
         def _split(item: Any) -> list[Any]:
+            # [FUNCTION DOC]
+            # HELPER: Splits or replicates one value as described, recording group
+            # indices in the enclosing scope on first use.
             nonlocal group_indices
             if _is_tensor_like(item):
                 if group_indices is None:
@@ -291,6 +356,11 @@ class DispatchRequest:
         dp_args: list[list[Any]],
         dp_kwargs: dict[str, list[Any]],
     ) -> list[Any]:
+        # [FUNCTION DOC]
+        # HELPER: Builds one payload per worker: DP heads (in order of dp_heads) get the
+        # next DP slice of args/kwargs serialized; other workers get the empty envelope.
+        # POSTs all concurrently, validates, then deserializes "result" from each DP
+        # head's response and returns the list in dp_heads order.
         d = self._dispatcher
         dp_head_set = set(d._topology.dp_heads)
 
@@ -331,6 +401,8 @@ class DispatchRequest:
 
 
 class BroadcastRequest:
+    # [CLASS DOC]
+    # Builder sending the same request to every worker (slots: dispatcher, path).
     """Builder for broadcast operations across all workers.
 
     Every worker receives the same request and all responses are
@@ -342,10 +414,14 @@ class BroadcastRequest:
     __slots__ = ("_dispatcher", "_path")
 
     def __init__(self, dispatcher: Dispatcher, path: str) -> None:
+        # [FUNCTION DOC]
+        # Stores dispatcher and path.
         self._dispatcher = dispatcher
         self._path = path
 
     async def get(self) -> list[bytes]:
+        # [FUNCTION DOC]
+        # GETs path from every worker and returns all bodies in worker order.
         """GET from every worker, return all responses."""
         d = self._dispatcher
         addrs = [w.addr for w in d._topology.workers]
@@ -354,6 +430,8 @@ class BroadcastRequest:
         return [r.content for r in responses]
 
     async def post(self, body: bytes) -> list[bytes]:
+        # [FUNCTION DOC]
+        # POSTs the same body to every worker and returns all bodies in worker order.
         """POST the same body to every worker, return all responses."""
         d = self._dispatcher
         addrs = [w.addr for w in d._topology.workers]
@@ -368,6 +446,8 @@ class BroadcastRequest:
 
 
 def _empty_payload() -> bytes:
+    # [FUNCTION DOC]
+    # HELPER: Returns JSON bytes with serialized empty args list and empty kwargs dict.
     """Empty args/kwargs envelope for non-DP-head workers.
 
     Non-heads only need to enter the endpoint to participate in
@@ -379,6 +459,9 @@ def _empty_payload() -> bytes:
 
 
 def _raise_for_worker(resp: _WorkerResponse) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Raises RuntimeError with worker addr, status and decoded body if status >=
+    # 400.
     if resp.status >= 400:
         text = resp.content.decode("utf-8", errors="replace")
         raise RuntimeError(f"Worker {resp.addr} returned {resp.status}: {text}")
@@ -387,6 +470,10 @@ def _raise_for_worker(resp: _WorkerResponse) -> None:
 def _contains_partitionable_tensor_batch(
     args: list[Any], kwargs: dict[str, Any]
 ) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if any positional arg or kwarg value is a non-empty list that is
+    # tensor-like (list of per-item tensor dicts); packed tensor dicts return False and
+    # use scalar fan-out instead.
     """Return True when payload matches list-of-items partition contract.
 
     The current partitioner (``_dispatch_tensors``) operates on list-like batches of
@@ -396,6 +483,8 @@ def _contains_partitionable_tensor_batch(
     """
 
     def _is_partitionable(v: Any) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Checks one value against the list-of-tensor-items contract.
         return isinstance(v, list) and len(v) > 0 and _is_tensor_like(v)
 
     return any(_is_partitionable(v) for v in args) or any(

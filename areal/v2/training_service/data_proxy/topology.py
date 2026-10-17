@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Discovers the parallel topology of a worker group by querying each worker's /topology
+# endpoint and building DP grouping information.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -14,6 +17,9 @@ logger = logging.getLogger("TrainDataProxy")
 
 @dataclass
 class WorkerInfo:
+    # [CLASS DOC]
+    # Dataclass describing one worker rank: addr, global rank, world_size, dp_rank,
+    # dp_size, whether it is the head (data-receiving) rank of its DP group, local_rank.
     addr: str
     rank: int = 0
     world_size: int = 1
@@ -25,6 +31,9 @@ class WorkerInfo:
 
 @dataclass
 class WorkerTopology:
+    # [CLASS DOC]
+    # Dataclass describing the whole group: workers (in worker_addrs order), indices of
+    # DP heads, dp_size, dp_groups (worker indices per dp rank) and pp/tp/cp/ep sizes.
     workers: list[WorkerInfo] = field(default_factory=list)
     dp_heads: list[int] = field(default_factory=list)
     dp_size: int = 1
@@ -39,10 +48,20 @@ async def discover_topology(
     worker_addrs: list[str],
     timeout: float = 10.0,
 ) -> WorkerTopology:
+    # [FUNCTION DOC]
+    # Concurrently GETs /topology from every address using one aiohttp session with a
+    # total timeout. Any failure (exception or HTTP >= 400) raises RuntimeError naming
+    # the address. Parallel sizes (pp/tp/cp/ep) are taken from the first response; per-
+    # worker fields default to a single-rank layout when absent. dp_size comes from the
+    # first worker; dp_groups lists worker indices by dp_rank (extended if a rank
+    # exceeds dp_size). Returns WorkerTopology.
     workers: list[WorkerInfo] = []
     meta: dict[str, int] = {}
 
     async def _fetch(session: aiohttp.ClientSession, addr: str) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: GETs addr/topology and returns the decoded JSON (ignoring content
+        # type); raises RuntimeError with status and body on HTTP errors.
         async with session.get(f"{addr}/topology") as resp:
             if resp.status >= 400:
                 text = await resp.text()

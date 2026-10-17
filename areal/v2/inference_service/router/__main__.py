@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# CLI entrypoint for running the inference router as a uvicorn server (python -m
+# areal.v2.inference_service.router).
 # SPDX-License-Identifier: Apache-2.0
 
 """CLI entrypoint for the router: ``python -m areal.v2.inference_service.router``."""
@@ -8,6 +11,14 @@ import argparse
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses CLI args (host, port default 8081, admin-api-key, poll-interval, worker-
+    # health-timeout, routing-strategy round_robin|least_busy, log-level; unknown args
+    # ignored), validates the admin key for the bind host, builds a RouterConfig,
+    # silences HTTP loggers, creates the app and runs uvicorn blocking without access
+    # log.
+    # KNOWN ISSUE: "least_busy" is offered as a CLI choice but get_strategy raises
+    # NotImplementedError for it.
     parser = argparse.ArgumentParser(description="AReaL Router")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=8081, help="Bind port")

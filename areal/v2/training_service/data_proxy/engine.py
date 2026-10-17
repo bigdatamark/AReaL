@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Registers the training data proxy's HTTP routes: health/topology info plus engine
+# routes that either DP-dispatch (compute on tensor batches) or broadcast to all
+# workers, returning worker JSON bytes unchanged. Handlers read the dispatcher and
+# topology from app.state.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -15,10 +20,23 @@ def register_engine_routes(
     *,
     _raw_json_response: Callable[[bytes], Any],
 ) -> None:
+    # [FUNCTION DOC]
+    # Defines route factories and registers: DP-dispatched POST /train_batch,
+    # /forward_batch, /eval_batch (padded), /sft/train, /sft/evaluate (padded),
+    # /ppo/actor/compute_logp, /ppo/actor/compute_advantages, /ppo/actor/update,
+    # /ppo/critic/compute_values, /ppo/critic/update, /rw/train, /rw/evaluate (padded);
+    # broadcast POST /train, /eval, /offload, /onload, /set_version, /save, /load,
+    # /step_lr_scheduler, /optimizer_zero_grad, /optimizer_step, /get_device_stats,
+    # /config_perf_tracer, /save_perf_tracer, /clear_batches (broadcast routes return
+    # the first worker's response); GET /get_version (DP heads, first response) and GET
+    # /export_stats (broadcast, first response). _raw_json_response wraps bytes into a
+    # response. Any dispatch error yields 502 with {"error"}.
     # -- core routes -------------------------------------------------------
 
     @app.get("/health")
     async def health():
+        # [FUNCTION DOC]
+        # GET /health: status ok, worker_count, dp_size and dp_heads from the topology.
         topology = app.state.topology
         return {
             "status": "ok",
@@ -29,6 +47,9 @@ def register_engine_routes(
 
     @app.get("/topology")
     async def topology():
+        # [FUNCTION DOC]
+        # GET /topology: full topology including per-worker dicts, dp groups and
+        # parallel sizes.
         t = app.state.topology
         return {
             "workers": [asdict(w) for w in t.workers],
@@ -44,7 +65,13 @@ def register_engine_routes(
     # -- dispatch helpers --------------------------------------------------
 
     def _dispatch_compute_route(path: str, *, pad_eval_batch: bool = False):
+        # [FUNCTION DOC]
+        # HELPER: Returns a POST handler that dispatches the body through DP-aware
+        # dispatch for path (optionally padded) and returns the merged bytes, or 502 on
+        # error.
         async def handler(request: Request):
+            # [FUNCTION DOC]
+            # HELPER: Request handler implementing the behavior above.
             dispatcher = app.state.dispatcher
             try:
                 body = await request.body()
@@ -59,7 +86,15 @@ def register_engine_routes(
         return handler
 
     def _broadcast_post_route(path: str, *, require_non_empty: bool = False):
+        # [FUNCTION DOC]
+        # HELPER: Returns a POST handler that broadcasts the body to all workers and
+        # returns the first worker's response; with require_non_empty raises (502) if
+        # there are no responses.
+        # KNOWN ISSUE: without require_non_empty an empty worker list raises IndexError,
+        # which is still reported as 502, so the flag has little effect.
         async def handler(request: Request):
+            # [FUNCTION DOC]
+            # HELPER: Request handler implementing the behavior above.
             dispatcher = app.state.dispatcher
             try:
                 body = await request.body()
@@ -73,7 +108,12 @@ def register_engine_routes(
         return handler
 
     def _dispatch_get_route(path: str):
+        # [FUNCTION DOC]
+        # HELPER: Returns a GET handler that queries DP heads and returns the first
+        # body, or 502 on error.
         async def handler():
+            # [FUNCTION DOC]
+            # HELPER: Request handler implementing the behavior above.
             dispatcher = app.state.dispatcher
             try:
                 return _raw_json_response(await dispatcher.dispatch(path).get())
@@ -83,7 +123,12 @@ def register_engine_routes(
         return handler
 
     def _broadcast_get_route(path: str, *, require_non_empty: bool = False):
+        # [FUNCTION DOC]
+        # HELPER: Returns a GET handler that queries every worker and returns the first
+        # body; 502 on error or (with require_non_empty) no responses.
         async def handler():
+            # [FUNCTION DOC]
+            # HELPER: Request handler implementing the behavior above.
             dispatcher = app.state.dispatcher
             try:
                 responses = await dispatcher.broadcast(path).get()
