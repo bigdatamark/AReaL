@@ -1,3 +1,14 @@
+# [PACKAGE DOC]
+# FP8 blockwise quantization package for Megatron weight conversion (Megatron ->
+# inference engine weight sync and FP8 checkpoint loading). Re-exports the public API of
+# its submodules: high-level quantize/dequantize of named params, Triton kernels, UE8M0
+# (power-of-two scale) helpers for DeepGEMM on Blackwell, DeepGEMM capability flags,
+# block-size config parsing and the FP8BlockwiseTensorHelper wrapper. No logic of its
+# own; importing it imports triton/torch via the submodules.
+# KNOWN ISSUE: ENABLE_JIT_DEEPGEMM, DEEPGEMM_BLACKWELL and DEEPGEMM_SCALE_UE8M0 are
+# pulled in with a from-import, which triggers deepgemm's lazy module __getattr__ at
+# package import time, so the values are snapshotted eagerly (querying CUDA) rather than
+# lazily as deepgemm.py intends.
 # SPDX-License-Identifier: Apache-2.0
 
 # FP8 quantization utilities

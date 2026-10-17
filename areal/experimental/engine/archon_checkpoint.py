@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Checkpoint I/O for the experimental ArchonEngine using torch.distributed.checkpoint
+# (DCP). Supports: HuggingFace safetensors export (sharded DCP write through the
+# engine's state-dict adapter, then distributed consolidation into model-XXXXX-of-
+# YYYYY.safetensors files plus an index JSON, written to a temp dir and atomically
+# renamed; optional async via AsyncCheckpointManager), HuggingFace loading (including
+# FP8 blockwise checkpoints dequantized on load, and the pipeline-parallel tied-
+# embedding case), native DCP save/load of model + optimizer for recovery, and simple
+# per-rank optimizer state files. All functions are collective over the engine's CPU
+# (gloo) group and assume a shared filesystem. Logs via "ArchonCheckpoint" and the
+# engine's logger.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -40,6 +51,14 @@ def _consolidate_shards_distributed(
     num_threads: int = 8,
     process_group: dist.ProcessGroup | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Replacement for torch's consolidate_safetensors_files_on_every_rank that
+    # barriers on the given process group (torch's version uses the default NCCL group
+    # and can deadlock when run from a background thread). Assigns output file indices
+    # round-robin (index % world_size == rank), consolidates this rank's files from
+    # input_dir's sharded safetensors into output_dir with torch's private
+    # _consolidate_safetensors_files (num_threads workers), then barriers on
+    # process_group. Writes files; collective.
     """Distribute safetensors consolidation across ranks, with correct PG barrier.
 
     This replaces ``consolidate_safetensors_files_on_every_rank`` which has a bug:
@@ -84,6 +103,12 @@ def _consolidate_shards_distributed(
 
 
 class DCPState(Stateful):
+    # [CLASS DOC]
+    # torch DCP Stateful wrapping one or more model parts (pipeline stages on this rank)
+    # and an optional optimizer. State: model_parts (list), optimizer, _is_pp (more than
+    # one part). Optimizer state is flattened (keys are parameter FQNs) to avoid index
+    # collisions across PP stages; loading is non-strict in PP mode and strict
+    # otherwise.
     """DCP wrapper for archon models.
 
     Key design decisions:
@@ -100,6 +125,9 @@ class DCPState(Stateful):
         model_parts: list[nn.Module] | nn.Module,
         optimizer: torch.optim.Optimizer | None = None,
     ):
+        # [FUNCTION DOC]
+        # Normalize model_parts to a list, store the optimizer and set _is_pp when there
+        # are multiple parts.
         """Initialize DCPState.
 
         Args:
@@ -115,6 +143,11 @@ class DCPState(Stateful):
         self._is_pp = len(self.model_parts) > 1
 
     def state_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Return {"model": merged model state dicts of all parts, "optim": merged
+        # flattened optimizer state dicts per part (only if an optimizer is set)}, both
+        # offloaded to CPU. Uses torch's get_model_state_dict / get_optimizer_state_dict
+        # (DTensor-sharded entries).
         """Get state dict for model parts and optimizer using DCP utilities."""
         # Merge model state dicts from all parts
         # cpu_offload=True ensures tensors are on CPU for DCP filesystem writer
@@ -145,6 +178,10 @@ class DCPState(Stateful):
         return state
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # Load the "model" entry into every part (strict unless PP) and, if an optimizer
+        # is set and "optim" exists, load the flattened optimizer state for every part
+        # with the same strictness. Mutates models/optimizer in place.
         """Load state dicts onto model parts and optimizer."""
         model_state = state_dict["model"]
 
@@ -165,6 +202,8 @@ class DCPState(Stateful):
 
 
 def _validate_model_initialized(engine: ArchonEngine) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Raise RuntimeError if the engine has no model parts.
     """Validate that model is properly initialized for checkpoint operations."""
     if not engine.model_parts:
         raise RuntimeError("Model parts not initialized")
@@ -174,6 +213,9 @@ def _get_merged_state_dict(
     engine: ArchonEngine,
     options: StateDictOptions,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Return the engine's model state dict with the given options; in PP mode
+    # merges the state dicts of all local model parts, else reads engine.model.
     """Get merged model state dict, handling PP mode."""
     if engine.parallel_dims.pp_enabled:
         state_dict: dict = {}
@@ -187,6 +229,11 @@ def _get_merged_state_dict(
 def _write_safetensors_index(
     output_dir: str, fqn_to_index_mapping: dict[str, int]
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Write model.safetensors.index.json in output_dir mapping each FQN to
+    # "model-<idx>-of-<max>.safetensors" (5-digit zero padded) and total_size computed
+    # by reading each referenced file's safetensors header (8-byte little-endian length
+    # + JSON, summing data_offsets spans). Raises if files are missing.
     """Write model.safetensors.index.json for multi-file HF checkpoints."""
     max_index = max(fqn_to_index_mapping.values())
     weight_map = {
@@ -224,6 +271,18 @@ def save_model_to_hf(
     processor: AutoProcessor | None = None,
     async_mgr: AsyncCheckpointManager | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Export the engine's model as a HuggingFace checkpoint directory at path. Raises
+    # RuntimeError if the model is not initialized or there is no state_dict_adapter.
+    # Rank 0 removes any stale "<path>.tmp", barrier, every rank creates the tmp dir;
+    # gets the sharded (non-full) model state dict (CPU offloaded unless async),
+    # converts it to HF names with the adapter, and writes it with a
+    # HuggingFaceStorageWriter into "<tmp>/sharded" using the adapter's
+    # fqn_to_index_mapping (consolidation mapping falls back to a single file index 1).
+    # Consolidation (see nested helper) runs immediately after dcp.save in sync mode, or
+    # as post_fn after async_mgr.save in async mode (using the manager's consolidation
+    # process group). Sync mode ends with a CPU-group barrier. tokenizer / processor are
+    # saved alongside when given.
     """Save model in HuggingFace format using DCP infrastructure.
 
     Args:
@@ -277,6 +336,13 @@ def save_model_to_hf(
     )
 
     def _consolidate_and_cleanup(process_group=consolidation_pg):
+        # [FUNCTION DOC]
+        # HELPER: Collective consolidation step: merge sharded files into tmp_path via
+        # _consolidate_shards_distributed on process_group (errors are logged and re-
+        # raised to avoid partial-rank deadlocks); then group rank 0 writes the
+        # safetensors index, removes the sharded dir, saves model config, tokenizer and
+        # processor, deletes any existing final path and renames tmp to path; finishes
+        # with a barrier.
         try:
             _consolidate_shards_distributed(
                 input_dir=sharded_dir,
@@ -328,6 +394,11 @@ def _check_fp8_shard_compatibility(
     hf_state_dict: dict[str, torch.Tensor],
     scale_keys: list[str],
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Raise ValueError if any FP8 weight (key derived by removing "_scale_inv"
+    # from each scale key) in hf_state_dict is a DTensor sharded on a dimension other
+    # than 0 (TP/ETP column sharding is not supported for FP8 dequant). No-op if DTensor
+    # imports fail.
     """Fail fast if any FP8 weight has non-Shard(0) DTensor placement.
 
     Must be called before ``_prepare_fp8_state_dict`` / ``dcp.load`` to
@@ -356,6 +427,17 @@ def _check_fp8_shard_compatibility(
 
 
 def load_model_from_hf(engine: ArchonEngine, path: str) -> None:
+    # [FUNCTION DOC]
+    # Load HF safetensors weights at path into the engine's model. Raises RuntimeError
+    # without model or adapter. Detects FP8 checkpoints by their scale_inv keys. Builds
+    # a sharded CPU state dict template, converts to HF names; in PP with weight tying
+    # on the last stage, adds an embed_tokens placeholder (shaped like output.weight) so
+    # the tied weight is read. For FP8: validates sharding and adds FP8 + scale
+    # placeholders. Loads via dcp.load with the adapter's HF storage reader, dequantizes
+    # FP8 to engine.config.dtype, converts back to Archon names, keeps only local keys
+    # in PP mode, logs (rank 0) missing keys (ignoring rotary_emb) and unexpected keys
+    # as warnings, and applies non-strictly with set_model_state_dict to each part (PP)
+    # or the whole model. Ends with a CPU-group barrier.
     """Load model from HuggingFace format using DCP infrastructure."""
     _validate_model_initialized(engine)
     if engine.state_dict_adapter is None:
@@ -466,6 +548,10 @@ def load_model_from_hf(engine: ArchonEngine, path: str) -> None:
 
 
 def save_to_dcp(engine: ArchonEngine, path: str, with_optim: bool) -> None:
+    # [FUNCTION DOC]
+    # Save model parts (and optimizer when with_optim) as a native DCP checkpoint at
+    # path via DCPState; creates the directory; ends with a CPU-group barrier.
+    # Collective.
     """Save model (and optionally optimizer) using DCP format."""
     _validate_model_initialized(engine)
 
@@ -480,6 +566,9 @@ def save_to_dcp(engine: ArchonEngine, path: str, with_optim: bool) -> None:
 
 
 def load_from_dcp(engine: ArchonEngine, path: str, with_optim: bool) -> None:
+    # [FUNCTION DOC]
+    # Load model parts (and optimizer when with_optim) from a DCP checkpoint at path via
+    # DCPState, in place; ends with a CPU-group barrier. Collective.
     """Load model (and optionally optimizer) from DCP format."""
     _validate_model_initialized(engine)
 
@@ -492,6 +581,10 @@ def load_from_dcp(engine: ArchonEngine, path: str, with_optim: bool) -> None:
 
 
 def save_optimizer_state(engine: ArchonEngine, path: str) -> None:
+    # [FUNCTION DOC]
+    # Save this rank's optimizer.state_dict() with torch.save to
+    # "<path>/optim_world_size_<W>_rank_<R>.pt" then barrier. Asserts an optimizer
+    # exists and torch.distributed is initialized. Does not create path.
     """Save optimizer state to disk (sharded by rank)."""
     assert engine.optimizer is not None
     assert dist.is_initialized()
@@ -505,6 +598,10 @@ def save_optimizer_state(engine: ArchonEngine, path: str) -> None:
 
 
 def load_optimizer_state(engine: ArchonEngine, path: str) -> None:
+    # [FUNCTION DOC]
+    # Load this rank's optimizer state file written by save_optimizer_state (same world
+    # size required; weights_only=False unpickling) into the optimizer, then barrier.
+    # Asserts optimizer and distributed init.
     """Load optimizer state from disk (sharded by rank)."""
     assert engine.optimizer is not None
     assert dist.is_initialized()

@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# AReaL's vLLM OpenAI-compatible API server entrypoint. Defines a FastAPI router with
+# AReaL control endpoints (disk / XCCL weight updates, LoRA updates and runtime LoRA
+# name registration, weight-update group init, pause/continue generation) that call into
+# vLLM workers through engine_client.collective_rpc (methods implemented by
+# vllm_worker_extension), plus a pause-aware override of POST /v1/completions. When run
+# as __main__, monkey patches vLLM's build_app to drop the stock /v1/completions route
+# and mount this router, parses vLLM serve CLI args and runs the server (or headless
+# mode). Module state: a global asyncio Event gating new completions (set = running).
+# Logs via vLLM's init_logger("areal_vllm_server") at INFO.
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -34,6 +44,10 @@ _generation_run_event.set()  # Initially not paused
 
 
 class UpdateWeightsRequest(OpenAIBaseModel):
+    # [CLASS DOC]
+    # Pydantic request body for /areal_update_weights: model_path (str), load_format
+    # (default "auto"), abort_all_requests (bool, default False). Only model_path is
+    # used by the handler.
     # The model path with the new weights
     model_path: str
     # The format to load the weights
@@ -43,6 +57,10 @@ class UpdateWeightsRequest(OpenAIBaseModel):
 
 
 class UpdateWeightsRequestLora(OpenAIBaseModel):
+    # [CLASS DOC]
+    # Pydantic body for /areal_update_weights_lora: lora_model_path, lora_name,
+    # lora_int_id, base_model_name, load_format, abort_all_requests (the last two
+    # unused).
     # The model path with the new weights of lora adaptor
     lora_model_path: str
     # The name of lora adaptor
@@ -58,6 +76,9 @@ class UpdateWeightsRequestLora(OpenAIBaseModel):
 
 
 class UpdateGroupRequest(OpenAIBaseModel):
+    # [CLASS DOC]
+    # Pydantic body for /areal_init_weights_update_group: master_address, master_port
+    # (str), rank_offset, world_size, backend, group_name.
     master_address: str
     master_port: str
     rank_offset: int
@@ -67,6 +88,9 @@ class UpdateGroupRequest(OpenAIBaseModel):
 
 
 class UpdateWeightsFromXcclRequest(OpenAIBaseModel):
+    # [CLASS DOC]
+    # Pydantic body for /areal_set_update_weight_meta: parallel lists of parameter
+    # names, dtype strings and shapes, plus the group name.
     names: list[str]
     dtypes: list[str]
     shapes: list[list[int]]
@@ -74,6 +98,10 @@ class UpdateWeightsFromXcclRequest(OpenAIBaseModel):
 
 
 class UpdateWeightsFromXcclRequestLora(OpenAIBaseModel):
+    # [CLASS DOC]
+    # Pydantic body for LoRA XCCL updates: names/dtypes/shapes, lora_name, lora_int_id,
+    # lora_target_modules (list or str), lora_rank, lora_alpha, lora_bias,
+    # base_model_name, group_name.
     names: list[str]
     dtypes: list[str]
     shapes: list[list[int]]
@@ -88,6 +116,9 @@ class UpdateWeightsFromXcclRequestLora(OpenAIBaseModel):
 
 
 def to_json_response(success, message):
+    # [FUNCTION DOC]
+    # HELPER: Return a JSONResponse {"success", "message"} with HTTP 200 on success, 400
+    # otherwise.
     content = {"success": success, "message": message}
     if success:
         return JSONResponse(content, status_code=200)
@@ -96,6 +127,10 @@ def to_json_response(success, message):
 
 
 def build_response(ret_list):
+    # [FUNCTION DOC]
+    # HELPER: Aggregate per-TP-rank (success, message) tuples from collective_rpc into
+    # one response: success only if all ranks succeeded; message lists each rank's
+    # success or failure reason. Returns to_json_response(...).
     success = True
     message = ""
     for rank, ret_value in enumerate(ret_list):
@@ -109,6 +144,10 @@ def build_response(ret_list):
 
 
 def _infer_runtime_lora_path(serving_models, lora_name: str, lora_int_id: int) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Choose a lora_path for a runtime-registered adapter: the existing path
+    # registered under lora_name, else the path of any registered request with the same
+    # lora_int_id, else a synthetic "xccl://<lora_name>".
     existing = serving_models.lora_requests.get(lora_name)
     if existing is not None and getattr(existing, "lora_path", ""):
         return existing.lora_path
@@ -129,6 +168,12 @@ def _register_runtime_lora_name(
     lora_int_id: int,
     base_model_name: str | None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Register (or rename) a LoRA adapter in the server's
+    # openai_serving_models.lora_requests so requests can route by the new versioned
+    # name: removes other names mapped to the same lora_int_id, then inserts a
+    # LoRARequest with the inferred path and optional base_model_name. Logs; logs a
+    # warning and returns if serving models are missing. Mutates app state.
     serving_models = getattr(app.state, "openai_serving_models", None)
     if serving_models is None:
         logger.warning(
@@ -163,6 +208,11 @@ def _register_runtime_lora_name(
 
 @router.post("/areal_update_weights")
 async def areal_update_weight(request: UpdateWeightsRequest, raw_request: Request):
+    # [FUNCTION DOC]
+    # POST /areal_update_weights: pause generation without waiting for in-flight
+    # requests (clearing cache), reset multimodal cache, run "areal_update_weights"
+    # (load weights from request.model_path) on all workers, always resume generation,
+    # and return the aggregated response.
     logger.info(f"API server starts areal_update_weight, {request.model_path}")
     llm = raw_request.app.state.engine_client
     await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
@@ -181,6 +231,10 @@ async def areal_update_weight(request: UpdateWeightsRequest, raw_request: Reques
 async def areal_update_weight_lora(
     request: UpdateWeightsRequestLora, raw_request: Request
 ):
+    # [FUNCTION DOC]
+    # POST /areal_update_weights_lora: same pause/reset/resume pattern, calling workers'
+    # "areal_update_weights_lora" with lora_model_path, lora_name, lora_int_id and
+    # base_model_name. Returns the aggregated response.
     logger.info(
         f"API server starts areal_update_weight_lora, lora_model_path-{request.lora_model_path}, lora_name-{request.lora_name}, lora_int_id-{request.lora_int_id}, base_model_name-{request.base_model_name}"
     )
@@ -206,6 +260,10 @@ async def areal_update_weight_lora(
 
 @router.post("/areal_update_weights_xccl")
 async def areal_update_weight_xccl(raw_request: Request):
+    # [FUNCTION DOC]
+    # POST /areal_update_weights_xccl: pause and reset caches, run workers'
+    # "areal_update_weight_xccl" (receive broadcast weights using previously set
+    # metadata), resume, return aggregated response.
     logger.info("API server starts areal_update_weight_xccl")
     llm = raw_request.app.state.engine_client
     await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
@@ -221,6 +279,10 @@ async def areal_update_weight_xccl(raw_request: Request):
 async def areal_update_weight_lora_xccl(
     request: UpdateWeightsFromXcclRequestLora, raw_request: Request
 ):
+    # [FUNCTION DOC]
+    # POST /areal_update_weights_lora_xccl: pause and reset caches, run workers'
+    # "areal_update_weight_lora_xccl"; if every worker succeeded, register the versioned
+    # LoRA name on the API server; always resume; return aggregated response.
     logger.info("API server starts areal_update_weight_lora_xccl")
     llm = raw_request.app.state.engine_client
     await llm.pause_generation(wait_for_inflight_requests=False, clear_cache=True)
@@ -245,6 +307,11 @@ async def areal_update_weight_lora_xccl(
 async def areal_init_weights_update_group(
     request: UpdateGroupRequest, raw_request: Request
 ):
+    # [FUNCTION DOC]
+    # POST /areal_init_weights_update_group: run workers'
+    # "areal_init_update_weight_group" with master address/port, rank_offset,
+    # world_size, backend and group name; returns aggregated response. Blocks until the
+    # trainer joins the group.
     logger.info("API server starts areal_init_weights_update_group")
     llm = raw_request.app.state.engine_client
     ret_list = await llm.collective_rpc(
@@ -265,6 +332,9 @@ async def areal_init_weights_update_group(
 async def areal_set_weight_meta_xccl(
     request: UpdateWeightsFromXcclRequest, raw_request: Request
 ):
+    # [FUNCTION DOC]
+    # POST /areal_set_update_weight_meta: store parameter names/dtypes/shapes/group name
+    # on each worker via "areal_set_weight_meta"; returns aggregated response.
     logger.info("API server starts areal_set_update_weight_meta_xccl")
     llm = raw_request.app.state.engine_client
     ret_list = await llm.collective_rpc(
@@ -283,6 +353,10 @@ async def areal_set_weight_meta_xccl(
 async def areal_set_weight_meta_xccl_lora(
     request: UpdateWeightsFromXcclRequestLora, raw_request: Request
 ):
+    # [FUNCTION DOC]
+    # POST /areal_set_update_weight_meta_lora: store LoRA XCCL metadata on each worker
+    # via "areal_set_weight_meta_lora" (params plus LoRA
+    # name/id/targets/rank/alpha/bias/base model); returns aggregated response.
     logger.info(
         f"API server starts areal_set_update_weight_meta_lora for {request.lora_name} with id {request.lora_int_id}"
     )
@@ -308,6 +382,10 @@ async def areal_set_weight_meta_xccl_lora(
 
 @router.post("/areal_pause_generation")
 async def areal_pause_generation(raw_request: Request):
+    # [FUNCTION DOC]
+    # POST /areal_pause_generation: clear the global run event (new /v1/completions
+    # calls block), pause the engine aborting in-flight requests and clearing cache,
+    # reset the multimodal cache; returns success JSON.
     logger.info("API server starts areal_pause_generation and aborts all requests")
     llm = raw_request.app.state.engine_client
     # Abort all running and waiting requests
@@ -323,6 +401,9 @@ async def areal_pause_generation(raw_request: Request):
 
 @router.post("/areal_continue_generation")
 async def areal_continue_generation(raw_request: Request):
+    # [FUNCTION DOC]
+    # POST /areal_continue_generation: resume the engine and set the run event so
+    # waiting completions proceed; returns success JSON.
     logger.info("API server starts areal_continue_generation")
     llm = raw_request.app.state.engine_client
     await llm.resume_generation()
@@ -331,6 +412,8 @@ async def areal_continue_generation(raw_request: Request):
 
 
 async def _wait_if_paused():
+    # [FUNCTION DOC]
+    # HELPER: Async; block until the global run event is set (generation not paused).
     """Wait if generation is paused."""
     if not _generation_run_event.is_set():
         await _generation_run_event.wait()
@@ -349,6 +432,13 @@ async def _wait_if_paused():
 @with_cancellation
 @load_aware_call
 async def create_completion(request: CompletionRequest, raw_request: Request):
+    # [FUNCTION DOC]
+    # POST /v1/completions replacement (JSON validated, cancellation-aware, load-
+    # tracked): waits while paused, then delegates to vLLM's original create_completion
+    # and returns its response.
+    # KNOWN ISSUE: only /v1/completions is gated by the pause event;
+    # /v1/chat/completions (used for VLM requests by vllm_remote) is not wrapped and can
+    # run while AReaL considers generation paused.
     """Wrapped completions endpoint that respects pause state."""
 
     await _wait_if_paused()
@@ -366,6 +456,9 @@ if __name__ == "__main__":
     import vllm.entrypoints.openai.api_server as _api_server_module
 
     def _areal_build_app(args, supported_tasks=None, model_config=None):
+        # [FUNCTION DOC]
+        # Patched vLLM build_app: builds the stock app, removes its POST /v1/completions
+        # route, includes AReaL's router, and returns the app.
         """Monkey-patched build_app that replaces vLLM's /v1/completions route
         with AReaL's wrapped version and adds AReaL custom endpoints."""
         app = _original_build_app(

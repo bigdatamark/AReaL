@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Triton kernels (adapted from slime / Pai-Megatron-Patch) for blockwise FP8 E4M3
+# quantization of 2D weights and blockwise dequantization back to a higher precision
+# dtype. Each tile of the matrix shares one float32 scale; the scale grid has shape
+# ceil(M/block_m) x ceil(N/block_n). Launch wrappers allocate outputs on the input's
+# device (GPU required).
 # SPDX-License-Identifier: Apache-2.0
 
 # FP8 Triton kernels for quantization and dequantization
@@ -29,6 +35,13 @@ def _blockwise_cast_to_fp8_triton(
     BLOCK_M: tl.constexpr = 32,
     BLOCK_N: tl.constexpr = 128,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Triton JIT kernel; one program per (BLOCK_M x BLOCK_N) tile indexed by
+    # program ids (axis 0 rows, axis 1 cols, int64 to avoid overflow). Loads the masked
+    # tile from X (strides given) as float32, computes absmax clamped below by eps,
+    # scale = absmax / fp8_max, writes clamp(x / scale, fp8_min, fp8_max) cast to Y's
+    # element type into Y, and stores the scale (not its inverse) into S at [pid_m,
+    # pid_n].
     pid_m = tl.cast(tl.program_id(axis=0), tl.int64)
     pid_n = tl.cast(tl.program_id(axis=1), tl.int64)
     off_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -56,6 +69,13 @@ def _blockwise_cast_to_fp8_triton(
 def blockwise_cast_to_fp8_triton(
     x: torch.Tensor, block_size: list[int] | tuple[int, int] | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Quantize a 2D tensor x (any float dtype, contiguous or strided) to float8_e4m3fn
+    # with per-tile scales. block_size: optional [block_m, block_n] (default 128x128;
+    # falsy values fall back to the default). Returns (y, s): y is an MxN FP8 tensor, s
+    # a float32 tensor of shape ceil(M/block_m) x ceil(N/block_n) holding dequant
+    # multipliers (absmax/448). Launches the kernel with 8 warps/2 stages for contiguous
+    # input, 1 warp/4 stages otherwise; eps 1e-10.
     """Blockwise FP8 quantization using Triton.
 
     Args:
@@ -78,6 +98,9 @@ def blockwise_cast_to_fp8_triton(
     )
 
     def grid(meta):
+        # [FUNCTION DOC]
+        # HELPER: Triton launch grid: number of row and column tiles given the meta
+        # block sizes.
         return (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
 
     if x.is_contiguous():
@@ -114,6 +137,11 @@ def blockwise_cast_to_fp8_triton(
 # Adapted from https://github.com/alibaba/Pai-Megatron-Patch/blob/2b201af08336dea0403df7c6b497c964cf5a2e75/toolkits/model_checkpoints_convertor/deepseek/fp8_cast_bf16.py
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
+    # [FUNCTION DOC]
+    # HELPER: Triton JIT dequant kernel; one program per square BLOCK_SIZE tile of a
+    # contiguous row-major MxN FP8 matrix. Loads the tile as float32, multiplies by the
+    # single scale at row-major position (pid_m, pid_n) in a scale grid with
+    # ceil(N/BLOCK_SIZE) columns, and stores into y (converted to y's dtype).
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     n = tl.cdiv(N, BLOCK_SIZE)
@@ -133,6 +161,11 @@ def weight_dequant(
     block_size: int = 128,
     dst_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Dequantize a contiguous 2D FP8 tensor x using a contiguous 2D per-block scale
+    # tensor s (multiplicative, i.e. "scale_inv" in HF naming) with square block_size
+    # (default 128). Returns a new tensor of x's shape in dst_dtype (default bfloat16).
+    # Raises AssertionError if inputs are non-contiguous or not 2D.
     """Dequantize FP8 weights to the given dtype.
 
     Args:
@@ -150,6 +183,8 @@ def weight_dequant(
     y = torch.empty_like(x, dtype=dst_dtype)
 
     def grid(meta):
+        # [FUNCTION DOC]
+        # HELPER: Triton launch grid: number of row and column tiles of size BLOCK_SIZE.
         return (triton.cdiv(M, meta["BLOCK_SIZE"]), triton.cdiv(N, meta["BLOCK_SIZE"]))
 
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)

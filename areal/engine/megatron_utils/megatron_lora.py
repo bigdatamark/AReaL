@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# LoRA support for the Megatron engine: maps megatron-bridge LoRA target module names to
+# vLLM/HF names, converts Megatron LoRA adapter weights (adapter.linear_in = LoRA A,
+# adapter.linear_out = LoRA B) of Qwen3 dense and MoE models into HF PEFT parameter
+# names ("base_model.model.model.layers.N....lora_A/B.default.weight"), and monkey
+# patches megatron-bridge's AutoBridge with save_hf_adapter (applied at import time)
+# when it lacks one.
 # SPDX-License-Identifier: Apache-2.0
 
 import re
@@ -9,6 +16,12 @@ import torch.distributed as dist
 
 
 def get_vllm_lora_target_modules(target_modules: list[str]) -> list[str]:
+    # [FUNCTION DOC]
+    # Translate Megatron LoRA target module names to vLLM/HF projection names. Empty
+    # input or "all-linear" means all of linear_qkv, linear_proj, linear_fc1,
+    # linear_fc2. Mapping: linear_qkv -> q/k/v_proj, linear_proj -> o_proj, linear_fc1
+    # -> gate/up_proj, linear_fc2 -> down_proj. Returns a sorted de-duplicated list.
+    # Raises NotImplementedError for any other name.
     if not target_modules or "all-linear" in target_modules:
         target_modules = [
             "linear_qkv",
@@ -39,6 +52,19 @@ def convert_qwen3_lora_to_hf(
     name: str,
     tensor: torch.Tensor,
 ) -> list[tuple[str, torch.Tensor]]:
+    # [FUNCTION DOC]
+    # Convert one Megatron LoRA tensor of a Qwen3 dense layer to HF PEFT (name, tensor)
+    # pairs. name must match
+    # "...decoder.layers.N.<module>.adapter.<linear_in|linear_out>.weight" with module
+    # self_attention.linear_qkv/linear_proj or mlp.linear_fc1/linear_fc2; otherwise
+    # returns []. linear_proj -> o_proj, linear_fc2 -> down_proj (A or B, tensor
+    # unchanged). linear_fc1: A is shared by gate_proj and up_proj; B is split in half
+    # along dim 0 into gate and up. linear_qkv: A is shared by q/k/v; B (rows =
+    # groups*(heads_per_group+2)*head_dim) is viewed as [num_query_groups,
+    # heads_per_group+2, head_dim, rank], split per group into heads_per_group query
+    # heads, 1 key head and 1 value head, and flattened back to 2D. head_dim =
+    # kv_channels or hidden/heads. Returns [] if tf_config.num_query_groups is None.
+    # Pure (views/contiguous copies).
     pattern = (
         r"(?:^|.*\.)decoder\.layers\.(\d+)\."
         r"(self_attention\.linear_qkv|self_attention\.linear_proj|mlp\.linear_fc1|mlp\.linear_fc2)\."
@@ -126,6 +152,14 @@ def convert_qwen3_moe_lora_to_hf(
     name: str,
     tensor: torch.Tensor,
 ) -> list[tuple[str, torch.Tensor]]:
+    # [FUNCTION DOC]
+    # Convert a Megatron LoRA tensor of a Qwen3 MoE model. First tries the dense
+    # converter (attention and dense MLP). Then handles grouped-expert names
+    # "...mlp.experts.<linear_fc1|linear_fc2>.adapter.<part>.weight": the same tensor is
+    # emitted for every expert index (from tf_config.num_moe_experts or num_experts; []
+    # if neither), using down_proj for fc2 and gate/up (A shared, B halved along dim 0)
+    # for fc1. Then per-expert names ending in ".weightK" map to expert K the same way.
+    # Returns [] if nothing matches.
     # Reuse non-MoE conversion for attention and dense MLP paths.
     converted = convert_qwen3_lora_to_hf(tf_config, name, tensor)
     if converted:
@@ -219,6 +253,11 @@ def convert_qwen3_moe_lora_to_hf(
 
 
 def _infer_target_modules_from_adapter_weights(weight_keys: Iterable[str]) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Infer PEFT target_modules from HF adapter weight keys: strips
+    # "base_model.model.", and for keys containing ".lora_A.weight" or ".lora_B.weight"
+    # takes the last dotted component before it. Returns the sorted unique module names.
+    # Keys using the ".lora_X.default.weight" form are ignored.
     """
     Infer PEFT target_modules from adapter weight parameter names.
 
@@ -252,6 +291,10 @@ def _build_adapter_config_dict(
     target_modules: list[str],
     base_model_name_or_path: str,
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Build a PEFT adapter_config.json dict (LORA, CAUSAL_LM, bias none, etc.)
+    # with r/lora_alpha/lora_dropout taken from peft_config.dim/alpha/dropout, the given
+    # target_modules and base model path.
     """
     Build PEFT adapter_config.json dictionary.
 
@@ -276,6 +319,10 @@ def _build_adapter_config_dict(
 
 
 def _monkey_patch_save_hf_adapter():
+    # [FUNCTION DOC]
+    # HELPER: If megatron.bridge.AutoBridge lacks save_hf_adapter, attach the
+    # implementation defined below as a method (global class mutation). Imports
+    # megatron.bridge. Called at import time.
     """Add save_hf_adapter to AutoBridge when megatron-bridge does not provide it."""
     from megatron.bridge import AutoBridge
 
@@ -291,6 +338,17 @@ def _monkey_patch_save_hf_adapter():
         base_model_name_or_path: str | None = None,
         show_progress: bool = True,
     ) -> None:
+        # [FUNCTION DOC]
+        # Collectively export LoRA adapter weights of the Megatron model (instance or
+        # list) to a PEFT directory. Barrier at start and end when torch.distributed is
+        # initialized. Collects (name, tensor) from self.export_adapter_weights (on GPU,
+        # no progress bar) into a dict keyed "base_model.model.<name>" with float32
+        # clones; raises RuntimeError if empty. Rank 0 only: creates the directory,
+        # infers base_model_name_or_path from hf_pretrained if not given, infers target
+        # modules, writes adapter_config.json and adapter_model.safetensors, and prints
+        # a summary to stdout. Returns None.
+        # KNOWN ISSUE: show_progress is accepted but ignored; uses print instead of the
+        # project logger.
         """
         Save LoRA adapter weights as a HuggingFace PEFT-compatible directory.
 

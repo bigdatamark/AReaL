@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# High-level FP8 API (adapted from slime) used when sending Megatron weights to an FP8
+# inference engine or loading FP8 checkpoints: decides which converted HuggingFace
+# parameters get quantized based on the originating Megatron parameter name, and
+# dequantizes blockwise FP8 weights.
 # SPDX-License-Identifier: Apache-2.0
 
 # High-level FP8 quantization and dequantization utilities
@@ -27,6 +32,20 @@ def _quantize_param(
     weight_block_size: tuple[int, int] | list[int] | None = None,
     scale_dtype: torch.dtype = torch.bfloat16,
 ) -> list[tuple[str, torch.Tensor]]:
+    # [FUNCTION DOC]
+    # HELPER: Quantize one ".weight" tensor to float8_e4m3fn. With weight_block_size
+    # (list/tuple [m, n]) it uses blockwise quantization: the UE8M0 DeepGEMM path
+    # (power-of-two scales, packed TMA-aligned int32 layout) when
+    # should_deepgemm_weight_requant_ue8m0 says so, else the Triton kernel; the scale
+    # param is named by replacing ".weight" with ".weight_scale_inv". Without a block
+    # size it does per-tensor quantization (scale = absmax clamped to 1e-12 / FP8 max,
+    # shape [1]) named ".weight_scale". Scale is cast to scale_dtype (default bfloat16).
+    # Returns [(name, qweight), (scale_name, scale)]. Raises AssertionError if name does
+    # not end with ".weight".
+    # KNOWN ISSUE: the UE8M0 path calls quant_weight_ue8m0, which asserts block size
+    # equals the list [128, 128]; a tuple (allowed by the type hint) or other size will
+    # fail the assertion. Also the packed UE8M0 scale is int32, so casting it to
+    # scale_dtype (bfloat16) corrupts the packed bits.
     """Quantize a single weight parameter to FP8 format.
 
     Args:
@@ -73,6 +92,20 @@ def quantize_params(
     quantization_config: dict[str, int | str | list[str]] | None,
     scale_dtype: torch.dtype = torch.bfloat16,
 ) -> list[tuple[str, torch.Tensor]]:
+    # [FUNCTION DOC]
+    # Quantize the HF parameters converted from one Megatron parameter. Inputs:
+    # megatron_name (str, with or without "module.module." prefix; "decoder." and "mtp."
+    # names get the prefix added), converted_named_params (list of (hf_name, tensor)),
+    # quantization_config (HF dict or None), scale_dtype. Returns converted_named_params
+    # unchanged when config is None or the param is not a quantizable linear weight.
+    # Asserts config quant_method "fp8", fmt "e4m3", activation_scheme "dynamic"
+    # (AssertionError otherwise). Parses layer index and remainder from decoder.layers.N
+    # or mtp.layers.N (dropping "transformer_layer."). Quantizes (via _quantize_param,
+    # block size from config) when the remainder is: routed expert linear_fc1/linear_fc2
+    # weightK (skipping converted names ending in "_scale"), shared_experts
+    # linear_fc1/fc2 weight, or attention/MLP linear weights (linear_proj, linear_qkv,
+    # mlp fc1/fc2, and MLA q/q_down/q_up/kv_down/kv_up projections). Returns the
+    # expanded list with interleaved weight and scale entries.
     """Apply FP8 quantization to converted HuggingFace parameters.
 
     Args:
@@ -178,6 +211,11 @@ def dequantize_params(
     dst_dtype: torch.dtype = torch.bfloat16,
     quantization_config: dict[str, int | str | list[str]] | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Dequantize an FP8 weight with its per-block scale_inv into dst_dtype (default
+    # bfloat16). Makes both inputs contiguous, reads the block size from
+    # quantization_config in strict mode (default 128 if config is None; ValueError if
+    # non-square), then calls weight_dequant. Returns the new tensor.
     """Dequantize FP8 weights to the given dtype.
 
     Args:

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Experimental CAMEL-AI integration: a CAMEL model backend that sends chat completions
+# through an injected AsyncOpenAI-compatible client (typically AReaL's OpenAI-compatible
+# proxy client that records completions for RL), and a token counter backed by a
+# HuggingFace tokenizer. At import, picks the tracing decorator "observe" from langfuse
+# (LANGFUSE_ENABLED=true), traceroot (TRACEROOT_ENABLED=true), falling back to
+# camel.utils.observe. Uses CAMEL's get_logger.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -41,11 +48,22 @@ logger = get_logger(__name__)
 
 
 class AReaLTokenCounter(BaseTokenCounter):
+    # [CLASS DOC]
+    # CAMEL BaseTokenCounter using a HuggingFace tokenizer. State: tokenizer,
+    # tokens_per_message (fixed per-message overhead).
     def __init__(self, tokenizer: "PreTrainedTokenizerFast", tokens_per_message: int):
+        # [FUNCTION DOC]
+        # Store the tokenizer and per-message token overhead.
         self.tokenizer = tokenizer
         self.tokens_per_message = tokens_per_message
 
     def count_tokens_from_messages(self, messages: list[OpenAIMessage]) -> int:
+        # [FUNCTION DOC]
+        # Approximate prompt token count for OpenAI-format messages: for each message
+        # add tokens_per_message plus the encoded length of every field value
+        # (stringified); list values must contain only {"type": "text"} items whose text
+        # is encoded, other item types raise ValueError. Adds 3 for the assistant reply
+        # priming. Returns int.
         num_tokens = 0
         for message in messages:
             num_tokens += self.tokens_per_message
@@ -62,13 +80,24 @@ class AReaLTokenCounter(BaseTokenCounter):
         return num_tokens
 
     def encode(self, text: str) -> list[int]:
+        # [FUNCTION DOC]
+        # Encode text to token ids with the tokenizer.
         return self.tokenizer.encode(text)
 
     def decode(self, token_ids: list[int]) -> str:
+        # [FUNCTION DOC]
+        # Decode token ids to text with the tokenizer.
         return self.tokenizer.decode(token_ids)
 
 
 class AReaLOpenAICompatibleModel(BaseModelBackend):
+    # [CLASS DOC]
+    # CAMEL BaseModelBackend whose async run delegates to a caller-supplied AsyncOpenAI
+    # client; synchronous run is unsupported and streaming is always off. State:
+    # tokenizer, _client, plus BaseModelBackend fields (model_type, model_config_dict,
+    # api key, url, timeout, retries, token counter).
+    # KNOWN ISSUE: the docstring omits the required openai_client and tokenizer
+    # arguments, and extra **kwargs are accepted but ignored.
     r"""Constructor for model backend supporting AReaL OpenAI compatibility.
 
     Args:
@@ -107,6 +136,11 @@ class AReaLOpenAICompatibleModel(BaseModelBackend):
         max_retries: int = 3,
         **kwargs: Any,
     ) -> None:
+        # [FUNCTION DOC]
+        # Resolve api_key from OPENAI_COMPATIBILITY_API_KEY and url from
+        # OPENAI_COMPATIBILITY_API_BASE_URL when not given, timeout from MODEL_TIMEOUT
+        # (default 180 s), initialize BaseModelBackend with these, then store the
+        # tokenizer and the injected client.
         api_key = api_key or os.environ.get("OPENAI_COMPATIBILITY_API_KEY")
         url = url or os.environ.get("OPENAI_COMPATIBILITY_API_BASE_URL")
         if timeout is None:
@@ -134,6 +168,9 @@ class AReaLOpenAICompatibleModel(BaseModelBackend):
         | Stream[ChatCompletionChunk]
         | ChatCompletionStreamManager[BaseModel]
     ):
+        # [FUNCTION DOC]
+        # Synchronous inference is not supported; always raises NotImplementedError.
+        # Wrapped by the tracing decorator.
         r"""Runs inference of OpenAI chat completion.
 
         Args:
@@ -165,6 +202,12 @@ class AReaLOpenAICompatibleModel(BaseModelBackend):
         | AsyncStream[ChatCompletionChunk]
         | AsyncChatCompletionStreamManager[BaseModel]
     ):
+        # [FUNCTION DOC]
+        # Async: call self._client.chat.completions.create with the messages and a copy
+        # of model_config_dict (plus tools when given) and return the result. Wrapped by
+        # the tracing decorator.
+        # KNOWN ISSUE: response_format is accepted but ignored, and the model name is
+        # not passed unless present in model_config_dict.
         r"""Runs inference of OpenAI chat completion in async mode.
 
         Args:
@@ -195,6 +238,9 @@ class AReaLOpenAICompatibleModel(BaseModelBackend):
 
     @property
     def token_counter(self) -> BaseTokenCounter:
+        # [FUNCTION DOC]
+        # Return the token counter, lazily defaulting to CAMEL's OpenAITokenCounter for
+        # GPT-4o-mini (the tokenizer-based AReaLTokenCounter is not used automatically).
         r"""Initialize the token counter for the model backend.
 
         Returns:
@@ -208,6 +254,8 @@ class AReaLOpenAICompatibleModel(BaseModelBackend):
 
     @property
     def stream(self) -> bool:
+        # [FUNCTION DOC]
+        # Always False: streaming is not supported.
         r"""Returns whether the model is in stream mode, which sends partial
         results each time.
 

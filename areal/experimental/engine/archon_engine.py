@@ -1,3 +1,17 @@
+# [MODULE DOC]
+# ArchonEngine: experimental torch-native TrainEngine (TorchTitan-style) for supported
+# HF model types. Builds the model from an Archon ModelSpec on the meta device, applies
+# FSDP2 / TP / Ulysses CP / EP / ETP / pipeline parallelism via spec-provided
+# parallelize and pipelining functions over an ArchonParallelDims device mesh, optional
+# FP8 linear/expert conversion, activation checkpointing and torch.compile, then
+# materializes and loads HF weights. Implements micro-batching with packed sequences (or
+# packed prefix trees for tree training), forward/backward through a
+# ForwardBackwardRunner (plain or pipeline schedule), actor/critic logprob, entropy and
+# value extraction, gradient clipping and optimizer steps, rollout integration
+# (connect_engine, weight sync over XCCL or disk), HF/DCP checkpointing
+# (archon_checkpoint) and torch_memory_saver offload. Also defines thin algorithm
+# wrappers (PPO actor/critic, SFT LM, reward model, DPO) that compose trainer-side
+# helpers with the engine.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -122,6 +136,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class ArchonTrainContext:
+    # [CLASS DOC]
+    # Dataclass carried with each micro-batch through forward/backward to the output-
+    # processing callback. Fields: mb_input (original unpadded micro-batch dict), labels
+    # (next-token ids rolled from input_ids, CP-sliced; None for tree training),
+    # pad_length (tokens of batch-level padding to trim from outputs), trie_node (packed
+    # tree root for tree training).
     """Context passed through Archon forward/backward pipeline.
 
     Attributes:
@@ -138,6 +158,9 @@ class ArchonTrainContext:
     trie_node: TrieNode | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Return a shallow dict of the dataclass fields (avoids recursive asdict on
+        # TrieNode).
         """Shallow dict conversion (avoids ``dataclasses.asdict`` which would
         recurse into TrieNode and hit ``RecursionError``).
         """
@@ -145,9 +168,24 @@ class ArchonTrainContext:
 
 
 class ArchonEngine(TrainEngine):
+    # [CLASS DOC]
+    # Torch-native training engine. Key state: config/optimizer_config, model_config
+    # (HF), spec (ModelSpec for the model type), model / model_parts (one part, or the
+    # local pipeline stages after PP), pp_stages and first/last-stage flags, tokenizer,
+    # optimizer, lr_scheduler, state_dict_adapter (Archon <-> HF names), runner,
+    # rank/world_size, parallel_dims and world mesh, cached process groups (cpu gloo,
+    # pp_cp_tp, tp, cp), dp rank/head, pp rank and last-stage rank, weight sync state,
+    # engine_lock, rollout engine/coordinator, version counter, offload flags.
+    # Lifecycle: __init__ -> create_process_group -> initialize -> train/eval/forward ->
+    # destroy. Most methods are collective across ranks.
     """Archon Engine is a torch-native training backend."""
 
     def __init__(self, config: TrainEngineConfig):
+        # [FUNCTION DOC]
+        # Store config, load the HF AutoConfig (trust_remote_code) from config.path,
+        # validate the model type is supported (ValueError otherwise) and look up its
+        # ModelSpec; declare/initialize all other attributes to defaults. No distributed
+        # or GPU work.
         # Configuration (immutable after init)
         self.config = config
         self.optimizer_config = config.optimizer
@@ -202,6 +240,16 @@ class ArchonEngine(TrainEngine):
         self,
         parallel_strategy: ParallelStrategy | None = None,
     ):
+        # [FUNCTION DOC]
+        # Set up distributed state: patch default group timeouts, init the global
+        # process group with the platform backend if not already (marking ownership),
+        # create a gloo CPU group, record rank/world size, create the per-rank logger,
+        # build ArchonParallelDims (dp_shard, tp, cp, pp, ep, etp from
+        # parallel_strategy, default ParallelStrategy()) and world mesh, derive dp rank,
+        # pp rank (last-stage rank set later), pp_cp_tp group and its first rank as the
+        # DP head, whether this rank is the pipeline-parallel head (dp, cp, tp ranks all
+        # 0), cached tp/cp groups (None when disabled); logs the dims and eagerly warms
+        # up the dp, pp_cp_tp, tp and cp communicators.
         patch_dist_group_timeout(DIST_GROUP_DEFAULT_TIMEOUT)
 
         backend = current_platform.communication_backend
@@ -297,6 +345,18 @@ class ArchonEngine(TrainEngine):
         )
 
     def initialize(self, addr: str | None, ft_spec: FinetuneSpec, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Build the trainable model. Asserts addr is None and ft_spec is given. Creates
+        # the weight-sync state and a DistributedLock, sets torch_memory_saver to
+        # preload hook mode when enabled, creates the meta-device model and the state
+        # dict adapter, sets param_dtype. If FP8 is enabled, requires dtype bfloat16
+        # (ValueError) and converts linear layers (minus excluded FQNs) and optionally
+        # experts to FP8 on the meta device. prepare_training_config resolves activation
+        # checkpointing and compile settings (may mutate config and set determinism env
+        # vars). Applies parallelism (timed), synchronizes and barriers, validates FP8
+        # shard alignment, materializes weights and loads them (HF or init from
+        # scratch), creates optimizer and LR scheduler, and builds the runner (pipeline-
+        # aware input preparation and schedule). Marks initialized.
         """Initialize model, optimizer, and apply parallelism."""
         assert addr is None, "ArchonEngine does not support remote initialization."
         assert ft_spec is not None, "ArchonEngine requires FinetuneSpec to initialize."
@@ -387,47 +447,74 @@ class ArchonEngine(TrainEngine):
 
     @property
     def world_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC]
+        # The full device mesh.
         return self._world_mesh
 
     @property
     def data_parallel_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Process group of the "dp" mesh dimension.
         return self.parallel_dims.world_mesh["dp"].get_group()
 
     @property
     def data_parallel_rank(self) -> int:
+        # [FUNCTION DOC]
+        # This rank's data-parallel rank.
         return self._dp_rank
 
     @property
     def data_parallel_world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Data-parallel world size (dp_shard degree).
         return self.parallel_dims.dp_shard
 
     def current_data_parallel_head(self) -> int:
+        # [FUNCTION DOC]
+        # Global rank of the DP head of this rank's pp_cp_tp group.
         return self._dp_head
 
     def is_data_parallel_head(self) -> bool:
+        # [FUNCTION DOC]
+        # Whether this rank is its group's DP head (holds the batch).
         return self.rank == self._dp_head
 
     @property
     def pipeline_parallel_rank(self) -> int:
+        # [FUNCTION DOC]
+        # This rank's pipeline-parallel rank (0 without PP).
         return self._pp_rank
 
     def is_pipeline_parallel_head(self) -> bool:
+        # [FUNCTION DOC]
+        # Whether this rank has dp, cp and tp ranks all equal to 0.
         return self._is_pipeline_parallel_head
 
     @property
     def context_and_model_parallel_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # The pp_cp_tp process group (asserted non-None).
         assert self._pp_cp_tp_group is not None
         return self._pp_cp_tp_group
 
     @property
     def cpu_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # The gloo CPU process group used for barriers.
         return self._cpu_group
 
     @property
     def initialized(self) -> bool:
+        # [FUNCTION DOC]
+        # Whether initialize() completed.
         return self._initialized
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Release optimizer, model and model parts, garbage collect and empty the device
+        # cache. If this engine created the global process group, barriers on the CPU
+        # group (errors logged and ignored) and destroys the global group, clearing
+        # ownership so repeated calls are safe. Marks not initialized.
         """Clean up resources."""
         if hasattr(self, "optimizer"):
             del self.optimizer
@@ -462,21 +549,35 @@ class ArchonEngine(TrainEngine):
         self._initialized = False
 
     def train(self, mode: bool = True):
+        # [FUNCTION DOC]
+        # Set train/eval mode on every model part; returns self.
         for m in self.model_parts:
             m.train(mode=mode)
         return self
 
     def set_version(self, version: int):
+        # [FUNCTION DOC]
+        # Set the weight version counter.
         self._version = version
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Return the weight version counter.
         return self._version
 
     def optimizer_zero_grad(self):
+        # [FUNCTION DOC]
+        # Zero optimizer gradients (asserts optimizer exists).
         assert self.optimizer is not None
         self.optimizer.zero_grad()
 
     def optimizer_step(self):
+        # [FUNCTION DOC]
+        # Clip gradients with fsdp2_clip_grad_norm across the DP (FSDP), TP and PP
+        # groups (max norm from optimizer config, aware of CPU-offloaded params). If the
+        # norm is non-finite, zeroes gradients and skips the step; otherwise steps the
+        # optimizer. Returns dict(update_successful as float, grad_norm as float or nan,
+        # lr = current scheduler LR). Does not step the LR scheduler.
         """Perform optimizer step with gradient clipping."""
         assert self.optimizer is not None
         assert self.optimizer_config is not None
@@ -508,6 +609,8 @@ class ArchonEngine(TrainEngine):
         )
 
     def lr_scheduler_step(self):
+        # [FUNCTION DOC]
+        # Advance the LR scheduler by one step.
         assert self.lr_scheduler is not None
         self.lr_scheduler.step()
 
@@ -519,6 +622,10 @@ class ArchonEngine(TrainEngine):
         ],
         forward_only: bool = False,
     ) -> list[torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # Run forward (and backward unless forward_only) over all micro-batches via the
+        # runner; process_output_fn(logits, ctx_dict) returns per-micro-batch loss or
+        # output. Returns the list of outputs (last pipeline stage) or None.
         """Forward and optionally backward through micro-batches."""
         return self.runner.run(mb_list, process_output_fn, forward_only)
 
@@ -528,6 +635,12 @@ class ArchonEngine(TrainEngine):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # One training step on a batch (dict or list of dicts concatenated): zero grads,
+        # build padded micro-batches on device, compute the global loss weight across
+        # DP, forward/backward with each micro-batch loss scaled by local_weight /
+        # total_weight * dp_size (to cancel FSDP gradient averaging), then
+        # optimizer_step. Returns the step stats plus num_micro_batches.
         """Train on a batch of data."""
         assert self._initialized
         self.optimizer_zero_grad()
@@ -543,6 +656,9 @@ class ArchonEngine(TrainEngine):
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
         ) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Per-micro-batch callback building ArchonTrainContext and returning
+            # the scaled training loss.
             ctx = ArchonTrainContext(**ctx_dict)
             return self._compute_logprobs_and_loss(
                 logits,
@@ -566,6 +682,11 @@ class ArchonEngine(TrainEngine):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> torch.Tensor | None:
+        # [FUNCTION DOC]
+        # No-grad evaluation: same micro-batching and loss weighting as training (no DP
+        # multiplier), forward only, then aggregates losses across DP (and from the last
+        # PP stage) with aggregate_eval_losses. Returns the aggregated loss tensor or
+        # None.
         """Evaluate on a batch of data."""
         assert self._initialized
 
@@ -580,6 +701,8 @@ class ArchonEngine(TrainEngine):
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
         ) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Per-micro-batch callback returning the weighted eval loss.
             ctx = ArchonTrainContext(**ctx_dict)
             return self._compute_logprobs_and_loss(
                 logits,
@@ -608,6 +731,15 @@ class ArchonEngine(TrainEngine):
         output_seqlens: list[int] | None = None,
         aggregate_fn: Callable[[list[torch.Tensor]], torch.Tensor] = torch.cat,
     ) -> torch.Tensor | list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # No-grad forward returning per-token outputs (actor logprobs of next tokens, or
+        # critic values). For list input the per-item seqlens are inferred from
+        # attention_mask widths (ValueError if they conflict with output_seqlens);
+        # otherwise output_seqlens default to the packed sequence lengths. Runs forward-
+        # only; on the last PP stage merges tree results or reorders/pads per-sequence
+        # outputs (aggregate_fn, default concatenation); with PP broadcasts the result
+        # from the last-stage rank over the pp group. Returns the result, split back per
+        # input item for list input.
         """Forward pass without gradient computation."""
         assert self._initialized
 
@@ -634,6 +766,9 @@ class ArchonEngine(TrainEngine):
         def process_output(
             logits: torch.Tensor, ctx_dict: dict[str, Any]
         ) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Per-micro-batch callback returning logprobs or values via
+            # _compute_forward_result.
             ctx = ArchonTrainContext(**ctx_dict)
             return self._compute_forward_result(logits, ctx)
 
@@ -664,6 +799,11 @@ class ArchonEngine(TrainEngine):
         return split_batch(res, meta)
 
     def connect_engine(self, engine: InferenceEngine, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Attach an inference engine: warns if replacing a different one, creates a
+        # DistRolloutCoordinator, initializes the XCCL weight update group if meta.type
+        # is "xccl" and not yet initialized, then synchronizes and barriers on the CPU
+        # group.
         """Connect to an inference engine for rollout."""
         if self.rollout_engine is not None and self.rollout_engine != engine:
             self.logger.warning(
@@ -693,6 +833,10 @@ class ArchonEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Run a synchronous rollout of data through the connected engine via the
+        # coordinator (raises RuntimeError if not connected). Returns the list of
+        # trajectories.
         """Perform rollout using connected inference engine."""
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.rollout_batch(
@@ -715,6 +859,9 @@ class ArchonEngine(TrainEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Produce a training batch from the dataloader via the coordinator's async
+        # rollout (raises RuntimeError if not connected).
         """Prepare batch from dataloader with rollout."""
         self._check_rollout_engine_connected()
         return self.rollout_coordinator.prepare_batch(
@@ -729,6 +876,8 @@ class ArchonEngine(TrainEngine):
         )
 
     def clear_batches(self, shard_ids: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Drop RTensor fetch-buffer entries for the given shard ids; no-op with none.
         """Drain this worker's client-side RTensor fetch buffer.
 
         Called via RPC by ``TrainController.clear_batches`` at step end so
@@ -743,12 +892,19 @@ class ArchonEngine(TrainEngine):
             clear_fetch_buffer(shard_ids)
 
     def fetch_buffer_stats(self) -> dict[str, int]:
+        # [FUNCTION DOC]
+        # Return local RTensor fetch-buffer statistics.
         """Expose local fetch-buffer stats for post-step drain verification."""
         from areal.infra.rpc.rtensor import fetch_buffer_stats
 
         return fetch_buffer_stats()
 
     def update_weights(self, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Push current weights to the inference engine (temporarily onloading if
+        # offloaded): "xccl" uses update_weights_from_distributed (group must be
+        # initialized, asserted), "disk" uses update_weights_from_disk; other types
+        # raise ValueError. Raises RuntimeError if no engine is connected.
         """Update weights to inference engine."""
         self._check_rollout_engine_connected()
         with self._offload_aware_context():
@@ -768,6 +924,11 @@ class ArchonEngine(TrainEngine):
                 raise ValueError(f"Unknown weight update type {meta.type}")
 
     def save(self, meta: SaveLoadMeta):
+        # [FUNCTION DOC]
+        # Save weights (onloading temporarily if needed): "hf" -> save_model_to_hf with
+        # tokenizer/processor (synchronous, no async manager), "dcp" -> save_to_dcp
+        # (includes optimizer when with_optim); ValueError otherwise. For hf with
+        # with_optim, also writes per-rank optimizer state files.
         """Save model in HuggingFace or DCP format."""
         with self._offload_aware_context():
             if meta.weight_format == "hf":
@@ -781,6 +942,10 @@ class ArchonEngine(TrainEngine):
                 save_optimizer_state(self, meta.path)
 
     def load(self, meta: SaveLoadMeta):
+        # [FUNCTION DOC]
+        # Load weights (onloading temporarily if needed): "hf" -> load_model_from_hf,
+        # "dcp" -> load_from_dcp (with optimizer when with_optim); ValueError otherwise.
+        # For hf with with_optim, also loads per-rank optimizer state files.
         """Load model from HuggingFace or DCP format."""
         with self._offload_aware_context():
             if meta.weight_format == "hf":
@@ -795,6 +960,10 @@ class ArchonEngine(TrainEngine):
 
     @contextmanager
     def _offload_aware_context(self):
+        # [FUNCTION DOC]
+        # HELPER: Reentrant context manager: if the engine is offloaded, onload on the
+        # outermost entry and offload again on the outermost exit (depth counter);
+        # otherwise a plain pass-through.
         """Temporarily onload parameters for offload-unsafe operations.
 
         Reentrant: nested calls increment depth; only the outermost
@@ -815,6 +984,10 @@ class ArchonEngine(TrainEngine):
                 self.offload()
 
     def offload(self) -> None:
+        # [FUNCTION DOC]
+        # Offload model memory with torch_memory_saver.pause (RuntimeError if TMS is not
+        # enabled), clearing caches first, then sync, CPU barrier, log device stats
+        # before/after, set is_offload.
         """Offload model memory to CPU using torch_memory_saver."""
         if not is_tms_enabled():
             raise RuntimeError(
@@ -833,6 +1006,9 @@ class ArchonEngine(TrainEngine):
         self.is_offload = True
 
     def onload(self) -> None:
+        # [FUNCTION DOC]
+        # Resume model memory with torch_memory_saver.resume, sync, CPU barrier, log
+        # device stats, clear is_offload.
         """Onload model memory from CPU back to GPU using torch_memory_saver."""
         torch_memory_saver.resume()
 
@@ -843,6 +1019,10 @@ class ArchonEngine(TrainEngine):
         self.is_offload = False
 
     def export_stats(self) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Export stats_tracker values reduced across the DP group (onloading if needed);
+        # with PP, broadcasts the last-stage rank's dict over the pp group and merges it
+        # in. Returns the dict. Collective.
         assert self._initialized
         with self._offload_aware_context():
             data = stats_tracker.export_all(
@@ -859,14 +1039,20 @@ class ArchonEngine(TrainEngine):
         return data
 
     def get_device_stats(self) -> DeviceRuntimeInfo:
+        # [FUNCTION DOC]
+        # Return current device memory/runtime info.
         return DeviceRuntimeInfo.get_current()
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Save perf tracer output for the step (force to flush).
         perf_tracer.save(step=step, force=force)
 
     def config_perf_tracer(
         self, config: PerfTracerConfig, rank: int, role: str
     ) -> None:
+        # [FUNCTION DOC]
+        # Configure the global perf tracer for this rank and role.
         perf_tracer.configure(config, rank=rank, role=role)
 
     # =========================================================================
@@ -874,6 +1060,8 @@ class ArchonEngine(TrainEngine):
     # =========================================================================
 
     def _check_rollout_engine_connected(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Raise RuntimeError unless both rollout engine and coordinator are set.
         if self.rollout_engine is None or self.rollout_coordinator is None:
             raise RuntimeError(
                 "Rollout engine not connected. Call connect_engine()"
@@ -881,6 +1069,9 @@ class ArchonEngine(TrainEngine):
             )
 
     def _validate_model_type(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Raise ValueError (listing supported types) if the HF model_type is not
+        # supported by Archon.
         model_type = getattr(self.model_config, "model_type", "")
         if not is_supported_model(model_type):
             supported = ", ".join(sorted(get_supported_model_types()))
@@ -895,6 +1086,8 @@ class ArchonEngine(TrainEngine):
         ac_config: ActivationCheckpointConfig | None,
         enable_compile: bool,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Dispatch to pipeline or non-pipeline parallelization.
         if self.parallel_dims.pp_enabled:
             self._apply_pipeline_parallelism(ac_config, enable_compile)
         else:
@@ -905,6 +1098,14 @@ class ArchonEngine(TrainEngine):
         ac_config: ActivationCheckpointConfig | None,
         enable_compile: bool,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Apply pipeline parallelism with the spec's pipelining_fn (RuntimeError
+        # if the model does not support it): splits the model into local stages (each
+        # parallelized with FSDP/TP/etc., bf16/param dtype, fp32 reduce, loss parallel,
+        # CPU offload, reshard policy, AC, compile), stores stages/parts and first/last
+        # flags, deletes the unsplit model, and records the last-stage rank (pp rank 0
+        # for V-shaped schedules ZBVZeroBubble/DualPipeV, else the last pp rank). Logs
+        # stage flags.
         """Apply pipeline parallelism using pipelining_fn."""
         if self.spec.pipelining_fn is None:
             raise RuntimeError(
@@ -957,6 +1158,9 @@ class ArchonEngine(TrainEngine):
         ac_config: ActivationCheckpointConfig | None,
         enable_compile: bool,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Parallelize the whole model in place with the spec's parallelize_fn
+        # using the same options as the PP path, and set model_parts to [model].
         """Apply parallelism using parallelize_fn."""
         self.spec.parallelize_fn(
             model=self.model,
@@ -974,6 +1178,12 @@ class ArchonEngine(TrainEngine):
     def _prepare_mb_inputs(
         self, mb_item: MicroBatchItem
     ) -> tuple[dict[str, Any], ArchonTrainContext]:
+        # [FUNCTION DOC]
+        # HELPER: Build model inputs and context for one micro-batch: copies the padded
+        # micro-batch dict, removes trie_node and turn_ids. Tree training: context with
+        # the trie and pad length (no labels). Otherwise: labels are input_ids rolled
+        # left by one; with CP, inputs and labels are Ulysses-sliced for this CP rank;
+        # [1, N] labels are squeezed to 1D. Returns (inputs, ArchonTrainContext).
         inputs = dict(mb_item.padded_mb)
 
         # Extract trie_node for tree training (if present)
@@ -1015,6 +1225,13 @@ class ArchonEngine(TrainEngine):
         self,
         mb_list: MicroBatchList,
     ) -> tuple[tuple, dict, torch.Tensor | None, list[ArchonTrainContext]]:
+        # [FUNCTION DOC]
+        # HELPER: Batch all micro-batches for the pipeline schedule: per micro-batch
+        # inputs/contexts as above, stacking input_ids (first stage only, as positional
+        # args), positions, cu_seqlens (right-padded with their last value to equal
+        # length, creating zero-length sequences), max_seqlen as a tensor, and labels
+        # (last stage, non-tree only) into the target. Returns (args tuple, kwargs dict,
+        # target or None, contexts).
         """Concatenate microbatch inputs for pipeline scheduler's step()/eval() API."""
         input_ids_list: list[torch.Tensor] = []
         positions_list: list[torch.Tensor] = []
@@ -1024,6 +1241,8 @@ class ArchonEngine(TrainEngine):
         contexts: list[ArchonTrainContext] = []
 
         def ensure_2d(t: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Add a leading batch dim to 1D tensors.
             return t.unsqueeze(0) if t.ndim == 1 else t
 
         for mb_item in mb_list:
@@ -1066,18 +1285,30 @@ class ArchonEngine(TrainEngine):
         return batched_args, batched_kwargs, batched_target, contexts
 
     def _create_state_dict_adapter(self) -> BaseStateDictAdapter | None:
+        # [FUNCTION DOC]
+        # HELPER: Instantiate the spec's state dict adapter for the HF config and
+        # checkpoint path.
         return self.spec.state_dict_adapter_class(
             self.model_config, hf_assets_path=self.config.path
         )
 
     def _get_all_parameters(self) -> list[nn.Parameter]:
+        # [FUNCTION DOC]
+        # HELPER: Flat list of parameters of all local model parts.
         return [p for m in self.model_parts for p in m.parameters()]
 
     def _get_model_name_parameters(self) -> Iterator[tuple[str, nn.Parameter]]:
+        # [FUNCTION DOC]
+        # HELPER: Generator over (name, param) of all local model parts.
         for m in self.model_parts:
             yield from m.named_parameters()
 
     def _create_device_model(self):
+        # [FUNCTION DOC]
+        # HELPER: Bind this process to LOCAL_RANK's device and NUMA node, set
+        # self.device, load the tokenizer, create the model structure on the meta device
+        # cast to config.dtype, store it as self.model, and log timing and device stats.
+        # Requires LOCAL_RANK in the environment (KeyError otherwise).
         current_platform.set_device(int(os.environ["LOCAL_RANK"]))
         current_platform.set_numa_affinity(int(os.environ["LOCAL_RANK"]))
         if current_platform.device_type == "cpu":
@@ -1103,6 +1334,11 @@ class ArchonEngine(TrainEngine):
         self.get_device_stats().log("after create model structure")
 
     def _create_model_structure(self) -> nn.Module:
+        # [FUNCTION DOC]
+        # HELPER: Choose the attention type (forced to "tree" when tree training, and
+        # "tree" downgraded to "varlen" otherwise, with warnings), router dtype (fp32 or
+        # None), build model args from the HF config (critic flag) and return an
+        # uninitialized model instance (called under the meta device).
         """Create model structure on meta device without loading weights."""
         # Use tree attention type when tree training is enabled
         attn_type = self.config.archon.attn_type
@@ -1131,6 +1367,12 @@ class ArchonEngine(TrainEngine):
         return self.spec.model_class(model_args)
 
     def _materialize_and_load_weights(self):
+        # [FUNCTION DOC]
+        # HELPER: Allocate real storage for all parts (to_empty on CPU when offloading
+        # params, else the accelerator), then either load HF weights from config.path or
+        # call init_weights when init_from_scratch, initialize buffers (e.g. RoPE
+        # caches) on the accelerator, barrier on the CPU group and log timing/device
+        # stats.
         """Materialize meta tensors and load weights after FSDP parallelization."""
         if self.config.archon.offload_params:
             init_device = "cpu"
@@ -1162,6 +1404,9 @@ class ArchonEngine(TrainEngine):
         self.get_device_stats().log("after materialize and load weights")
 
     def _create_optimizer(self, ft_spec: FinetuneSpec):
+        # [FUNCTION DOC]
+        # HELPER: Create the optimizer over all local parameters and the LR scheduler
+        # sized by ft_spec.total_train_steps; skipped when no optimizer config is set.
         if self.optimizer_config is None:
             return
 
@@ -1180,11 +1425,26 @@ class ArchonEngine(TrainEngine):
     def _normalize_batch_input(
         input_: list[dict[str, Any]] | dict[str, Any],
     ) -> tuple[dict[str, Any], Any | None]:
+        # [FUNCTION DOC]
+        # HELPER: For list input, concatenate the dicts with concat_batch and return
+        # (batch, split metadata); for a dict input return (input, None).
         if isinstance(input_, list):
             return concat_batch(input_)
         return input_, None
 
     def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
+        # [FUNCTION DOC]
+        # HELPER: Split a padded batch dict (requires attention_mask and input_ids;
+        # AssertionError otherwise) into device-ready micro-batches. Tree training:
+        # build packed prefix-tree micro-batches (synchronized across DP, TP-aligned)
+        # and log stats. Otherwise: amend position_ids; with PP require at least
+        # pp*stages_per_rank sequences (RuntimeError) and force n_mbs to at least that,
+        # divisible by pp; split by mb_spec, pack each micro-batch to 1D with
+        # cu_seqlens, pad every micro-batch to a multiple of lcm(page-size tokens
+        # derived from DEFAULT_PAGE_SIZE_BYTES / hidden_size / dtype size, the parallel
+        # seq-len divisor) (or to the maximum when pad_to_maximum), log token counts,
+        # add a leading batch dim and convert micro-batches to plain dicts. Returns the
+        # MicroBatchList.
         assert "attention_mask" in input_ and "input_ids" in input_
         input_ = input_.copy()
 
@@ -1275,6 +1535,14 @@ class ArchonEngine(TrainEngine):
         total_loss_weight: torch.Tensor,
         loss_multiplier: float = 1.0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Compute one micro-batch's scaled loss. If the micro-batch loss weight
+        # is 0 (or the tree is a dummy), returns logits.mean()*0 to keep the graph.
+        # Actor: gathers logprobs, entropy and vocab min/max logits and calls
+        # loss_fn(logprobs, entropy, mb_input, vocab_min_logits=...,
+        # vocab_max_logits=...). Critic: loss_fn(values, mb_input). Returns loss *
+        # local_weight / total_loss_weight * loss_multiplier. Comparing the weight
+        # tensor to 0 forces a GPU sync.
         """Compute logprobs/entropy and return scaled loss."""
         local_weight = loss_weight_fn(ctx.mb_input)
         if local_weight == 0:
@@ -1304,6 +1572,9 @@ class ArchonEngine(TrainEngine):
         logits: torch.Tensor,
         ctx: ArchonTrainContext,
     ) -> torch.Tensor | dict[int, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Return actor forward logprobs (tensor or per-sequence dict for trees)
+        # or critic values for one micro-batch.
         """Compute forward output (logprobs or values)."""
         if not self.config.is_critic:
             return self._gather_actor_forward_output(logits, ctx)
@@ -1314,6 +1585,13 @@ class ArchonEngine(TrainEngine):
         logits: torch.Tensor,
         ctx: ArchonTrainContext,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # HELPER: Actor training outputs per token. Tree training: None for a
+        # dummy/empty trie, else vocab min/max and logprobs/entropy gathered along the
+        # packed tree. Otherwise: logprobs and entropy of labels at the configured
+        # temperature (TP-aware, chunked), vocab min/max over the vocabulary dim, all
+        # gathered across Ulysses CP ranks, then trailing padding trimmed. Returns
+        # (logprobs, entropy, vocab_min, vocab_max).
         """Compute (logprobs, entropy, vocab_min, vocab_max) for actor training."""
         if self.enable_tree_training:
             # Handle dummy trie (empty tree for DP synchronization)
@@ -1359,6 +1637,10 @@ class ArchonEngine(TrainEngine):
         logits: torch.Tensor,
         ctx: ArchonTrainContext,
     ) -> torch.Tensor | dict[int, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Forward-only actor logprobs: tree path returns per-sequence logprobs
+        # from the trie; otherwise next-token logprobs (temperature, TP-aware, chunked),
+        # CP-gathered and padding-trimmed.
         """Compute actor logprobs for forward-only path."""
         if self.enable_tree_training:
             assert ctx.trie_node is not None
@@ -1392,6 +1674,8 @@ class ArchonEngine(TrainEngine):
         logits: torch.Tensor,
         ctx: ArchonTrainContext,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Critic values: squeeze the last logits dim, CP-gather, trim padding.
         """Compute critic values with CP gather and pad trimming."""
         values = logits.squeeze(-1)
 
@@ -1406,6 +1690,8 @@ class ArchonEngine(TrainEngine):
         self,
         logits: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Per-token min and max logits over the vocabulary (detached, float32).
         """Get vocab min/max logits for non-tree training path."""
         vocab_min_logits = logits.detach().min(-1).values.float()
         vocab_max_logits = logits.detach().max(-1).values.float()
@@ -1413,9 +1699,15 @@ class ArchonEngine(TrainEngine):
 
 
 class ArchonPPOActor(ArchonEngine):
+    # [CLASS DOC]
+    # ArchonEngine variant for PPO actors: composes a PPOActor (constructed with the
+    # config and this engine) and exposes its compute_logp / compute_advantages /
+    # ppo_update.
     """PPO Actor implementation using Archon backend."""
 
     def __init__(self, config):
+        # [FUNCTION DOC]
+        # Construct the engine then the PPOActor helper (lazy import).
         from areal.trainer.ppo.actor import PPOActor
 
         super().__init__(config)
@@ -1423,17 +1715,26 @@ class ArchonPPOActor(ArchonEngine):
 
     @torch.no_grad()
     def compute_logp(self, *args, **kwargs) -> list[torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # No-grad: delegate to PPOActor.compute_logp.
         return self.actor.compute_logp(*args, **kwargs)
 
     @torch.no_grad()
     def compute_advantages(self, *args, **kwargs) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # No-grad: delegate to PPOActor.compute_advantages.
         return self.actor.compute_advantages(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Delegate a PPO policy update to PPOActor.ppo_update.
         self.actor.ppo_update(*args, **kwargs)
 
     @classmethod
     def as_controller(cls, config, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Return a PPOActorControllerV2 for config._version "v2", else a
+        # PPOActorController, wrapping this engine class and scheduler.
         if config._version == "v2":
             from areal.trainer.ppo.actor import PPOActorControllerV2
 
@@ -1449,9 +1750,14 @@ class ArchonPPOActor(ArchonEngine):
 
 
 class ArchonPPOCritic(ArchonEngine):
+    # [CLASS DOC]
+    # ArchonEngine variant for PPO critics: composes a PPOCritic and exposes
+    # compute_values / ppo_update.
     """PPO Critic implementation using Archon backend."""
 
     def __init__(self, config):
+        # [FUNCTION DOC]
+        # Construct the engine then the PPOCritic helper.
         from areal.trainer.ppo.critic import PPOCritic
 
         super().__init__(config)
@@ -1459,13 +1765,19 @@ class ArchonPPOCritic(ArchonEngine):
 
     @torch.no_grad()
     def compute_values(self, *args, **kwargs) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # No-grad: delegate to PPOCritic.compute_values.
         return self.critic.compute_values(*args, **kwargs)
 
     def ppo_update(self, *args, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Delegate a value-function update to PPOCritic.ppo_update.
         self.critic.ppo_update(*args, **kwargs)
 
     @classmethod
     def as_controller(cls, config, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Return PPOCriticControllerV2 for "v2" configs else PPOCriticController.
         if config._version == "v2":
             from areal.trainer.ppo.critic import PPOCriticControllerV2
 
@@ -1481,22 +1793,32 @@ class ArchonPPOCritic(ArchonEngine):
 
 
 class ArchonLMEngine(ArchonEngine):
+    # [CLASS DOC]
+    # ArchonEngine variant for supervised fine-tuning: composes an LMEngine helper.
     """Archon-based LM Engine for SFT training."""
 
     def __init__(self, config: TrainEngineConfig):
+        # [FUNCTION DOC]
+        # Construct the engine then the LMEngine helper.
         from areal.trainer.sft.lm_engine import LMEngine
 
         super().__init__(config)
         self.lm_engine = LMEngine(self)
 
     def train_lm(self, data):
+        # [FUNCTION DOC]
+        # Delegate an SFT training step to LMEngine.train_lm.
         return self.lm_engine.train_lm(data)
 
     def evaluate_lm(self, data):
+        # [FUNCTION DOC]
+        # Delegate SFT evaluation to LMEngine.evaluate_lm.
         return self.lm_engine.evaluate_lm(data)
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Return LMControllerV2 for "v2" configs else LMController.
         if config._version == "v2":
             from areal.trainer.sft.lm_engine import LMControllerV2
 
@@ -1512,9 +1834,15 @@ class ArchonLMEngine(ArchonEngine):
 
 
 class ArchonRWEngine(ArchonEngine):
+    # [CLASS DOC]
+    # ArchonEngine variant for reward-model training: composes an RWEngine and forces
+    # mb_spec.granularity to 2 (chosen/rejected pairs stay in the same micro-batch).
     """Archon-based RW Engine for reward modeling."""
 
     def __init__(self, config: TrainEngineConfig):
+        # [FUNCTION DOC]
+        # Construct the engine and RWEngine helper; if mb_spec.granularity != 2, logs a
+        # warning and replaces self.config with a deep copy whose granularity is 2.
         from copy import deepcopy
 
         from areal.trainer.rw.rw_engine import RWEngine
@@ -1528,13 +1856,19 @@ class ArchonRWEngine(ArchonEngine):
             self.config.mb_spec.granularity = 2
 
     def train_rw(self, data):
+        # [FUNCTION DOC]
+        # Delegate a reward-model training step to RWEngine.train_rw.
         return self.rw_engine.train_rw(data)
 
     def evaluate_rw(self, data):
+        # [FUNCTION DOC]
+        # Delegate reward-model evaluation to RWEngine.evaluate_rw.
         return self.rw_engine.evaluate_rw(data)
 
     @classmethod
     def as_controller(cls, config: TrainEngineConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Return RWControllerV2 for "v2" configs else RWController.
         if config._version == "v2":
             from areal.trainer.rw.rw_engine import RWControllerV2
 
@@ -1546,9 +1880,15 @@ class ArchonRWEngine(ArchonEngine):
 
 
 class ArchonDPOEngine(ArchonEngine):
+    # [CLASS DOC]
+    # ArchonEngine variant for DPO: composes a DPOEngine and forces mb_spec.granularity
+    # to 2 like the reward engine.
     """Archon-based DPO Engine for direct preference optimization."""
 
     def __init__(self, config: DPOEngineConfig):
+        # [FUNCTION DOC]
+        # Construct the engine and DPOEngine helper; if granularity != 2, warn and deep-
+        # copy the config with granularity 2.
         from copy import deepcopy
 
         from areal.trainer.dpo.dpo_engine import DPOEngine
@@ -1562,12 +1902,18 @@ class ArchonDPOEngine(ArchonEngine):
             self.config.mb_spec.granularity = 2
 
     def train_dpo(self, data):
+        # [FUNCTION DOC]
+        # Delegate a DPO training step to DPOEngine.train_dpo.
         return self.dpo_engine.train_dpo(data)
 
     def evaluate_dpo(self, data):
+        # [FUNCTION DOC]
+        # Delegate DPO evaluation to DPOEngine.evaluate_dpo.
         return self.dpo_engine.evaluate_dpo(data)
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # Delegate reference/policy logprob computation to DPOEngine.compute_logp.
         return self.dpo_engine.compute_logp(data)
 
     @classmethod
@@ -1576,6 +1922,8 @@ class ArchonDPOEngine(ArchonEngine):
         config: DPOEngineConfig,
         scheduler: Scheduler,
     ):
+        # [FUNCTION DOC]
+        # Return DPOControllerV2 for "v2" configs else DPOController.
         if config._version == "v2":
             from areal.trainer.dpo.dpo_engine import DPOControllerV2
 

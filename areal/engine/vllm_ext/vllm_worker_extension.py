@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# vLLM worker extension (passed to vLLM as worker_extension_cls) implementing the
+# worker-side methods invoked by areal_vllm_server through collective_rpc: reload full
+# weights or a LoRA adapter from disk, create custom NCCL/HCCL weight-update process
+# groups with the trainer, store broadcast metadata, and receive full-model or LoRA
+# weights via broadcast. Each method runs on every vLLM worker (TP/PP rank) and returns
+# a (success, message) tuple. Provides a no-op fallback for set_current_vllm_config on
+# vLLM < 0.19. Logs via vLLM's init_logger.
 # SPDX-License-Identifier: Apache-2.0
 
 import traceback
@@ -17,6 +25,9 @@ except ImportError:
     # vLLM < 0.19 does not require an explicit config context for weight loading.
     @contextmanager
     def set_current_vllm_config(*_args, **_kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fallback no-op context manager used when vLLM lacks
+        # set_current_vllm_config; ignores all args and yields.
         yield
 
 
@@ -28,15 +39,34 @@ logger = init_logger("vllm_worker_extension")
 
 
 class VLLMWorkerExtension:
+    # [CLASS DOC]
+    # Mixin merged into vLLM's Worker class; relies on the worker's model_runner, rank
+    # and device. Adds state attributes: weight_update_groups (group name ->
+    # ProcessGroup), areal_weight_meta_* (names/dtypes/shapes/group for full updates),
+    # areal_lora_* (LoRA XCCL metadata) and _lora_partial_shards ((lora_name, id) ->
+    # group name -> received tensors) for buffering per-PP-stage LoRA shards.
+    # KNOWN ISSUE: docstring says "Iherited from vllm codebase" (typo; it is an
+    # extension mixin, not inherited).
     """
     Iherited from vllm codebase
     """
 
     def sync(self):
+        # [FUNCTION DOC]
+        # HELPER: Device synchronize via current_platform followed by a default-group
+        # torch.distributed barrier across vLLM workers.
         current_platform.synchronize()
         torch.distributed.barrier()
 
     def areal_update_weights(self, model_path):
+        # [FUNCTION DOC]
+        # Reload all model weights from model_path in place: sets model_config.model to
+        # the path, gets the model loader for the load config and calls load_weights on
+        # the live model within the vLLM config context, then syncs. Returns (True,
+        # "Success") or (False, error message) on exception (logged).
+        # KNOWN ISSUE: the first logger.info call passes flush=True, which standard
+        # logging.Logger methods reject with TypeError (outside the try block), unless
+        # vLLM's logger accepts it; same pattern in the LoRA and XCCL update methods.
         logger.info(f"start update weights, {model_path}", flush=True)
         try:
             # load weight
@@ -62,6 +92,11 @@ class VLLMWorkerExtension:
         lora_int_id: int,
         base_model_name: str,
     ):
+        # [FUNCTION DOC]
+        # Replace a LoRA adapter from disk: removes adapter lora_int_id from the LoRA
+        # manager, builds a LoRARequest (name, id, path, base model) and adds it through
+        # model_runner.add_lora inside the config context, then syncs. Returns (success,
+        # message); errors are logged and returned.
         logger.info(
             f"start lora update weights, lora_model_path-{lora_model_path}, lora_name-{lora_name}, lora_int_id-{lora_int_id}, base_model_name-{base_model_name}",
             flush=True,
@@ -93,6 +128,10 @@ class VLLMWorkerExtension:
         shapes: list[list[int]],
         group_name: str,
     ):
+        # [FUNCTION DOC]
+        # Store full-model broadcast metadata (names, dtype strings, shapes, group name)
+        # on the worker for the next areal_update_weight_xccl. Returns (True,
+        # "Success").
         logger.info("start set weights meta")
         self.areal_weight_meta_names = names
         self.areal_weight_meta_dtypes = dtypes
@@ -114,6 +153,10 @@ class VLLMWorkerExtension:
         lora_bias: str,
         base_model_name: str,
     ):
+        # [FUNCTION DOC]
+        # Store LoRA broadcast metadata (names/dtypes/shapes, group name, LoRA name, id,
+        # target modules, rank, alpha, bias, base model name) for the next
+        # areal_update_weight_lora_xccl. Returns (True, "Success").
         logger.info(
             f"start set lora weights meta for lora_name={lora_name}, lora_int_id={lora_int_id}"
         )
@@ -131,6 +174,14 @@ class VLLMWorkerExtension:
         return True, "Success"
 
     def areal_update_weight_xccl(self):
+        # [FUNCTION DOC]
+        # Receive full-model weights from the trainer: looks up the process group by the
+        # stored group name (raises KeyError if absent, not caught), then for each
+        # stored (name, dtype, shape) allocates an empty tensor on the worker device,
+        # receives it by broadcast from group rank 0 (blocking) and immediately loads it
+        # into the model with load_weights inside the config context. Syncs at the end.
+        # Returns (success, message); other exceptions are logged and returned as
+        # failure.
         logger.info("start update weights by nccl or hccl", flush=True)
         names = self.areal_weight_meta_names
         dtypes = self.areal_weight_meta_dtypes
@@ -165,6 +216,20 @@ class VLLMWorkerExtension:
             return False, error_msg
 
     def areal_update_weight_lora_xccl(self):
+        # [FUNCTION DOC]
+        # Receive LoRA weights via broadcast and hot-swap the adapter (uses private vLLM
+        # adapter-manager APIs). Raises KeyError if the group is unknown. Requires an
+        # initialized LoRA manager with adapter lora_int_id already registered (else
+        # failure). Receives each tensor from group rank 0, moves it to CPU, strips
+        # "default." from names, and buffers the shard under (lora_name, id) and the
+        # group name. Until shards from as many groups as are registered have arrived
+        # (one per training PP stage), syncs and returns success. Once complete, merges
+        # shards, builds a PEFTHelper (r, lora_alpha, target_modules, bias), creates a
+        # CPU LoRAModel from the tensors with the manager's LoRA dtype, vocab size
+        # (+extra vocab) and the model's hf_to_vllm mapper, removes the old adapter,
+        # adds and activates the new one, logs (warning if the module count differs from
+        # the old adapter), and syncs. Returns (success, message) with traceback on
+        # failure.
         # NOTE: This code relies on vLLM private APIs: _adapter_manager, _registered_adapters,
         # and _add_adapter/activate_adapter, which may change/ breakdown due to newer vllm versions.
 
@@ -316,6 +381,13 @@ class VLLMWorkerExtension:
         backend: str,
         group_name: str,
     ):
+        # [FUNCTION DOC]
+        # Join a custom process group with the trainer: lazily creates
+        # weight_update_groups and, when LoRA is enabled, _lora_partial_shards; calls
+        # init_custom_process_group with the backend, world_size,
+        # tcp://master_address:master_port init method, rank = worker rank +
+        # rank_offset, the group name and the default timeout (blocks until all members
+        # join), and stores the group. Returns (success, message).
         if not hasattr(self, "weight_update_groups"):
             self.weight_update_groups: dict[str, dist.ProcessGroup] = {}
 

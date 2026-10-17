@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Megatron -> HuggingFace weight export utilities (largely adapted from slime) used for
+# weight sync to inference engines and HF saving. Provides: TP all-gather of sharded
+# parameters (including GLU de-interleaving and TransformerEngine blockwise FP8 tensors
+# kept in FP8), vocab padding removal, per-architecture name/layout converters
+# (Qwen2/Qwen3 dense, Qwen3-MoE, Qwen2.5-VL, Qwen3-VL dense/MoE, DeepSeek-V3, BailingMoe
+# V2/V2.5, Qwen LoRA adapters), a substring-dispatched registry with optional FP8
+# quantization (convert_to_hf), and a generator of globally-indexed named parameters
+# across pipeline/virtual-pipeline and expert-parallel shards. Megatron names are
+# expected in the "module.module." (DDP + Float16Module wrapped) form. Converters are
+# pure (views/chunks, no copies unless noted) and raise ValueError on unknown names.
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
@@ -27,6 +38,9 @@ from areal.engine.megatron_utils.megatron_lora import (
 
 @functools.cache
 def _accepts_hf_config(fn) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Cached check whether a conversion function's signature has an hf_config
+    # parameter.
     return "hf_config" in inspect.signature(fn).parameters
 
 
@@ -39,6 +53,14 @@ def _all_gather_and_concat(
     name: str,
     gated_linear_unit: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: All-gather a TP-sharded tensor over tp_group (collective) and concatenate
+    # along partition_dim. For gated_linear_unit with linear_fc1 weight/bias and stride
+    # 1, forces stride 2 because each rank stores [gate_local | up_local]. With stride S
+    # > 1, each gathered partition is split into S chunks and regrouped so all ranks'
+    # chunk 0 come first, then chunk 1, etc. Works around a Megatron grouped-MoE quirk:
+    # names containing "linear_fc2.weight" with partition_dim 0 are concatenated along
+    # dim 1. Returns the full tensor (new memory).
     """All-gather tensor partitions and concatenate along partition dimension.
 
     When partition_stride > 1 (e.g., GLU/SwiGLU layers where gate and up projections
@@ -93,6 +115,11 @@ def _all_gather_fp8_tensor_and_concat(
     block_size: int = 128,
     gated_linear_unit: bool = False,
 ) -> FP8BlockwiseTensorHelper:
+    # [FUNCTION DOC]
+    # HELPER: TP all-gather for a TE Float8BlockwiseQTensor: gathers its _rowwise_data
+    # and _rowwise_scale_inv separately with _all_gather_and_concat (same dims/stride
+    # handling) and wraps them in an FP8BlockwiseTensorHelper with block_size (default
+    # 128). Collective.
     """All-gather a Float8BlockwiseQTensor along the partition dimension.
 
     Returns FP8BlockwiseTensorHelper that wraps rowwise_data and rowwise_scale_inv.
@@ -131,6 +158,18 @@ def all_gather_param(
     duplicated_param_names: set[str] | None = None,
     gated_linear_unit: bool = False,
 ) -> torch.Tensor | FP8BlockwiseTensorHelper:
+    # [FUNCTION DOC]
+    # Return the full (TP-unsharded) value of one Megatron parameter for export. Inputs:
+    # name, param, fp8_direct_convert (keep TE FP8 tensors in FP8 instead of
+    # dequantizing via .data), quantization_config (for FP8 block size),
+    # duplicated_param_names (names known to be replicated even though TE marks them
+    # tensor_model_parallel), gated_linear_unit. Behavior: names containing
+    # "expert_bias" are returned as is; params without the tensor_model_parallel
+    # attribute, or not TP-sharded, or listed as duplicated, are returned as is when
+    # FP8-direct else as param.data (TE FP8 .data dequantizes to bf16). Otherwise all-
+    # gathers over the expert-TP group for ".experts." names, else the TP group,
+    # returning an FP8BlockwiseTensorHelper for FP8-direct or a plain tensor. Collective
+    # when sharded.
     if "expert_bias" in name:
         return param
 
@@ -201,6 +240,10 @@ def all_gather_param(
 def remove_padding(
     name: str, param: Parameter | Tensor | FP8BlockwiseTensorHelper, vocab_size: int
 ):
+    # [FUNCTION DOC]
+    # Trim vocabulary padding: for the (language-model) word embedding and output layer
+    # weights in "module.module." naming, returns the first vocab_size rows; returns
+    # param unchanged for all other names.
     if name in (
         "module.module.embedding.word_embeddings.weight",
         "module.module.output_layer.weight",
@@ -217,6 +260,20 @@ def convert_qwen3moe_to_hf(
     name: str,
     param: Parameter | Tensor | FP8BlockwiseTensorHelper,
 ):
+    # [FUNCTION DOC]
+    # Convert one Qwen3-MoE Megatron parameter (layer index already global) to HF (name,
+    # tensor) pairs. Handles embeddings, lm_head, final norm; per-layer: routed experts
+    # linear_fc1 weightK (split in half into gate/up) and linear_fc2 weightK (down),
+    # shared experts fc1/fc2, attention o_proj, fused QKV weight (viewed as [groups,
+    # heads_per_group+2, head_dim, hidden] and split into q/k/v), fused QKV bias (split
+    # per group), dense MLP fc1/fc2, input/post-attention layernorms (fused
+    # layer_norm_weight or pre_mlp_layernorm), router weight -> mlp.gate.weight, router
+    # expert_bias -> mlp.gate.e_score_correction_bias, q/k layernorms. head_dim =
+    # kv_channels or hidden/heads. Raises ValueError on unknown names or unknown
+    # expert/shared expert sub-names.
+    # KNOWN ISSUE: heads-per-group is computed by dividing by num_query_groups before
+    # the None check, so a None num_query_groups raises TypeError instead of the
+    # intended ValueError.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":
@@ -369,6 +426,11 @@ def convert_qwen3moe_to_hf(
 
 
 def _vision_qkv_mcore_to_hf(param: Tensor, vision_num_heads: int) -> Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Reorder a vision-encoder QKV weight [3*Hv, in] or bias [3*Hv] from
+    # Megatron per-head interleaved layout [heads, 3, head_dim] to HF grouped layout [3,
+    # heads, head_dim]. Asserts no GQA (3 * heads * head_dim equals the first dim).
+    # Returns a new contiguous tensor of the same shape.
     """Convert vision encoder QKV from mcore interleaved to HF grouped format.
 
     mcore: per-head interleaved [num_heads, 3, head_dim, H] flattened to [3*H_v, H_v]
@@ -407,6 +469,15 @@ def convert_qwen2_5_vl_to_hf(
     param: Parameter | Tensor | FP8BlockwiseTensorHelper,
     hf_config=None,
 ):
+    # [FUNCTION DOC]
+    # Convert a Qwen2.5-VL Megatron parameter to HF. "module.module.language_model."
+    # names are rewritten to "module.module." and delegated to convert_qwen2_to_hf.
+    # megatron-bridge "module.module.visual." names are already HF-formatted: just strip
+    # "module.module.". mbridge vision_model names: fixed direct mapping for patch
+    # embed, final layernorm (merger.ln_q) and merger MLP; per-block QKV weight/bias
+    # reordered via _vision_qkv_mcore_to_hf (requires hf_config.vision_config.num_heads,
+    # else ValueError), attention proj, norm1/norm2 and gated MLP (fc1 weight/bias split
+    # into gate/up, fc2 -> down). Raises ValueError for anything else.
     """Convert Qwen2.5-VL Megatron parameters to HuggingFace format.
 
     Handles both vision_model and language_model parameters.
@@ -506,6 +577,10 @@ _QWEN3_VL_VISION_DEEPSTACK_RE = re.compile(
 
 
 def _convert_qwen3_vl_lm_global(name, param):
+    # [FUNCTION DOC]
+    # HELPER: Map Qwen3-VL language-model global tensors (embed tokens, final norm,
+    # lm_head) to HF names under model.language_model / lm_head; returns None when the
+    # name is not one of them.
     """Top-level language-model tensors (embeddings, final norm, lm_head).
 
     Returns the converted name list if matched, else ``None``.
@@ -520,6 +595,12 @@ def _convert_qwen3_vl_lm_global(name, param):
 
 
 def _convert_qwen3_vl_lm_attention(tf_config, layer_idx, rest, param):
+    # [FUNCTION DOC]
+    # HELPER: Map one Qwen3-VL language-model layer's attention tensor (rest = name
+    # after the layer index) to HF names under model.language_model.layers.N: o_proj,
+    # fused QKV weight/bias split into q/k/v (grouped GQA layout as in the Qwen2
+    # converter), input_layernorm, q_norm, k_norm. Returns None for non-attention keys.
+    # Raises ValueError if num_query_groups is None.
     """Per-layer attention block shared by Qwen3-VL dense and MoE.
 
     Returns the converted name list if ``rest`` matches an attention key,
@@ -574,6 +655,13 @@ def _convert_qwen3_vl_lm_attention(tf_config, layer_idx, rest, param):
 
 
 def _convert_qwen3_vl_vision_to_hf(name, param, hf_config):
+    # [FUNCTION DOC]
+    # HELPER: Map Qwen3-VL vision tower and deepstack merger tensors (mbridge layout) to
+    # HF "model.visual." names: fixed direct entries (patch embed weight/bias,
+    # pos_embed, merger norm and fc1/fc2), per-block QKV (reordered, needs
+    # hf_config.vision_config.num_heads else ValueError), proj, norm1/norm2 weight+bias,
+    # non-gated MLP fc1/fc2 one-to-one, and deepstack_merger_list.N patch_norm -> norm
+    # and fc1/fc2 as is. Raises ValueError for unknown names.
     """Vision tower + deepstack merger conversion shared by dense and MoE.
 
     Mirrors mbridge.models.qwen3_vl.Qwen3VBaseBridge mappings.
@@ -660,6 +748,12 @@ def convert_qwen3_vl_to_hf(
     param: Parameter | Tensor | FP8BlockwiseTensorHelper,
     hf_config=None,
 ):
+    # [FUNCTION DOC]
+    # Convert a dense Qwen3-VL Megatron parameter to HF: tries language-model globals,
+    # then for language_model decoder layers the shared attention mapping followed by
+    # dense gated MLP (fc1 split into gate/up, fc2 -> down, fc1 layer_norm_weight ->
+    # post_attention_layernorm); other language_model names raise ValueError; anything
+    # else goes to the vision converter (hf_config needed for vision QKV).
     """Convert dense Qwen3-VL Megatron parameters to HuggingFace format.
 
     Qwen3-VL-MoE is handled by ``convert_qwen3_vl_moe_to_hf``; the registry
@@ -715,6 +809,13 @@ def convert_qwen3_vl_moe_to_hf(
     param: Parameter | Tensor | FP8BlockwiseTensorHelper,
     hf_config=None,
 ):
+    # [FUNCTION DOC]
+    # Convert a Qwen3-VL-MoE Megatron parameter to HF: same as the dense Qwen3-VL
+    # converter but per-layer MLP handling covers per-expert
+    # "mlp.experts.linear_fc1/linear_fc2.weightK" (fc1 split into gate/up per expert),
+    # router weight -> mlp.gate.weight, pre_mlp_layernorm -> post_attention_layernorm,
+    # plus a dense-MLP fallback. ValueError on unknown expert kinds or language-model
+    # names; non-language names go to the vision converter.
     """Convert Qwen3-VL-MoE Megatron parameters to HuggingFace format.
 
     Mirrors ``convert_qwen3moe_to_hf`` (per-expert flat HF keys, no transpose,
@@ -803,6 +904,15 @@ def convert_qwen2_to_hf(
     name: str,
     param: Parameter | Tensor | FP8BlockwiseTensorHelper,
 ):
+    # [FUNCTION DOC]
+    # Convert a Qwen2 / Qwen3 dense Megatron parameter to HF: embeddings, lm_head, final
+    # norm, and per layer o_proj, fused QKV weight (view [groups, heads_per_group+2,
+    # head_dim, hidden] then split q/k/v and flatten) and bias (per-group split), gated
+    # MLP fc1 -> gate/up halves, fc2 -> down, fused input/post-attention layernorm
+    # weights, and Qwen3 q/k norms. head_dim = kv_channels or hidden/heads. Raises
+    # ValueError on unknown names.
+    # KNOWN ISSUE: as in the Qwen3-MoE converter, the None check on num_query_groups
+    # happens after it is used in a division.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":
@@ -893,6 +1003,14 @@ def convert_deepseekv3_to_hf(
     name: str,
     param: Parameter | Tensor | FP8BlockwiseTensorHelper,
 ):
+    # [FUNCTION DOC]
+    # Convert a DeepSeek-V3 (MLA + MoE) Megatron parameter to HF: embeddings, lm_head,
+    # final norm; per layer routed experts (fc1 split gate/up, fc2 down) and shared
+    # experts, o_proj, MLA projections (linear_q_proj -> q_proj, q_down -> q_a_proj,
+    # q_up layernorm -> q_a_layernorm, q_up -> q_b_proj, kv_down -> kv_a_proj_with_mqa,
+    # kv_up layernorm -> kv_a_layernorm, kv_up -> kv_b_proj), optional fused QKV bias
+    # split, dense MLP, input/post-attention layernorms, router weight and expert_bias
+    # (-> e_score_correction_bias). Raises ValueError on unknown names.
     if name == "module.module.embedding.word_embeddings.weight":
         return [("model.embed_tokens.weight", param)]
     if name == "module.module.output_layer.weight":
@@ -1053,6 +1171,20 @@ def convert_bailingmoe_to_hf(
     name: str,
     param: Parameter | Tensor | FP8BlockwiseTensorHelper,
 ):
+    # [FUNCTION DOC]
+    # Convert a BailingMoe V2 / V2.5 Megatron parameter to HF (attention modules under
+    # "attention."). Names containing "_extra_state" yield []. Handles embeddings
+    # (model.word_embeddings), lm_head, final norm; routed/shared experts and dense MLP
+    # (fc1 split gate/up); router weight and expert_bias (kept as mlp.gate.expert_bias);
+    # Lightning attention fused QKV weight converted from per-head interleaved [heads,
+    # 3, head_dim, hidden] to concatenated [Q; K; V] (bias passed through without
+    # reordering), gate projection g_proj and g_norm; MLA projections
+    # (q_a/q_b/kv_a/kv_b, their layernorms, q_proj); output proj -> attention.dense;
+    # input/post-attention layernorms; q/k layernorms -> query_layernorm/key_layernorm.
+    # ValueError on unknown names.
+    # KNOWN ISSUE: the Lightning QKV bias is passed through in Megatron's interleaved
+    # order while the weight is reordered to [Q; K; V], so a model with QKV bias would
+    # get a mismatched bias layout.
     """Convert BailingMoeV2_5 megatron-core weights to HuggingFace format.
 
     BailingMoeV2_5 has two attention types per layer:
@@ -1269,6 +1401,15 @@ def convert_to_hf(
     fp8_direct_convert: bool = False,
     hf_config=None,
 ):
+    # [FUNCTION DOC]
+    # Convert one Megatron parameter to a list of HF (name, tensor) pairs by dispatching
+    # on the first registry key that is a substring of model_name (registry order
+    # matters). Passes hf_config only to converters that accept it. If
+    # quantization_config is truthy: with fp8_direct_convert, expands
+    # FP8BlockwiseTensorHelper outputs into (name, float8 weight) + (name_scale_inv,
+    # scale) pairs; otherwise quantizes the converted bf16 tensors with quantize_params
+    # (keyed by the Megatron name). Returns the list. Raises ValueError for unsupported
+    # model names (and whatever the converter raises).
     """Convert Megatron parameter to HuggingFace format, optionally with FP8 quantization.
 
     Args:
@@ -1313,7 +1454,24 @@ def convert_to_hf(
 
 
 def get_named_parameters(model_module, num_experts):
+    # [FUNCTION DOC]
+    # Generator yielding (name, tensor) for all parameters of a Megatron model (single
+    # module or list of virtual pipeline chunks), renamed to global indices: decoder
+    # layer indices (text or VLM language_model) are shifted by this PP/VPP stage's
+    # transformer layer offset, and per-expert grouped-GEMM names
+    # "mlp.experts.<x>.weightK" (also in MTP layers) get K shifted by the EP rank's
+    # expert offset (ep_rank * num_experts / ep_size). Names lacking "module.module."
+    # get one "module." prefix added. Also yields expert_bias buffers as parameters
+    # (layer-index shifted). For lists with VPP world size > 1, sets the Megatron
+    # virtual pipeline rank per chunk while iterating and restores the original rank
+    # afterwards (global mpu state mutation). Vision tower layers are not shifted.
     def _iter_single(single_module):
+        # [FUNCTION DOC]
+        # HELPER: Yield renamed params/buffers for one model chunk. Resolves the chunk's
+        # TransformerConfig (from the chunk or its .module; AttributeError if missing),
+        # its vp stage (chunk attribute, else mpu's current VP rank, else None), and the
+        # layer offset via get_transformer_layer_offset, then applies the renaming rules
+        # described above.
         ep_size = mpu.get_expert_model_parallel_world_size()
         ep_rank = mpu.get_expert_model_parallel_rank()
         if num_experts:

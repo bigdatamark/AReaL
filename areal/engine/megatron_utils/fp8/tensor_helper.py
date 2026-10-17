@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tensor-subclass helper that lets Megatron<->HF weight conversion code treat a
+# blockwise FP8 weight (fp8 data plus per-block scale_inv) like a plain tensor: shape
+# ops (view, reshape, chunk, split, cat, slicing, flatten) are applied to the data and
+# mirrored on the scale tensor. Also converts to/from TransformerEngine
+# Float8BlockwiseQTensor and to plain PyTorch float8 + scale pairs.
 # SPDX-License-Identifier: Apache-2.0
 
 import math
@@ -9,6 +15,14 @@ from areal.infra.platforms import current_platform
 
 
 class FP8BlockwiseTensorHelper(torch.Tensor):
+    # [CLASS DOC]
+    # Wrapper tensor subclass (via _make_wrapper_subclass, no storage of its own) whose
+    # apparent shape/dtype/device is the FP8 data's. Attributes: _rowwise_data
+    # (float8_e4m3fn view of the data), _rowwise_scale_inv (per-block multiplicative
+    # scales, same rank as data, last two dims divided by block size, earlier dims
+    # unchanged), _block_size (int). Supported aten ops via __torch_dispatch__ are only
+    # cat/split/chunk; everything else raises NotImplementedError. Every op returns a
+    # new helper; nothing mutates in place except to_te_fp8_inplace on the target.
     """A helper wrapper tensor that maps operations on data to operations on both data and scale_inv.
 
     This is a customized helper class for blockwise FP8 quantization, not a general-purpose tensor.
@@ -29,6 +43,10 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         rowwise_scale_inv: torch.Tensor,
         block_size: int = 128,
     ):
+        # [FUNCTION DOC]
+        # Construct the wrapper: reinterpret rowwise_data as float8_e4m3fn (view, no
+        # copy), create the subclass with that shape/dtype/device and requires_grad
+        # False, and store data, scale_inv (as is) and block_size (default 128).
         # Create a tensor subclass that wraps rowwise_data
         rowwise_data = rowwise_data.view(torch.float8_e4m3fn)
         obj = torch.Tensor._make_wrapper_subclass(
@@ -44,18 +62,36 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         return obj
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC]
+        # Return a debug string with data, scale_inv, both shapes and block size.
         return f"FP8BlockwiseTensorHelper(data={self._rowwise_data}\nscale_inv={self._rowwise_scale_inv}\ndata_shape={self.shape}, scale_shape={self._rowwise_scale_inv.shape}, block_size={self._block_size})"
 
     def _ceil_div(self, a: int, b: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Integer ceiling division of a by b.
         return (a + b - 1) // b
 
     def _map_data_dim_to_scale_dim(self, data_dim_size: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Number of scale entries covering a data dimension of the given size
+        # (ceil divide by block size).
         """Map a data dimension size to the corresponding scale dimension size."""
         return self._ceil_div(data_dim_size, self._block_size)
 
     def _compute_scale_shape(
         self, old_data_shape: tuple, new_data_shape: tuple, old_scale_shape: tuple
     ) -> tuple:
+        # [FUNCTION DOC]
+        # HELPER: Compute the scale_inv shape matching a reshape of the data. Asserts
+        # the last data dim is unchanged. If the rank is unchanged, asserts the shapes
+        # are identical and returns old_scale_shape. Otherwise maps each new data dim:
+        # the last two dims become ceil(dim / block_size), earlier dims are kept as is;
+        # asserts the element count of the new scale shape equals the old one. Returns
+        # the tuple.
+        # KNOWN ISSUE: same-rank reshapes to a different shape (e.g. [A, B] -> [B, A])
+        # are rejected by assertion rather than supported, and splitting a block-dim
+        # into leading dims only works when the block boundaries line up (checked only
+        # via total element count).
         """Compute scale_inv shape after a view/reshape operation.
 
         - When data dimension is divided by block_size to get scale dimension
@@ -95,6 +131,11 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         return tuple(new_scale_shape)
 
     def chunk(self, chunks: int, dim: int = 0):
+        # [FUNCTION DOC]
+        # Split data and scale_inv into `chunks` pieces along the same dim (default 0)
+        # and return a tuple of helpers. Asserts data and scale ranks match. Note that
+        # chunking a block dim splits data and scales independently, so it is only
+        # consistent when chunk sizes are block aligned.
         """Chunk operation: split both data and scale_inv along the same dimension."""
         assert self._rowwise_data.ndim == self._rowwise_scale_inv.ndim, (
             "data and scale_inv must have the same number of dimensions"
@@ -108,6 +149,11 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         )
 
     def split(self, split_size_or_sections, dim: int = 0):
+        # [FUNCTION DOC]
+        # Split data and scale_inv with the same split_size_or_sections along dim
+        # (default 0); returns a tuple of helpers. Asserts equal ranks and that dim is
+        # not one of the last two dims (dim < ndim-2 for non-negative or dim < -2 for
+        # negative).
         """Split operation: split both data and scale_inv along the same dimension."""
         assert self._rowwise_data.ndim == self._rowwise_scale_inv.ndim, (
             "data and scale_inv must have the same number of dimensions"
@@ -128,6 +174,10 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         )
 
     def view(self, *shape):
+        # [FUNCTION DOC]
+        # View both tensors: views the data to *shape, derives the scale shape with
+        # _compute_scale_shape, views scale_inv to it, returns a new helper. Raises as
+        # the underlying view/assertions do.
         """View operation: reshape both data and scale_inv.
 
         When data is reshaped, scale_inv needs to be reshaped correspondingly.
@@ -147,6 +197,8 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         return FP8BlockwiseTensorHelper(new_data, new_scale, self._block_size)
 
     def reshape(self, *shape):
+        # [FUNCTION DOC]
+        # Same as view but uses reshape (may copy) for both data and scale_inv.
         """Reshape operation: same as view but allows non-contiguous tensors."""
         old_data_shape = self._rowwise_data.shape
         new_data = self._rowwise_data.reshape(*shape)
@@ -159,6 +211,20 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         return FP8BlockwiseTensorHelper(new_data, new_scale, self._block_size)
 
     def __getitem__(self, indices):
+        # [FUNCTION DOC]
+        # Index data and the scale tensor consistently and return a new helper. A single
+        # slice or int indexes dim 0: for <=2D tensors dim 0 is a block dim so the slice
+        # bounds are converted to block indices (start floor, stop ceil; an int keeps a
+        # one-row scale slice); for >2D it is applied to scale as is (int index keeps a
+        # length-1 dim on the scale while the data loses the dim). A tuple maps each
+        # slice/int per dim, converting indices on the last two dims to block
+        # coordinates. Other index types (tensors, Ellipsis, None) raise
+        # NotImplementedError. Slice steps are ignored for scales.
+        # KNOWN ISSUE: int indexing leaves scale rank different from data rank (data
+        # drops a dim, scale keeps a size-1 dim in the single-int case, and for tuple
+        # ints in the last two dims the scale drops a dim while still representing a
+        # whole block), so subsequent chunk/split/cat rank asserts may fail; and for >2D
+        # tensors the "last two dims" test uses the original rank.
         """Indexing operation: slice data and scale_inv accordingly.
 
         Only the last two dimensions' indices need to be divided by block_size.
@@ -225,6 +291,11 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
 
     @staticmethod
     def cat(tensors, dim: int = 0):
+        # [FUNCTION DOC]
+        # Concatenate a non-empty sequence of helpers along dim (default 0) by
+        # concatenating data and scale_inv along the same dim; uses the first tensor's
+        # block size. Raises ValueError when empty or any element is not a helper;
+        # AssertionError on rank mismatches.
         """Concatenate FP8BlockwiseTensorHelper instances along specified dimension.
 
         Both data and scale_inv are concatenated along the same dimension.
@@ -257,6 +328,8 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         return FP8BlockwiseTensorHelper(new_data, new_scale, block_size)
 
     def contiguous(self):
+        # [FUNCTION DOC]
+        # Return a helper whose data and scale_inv are both made contiguous.
         """Make both data and scale_inv contiguous."""
         return FP8BlockwiseTensorHelper(
             self._rowwise_data.contiguous(),
@@ -265,6 +338,9 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         )
 
     def flatten(self, start_dim: int = 0, end_dim: int = -1):
+        # [FUNCTION DOC]
+        # Flatten data and scale_inv over the same dim range (default all) and return a
+        # new helper. Only meaningful when the flattened dims are not block dims.
         """Flatten operation."""
         new_data = self._rowwise_data.flatten(start_dim, end_dim)
         new_scale = self._rowwise_scale_inv.flatten(start_dim, end_dim)
@@ -273,6 +349,13 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
     def to_pytorch_fp8(
         self, scale_inv_dtype: torch.dtype = torch.bfloat16
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Convert to a plain (float8_e4m3fn data, scale_inv) pair: data viewed as
+        # float8, scale cast to scale_inv_dtype (default bfloat16) and trimmed/cloned to
+        # [ceil(M/block), ceil(K/block)] where M is the first data dim and K the last,
+        # dropping any TE padding.
+        # KNOWN ISSUE: assumes 2D data; for >2D tensors M is taken from dim 0 and only
+        # the first two scale dims are sliced, which is wrong.
         """Convert FP8BlockwiseTensorHelper to PyTorch float8 tensor.
 
         This function extracts the data and scale_inv from this FP8BlockwiseTensorHelper
@@ -310,6 +393,11 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         tensor: torch.Tensor,
         block_size: int = 128,
     ) -> "FP8BlockwiseTensorHelper":
+        # [FUNCTION DOC]
+        # Build a helper from a TransformerEngine Float8BlockwiseQTensor by cloning its
+        # _rowwise_data and _rowwise_scale_inv (scale may include TE padding). Raises
+        # ValueError if not a TE float8 tensor, RuntimeError if the rowwise attributes
+        # are missing.
         """Convert Transformer Engine Float8BlockwiseQTensor to FP8BlockwiseTensorHelper.
 
         Args:
@@ -339,6 +427,14 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
         return cls(rowwise_data, rowwise_scale_inv, block_size)
 
     def to_te_fp8_inplace(self, target_te_tensor: torch.Tensor) -> None:
+        # [FUNCTION DOC]
+        # Copy this helper's data (viewed as uint8) and 2D scale_inv into an existing TE
+        # Float8BlockwiseQTensor in place (scale copied into the top-left region of the
+        # possibly padded TE scale buffer), synchronize the device via current_platform,
+        # then regenerate TE's columnwise (transposed) copy on the target's CUDA device.
+        # Raises ValueError if target is not a TE float8 tensor and RuntimeError if it
+        # lacks rowwise buffers; asserts matching data shape and 2D scales. Returns
+        # None.
         """Convert FP8BlockwiseTensorHelper to Transformer Engine Float8BlockwiseQTensor format inplace.
 
         This function copies the data and scale_inv from this FP8BlockwiseTensorHelper
@@ -378,6 +474,11 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        # [FUNCTION DOC]
+        # Torch dispatch hook: routes aten cat (all inputs must be helpers, else
+        # RuntimeError), split and chunk (when the first arg is a helper) to the
+        # corresponding helper methods, reading dims/sizes from positional or keyword
+        # args. Any other op raises NotImplementedError.
         """Intercept torch operations and handle them appropriately."""
         if kwargs is None:
             kwargs = {}
@@ -417,6 +518,10 @@ class FP8BlockwiseTensorHelper(torch.Tensor):
 def convert_fp8_helper_to_pytorch_fp8(
     named_tensors: list[tuple[str, torch.Tensor | FP8BlockwiseTensorHelper]],
 ) -> list[tuple[str, torch.Tensor]]:
+    # [FUNCTION DOC]
+    # Flatten a list of (name, tensor-or-helper) into plain tensors: each helper becomes
+    # (name, float8 data) followed by (name + "_scale_inv", bfloat16 scale) using
+    # to_pytorch_fp8; regular tensors pass through. Returns a new list.
     """Convert FP8BlockwiseTensorHelper instances in named tensors to PyTorch FP8 format.
 
     This function processes a list of (name, tensor) pairs and converts any

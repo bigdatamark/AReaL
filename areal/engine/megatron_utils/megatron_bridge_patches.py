@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Import-time monkey patches for megatron-bridge bugs not yet in a release. Importing
+# this module applies all patches once (idempotent via a class-level sentinel) and logs
+# through the "MegatronBridgePatches" logger. Each patch silently does nothing if the
+# patched megatron-bridge class cannot be imported.
 # SPDX-License-Identifier: Apache-2.0
 
 """Runtime patches for megatron-bridge bugs not yet in a released version.
@@ -17,6 +22,14 @@ logger = logging.getLogger("MegatronBridgePatches")
 
 
 def _patch_qwen3vl_pr3143_word_embeddings() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Workaround for megatron-bridge PR #3143. If Qwen3VLGPTModel is importable
+    # and not already patched, replaces its _postprocess with a wrapper that, when the
+    # instance's "embedding" is a plain closure lacking word_embeddings (the sequence-
+    # parallel MTP shadow embedding), scans the closure cells for an object with
+    # word_embeddings and attaches that attribute to the closure, then calls the
+    # original _postprocess. Sets the _areal_pr3143_applied sentinel on the class and
+    # logs at INFO. Returns None; global class mutation.
     """megatron-bridge PR #3143: expose word_embeddings on MTP shadow embedding.
 
     Bug (issue #3112 / PR #3143): in ``Qwen3VLGPTModel.forward``, when
@@ -51,6 +64,10 @@ def _patch_qwen3vl_pr3143_word_embeddings() -> None:
     _orig_postprocess = Qwen3VLGPTModel._postprocess
 
     def _patched_postprocess(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Replacement _postprocess: lazily restores word_embeddings on the
+        # shadow embedding closure (skipping empty cells) before delegating all args to
+        # the original method and returning its result.
         emb = self.__dict__.get("embedding")
         # Only intervene when the shadow closure is currently installed and
         # lacks the expected attribute.
@@ -78,6 +95,8 @@ def _patch_qwen3vl_pr3143_word_embeddings() -> None:
 
 
 def _apply_patches_on_import() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Apply every patch in this module; called once at module import.
     _patch_qwen3vl_pr3143_word_embeddings()
 
 

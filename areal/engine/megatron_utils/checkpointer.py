@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Megatron-Core distributed checkpointing (modified from VeRL). Saves/loads sharded
+# model, distributed-optimizer, LR scheduler and RNG state with
+# megatron.core.dist_checkpointing ("torch_dist" format wrapped in fully-parallel
+# strategies over the DP x CP group), with optional asynchronous saving through MCore's
+# AsyncCallsQueue (background process does disk IO after GPU->CPU staging). All public
+# entry points are collective across ranks. Logs via "MegatronCheckpointer".
 # SPDX-License-Identifier: Apache-2.0
 
 # Modified from VeRL: verl/utils/checkpoint/megatron_checkpoint_manager.py
@@ -45,11 +52,17 @@ logger = logging.getLogger("MegatronCheckpointer")
 
 
 def log_with_rank(message: str, rank: int, log_only_rank_0: bool = False):
+    # [FUNCTION DOC]
+    # HELPER: Log message at INFO prefixed with "[Rank N]"; when log_only_rank_0 is True
+    # only rank 0 logs.
     if not log_only_rank_0 or rank == 0:
         logger.info(f"[Rank {rank}] {message}")
 
 
 def get_device_name() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Return the platform device type string (e.g. "cuda") if an accelerator is
+    # available, else "cpu".
     if current_platform.is_available():
         device = current_platform.device_type
     else:
@@ -58,6 +71,10 @@ def get_device_name() -> str:
 
 
 class _UnsupportedMCoreAsyncLayout(RuntimeError):
+    # [CLASS DOC]
+    # HELPER: Private RuntimeError subclass signaling that MCore's async save request
+    # has a layout this module does not recognize, so its retained GPU tensor references
+    # cannot be released; raised before the request is scheduled.
     """Raised when MCore's retained async payload cannot be released safely.
 
     This includes malformed async request arguments, write buckets, bucket
@@ -69,6 +86,9 @@ class _UnsupportedMCoreAsyncLayout(RuntimeError):
 
 
 def _mcore_version() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Return the installed megatron-core package version string, or "unknown" if
+    # not installed.
     try:
         return metadata.version("megatron-core")
     except metadata.PackageNotFoundError:
@@ -76,9 +96,19 @@ def _mcore_version() -> str:
 
 
 def _inspect_retained_payload(async_request: AsyncRequest) -> list[list]:
+    # [FUNCTION DOC]
+    # HELPER: Validate the internal structure of an MCore AsyncRequest and collect the
+    # tensor lists it retains. Expects async_fn_args to be a 3-item list/tuple whose
+    # second item is the write_buckets list; each bucket must be a 3-tuple whose third
+    # item is a (bytes_data, tensor_data) pair with tensor_data a list. Returns the list
+    # of those tensor_data lists. Raises _UnsupportedMCoreAsyncLayout (message includes
+    # megatron-core version) on any mismatch. Relies on MCore internals.
     """Validate MCore's retained payload layout before scheduling the save."""
 
     def unsupported(detail: str) -> _UnsupportedMCoreAsyncLayout:
+        # [FUNCTION DOC]
+        # HELPER: Build (not raise) an _UnsupportedMCoreAsyncLayout with a standard
+        # message including the detail and MCore version.
         return _UnsupportedMCoreAsyncLayout(
             "Unsupported MCore async checkpoint layout "
             f"(megatron-core={_mcore_version()}): {detail}. "
@@ -116,6 +146,11 @@ def _inspect_retained_payload(async_request: AsyncRequest) -> list[list]:
 
 
 def _release_retained_payload(tensor_lists: list[list]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Clear (in place) each retained tensor list so the trainer process drops
+    # its GPU tensor references after MCore staged them to CPU, keeping the bucket
+    # structure for finalization. Raises RuntimeError if any list is still non-empty
+    # afterwards.
     """Drop parent-side GPU references after MCore finishes D2H staging.
 
     MCore retains the original request for finalization, whose writer still owns
@@ -133,6 +168,14 @@ def _release_retained_payload(tensor_lists: list[list]) -> None:
 def save_dist_checkpointing(
     sharded_state_dict, ckpt_path, async_save=False
 ) -> AsyncRequest | None:
+    # [FUNCTION DOC]
+    # Save a sharded state dict to directory ckpt_path with dist_checkpointing.save
+    # using the default "torch_dist" save strategy wrapped in
+    # FullyParallelSaveStrategyWrapper over the DP group including CP, with access-
+    # integrity validation. When async_save is True passes async_sharded_save with
+    # async_strategy "mcore" and returns the AsyncRequest that the caller must schedule;
+    # otherwise performs the save synchronously and returns None (as returned by MCore).
+    # Collective; writes files.
     validate_sharding_integrity = True
     # Get checkpointing strategies
     save_strategy = get_default_save_sharded_strategy("torch_dist")
@@ -160,6 +203,11 @@ def save_dist_checkpointing(
 
 
 def load_dist_checkpointing(sharded_state_dict, ckpt_dir):
+    # [FUNCTION DOC]
+    # Load a sharded state dict template from ckpt_dir using the checkpoint's default
+    # load strategy wrapped in FullyParallelLoadStrategyWrapper over the DP x CP group.
+    # Returns the loaded state dict (tensors filled per the template). Collective; reads
+    # files.
     # Get checkpointing strategies
     load_strategy = get_default_load_sharded_strategy(ckpt_dir)
     load_strategy = FullyParallelLoadStrategyWrapper(
@@ -175,6 +223,17 @@ def load_dist_checkpointing(sharded_state_dict, ckpt_dir):
 
 
 class MegatronCheckpointManager:
+    # [CLASS DOC]
+    # Checkpoint manager for a list of Megatron model chunks (one per virtual pipeline
+    # stage) plus a distributed optimizer and optional LR scheduler. State: model,
+    # optimizer, lr_scheduler, flags (use_distributed_optimizer must be True,
+    # use_checkpoint_opt_param_scheduler, use_dist_checkpointing, async_save), rank
+    # (global), and _async_queue (AsyncCallsQueue when async_save, else None). The
+    # checkpoint directory is passed directly per call; there is no step-based directory
+    # layout or retention policy despite the class docstring.
+    # KNOWN ISSUE: the class docstring mentions directory creation by global step,
+    # cleanup/retention policies and a global_step argument to save_checkpoint, none of
+    # which exist in this implementation.
     """
     Checkpoint manager for Megatron-LM distributed training.
 
@@ -237,6 +296,10 @@ class MegatronCheckpointManager:
         use_dist_checkpointing: bool = True,
         async_save: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Store references and flags; asserts use_distributed_optimizer is True
+        # (AssertionError otherwise); reads the global rank (requires torch.distributed
+        # initialized); creates an AsyncCallsQueue only when async_save is True.
         self.model = model
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
@@ -258,6 +321,14 @@ class MegatronCheckpointManager:
     def get_rng_state(
         self, use_dist_ckpt: bool = True, data_parallel_random_init: bool = False
     ):
+        # [FUNCTION DOC]
+        # Collect Python, NumPy, torch CPU, Megatron CUDA RNG tracker and (if an
+        # accelerator is present) device RNG states into a dict. If
+        # data_parallel_random_init and DP size > 1, all_gather_object the dicts across
+        # the DP group (collective); otherwise wrap the single dict in a list. When
+        # use_dist_ckpt (default True) the list is wrapped in a ShardedObject
+        # "rng_state" sharded over (pp_size, tp_size) at (pp_rank, tp_rank) with
+        # replica_id equal to the DP (with CP) rank. Returns the list or ShardedObject.
         """collect rng state across data parallel ranks"""
         rng_state = {
             "random_rng_state": random.getstate(),
@@ -311,6 +382,14 @@ class MegatronCheckpointManager:
         return_base_dir=True,
         basename="model.pt",
     ):
+        # [FUNCTION DOC]
+        # Legacy helper returning the per-rank checkpoint directory under
+        # checkpoints_path: "mp_rank_TT" or, with pipeline parallelism,
+        # "mp_rank_TT_PPP", plus "_EEE" when expert parallel; defaults for each
+        # rank/flag are read from mpu. Creates the directory (os.makedirs). Returns the
+        # directory when return_base_dir (default True) else the path joined with
+        # basename ("model.pt"). cp_rank is accepted but unused (models are identical
+        # across CP ranks).
         """Determine the directory name for this rank's checkpoint."""
         # Use both the tensor and pipeline MP rank.
         if pipeline_parallel is None:
@@ -354,6 +433,17 @@ class MegatronCheckpointManager:
         with_rng: bool = True,
         is_loading: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Build the sharded state dict used both for save and as the load template.
+        # with_model: for each model chunk (unwrapping .module), sets the virtual
+        # pipeline rank when there are multiple chunks and stores
+        # chunk.sharded_state_dict() under "model" or "modelN". with_optimizer: barrier,
+        # then the optimizer's sharded_state_dict with "dp_reshardable" distributed-
+        # optimizer sharding (is_loading pre-allocates Adam moments so they are
+        # requested on load) under "optimizer", plus the LR scheduler's plain state_dict
+        # under "lr_scheduler" if a scheduler exists. with_rng: barrier, then
+        # get_rng_state() under "rng_state". Returns the dict. Collective (barriers).
+        # Note optimizer resharding is only across DP, so load requires identical TP/PP.
         # For save dist checkpointing
         state_dict = {}
 
@@ -406,6 +496,11 @@ class MegatronCheckpointManager:
         return state_dict
 
     def load_rng_states(self, rng_states, data_parallel_random_init=False):
+        # [FUNCTION DOC]
+        # Restore RNG states from the loaded list: picks the entry for this DP rank when
+        # data_parallel_random_init else entry 0, then sets Python, NumPy, torch CPU,
+        # device (if not CPU) and Megatron CUDA RNG tracker states (global side
+        # effects). Raises a bare KeyError if the tracker states are empty.
         # access rng_state for data parallel rank
         if data_parallel_random_init:
             rng_states = rng_states[mpu.get_data_parallel_rank()]
@@ -432,6 +527,16 @@ class MegatronCheckpointManager:
         with_optimizer: bool = True,
         with_rng: bool = True,
     ):
+        # [FUNCTION DOC]
+        # Load a checkpoint from local_path (must exist; AssertionError otherwise; None
+        # skips the check). First waits for pending async saves. Builds the load
+        # template via generate_state_dict(is_loading=True), loads it with
+        # load_dist_checkpointing, then: with_model - asserts model keys are present and
+        # loads each chunk's state dict (setting the virtual pipeline rank) or raises
+        # NotImplementedError if dist checkpointing is disabled; with_optimizer - loads
+        # optimizer state and, if use_checkpoint_opt_param_scheduler, asserts and loads
+        # the LR scheduler state; with_rng - restores RNG states. Logs each step.
+        # Collective; returns None.
         # If a prior save to the same directory is still flushing in the
         # background, block until it finishes so we don't load a half-written
         # checkpoint.
@@ -516,6 +621,16 @@ class MegatronCheckpointManager:
         with_optimizer=True,
         with_rng: bool = True,
     ):
+        # [FUNCTION DOC]
+        # Save a checkpoint to local_path. Raises NotImplementedError unless dist
+        # checkpointing is used. Non-blockingly finalizes finished async saves, builds
+        # the state dict, calls save_dist_checkpointing. Async mode: asserts an
+        # AsyncRequest was returned, validates and records its retained tensor lists,
+        # schedules it on the queue (which synchronizes and forks the writer), then
+        # clears the retained GPU references, records the stat
+        # "ckpt/async_save_queue_depth" via stats_tracker and logs on rank 0. Sync mode:
+        # asserts no request was returned and does a global barrier. Collective; returns
+        # None. with_optimizer also controls whether the LR scheduler state is saved.
         dist_checkpoint_path = local_path
 
         if not self.use_dist_checkpointing:
@@ -574,6 +689,10 @@ class MegatronCheckpointManager:
             torch.distributed.barrier()
 
     def _reap_finished_async_saves(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Collectively finalize, without blocking, async saves whose background
+        # processes have finished (writing their metadata) and log each finalized call
+        # index on rank 0. No-op when async saving is disabled.
         """Non-blocking finalize of any background save processes that have finished.
 
         Must be called collectively on all ranks: maybe_finalize_async_calls
@@ -591,6 +710,12 @@ class MegatronCheckpointManager:
             )
 
     def wait_async_saves(self) -> None:
+        # [FUNCTION DOC]
+        # Collectively block until all scheduled async saves are finalized, logging the
+        # pending count and each finalized call on rank 0. Always enters the collective
+        # finalize (even with zero local pending) to avoid cross-rank deadlocks. No-op
+        # when async saving is disabled. Raises whatever MCore raises if a background
+        # save failed.
         """Block until every previously scheduled async save has finalized.
 
         Must be called collectively on all ranks. Call before:
@@ -621,6 +746,9 @@ class MegatronCheckpointManager:
             )
 
     def close(self) -> None:
+        # [FUNCTION DOC]
+        # Drain pending async saves then drop the async queue (subsequent async-related
+        # calls become no-ops). Collective; idempotent.
         """Drain all pending async saves. Idempotent; safe to call multiple times."""
         self.wait_async_saves()
         self._async_queue = None

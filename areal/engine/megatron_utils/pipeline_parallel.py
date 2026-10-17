@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Parameter-balanced pipeline-parallel layer partitioning for Megatron. Estimates per-
+# decoder-layer parameter counts (dense and MoE) plus embedding/output head sizes from
+# HF and Megatron configs, finds the split of contiguous layers over pp*vpp stages that
+# minimizes the maximum per-stage parameter load (dynamic programming), and writes it
+# into the TransformerConfig as an explicit PipelineParallelLayerLayout. Logs via
+# "MCoreParallel".
 # SPDX-License-Identifier: Apache-2.0
 
 import math
@@ -19,6 +26,20 @@ def configure_pipeline_layer_splits(
     hf_config: PretrainedConfig,
     tf_config: TransformerConfig,
 ) -> TransformerConfig:
+    # [FUNCTION DOC]
+    # Configure a custom pipeline layer layout on tf_config (mutated in place and
+    # returned). Inputs: parallel_strategy (pipeline_parallel_size,
+    # virtual_pipeline_parallel_size), hf_config (HF PretrainedConfig) and tf_config
+    # (Megatron TransformerConfig). Returns tf_config untouched when pp <= 1, num_layers
+    # is invalid, parameter estimates are empty/non-positive, or no partition is found
+    # (the last case logs a warning). Otherwise computes stage lengths for pp*vpp
+    # stages, builds a layout where stage 0 starts with "embedding", each stage has its
+    # "decoder" entries and the last stage ends with "loss", sets
+    # pipeline_model_parallel_layout, clears num_layers_in_first/last_pipeline_stage and
+    # disables account_for_embedding/loss_in_pipeline_split when those attributes exist,
+    # and logs per-stage decoder counts and estimated parameter loads (in millions).
+    # KNOWN ISSUE: if the estimated layer list is shorter than num_layers, the layout is
+    # built for the truncated count and will not cover all model layers.
     pp_size = parallel_strategy.pipeline_parallel_size
     vpp_size = parallel_strategy.virtual_pipeline_parallel_size
 
@@ -106,6 +127,15 @@ def _compute_stage_layer_lengths(
     output_params: float,
     pp_size: int,
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Min-max partition of a sequence of layer weights into pp_size contiguous
+    # stages. Stage 1 additionally carries embedding_params and the last stage
+    # output_params; middle stages must be non-empty while first/last may hold zero
+    # decoder layers. Uses an O(stages * layers^2) DP over prefix sums tracking the best
+    # previous split, then backtracks. Returns a list of per-stage layer counts summing
+    # to the number of layers, or [] if no layers, pp_size <= 0 or no feasible
+    # partition. With pp_size 1 the single stage gets embedding_params only
+    # (output_params ignored).
     total_layers = len(layer_param_weights)
     if total_layers == 0 or pp_size <= 0:
         return []
@@ -115,6 +145,8 @@ def _compute_stage_layer_lengths(
         prefix_sums.append(prefix_sums[-1] + float(value))
 
     def segment_sum(start: int, end: int) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Sum of layer weights in [start, end) via prefix sums.
         return prefix_sums[end] - prefix_sums[start]
 
     stages = pp_size
@@ -160,6 +192,25 @@ def _compute_stage_layer_lengths(
 def estimate_stage_parameter_buckets(
     hf_conf: PretrainedConfig, tf_conf: TransformerConfig
 ) -> tuple[list[float], float, float]:
+    # [FUNCTION DOC]
+    # Estimate parameter counts. Determines layer count (tf num_layers, else hf
+    # num_hidden_layers) and hidden size (hf, else tf); returns ([], 0.0, 0.0) if either
+    # is missing/invalid. Reads FFN size, heads, KV heads, head_dim (hf head_dim, else
+    # tf kv_channels, else hidden/heads) and bias/GLU flags with HF-then-Megatron
+    # fallbacks. Each dense layer = Q/K/V/O projections + optional biases + two norm
+    # vectors + MLP (up, optional gate, down, optional biases). Embedding = vocab*hidden
+    # (+vocab if embedding_bias); output head = vocab*hidden, or equal to embedding when
+    # tie_word_embeddings. For MoE (tf num_moe_experts), layers selected by
+    # moe_layer_freq (int step -> every step-th layer starting at index step-1;
+    # list/tuple -> truthy entries, asserted length = layers) use attention + router
+    # (+expert bias) + local experts (experts / EP size, ceil) * expert MLP + optional
+    # shared expert MLP. Returns (per-layer weights list, embedding params, output
+    # params) as floats.
+    # KNOWN ISSUE: the output projection is counted as hidden*hidden rather than
+    # (heads*head_dim)*hidden; an int moe_layer_freq selects layers step-1, 2*step-1,
+    # ... whereas Megatron's pattern marks layers with index divisible by the step (0,
+    # step, ...); negative freq values are treated by absolute value. These only affect
+    # load-balance estimates.
     total_layers = getattr(tf_conf, "num_layers", None)
     if not isinstance(total_layers, int) or total_layers <= 0:
         total_layers = getattr(hf_conf, "num_hidden_layers", 0)
@@ -201,6 +252,10 @@ def estimate_stage_parameter_buckets(
     gated_linear_unit = bool(getattr(tf_conf, "gated_linear_unit", False))
 
     def mlp_params(intermediate: int | None) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Parameter count of one MLP of the given intermediate size (0 if
+        # falsy/non-positive): up and down projections, a gate projection when
+        # gated_linear_unit, and biases when add_bias_linear.
         if not intermediate or intermediate <= 0:
             return 0.0
         proj = hidden_size * intermediate

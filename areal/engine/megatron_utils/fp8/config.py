@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Parses the FP8 block size from a HuggingFace-style quantization config dict.
 # SPDX-License-Identifier: Apache-2.0
 
 
@@ -6,6 +8,13 @@ def get_block_size_from_config(
     default: int = 128,
     strict: bool = False,
 ) -> int:
+    # [FUNCTION DOC]
+    # Return the FP8 quantization block size (int). Inputs: quantization_config (dict or
+    # None) possibly holding "weight_block_size"; default (int, 128) returned when the
+    # config or key is absent or (non-strict) malformed; strict (bool) - when True,
+    # raise ValueError if weight_block_size is not a 2-element list/tuple or its two
+    # entries differ. Otherwise returns the first element of weight_block_size (non-
+    # strict mode does not check squareness). Pure function.
     """Extract block size from quantization configuration.
 
     Args:

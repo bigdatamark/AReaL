@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Helper for putting Megatron-Core training into deterministic mode: mutates the
+# transformer config flags, exports env vars read by TransformerEngine / NCCL / cuBLAS,
+# and enables torch deterministic algorithms. Uses the "MCoreDeterm" logger.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -11,6 +15,20 @@ logger = logging.getLogger("MCoreDeterm")
 
 
 def set_deterministic_algorithms(model_config, prebuild: bool = False):
+    # [FUNCTION DOC]
+    # Enable deterministic execution. Inputs: model_config (Megatron TransformerConfig
+    # or a built model's config, mutated in place); prebuild (bool, default False) -
+    # True when called on the config before the model is built. Always sets
+    # deterministic_mode=True and disables cross_entropy_loss_fusion and
+    # bias_dropout_fusion. When prebuild and the config has attention_backend, sets it
+    # to the flash AttnBackend (cuDNN fused attention deterministic backward is too
+    # memory hungry) and logs it.
+    # Env side effects: if NVTE_ALLOW_NONDETERMINISTIC_ALGO is not already "0", warns if
+    # transformer_engine was already imported (TE may have snapshotted it) and sets it
+    # to "0"; sets NCCL_ALGO to "Ring" unless it is one of
+    # Tree/Ring/CollnetDirect/CollnetChain/^NVLS; sets CUBLAS_WORKSPACE_CONFIG to
+    # ":4096:8" unless it is ":4096:8" or ":16:8". Finally calls
+    # torch.use_deterministic_algorithms(True, warn_only=True) (global). Returns None.
     """Enable deterministic execution on a Megatron transformer config.
 
     ``deterministic_mode`` has two kinds of consumers in Megatron-Core:

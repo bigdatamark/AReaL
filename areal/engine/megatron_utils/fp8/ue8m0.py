@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# UE8M0 scale utilities (adapted from DeepGEMM / SGLang). UE8M0 keeps only the 8-bit
+# biased exponent of a float32 scale, so scales are powers of two. Provides TMA
+# alignment helpers, 128x128 blockwise FP8 quantization with power-of-two scales, and
+# conversion of float32 scales into DeepGEMM's packed (4 exponents per int32), MN-major,
+# TMA-aligned layout. Pure torch, runs on the tensors' device.
 # SPDX-License-Identifier: Apache-2.0
 
 # UE8M0 format utilities for FP8 quantization
@@ -17,6 +23,9 @@ _NUM_TMA_ALIGNMENT_BYTES = 16
 
 
 def get_tma_aligned_size(x: int, element_size: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Round size x up to a multiple of 16 bytes worth of elements (16 //
+    # element_size). Asserts element_size divides 16. Returns int.
     """Get TMA aligned size (16 bytes alignment).
 
     Args:
@@ -31,6 +40,10 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
 
 
 def ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Round the absolute values of x up to the nearest power of two (2 **
+    # ceil(log2|x|)). Returns a new float tensor. Zero inputs produce 0 (log2 gives
+    # -inf).
     """Convert scale to power of 2 (UE8M0 format).
 
     UE8M0 format stores only the exponent, so scales are rounded up
@@ -46,6 +59,14 @@ def ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
 
 
 def get_mn_major_tma_aligned_packed_ue8m0_tensor(x: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Convert a float32 scale tensor of shape (mn, k) or (batch, mn, k) to packed UE8M0:
+    # takes bits 23..30 of each float as uint8 (assumes positive scales; the sign bit
+    # would leak in otherwise), zero-pads mn to a TMA-aligned multiple of 4 and k to a
+    # multiple of 4, reinterprets each 4 bytes as one int32, then copies into a buffer
+    # whose memory is MN-major (stride 1 along mn) and slices back to mn rows. Returns
+    # an int32 tensor of shape (..., mn, ceil(k/4)) with that non-contiguous layout;
+    # batch dim removed for 2D input. AssertionError on wrong dtype/rank.
     """Convert FP32 scale tensor to TMA-aligned packed UE8M0 format.
 
     This is the pure PyTorch implementation from DeepGEMM tests/test_layout.py
@@ -100,6 +121,11 @@ def get_mn_major_tma_aligned_packed_ue8m0_tensor(x: torch.Tensor) -> torch.Tenso
 def per_block_cast_to_fp8_ue8m0(
     x: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Quantize a 2D tensor (m, n) to float8_e4m3fn with 128x128 blocks: zero-pads to
+    # multiples of 128, computes per-block absmax (float, clamped >= 1e-4), scale =
+    # absmax/448 rounded up to a power of two, divides and casts. Returns (fp8 tensor of
+    # shape (m, n), contiguous; float32 scale of shape (ceil(m/128), ceil(n/128))).
     """Quantize 2D tensor to FP8 with 128x128 block-wise UE8M0 scaling.
 
     From SGLang fp8_utils.py, which is copied from DeepGEMM.
@@ -131,6 +157,15 @@ def quant_weight_ue8m0(
     weight_dequant: torch.Tensor,
     weight_block_size: list[int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Quantize a bfloat16 weight of shape (..., n, k) to FP8 with UE8M0 128x128 block
+    # scales by flattening leading dims into rows and calling
+    # per_block_cast_to_fp8_ue8m0. Returns (fp8 weight of the same shape, float32 scale
+    # of shape (..., ceil(n/128), ceil(k/128))). Asserts weight_block_size == [128, 128]
+    # (list) and dtype bfloat16.
+    # KNOWN ISSUE: for batched (>2D) input where n is not a multiple of 128, blocks span
+    # batch boundaries in the flattened view and the scale reshape to (..., ceil(n/128),
+    # ...) will not match the element count.
     """Quantize weight to FP8 + UE8M0 scale format.
 
     From SGLang sglang/srt/layers/quantization/fp8_utils.py.
@@ -167,6 +202,11 @@ def quant_weight_ue8m0(
 
 
 def transform_scale_ue8m0(sf: torch.Tensor, mn: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Expand a block-scale tensor along the row dim to one row per original row (row i
+    # takes block row i // 128, hard-coded 128 block) for mn rows, then pack it via
+    # get_mn_major_tma_aligned_packed_ue8m0_tensor. Returns the packed int32 tensor for
+    # DeepGEMM.
     """Transform scale to UE8M0 packed format for DeepGEMM.
 
     From SGLang sglang/srt/layers/quantization/fp8_utils.py.

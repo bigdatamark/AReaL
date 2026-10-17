@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# SGLang remote inference engine. SGLangBackend translates AReaL engine operations
+# (generation, scoring, weight updates from disk or NCCL/XCCL, LoRA loading,
+# pause/resume, memory offload/onload, health checks, server launch) into SGLang HTTP
+# requests and parses its responses; RemoteSGLangEngine is the public InferenceEngine
+# that composes a generic RemoteInfEngine with this backend and forwards every call to
+# it. Logs via "SGLangRemote".
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -42,10 +49,19 @@ logger = getLogger("SGLangRemote")
 
 
 class SGLangBackend:
+    # [CLASS DOC]
+    # Stateless SGLang protocol adapter consumed by RemoteInfEngine. Each build_* /
+    # get_* method returns an HttpRequest (endpoint, JSON payload, optional
+    # method/best_effort) or a WeightUpdateRequests bundle; parse_* methods turn SGLang
+    # JSON into AReaL result types; launch_server starts the server process.
     """SGLang-specific backend implementation for remote inference."""
 
     @staticmethod
     def build_server_env(env: Mapping[str, str]) -> dict[str, str]:
+        # [FUNCTION DOC]
+        # Return a copy of env with TRITON_CACHE_PATH set to a fresh uuid4 subdirectory
+        # of the existing value (or the default launcher path) so concurrent servers do
+        # not share a Triton cache.
         _env = dict(env)
         triton_cache_path = _env.get("TRITON_CACHE_PATH", TRITON_CACHE_PATH)
         _env["TRITON_CACHE_PATH"] = os.path.join(triton_cache_path, str(uuid.uuid4()))
@@ -54,6 +70,15 @@ class SGLangBackend:
     def build_generation_request(
         self, req: ModelRequest, with_lora: bool, version: int
     ) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Build a POST /generate request from a ModelRequest. Sampling params: top_p,
+        # top_k, max_new_tokens, temperature (0 when greedy), stop_token_ids,
+        # ignore_eos, skip_special_tokens, frequency_penalty, plus stop strings and
+        # sampling_seed when set. Payload includes a copy of input_ids, image_data,
+        # return_logprob True, stream False, return_routed_experts when req.metadata
+        # requests it, and lora_path set to the versioned LoRA name when with_lora.
+        # Raises NotImplementedError for beam search and ValueError if with_lora but
+        # gconfig.lora_name is empty.
         """Build SGLang generation request."""
         gconfig = req.gconfig
         stop_token_ids = gconfig.stop_token_ids
@@ -104,6 +129,14 @@ class SGLangBackend:
     def parse_generation_response(
         self, response: dict[str, Any]
     ) -> HttpGenerationResult:
+        # [FUNCTION DOC]
+        # Parse a /generate response into HttpGenerationResult. Reads
+        # meta_info.finish_reason type (stop reason) and message. If routed_experts is
+        # present, base64-decodes it into an int32 numpy array reshaped to
+        # (prompt_tokens + completion_tokens - 1, -1). For aborts with message starting
+        # "Abort before prefill" returns empty tokens/logprobs; otherwise output tokens
+        # and logprobs come from output_token_logprobs entries (logprob, token_id).
+        # Raises KeyError on missing fields.
         """Parse SGLang generation response."""
         meta_info = response["meta_info"]
         finish_reason = meta_info["finish_reason"]
@@ -142,6 +175,11 @@ class SGLangBackend:
     def build_score_request(
         self, input_ids: list[int], target_len: int, with_lora: bool, version: int
     ) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Build a /generate request that scores the last target_len tokens of input_ids:
+        # generate 1 token greedily with return_logprob, logprob_start_len = max(0, len
+        # - target_len - 1), no top logprobs. Raises NotImplementedError when with_lora.
+        # version is unused.
         payload: dict[str, Any] = {
             "input_ids": input_ids,
             "sampling_params": {
@@ -162,6 +200,10 @@ class SGLangBackend:
     def parse_score_response(
         self, response: dict[str, Any], target_len: int
     ) -> list[float]:
+        # [FUNCTION DOC]
+        # Return the last target_len input-token logprobs (floats) from
+        # meta_info.input_token_logprobs. Raises ValueError if meta_info is missing or
+        # fewer than target_len logprobs are returned.
         meta_info = response.get("meta_info")
         if meta_info is None:
             raise ValueError("SGLang response missing meta_info for score request")
@@ -176,6 +218,13 @@ class SGLangBackend:
     def build_disk_weight_update_requests(
         self, meta: WeightUpdateMeta
     ) -> WeightUpdateRequests:
+        # [FUNCTION DOC]
+        # Build disk-based weight update requests. LoRA (meta.use_lora): requires
+        # lora_name and version (ValueError otherwise); returns a best-effort
+        # /load_lora_adapter for the versioned name with meta.path, plus a best-effort
+        # /unload_lora_adapter for version - lora_keep_versions when keep > 0 and that
+        # version is >= 0 (bounded adapter retention). Full model: a single
+        # /update_weights_from_disk with model_path and abort_all_requests True.
         """Build SGLang disk weight update requests."""
         if meta.use_lora:
             if not meta.lora_name:
@@ -227,6 +276,10 @@ class SGLangBackend:
     def build_distributed_weight_update_requests(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ) -> WeightUpdateRequests:
+        # [FUNCTION DOC]
+        # Build a single /update_weights_from_distributed request listing param names,
+        # dtypes and shapes from param_specs, the NCCL group name and abort_all_requests
+        # True. Raises ValueError for LoRA (unsupported over NCCL with SGLang).
         """Build SGLang distributed weight update requests.
 
         Note: SGLang distributed weight update (NCCL-based) does not support LoRA.
@@ -255,6 +308,16 @@ class SGLangBackend:
     def build_init_weights_group_request(
         self, addr: str, server_idx: int, meta: WeightUpdateMeta
     ) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Build the /init_weights_update_group request for server number server_idx.
+        # Asserts meta.gen_allocation is set. If inference pp_size > 1 and the group
+        # name ends with "_<int>" (per-PP-stage groups), pp_rank comes from that suffix,
+        # rank_offset = 1 + server_idx * tp_size, world_size = n_servers * tp_size + 1
+        # with n_servers = world_size / (tp*pp), and pp_rank is included. Otherwise
+        # rank_offset = 1 + server_idx * tp*pp and world_size = total inference world
+        # size + 1 (rank 0 is the trainer). Payload also has master address (URL-
+        # formatted host), port as string, platform communication backend and group
+        # name. addr is unused.
         """Build SGLang init weights group request.
 
         Supports two scenarios:
@@ -337,11 +400,17 @@ class SGLangBackend:
         return HttpRequest(endpoint="/init_weights_update_group", payload=payload)
 
     def get_pause_request(self, mode: str | None = None) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Build a /pause_generation request; includes "mode" only when given.
         """Get SGLang pause request."""
         payload = {} if mode is None else {"mode": mode}
         return HttpRequest(endpoint="/pause_generation", payload=payload)
 
     def get_pause_requests(self) -> list[HttpRequest]:
+        # [FUNCTION DOC]
+        # Return the two-step pause sequence: default-mode pause (aborts in-flight
+        # requests and idles the scheduler) followed by an "in_place" pause (sets the
+        # scheduler's paused flag needed by colocated awex weight work).
         """Pause in two steps so memory can be released safely.
 
         The first request keeps SGLang's default mode, which aborts in-flight
@@ -364,23 +433,34 @@ class SGLangBackend:
         ]
 
     def get_resume_request(self) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Build the /continue_generation request.
         """Get SGLang resume request."""
         return HttpRequest(endpoint="/continue_generation", payload={})
 
     def get_abort_all_request(self) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Build an /abort_request request with abort_all True.
         """Get SGLang abort all requests."""
         return HttpRequest(endpoint="/abort_request", payload={"abort_all": True})
 
     def get_health_check_request(self) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Build a GET /health request.
         """Get SGLang health check request."""
         return HttpRequest(endpoint="/health", payload={}, method="GET")
 
     def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Build /release_memory_occupation, with optional tags (e.g. weights, kv_cache)
+        # to release.
         """Get SGLang offload request."""
         payload = {"tags": tags} if tags is not None else {}
         return HttpRequest(endpoint="/release_memory_occupation", payload=payload)
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Build /resume_memory_occupation, with optional tags to restore.
         """Get SGLang onload request.
 
         Parameters:
@@ -392,6 +472,16 @@ class SGLangBackend:
         return HttpRequest(endpoint="/resume_memory_occupation", payload=payload)
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
+        # [FUNCTION DOC]
+        # Start an SGLang server subprocess from server_args (mutated:
+        # awex_meta_server_addr, awex_colocate_mode and _awex_gpus_per_server are
+        # popped). In awex colocate mode with SLURM_LOCALID set, sets base_gpu_id =
+        # SLURM_LOCALID * gpus_per_server and logs it. Builds the command with
+        # SGLangConfig.build_cmd_from_args and an env with a unique Triton cache. If
+        # colocate mode or an awex meta address (argument or AWEX_META_SERVER_ADDR env)
+        # is present, swaps the sglang launch_server module entry for
+        # areal.engine.awex.sglang_plugin and exports AWEX_META_SERVER_ADDR. Returns the
+        # Popen with stdout/stderr redirected to this process's stdout.
         """Launch SGLang server subprocess."""
         awex_meta_addr = server_args.pop("awex_meta_server_addr", None)
         awex_colocate = server_args.pop("awex_colocate_mode", False)
@@ -444,6 +534,10 @@ class SGLangBackend:
 
 
 class RemoteSGLangEngine(InferenceEngine):
+    # [CLASS DOC]
+    # Public SGLang InferenceEngine: holds config and a RemoteInfEngine(config,
+    # SGLangBackend()) in _engine; all methods delegate to it (pure composition), except
+    # export_stats, as_controller, RTensor fetch-buffer helpers and perf tracer hooks.
     """SGLang remote inference engine.
 
     This class delegates all functionality to RemoteInfEngine with
@@ -456,6 +550,9 @@ class RemoteSGLangEngine(InferenceEngine):
     """
 
     def __init__(self, config: InferenceEngineConfig):
+        # [FUNCTION DOC]
+        # Store config and build the internal RemoteInfEngine with an SGLangBackend. No
+        # network activity.
         self.config = config
         # Pure composition - create internal engine with SGLang backend
         self._engine = RemoteInfEngine(config, SGLangBackend())
@@ -468,6 +565,12 @@ class RemoteSGLangEngine(InferenceEngine):
         max_concurrent_rollouts: int | None = None,
         **kwargs,
     ) -> "RemoteInfEngine":
+        # [FUNCTION DOC]
+        # Convenience constructor: builds InferenceEngineConfig with backend
+        # "sglang:d<dp_size>", max_concurrent_rollouts, tokenizer_path and extra kwargs,
+        # and returns cls(config).
+        # KNOWN ISSUE: annotated and documented as returning RemoteInfEngine, but it
+        # returns a RemoteSGLangEngine instance.
         """Create a RemoteInfEngine without kwargs instead of InferenceEngineConfig.
 
         Parameters
@@ -505,6 +608,10 @@ class RemoteSGLangEngine(InferenceEngine):
         addr: str | list[str] | None = None,
         train_data_parallel_size: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Initialize by discovering/connecting to SGLang servers via the inner engine.
+        # If train_data_parallel_size is None it is derived from the config backend
+        # string's data-parallel size. Returns the inner engine's result.
         """Initialize the engine by discovering and connecting to servers."""
         if train_data_parallel_size is None:
             train_data_parallel_size = ModelAllocation.from_str(
@@ -513,36 +620,53 @@ class RemoteSGLangEngine(InferenceEngine):
         return self._engine.initialize(engine_id, addr, train_data_parallel_size)
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Destroy the inner engine (stop executors, clean up resources).
         """Destroy the engine and clean up resources."""
         return self._engine.destroy()
 
     @property
     def initialized(self) -> bool:
+        # [FUNCTION DOC]
+        # Whether the inner engine has been initialized.
         return self._engine.initialized
 
     @property
     def workflow_executor(self) -> WorkflowExecutor:
+        # [FUNCTION DOC]
+        # The inner engine's WorkflowExecutor.
         """Get the workflow executor of the inference engine."""
         return self._engine.workflow_executor
 
     def set_version(self, version: int):
+        # [FUNCTION DOC]
+        # Set the current weight version on the inner engine.
         """Set the current weight version."""
         return self._engine.set_version(version)
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Return the inner engine's current weight version.
         """Get the current weight version."""
         return self._engine.get_version()
 
     def set_proxy_gateway_addr(self, addr: str) -> None:
+        # [FUNCTION DOC]
+        # Forward the proxy gateway address to the inner engine.
         return self._engine.set_proxy_gateway_addr(addr)
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
+        # [FUNCTION DOC]
+        # Async: generate a ModelResponse for req via the inner engine (HTTP to an
+        # SGLang server).
         """Asynchronously generate a response for the given request."""
         return await self._engine.agenerate(req)
 
     def init_weights_update_group(
         self, meta: WeightUpdateMeta, xccl_group_ranks: list[int] | None = None
     ) -> Future[None]:
+        # [FUNCTION DOC]
+        # Initialize the NCCL/XCCL weight update group on all servers; returns a Future.
         """Initialize the weight update process group."""
         return self._engine.init_weights_update_group(
             meta, xccl_group_ranks=xccl_group_ranks
@@ -551,10 +675,14 @@ class RemoteSGLangEngine(InferenceEngine):
     def update_weights_from_distributed(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ) -> Future[None]:
+        # [FUNCTION DOC]
+        # Push weights over the distributed group to the servers; returns a Future.
         """Update weights from distributed memory."""
         return self._engine.update_weights_from_distributed(meta, param_specs)
 
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
+        # [FUNCTION DOC]
+        # Make servers reload weights (or LoRA) from disk; returns a Future.
         """Update weights from disk."""
         return self._engine.update_weights_from_disk(meta)
 
@@ -572,6 +700,10 @@ class RemoteSGLangEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> int:
+        # [FUNCTION DOC]
+        # Submit one data item to the workflow executor for rollout with the given
+        # workflow, acceptance filter, group size and options; returns a task id. Pure
+        # delegation.
         """Submit a request to the inference engine."""
         return self._engine.submit(
             data=data,
@@ -590,12 +722,17 @@ class RemoteSGLangEngine(InferenceEngine):
     def wait(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> list[dict[str, Any] | None]:
+        # [FUNCTION DOC]
+        # Block until count rollout results are available (timeout optional;
+        # raise_timeout controls raising). Returns the results list.
         """Wait for a specified number of requests to complete."""
         return self._engine.wait(count, timeout, raise_timeout)
 
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
+        # [FUNCTION DOC]
+        # Block until the given task id finishes; returns its result or None.
         """Wait for a specific task to complete by task_id."""
         return self._engine.wait_for_task(task_id, timeout, raise_timeout)
 
@@ -608,6 +745,9 @@ class RemoteSGLangEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Synchronously roll out a list of data items and return the batched result.
+        # Intended for offline use/debugging.
         """Submit a batch of requests and wait for results.
 
         This method does not support asynchronous rollout and should be used for offline
@@ -633,6 +773,9 @@ class RemoteSGLangEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Keep submitting from the dataloader and return once a full training batch is
+        # ready (async rollout).
         """Asynchronously submit and wait until a full batch is ready."""
         return self._engine.prepare_batch(
             dataloader=dataloader,
@@ -646,43 +789,72 @@ class RemoteSGLangEngine(InferenceEngine):
         )
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Compute per-token logprobs for the given data through the servers (teacher
+        # scoring); returns a list of tensors.
         return self._engine.compute_logp(data)
 
     def pause(self):
+        # [FUNCTION DOC]
+        # Pause rollout submission/generation via the inner engine.
         return self._engine.pause()
 
     def resume(self):
+        # [FUNCTION DOC]
+        # Resume rollout via the inner engine.
         return self._engine.resume()
 
     def pause_generation(self):
+        # [FUNCTION DOC]
+        # Send pause-generation requests to the servers.
         return self._engine.pause_generation()
 
     def continue_generation(self):
+        # [FUNCTION DOC]
+        # Send continue-generation requests to the servers.
         return self._engine.continue_generation()
 
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
+        # [FUNCTION DOC]
+        # Launch a local SGLang server via the inner engine; returns its
+        # LocalInfServerInfo.
         return self._engine.launch_server(server_args)
 
     def teardown_server(self):
+        # [FUNCTION DOC]
+        # Tear down locally launched servers.
         return self._engine.teardown_server()
 
     def offload(self, tags: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Release server memory (optionally only given tags), logging before and after;
+        # returns the inner result.
         logger.info("RemoteSGLangEngine.offload(tags=%s) called", tags)
         result = self._engine.offload(tags=tags)
         logger.info("RemoteSGLangEngine.offload(tags=%s) done", tags)
         return result
 
     def abort_all_requests(self):
+        # [FUNCTION DOC]
+        # Abort all in-flight requests on the servers.
         return self._engine.abort_all_requests()
 
     def onload(self, tags: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Restore released server memory (optionally only given tags).
         return self._engine.onload(tags=tags)
 
     def export_stats(self) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Export all stats_tracker scalars without cross-rank reduction.
         return stats_tracker.export_all(reduce_group=None)
 
     @classmethod
     def as_controller(cls, config: InferenceEngineConfig, scheduler: Scheduler):
+        # [FUNCTION DOC]
+        # Create the rollout controller for this engine: RolloutControllerV2 (imported
+        # lazily) when config._version is "v2", else RolloutController(cls, config,
+        # scheduler).
         if config._version == "v2":
             from areal.v2.inference_service.controller.controller import (
                 RolloutControllerV2,
@@ -692,6 +864,9 @@ class RemoteSGLangEngine(InferenceEngine):
         return RolloutController(cls, config=config, scheduler=scheduler)
 
     def clear_batches(self, shard_ids: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Drop cached RTensor fetch-buffer shards for the given shard ids; no-op when
+        # none are given (non-DP-head ranks).
         """Drain this worker's client-side RTensor fetch buffer.
 
         Called via RPC by ``TrainController.clear_batches`` at step end so
@@ -706,17 +881,25 @@ class RemoteSGLangEngine(InferenceEngine):
             clear_fetch_buffer(shard_ids)
 
     def fetch_buffer_stats(self) -> dict[str, int]:
+        # [FUNCTION DOC]
+        # Return local RTensor fetch-buffer statistics.
         """Expose local fetch-buffer stats for post-step drain verification."""
         from areal.infra.rpc.rtensor import fetch_buffer_stats
 
         return fetch_buffer_stats()
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Persist perf tracer data for the given step (force to flush regardless of
+        # schedule).
         perf_tracer.save(step=step, force=force)
 
     def config_perf_tracer(
         self, config: PerfTracerConfig, rank: int, role: str
     ) -> None:
+        # [FUNCTION DOC]
+        # Configure the global perf tracer for this rank/role unless it is already
+        # configured.
         if perf_tracer.is_configured():
             return
         perf_tracer.configure(config, rank=rank, role=role)

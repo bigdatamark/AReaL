@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Forward-pass input/output layout helpers for the Megatron engine with packed (THD)
+# sequences, context parallelism (CP) and vision-language models. Implements the load-
+# balanced CP split (each sequence cut into 2*cp chunks; CP rank r keeps chunk r and
+# chunk 2*cp-1-r), its inverse (non-differentiable gather for model outputs,
+# differentiable gather for per-token logprobs), padded [B, S] reconstruction for VLM /
+# packed-incompatible models, multimodal input extraction, and the unified
+# packed_context_parallel_forward used as the Megatron forward step. Uses Megatron
+# parallel_state (mpu) for TP/CP/PP info.
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import contextmanager
@@ -24,6 +33,12 @@ def prepare_microbatches_for_sequence_layout(
     pad_to_maximum: bool,
     seq_align_to: int,
 ) -> MicroBatchList:
+    # [FUNCTION DOC]
+    # Pad or align a MicroBatchList for the chosen sequence layout. For
+    # SequencePackingMode.WRAPPER_THD or when pad_to_maximum is set, uses pad_mb_list
+    # (pads the packed token axis, trailing padding forms an extra segment); otherwise
+    # uses align_mb_list_sequences (aligns each real sequence length to seq_align_to).
+    # Pad value 0.0. Returns the new MicroBatchList.
     """Apply padding that remains inert in the model's input layout.
 
     Wrapper-owned THD consumes trailing packed-token padding as a segment.
@@ -46,6 +61,9 @@ def prepare_microbatches_for_sequence_layout(
 
 
 def _unwrap_language_model(model: torch.nn.Module) -> torch.nn.Module:
+    # [FUNCTION DOC]
+    # HELPER: Strip nested ".module" wrappers (DDP/Float16Module) and return the inner
+    # language_model attribute if present (VLMs), else the innermost module.
     current = model
     while hasattr(current, "module"):
         current = current.module
@@ -54,6 +72,12 @@ def _unwrap_language_model(model: torch.nn.Module) -> torch.nn.Module:
 
 @contextmanager
 def _hidden_states_output(model: torch.nn.Module, enabled: bool):
+    # [FUNCTION DOC]
+    # HELPER: Context manager. When enabled, temporarily sets the unwrapped language
+    # model's post_process to False so the forward returns hidden states instead of
+    # logits/loss (used for chunked LM-head loss), restoring the original value on exit.
+    # Raises TypeError if the model has no post_process attribute. When disabled it just
+    # yields.
     if not enabled:
         yield
         return
@@ -74,6 +98,15 @@ def preprocess_packed_seqs_context_parallel(
     input_ids: torch.Tensor,
     cu_seqlens: torch.Tensor,
 ) -> tuple[torch.Tensor, PackedSeqParams]:
+    # [FUNCTION DOC]
+    # Prepare a packed 1D input_ids (total_len) with cu_seqlens (batch+1 boundaries) for
+    # Megatron THD forward. Builds PackedSeqParams (qkv_format "thd", same cu_seqlens
+    # for q/kv and padded variants, max seqlen from the lengths). Requires each sequence
+    # length to be a multiple of tp*cp*2 (or tp when cp == 1), else ValueError. With cp
+    # <= 1 returns (input_ids[None], params). Otherwise returns this CP rank's [1,
+    # total_len/cp] slice built per sequence from the two load-balanced chunks (front
+    # chunk r and mirrored back chunk), with PackedSeqParams still describing the full-
+    # length sequences. GPU syncs via .item().
     """
     Preprocess packed sequences.
     CP splits sequence into CP*2 chunks, and each GPU gets 2 chunks (GPU0 gets first and last chunks, GPU1 gets second and second last chunks, and so on),
@@ -134,6 +167,12 @@ def split_packed_seqs_for_context_parallel(
     tensor: torch.Tensor,
     cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Split any 1D packed tensor (e.g. labels, loss masks) into this CP rank's local
+    # part using the same per-sequence two-chunk layout as
+    # preprocess_packed_seqs_context_parallel. Returns the tensor unchanged when cp <=
+    # 1; otherwise a new tensor of length total/cp. Assumes lengths are already aligned
+    # to 2*cp.
     """Split a 1D packed tensor using the same interleaved pattern as
     preprocess_packed_seqs_context_parallel."""
     cp_size = mpu.get_context_parallel_world_size()
@@ -170,6 +209,12 @@ def _build_cp_reassemble_indices(
     padded_cu_seqlens: torch.Tensor,
     cp_size: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Build a LongTensor of length total padded tokens mapping each full-
+    # sequence position to its source index in the concatenation of all CP ranks' local
+    # tensors (rank j's block starts at j * total/cp). For each sequence, rank j's first
+    # half-chunk fills positions [j*H, (j+1)*H) and its second half-chunk fills the
+    # mirrored positions [L-(j+1)*H, L-j*H). Host loops with .item() syncs.
     """Build the index mapping from concatenated CP chunks to original order.
 
     Returns a 1D LongTensor of length ``output_len`` where ``indices[dst] = src``
@@ -208,6 +253,12 @@ def reassemble_cp_packed_logprobs(
     local_tensor: torch.Tensor,
     padded_cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Differentiably all-gather 1D CP-local values (length total/cp) over the CP group
+    # (torch.distributed.nn all_gather, backward reduce-scatter), concatenate, and
+    # permute with the reassemble indices into full original order (length total).
+    # Returns the input unchanged when cp <= 1. padded_cu_seqlens are the pre-split
+    # boundaries. Collective over CP.
     """All-gather CP-local 1D tensors and reassemble in original sequence order.
 
     This is the differentiable inverse of ``split_packed_seqs_for_context_parallel``.
@@ -250,6 +301,14 @@ def postprocess_packed_seqs_context_parallel(
     post_process: bool,
     gather_output: bool = True,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Undo CP splitting on the model output. Returns output unchanged if this is not the
+    # last pipeline stage (post_process False); returns output squeezed at dim 0 when cp
+    # <= 1, cu_seqlens is None, or gather_output is False. Otherwise all-gathers (non-
+    # differentiable for other ranks; the local rank's slot keeps the autograd-attached
+    # tensor) the [1, total/cp, ...] outputs across CP, and for each sequence places
+    # rank j's two half-chunks at the front position j and mirrored back position,
+    # returning a [total_len, ...] tensor. Collective over CP.
     """
     Postprocess packed sequences
     """
@@ -307,10 +366,15 @@ _VLM_FORWARD_KEYS = ("pixel_values", "image_grid_thw", "video_grid_thw")
 
 
 def _is_multi_modal_payload_key(key: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if key is one of pixel_values / image_grid_thw / video_grid_thw or
+    # recognized as multimodal by is_multi_modal_key.
     return key in _VLM_FORWARD_KEYS or is_multi_modal_key(key)
 
 
 def _drop_multi_modal_payload(data: dict[str, Any]) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Remove all multimodal payload keys from data in place.
     for key in list(data.keys()):
         if _is_multi_modal_payload_key(key):
             data.pop(key, None)
@@ -319,6 +383,13 @@ def _drop_multi_modal_payload(data: dict[str, Any]) -> None:
 def extract_vision_from_multi_modal(
     mb: dict[str, Any], padded_mb: dict[str, Any]
 ) -> None:
+    # [FUNCTION DOC]
+    # Move vision inputs from the per-sample "multi_modal_input" list of dicts into
+    # batched tensors on padded_mb. Pops multi_modal_input from mb (or, if absent there,
+    # from padded_mb) and from padded_mb; for each of pixel_values / image_grid_thw /
+    # video_grid_thw present in any item, concatenates the items along dim 0 into
+    # padded_mb[key]. Finally strips all multimodal keys from mb. Mutates both dicts;
+    # returns None.
     """Extract pixel_values / image_grid_thw / video_grid_thw from multi_modal_input.
 
     Mirrors FSDPEngine's `_prepare_multimodal_forward_inputs` (#1272): vision
@@ -347,6 +418,11 @@ def _reconstruct_padded_2d(
     cu_seqlens: torch.Tensor,
     max_seqlen: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    # [FUNCTION DOC]
+    # HELPER: Convert packed 1D input_ids into a zero-padded [B, max_seqlen] int64
+    # tensor using cu_seqlens. max_seqlen defaults to the longest sequence (GPU sync)
+    # and must cover all lengths. Returns (input_ids_2d, boolean attention mask [B, S]
+    # of valid positions, seq_lens, max_seqlen).
     """Reconstruct padded ``[B, S]`` ids and their validity mask."""
     batch_size = cu_seqlens.shape[0] - 1
     seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
@@ -370,6 +446,9 @@ def _reconstruct_padded_2d(
 def _build_thd_packed_seq_params(
     cu_seqlens: torch.Tensor, max_seqlen: int
 ) -> PackedSeqParams:
+    # [FUNCTION DOC]
+    # HELPER: Build THD PackedSeqParams using cu_seqlens for q/kv (including the padded
+    # variants) and the given max_seqlen.
     """Build THD metadata for sequences already aligned by AReaL."""
     return PackedSeqParams(
         qkv_format="thd",
@@ -392,6 +471,29 @@ def packed_context_parallel_forward(
     fp32_output: bool | None = None,
     return_hidden_states: bool = False,
 ):
+    # [FUNCTION DOC]
+    # Run one Megatron model forward on a micro-batch dict and return logits/outputs in
+    # packed form. input_ keys: input_ids (packed 1D), optional position_ids,
+    # cu_seqlens, max_seqlen, attention_mask, tree_triton_data and vision tensors.
+    # Routing when cu_seqlens is given: use_model_packed_seq -> rebuild padded [B,S]
+    # ids/mask plus THD params, drop position_ids (ValueError if a mask or tree data is
+    # supplied, NotImplementedError if CP > 1); text models without use_padded_seq ->
+    # CP-split packed THD input (ValueError if a mask/tree data is supplied); vision
+    # models or use_padded_seq -> padded [B,S] input with repacking recorded. Attention
+    # mask passed: model-packed -> padded mask; VLM (except the dense-mask text case) ->
+    # None; otherwise tree_triton_data if present else attention_mask. Vision tensors
+    # are forwarded when present; position_ids dropped for the dense-mask text forward.
+    # fp32_output is forwarded only when not None. Exceptions from the model are wrapped
+    # in RuntimeError. If return_hidden_states, runs with post_process disabled and
+    # returns the raw output. Otherwise, on the last pipeline stage (respecting the
+    # model's vp_stage), selects valid positions of padded outputs to get packed [total,
+    # ...], then calls postprocess_packed_seqs_context_parallel (gather controlled by
+    # gather_cp_output). Intermediate PP stages return the raw output.
+    # KNOWN ISSUE: the padded (VLM / use_padded_seq) branch does not split input across
+    # CP ranks, yet the postprocess step still all-gathers and re-interleaves when CP >
+    # 1 and gather_cp_output is set, which would produce wrong results for padded models
+    # with CP > 1. The model-packed branch never repacks its [B, S]-shaped output
+    # either, relying on the model to return packed output.
     input_ids = input_["input_ids"]
     position_ids = input_.get("position_ids", None)
     cu_seqlens = input_.get("cu_seqlens", None)
