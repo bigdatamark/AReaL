@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tests apply_dte_config_envvars (areal/utils/dte.py, loaded directly from its file path
+# to avoid importing the areal package) and DTE-related config fields in
+# areal.api.cli_args. DTE = delta weight transfer for separated actor/rollout
+# topologies; when enabled and valid it exports DTE_* env vars to the returned dict, the
+# given environ and both scheduling specs' env_vars.
 """Tests for the separation-only DTE configuration boundary."""
 
 import importlib.util
@@ -10,6 +16,10 @@ _HELPER_PATH = Path(__file__).parents[1] / "areal/utils/dte.py"
 
 
 def _load_helpers():
+    # [FUNCTION DOC]
+    # HELPER: Loads areal/utils/dte.py as an isolated module named "areal_utils_dte" via
+    # importlib spec_from_file_location and returns it. Raises AssertionError if the
+    # spec has no loader.
     spec = importlib.util.spec_from_file_location("areal_utils_dte", _HELPER_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -30,6 +40,13 @@ def _config(
     weight_update_mode="awex",
     use_lora=False,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Builds a fake experiment config (nested SimpleNamespace) with actor fields
+    # (backend, _version, weight_update_mode, enable_delta_weight_update,
+    # weight_update_delta_method, weight_update_anchor_interval, use_lora, one
+    # scheduling spec with empty env_vars) and rollout fields (backend, _version,
+    # scheduling_strategy.type=topology, one scheduling spec). Keyword-only args default
+    # to a valid separation/megatron/sglang/awex/v2 setup with DTE disabled.
     actor_spec = SimpleNamespace(env_vars={})
     rollout_spec = SimpleNamespace(env_vars={})
     return SimpleNamespace(
@@ -53,6 +70,9 @@ def _config(
 
 
 def test_disabled_delta_weight_update_does_not_change_environment():
+    # [FUNCTION DOC]
+    # With DTE disabled, asserts nothing is exported and no scheduling spec env_vars
+    # change.
     config = _config()
 
     exported = _load_helpers().apply_dte_config_envvars(config, environ={})
@@ -63,6 +83,10 @@ def test_disabled_delta_weight_update_does_not_change_environment():
 
 
 def test_delta_weight_transfer_exports_only_separation_adamw_switches():
+    # [FUNCTION DOC]
+    # With DTE enabled on the default valid config, asserts exactly the four DTE
+    # switches (separation update, delta transfer, anchor interval "20", streaming
+    # reconstruct) are exported and copied into both actor and rollout spec env_vars.
     config = _config(enabled=True)
 
     exported = _load_helpers().apply_dte_config_envvars(config, environ={})
@@ -98,6 +122,12 @@ def test_delta_weight_transfer_exports_only_separation_adamw_switches():
     ],
 )
 def test_dte_rejects_out_of_scope_modes(kwargs, match):
+    # [FUNCTION DOC]
+    # Parametrized over each unsupported setting (colocation topology, non-adamw delta
+    # method, negative anchor interval, non-megatron actor, non-sglang rollout, v1
+    # versions, non-awex update mode, LoRA). Asserts ValueError matching the expected
+    # message and that environ and both spec env_vars remain empty (validation before
+    # mutation).
     kwargs = dict(kwargs)
     topology = kwargs.pop("topology", "separation")
     config = _config(enabled=True, topology=topology, **kwargs)
@@ -112,6 +142,10 @@ def test_dte_rejects_out_of_scope_modes(kwargs, match):
 
 
 def test_dte_requires_one_ppo_minibatch_per_weight_update():
+    # [FUNCTION DOC]
+    # Requires httpx. Asserts PPOActorConfig accepts delta weight update with
+    # ppo_n_minibatches=1, raises ValueError for 2, and defaults ppo_n_minibatches to 4
+    # when DTE is disabled.
     pytest.importorskip("httpx")
     from areal.api.cli_args import PPOActorConfig
 
@@ -129,6 +163,9 @@ def test_dte_requires_one_ppo_minibatch_per_weight_update():
 
 
 def test_delta_weight_transfer_fields_belong_to_train_engine_config():
+    # [FUNCTION DOC]
+    # Requires httpx. Asserts TrainEngineConfig has no "dte" field but has the three
+    # delta-weight-update fields, with enable_delta_weight_update defaulting to False.
     pytest.importorskip("httpx")
     from dataclasses import fields
 

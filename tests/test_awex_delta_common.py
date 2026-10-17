@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Shared tests and file-loaders for AWEX DTE (delta weight transfer). Target modules
+# under areal/v2/weight_update/awex (delta_config, delta_detect, sglang_adapter,
+# megatron_adapter) are executed from their file paths with stub modules in sys.modules
+# so no full AReaL runtime import is needed. Covers env-driven DTERuntimeConfig, wire-
+# dtype synchronization, DTE world-size validation, AdamW inversion, and memory
+# telemetry. Loader helpers are reused by other test modules (e.g.
+# test_awex_separation_delta). Requires torch.
 # SPDX-License-Identifier: Apache-2.0
 """Shared Stage-3 tests and loaders for AWEX DTE delta transfer.
 
@@ -25,9 +33,15 @@ _DC_PATH = _ROOT / "areal/v2/weight_update/awex/delta_config.py"
 
 
 def _make_environ_stub():
+    # [FUNCTION DOC]
+    # HELPER: Builds a stub "areal.utils.environ" module exposing get_env_var and
+    # get_bool_env_var with the real helpers' signatures; returns the module.
     environ_mod = types.ModuleType("areal.utils.environ")
 
     def get_env_var(name, default=None, *, fallback_names=(), allow_empty=False):
+        # [FUNCTION DOC]
+        # HELPER: Returns the first of name and fallback_names whose os.environ value is
+        # set and (unless allow_empty) not blank; otherwise default.
         for candidate in (name, *fallback_names):
             value = os.environ.get(candidate)
             if value is not None and (allow_empty or value.strip() != ""):
@@ -43,6 +57,12 @@ def _make_environ_stub():
         falsy_values=("false", "0"),
         strip_value=False,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Reads the variable via get_env_var (default "false"), optionally
+        # strips whitespace, and returns whether its lowercased value is in
+        # truthy_values. falsy_values is accepted but ignored.
+        # KNOWN ISSUE: a None default would crash on strip/lower; stub only, so values
+        # outside truthy_values are simply False.
         del falsy_values
         value = get_env_var(name, default, fallback_names=fallback_names)
         value = value.strip() if strip_value else value
@@ -54,6 +74,11 @@ def _make_environ_stub():
 
 
 def _load_delta_config():
+    # [FUNCTION DOC]
+    # HELPER: Executes areal/v2/weight_update/awex/delta_config.py as module
+    # "awex_delta_config", temporarily installing stub areal, areal.utils and environ
+    # modules, then restoring (or removing) the previous sys.modules entries. The loaded
+    # module stays registered in sys.modules under its spec name. Returns the module.
     spec = importlib.util.spec_from_file_location("awex_delta_config", _DC_PATH)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -76,10 +101,17 @@ def _load_delta_config():
 
 @pytest.fixture
 def dc():
+    # [FUNCTION DOC]
+    # HELPER: Fixture returning a freshly loaded delta_config module.
     return _load_delta_config()
 
 
 def _encode_like_adapter(tracker, params, version):
+    # [FUNCTION DOC]
+    # HELPER: Mirrors adapter sender logic: if tracker.full_sync_reason(version) is not
+    # None, seeds the tracker with all params and returns all names/tensors; otherwise
+    # returns names/tensors from tracker.encode. Input params is an ordered dict
+    # name->tensor.
     """Mirror the sender-side DeltaTracker contract used by adapters."""
     params_list = list(params.items())
     reason = tracker.full_sync_reason(version)
@@ -91,11 +123,17 @@ def _encode_like_adapter(tracker, params, version):
 
 
 def _over_the_wire(names, tensors):
+    # [FUNCTION DOC]
+    # HELPER: Simulates IPC transfer by returning a dict mapping names to cloned
+    # tensors.
     """Stand in for cuda_ipc serialize/deserialize: clone to detach storage."""
     return dict(zip(names, [t.clone() for t in tensors]))
 
 
 def _weights(seed: int):
+    # [FUNCTION DOC]
+    # HELPER: Returns deterministic fake weights (embed 32x16, layer 16x16, bias 16)
+    # from a seeded CPU generator.
     generator = torch.Generator().manual_seed(seed)
     return {
         "embed.weight": torch.randn(32, 16, generator=generator),
@@ -105,6 +143,10 @@ def _weights(seed: int):
 
 
 def test_delta_config_env_gates(dc, monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts DTERuntimeConfig.from_env delta_transfer defaults False, follows legacy
+    # AWEX_DELTA_TRANSFER, and is overridden by DTE_DELTA_TRANSFER; likewise
+    # anchor_interval follows AWEX_ then DTE_ anchor env vars.
     """DTE env vars must honor DTE_* overrides over legacy AWEX_* names."""
     monkeypatch.delenv("DTE_DELTA_TRANSFER", raising=False)
     monkeypatch.delenv("AWEX_DELTA_TRANSFER", raising=False)
@@ -123,6 +165,11 @@ def test_delta_config_env_gates(dc, monkeypatch):
 
 
 def test_delta_runtime_config_preserves_legacy_values_and_snapshots(dc, monkeypatch):
+    # [FUNCTION DOC]
+    # With blank DTE_DELTA_TRANSFER, legacy " yes " and DTE_SEPARATION_WEIGHT_UPDATE
+    # "on": asserts delta transfer, separation and enabled are True. Then asserts a
+    # later env change does not mutate the existing config (snapshot) but a fresh
+    # from_env sees enabled False.
     monkeypatch.setenv("DTE_DELTA_TRANSFER", "")
     monkeypatch.setenv("AWEX_DELTA_TRANSFER", " yes ")
     monkeypatch.setenv("DTE_SEPARATION_WEIGHT_UPDATE", "on")
@@ -141,11 +188,18 @@ def test_delta_runtime_config_preserves_legacy_values_and_snapshots(dc, monkeypa
 def test_wire_dtype_union_is_global_sorted_and_includes_empty_local_rank(
     dc, monkeypatch
 ):
+    # [FUNCTION DOC]
+    # Empty local plan on one rank: monkeypatches dist.all_gather_object/get_world_size
+    # and asserts synchronize_wire_dtypes returns the global union sorted canonically
+    # (bfloat16, float32).
     """Every rank derives the same rounds even when its local plan is empty."""
     plan = SimpleNamespace(operations={})
     group = object()
 
     def _all_gather_object(output, local_names, group=None):
+        # [FUNCTION DOC]
+        # HELPER: Fake all_gather_object asserting an empty local list and non-None
+        # group, filling outputs with one empty and one two-dtype list.
         assert local_names == []
         assert group is not None
         output[:] = [[], ["torch.float32", "torch.bfloat16"]]
@@ -159,11 +213,16 @@ def test_wire_dtype_union_is_global_sorted_and_includes_empty_local_rank(
 
 
 def test_wire_dtype_union_ignores_rank_local_discovery_order(dc, monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts the dtype union order does not depend on per-rank insertion order.
     """Canonical ordering is independent of each rank's metadata insertion order."""
     op = SimpleNamespace(recv_shard_meta=SimpleNamespace(dtype=torch.float32))
     plan = SimpleNamespace(operations={1: [op]})
 
     def _all_gather_object(output, local_names, group=None):
+        # [FUNCTION DOC]
+        # HELPER: Fake all_gather_object asserting the local list is ["torch.float32"]
+        # and returning two rank lists in different orders.
         assert local_names == ["torch.float32"]
         output[:] = [
             ["torch.float32", "torch.bfloat16"],
@@ -179,11 +238,16 @@ def test_wire_dtype_union_ignores_rank_local_discovery_order(dc, monkeypatch):
 
 
 def test_wire_dtype_union_preserves_single_bfloat16_round(dc, monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts a BF16-only plan on all ranks yields exactly (bfloat16,).
     """The established BF16-only path retains exactly one protocol round."""
     op = SimpleNamespace(recv_shard_meta=SimpleNamespace(dtype=torch.bfloat16))
     plan = SimpleNamespace(operations={1: [op]})
 
     def _all_gather_object(output, local_names, group=None):
+        # [FUNCTION DOC]
+        # HELPER: Fake all_gather_object asserting local ["torch.bfloat16"] and
+        # returning BF16 for both ranks.
         assert local_names == ["torch.bfloat16"]
         output[:] = [["torch.bfloat16"], ["torch.bfloat16"]]
 
@@ -194,9 +258,13 @@ def test_wire_dtype_union_preserves_single_bfloat16_round(dc, monkeypatch):
 
 
 def test_wire_dtype_union_rejects_globally_empty_plan(dc, monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts ValueError "no wire dtypes" when all ranks report empty plans.
     monkeypatch.setattr(dc.dist, "get_world_size", lambda group: 2)
 
     def _all_gather_object(output, local_names, group=None):
+        # [FUNCTION DOC]
+        # HELPER: Fake all_gather_object filling outputs with two empty lists.
         output[:] = [[], []]
 
     monkeypatch.setattr(dc.dist, "all_gather_object", _all_gather_object)
@@ -207,11 +275,17 @@ def test_wire_dtype_union_rejects_globally_empty_plan(dc, monkeypatch):
 
 @pytest.mark.parametrize("world_size", [2, 4, 8, 16])
 def test_dte_world_size_accepts_recursive_scheduler_sizes(dc, world_size):
+    # [FUNCTION DOC]
+    # Parametrized power-of-two world sizes split evenly; asserts
+    # validate_dte_world_size does not raise.
     dc.validate_dte_world_size(world_size, world_size // 2, world_size // 2)
 
 
 @pytest.mark.parametrize("world_size", [3, 5, 6])
 def test_dte_world_size_rejects_incomplete_recursive_schedules(dc, world_size):
+    # [FUNCTION DOC]
+    # Parametrized non-power-of-two sizes 3, 5, 6; asserts ValueError whose message
+    # lists inference, training and combined sizes.
     infer_world_size = world_size // 2
     train_world_size = world_size - infer_world_size
 
@@ -236,6 +310,9 @@ def test_dte_world_size_rejects_incomplete_recursive_schedules(dc, world_size):
 def test_dte_world_size_rejects_missing_side_or_inconsistent_total(
     dc, combined_world_size, infer_world_size, train_world_size
 ):
+    # [FUNCTION DOC]
+    # Asserts ValueError for a missing training side (1,1,0) and an inconsistent total
+    # (4,1,2).
     with pytest.raises(ValueError, match=f"combined={combined_world_size}"):
         dc.validate_dte_world_size(
             combined_world_size,
@@ -245,6 +322,9 @@ def test_dte_world_size_rejects_missing_side_or_inconsistent_total(
 
 
 def test_factory_builds_dte_tracker(dc, monkeypatch):
+    # [FUNCTION DOC]
+    # Requires dte. With anchor interval 0, asserts create_delta_tracker returns an
+    # object with encode and seed methods.
     """The lazy factory should build a DTE tracker when DTE is available."""
     pytest.importorskip("dte")
     monkeypatch.setenv("AWEX_DELTA_ANCHOR_INTERVAL", "0")
@@ -253,6 +333,9 @@ def test_factory_builds_dte_tracker(dc, monkeypatch):
 
 
 def test_invert_adamw_roundtrip():
+    # [FUNCTION DOC]
+    # Requires dte. Runs one AdamW step on a random 512-vector and asserts
+    # dte.core.invert_adamw recovers the pre-step weights within tolerance.
     """DTE AdamW inversion recovers pre-step weights on CPU."""
     pytest.importorskip("dte")
     from dte.core import invert_adamw
@@ -280,6 +363,9 @@ def test_invert_adamw_roundtrip():
 
 
 def _stub_colocate_device(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Installs a stub colocate_device module (device_mapping_key, fixed local
+    # IP, physical device id from local index) via monkeypatch.
     colocate_device_mod = types.ModuleType(
         "areal.v2.weight_update.awex.colocate_device"
     )
@@ -296,6 +382,11 @@ def _stub_colocate_device(monkeypatch):
 
 
 def _stub_areal_packages(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Installs stub modules for httpx, areal package hierarchy, awex package
+    # helpers, colocate_device, areal.utils.logging (stdlib getLogger),
+    # areal.infra.platforms (no-op synchronize) and weight_digest (no-op
+    # log_tensor_digest).
     monkeypatch.setitem(sys.modules, "httpx", types.ModuleType("httpx"))
     monkeypatch.setitem(sys.modules, "areal", types.ModuleType("areal"))
     monkeypatch.setitem(sys.modules, "areal.v2", types.ModuleType("areal.v2"))
@@ -337,6 +428,10 @@ def _stub_areal_packages(monkeypatch):
 
 
 def _load_delta_detect(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Installs stub areal/logging/environ/v2 packages, a freshly loaded
+    # delta_config module, then executes delta_detect.py as "awex_delta_detect" and
+    # returns it.
     """Load delta_detect.py without the full AReaL runtime."""
     fake = types.ModuleType("areal.utils.logging")
     fake.getLogger = stdlib_logging.getLogger
@@ -364,6 +459,9 @@ def _load_delta_detect(monkeypatch):
 
 
 def test_cuda_mem_stats_mb_without_cuda_returns_sentinel(monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts _cuda_mem_stats_mb returns non-negative MB values with CUDA, else (-1.0,
+    # -1.0) sentinels (also with reset_peak=False).
     """CPU-only hosts must not fail while reporting DTE memory telemetry."""
     mod = _load_delta_detect(monkeypatch)
     alloc_mb, peak_mb = mod._cuda_mem_stats_mb()
@@ -376,6 +474,9 @@ def test_cuda_mem_stats_mb_without_cuda_returns_sentinel(monkeypatch):
 
 
 def test_adamw_hparams_require_and_prefer_recorded_step_lr(monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts _adamw_hparams uses the recorded "_areal_last_step_lr" over the group's
+    # lr, and returns None once that key is removed.
     """A scheduler's next-step LR cannot silently drive AdamW inversion."""
     mod = _load_delta_detect(monkeypatch)
     param_group = {
@@ -395,9 +496,17 @@ def test_adamw_hparams_require_and_prefer_recorded_step_lr(monkeypatch):
 
 
 def test_missing_recorded_step_lr_forces_dense_reconstruction(monkeypatch):
+    # [FUNCTION DOC]
+    # Installs a fake dte.core whose invert_adamw fails the test if called. Sets up an
+    # AdamWInversionDetector with bound fake param names and a stored fingerprint, steps
+    # a plain AdamW (which does not record the step LR), and asserts
+    # _reconstruct_pre_step_mcore with a fake distributed optimizer returns None (dense
+    # fallback) without attempting inversion.
     """Missing LR metadata must not fall back to the scheduler's current LR."""
 
     def _unexpected_invert_adamw(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fails the test if invoked.
         del args, kwargs
         pytest.fail("AdamW inversion must not run without a recorded step LR")
 
@@ -426,15 +535,23 @@ def test_missing_recorded_step_lr_forces_dense_reconstruction(monkeypatch):
     assert "_areal_last_step_lr" not in optimizer.param_groups[0]
 
     class _FakeDistOpt:
+        # [CLASS DOC]
+        # HELPER: Minimal Megatron distributed-optimizer stand-in holding the param in
+        # fp32/fp16 groups and the real optimizer.
         shard_fp32_from_float16_groups = [[param]]
         model_float16_groups = [[param]]
         model_param_group_index_map = None
         data_parallel_group = None
 
         def __init__(self):
+            # [FUNCTION DOC]
+            # HELPER: Stores the real optimizer.
             self.optimizer = optimizer
 
         def _get_model_param_range_map(self, model_param):
+            # [FUNCTION DOC]
+            # HELPER: Asserts the expected param and returns a range map covering all
+            # its elements.
             assert model_param is param
             return {"param": SimpleNamespace(start=0, end=param.numel())}
 
@@ -442,12 +559,19 @@ def test_missing_recorded_step_lr_forces_dense_reconstruction(monkeypatch):
 
 
 def _bind_inversion_param_names(inv, *named_params):
+    # [FUNCTION DOC]
+    # HELPER: Overrides inv._module_param_key_maps to return a mapping from param id to
+    # the given names and an empty second map.
     """Bind fake mcore parameter names for CPU-only inversion tests."""
     id2key = {id(param): name for name, param in named_params}
     inv._module_param_key_maps = lambda: (id2key, {})
 
 
 def _load_sglang_adapter(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Requires awex weight_meta and sglang_sharding. Stubs AReaL packages, a
+    # delta_config with DTE disabled, AwexInferenceAdapter and nccl_group, then executes
+    # sglang_adapter.py and returns the module.
     """Load sglang_adapter.py with only its AReaL imports stubbed."""
     pytest.importorskip("awex.meta.weight_meta")
     pytest.importorskip("awex.sharding.sglang_sharding")
@@ -457,8 +581,12 @@ def _load_sglang_adapter(monkeypatch):
     delta_config_mod = types.ModuleType("areal.v2.weight_update.awex.delta_config")
 
     class _DTERuntimeConfig:
+        # [CLASS DOC]
+        # HELPER: Stub runtime config class.
         @classmethod
         def from_env(cls):
+            # [FUNCTION DOC]
+            # HELPER: Returns a namespace with enabled=False.
             return SimpleNamespace(enabled=False)
 
     delta_config_mod.DTERuntimeConfig = _DTERuntimeConfig
@@ -473,6 +601,8 @@ def _load_sglang_adapter(monkeypatch):
     inference_adapter_mod = types.ModuleType("areal.v2.weight_update.inference_adapter")
 
     class _AwexInferenceAdapter:
+        # [CLASS DOC]
+        # HELPER: Empty stub base class.
         pass
 
     inference_adapter_mod.AwexInferenceAdapter = _AwexInferenceAdapter
@@ -500,6 +630,10 @@ def _load_sglang_adapter(monkeypatch):
 
 
 def _load_megatron_adapter(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Requires several awex submodules. Stubs AReaL packages, a delta_config
+    # with DTE enabled (tracker factory returning None), delta_detect, nccl_group and
+    # AwexTrainingAdapter, then executes megatron_adapter.py and returns the module.
     """Load megatron_adapter.py with runtime-heavy AReaL imports stubbed."""
     pytest.importorskip("awex.meta.weight_meta")
     pytest.importorskip("awex.sharding.param_sharding")
@@ -511,8 +645,13 @@ def _load_megatron_adapter(monkeypatch):
     delta_config_mod = types.ModuleType("areal.v2.weight_update.awex.delta_config")
 
     class _DTERuntimeConfig:
+        # [CLASS DOC]
+        # HELPER: Stub runtime config class.
         @classmethod
         def from_env(cls):
+            # [FUNCTION DOC]
+            # HELPER: Returns a namespace with enabled=True and a create_delta_tracker
+            # returning None.
             return SimpleNamespace(
                 enabled=True,
                 create_delta_tracker=lambda: None,
@@ -547,6 +686,8 @@ def _load_megatron_adapter(monkeypatch):
     training_adapter_mod = types.ModuleType("areal.v2.weight_update.training_adapter")
 
     class _AwexTrainingAdapter:
+        # [CLASS DOC]
+        # HELPER: Empty stub base class.
         pass
 
     training_adapter_mod.AwexTrainingAdapter = _AwexTrainingAdapter

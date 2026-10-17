@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# CPU tests for the DPO trainer loss (areal.trainer.dpo.dpo_engine): compute_dpo_loss
+# over packed sequences laid out as consecutive (chosen, rejected) pairs described by
+# cu_seqlens, with a loss_mask shifted within each sequence (last token of each sequence
+# never counted); _dpo_valid_pairs and _dpo_loss_weight helpers; and the "ipo" loss
+# variant with per-token length normalization.
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
@@ -11,10 +17,16 @@ from areal.trainer.dpo.dpo_engine import (
 
 
 class TestDPOLoss:
+    # [CLASS DOC]
+    # Groups sigmoid-DPO loss tests (shape, finiteness, sign, preference direction,
+    # beta, reference effect, empty input, masking, missing key).
     """Test cases for the DPO loss function."""
 
     @pytest.fixture
     def basic_pair_data(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture returning a 2-pair packed batch (lengths 5,6,4,7) with
+        # response-only loss_mask and random ref_logprobs.
         """Create a basic paired dataset with 2 pairs (4 sequences packed)."""
         # Sequence lengths: [5, 6, 4, 7] = chosen0, rejected0, chosen1, rejected1
         cu_seqlens = torch.tensor([0, 5, 11, 15, 22], dtype=torch.int32)
@@ -38,24 +50,33 @@ class TestDPOLoss:
         }
 
     def test_loss_is_scalar(self, basic_pair_data):
+        # [FUNCTION DOC]
+        # Asserts the loss for random logprobs is a 0-d tensor.
         """DPO loss should be a scalar."""
         logprobs = torch.randn(22)
         loss = compute_dpo_loss(logprobs, None, basic_pair_data, beta=0.1)
         assert loss.ndim == 0
 
     def test_loss_is_finite(self, basic_pair_data):
+        # [FUNCTION DOC]
+        # Asserts the loss for random logprobs is finite.
         """DPO loss should be finite."""
         logprobs = torch.randn(22)
         loss = compute_dpo_loss(logprobs, None, basic_pair_data, beta=0.1)
         assert torch.isfinite(loss)
 
     def test_loss_positive(self, basic_pair_data):
+        # [FUNCTION DOC]
+        # Asserts the loss (negative log-sigmoid) is non-negative.
         """DPO loss (negative logsigmoid) should always be non-negative."""
         logprobs = torch.randn(22)
         loss = compute_dpo_loss(logprobs, None, basic_pair_data, beta=0.1)
         assert loss.item() >= 0.0
 
     def test_loss_decreases_when_chosen_preferred(self):
+        # [FUNCTION DOC]
+        # One pair, all-response mask, zero reference: asserts the loss is lower when
+        # the policy favors chosen than when it favors rejected.
         """When policy strongly prefers chosen over rejected, loss should be lower."""
         cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
         loss_mask = torch.ones(8, dtype=torch.bool)
@@ -79,6 +100,10 @@ class TestDPOLoss:
         assert loss_good.item() < loss_bad.item()
 
     def test_beta_scaling(self):
+        # [FUNCTION DOC]
+        # Asserts loss values differ between beta 0.01 and 1.0 for the same input.
+        # KNOWN ISSUE: docstring/comment claim higher beta lowers the loss, but only
+        # inequality is asserted.
         """Higher beta should amplify the loss difference."""
         cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
         loss_mask = torch.ones(8, dtype=torch.bool)
@@ -100,6 +125,9 @@ class TestDPOLoss:
         assert loss_low_beta.item() != loss_high_beta.item()
 
     def test_ref_logprobs_effect(self):
+        # [FUNCTION DOC]
+        # Asserts the loss is lower when the reference prefers rejected than when the
+        # reference matches the policy (implicit reward is policy minus reference).
         """Reference logprobs should offset the policy preference."""
         cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
         loss_mask = torch.ones(8, dtype=torch.bool)
@@ -133,6 +161,8 @@ class TestDPOLoss:
         assert loss_opp.item() < loss_same.item()
 
     def test_empty_pairs(self):
+        # [FUNCTION DOC]
+        # All sequences empty: asserts the loss is exactly 0.
         """When all sequences are empty, loss should be zero."""
         cu_seqlens = torch.tensor([0, 0, 0], dtype=torch.int32)
         loss_mask = torch.zeros(0, dtype=torch.bool)
@@ -149,6 +179,8 @@ class TestDPOLoss:
         assert loss.item() == 0.0
 
     def test_loss_mask_only_response(self):
+        # [FUNCTION DOC]
+        # Two inputs differing only on prompt (mask 0) tokens: asserts equal losses.
         """Only response tokens (loss_mask=True) should contribute to the loss."""
         cu_seqlens = torch.tensor([0, 6, 12], dtype=torch.int32)
         # Prompt is 4 tokens, response is 2 tokens for each
@@ -189,6 +221,8 @@ class TestDPOLoss:
         torch.testing.assert_close(loss_a, loss_b, rtol=1e-5, atol=1e-5)
 
     def test_missing_ref_logprobs_raises(self):
+        # [FUNCTION DOC]
+        # Asserts KeyError when ref_logprobs is missing from the input dict.
         """When ref_logprobs is not in input_, a KeyError should be raised."""
         cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
         loss_mask = torch.ones(8, dtype=torch.bool)
@@ -203,15 +237,22 @@ class TestDPOLoss:
 
 
 class TestDPOValidPairs:
+    # [CLASS DOC]
+    # Groups tests of pair-validity and loss-weight helpers.
     """Test the helper functions for DPO pair validation."""
 
     def test_valid_pairs_all_nonempty(self):
+        # [FUNCTION DOC]
+        # Asserts all pairs are valid when every sequence is non-empty.
         cu_seqlens = torch.tensor([0, 5, 10, 15, 20], dtype=torch.int32)
         input_ = {"cu_seqlens": cu_seqlens}
         valid = _dpo_valid_pairs(input_)
         assert valid.all()
 
     def test_valid_pairs_with_empty(self):
+        # [FUNCTION DOC]
+        # Pair with an empty rejected sequence: asserts first pair valid, second
+        # invalid.
         # Second pair has an empty rejected sequence
         cu_seqlens = torch.tensor([0, 5, 10, 15, 15], dtype=torch.int32)
         input_ = {"cu_seqlens": cu_seqlens}
@@ -220,6 +261,8 @@ class TestDPOValidPairs:
         assert valid[1].item() is False
 
     def test_loss_weight(self):
+        # [FUNCTION DOC]
+        # Asserts _dpo_loss_weight returns the number of valid pairs (2.0).
         cu_seqlens = torch.tensor([0, 5, 10, 15, 20], dtype=torch.int32)
         input_ = {"cu_seqlens": cu_seqlens}
         weight = _dpo_loss_weight(input_)
@@ -227,9 +270,16 @@ class TestDPOValidPairs:
 
 
 class TestDPOLossIntraSequenceShift:
+    # [CLASS DOC]
+    # Regression tests for the intra-sequence mask shift (no cross-sequence leakage of
+    # mask bits).
     """Regression tests for the shift-align fix (no cross-sequence leakage)."""
 
     def test_chosen_last_response_token_does_not_leak_into_next_prompt(self):
+        # [FUNCTION DOC]
+        # Puts extreme logprobs on the first token of each sequence (positions that
+        # would be counted only under a global roll); asserts the loss equals log(2),
+        # i.e. those positions are excluded.
         """Two adjacent packed sequences; chosen ends with a response token
         whose mask is True. A naive global ``torch.roll`` would wrap this True
         to the first position of the next sequence (a prompt token) and pollute
@@ -276,6 +326,9 @@ class TestDPOLossIntraSequenceShift:
         )
 
     def test_last_token_of_sequence_is_never_counted(self):
+        # [FUNCTION DOC]
+        # Two identical all-response sequences with a huge logprob at each last token;
+        # asserts loss log(2), proving last positions are never counted.
         """The last position of each packed sequence has no "next token" —
         its shifted mask must be False regardless of the original mask value.
         """
@@ -311,6 +364,9 @@ class TestDPOLossIntraSequenceShift:
         )
 
     def test_two_pairs_same_content_zero_margin(self):
+        # [FUNCTION DOC]
+        # Two pairs with identical chosen/rejected content and beta 0.5; asserts loss
+        # log(2).
         """Two pairs with identical chosen/rejected content must yield log(2) loss
         (logits=0) independent of masked token values — sanity check after
         vectorized refactor.
@@ -339,6 +395,9 @@ class TestDPOLossIntraSequenceShift:
         )
 
     def test_no_gpu_cpu_sync_in_hot_path(self):
+        # [FUNCTION DOC]
+        # Asserts backward through the loss yields finite gradients on a leaf logprob
+        # tensor (smoke test for the vectorized path).
         """Smoke test: the computation should work without any ``.cpu()``
         calls in the new implementation. Verified indirectly by ensuring the
         loss runs and backward is feasible on a leaf tensor.
@@ -360,10 +419,15 @@ class TestDPOLossIntraSequenceShift:
 
 
 class TestDPOLossIPO:
+    # [CLASS DOC]
+    # Groups IPO-variant tests (loss_type="ipo").
     """Test cases for the IPO loss variant with per-token length normalization."""
 
     @pytest.fixture
     def simple_pair_data(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture returning one pair of 4-token all-response sequences with zero
+        # reference logprobs.
         """Single pair with all response tokens."""
         cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
         loss_mask = torch.ones(8, dtype=torch.bool)
@@ -375,6 +439,8 @@ class TestDPOLossIPO:
         }
 
     def test_ipo_loss_is_scalar(self, simple_pair_data):
+        # [FUNCTION DOC]
+        # Asserts the IPO loss is a 0-d tensor.
         """IPO loss should be a scalar."""
         logprobs = torch.randn(8)
         loss = compute_dpo_loss(
@@ -383,6 +449,8 @@ class TestDPOLossIPO:
         assert loss.ndim == 0
 
     def test_ipo_loss_is_finite(self, simple_pair_data):
+        # [FUNCTION DOC]
+        # Asserts the IPO loss is finite.
         """IPO loss should be finite."""
         logprobs = torch.randn(8)
         loss = compute_dpo_loss(
@@ -391,6 +459,8 @@ class TestDPOLossIPO:
         assert torch.isfinite(loss)
 
     def test_ipo_loss_non_negative(self, simple_pair_data):
+        # [FUNCTION DOC]
+        # Asserts the squared IPO loss is non-negative.
         """IPO loss (squared) should always be non-negative."""
         logprobs = torch.randn(8)
         loss = compute_dpo_loss(
@@ -399,6 +469,9 @@ class TestDPOLossIPO:
         assert loss.item() >= 0.0
 
     def test_ipo_loss_zero_at_target(self, simple_pair_data):
+        # [FUNCTION DOC]
+        # Sets chosen per-token average log-ratio to 1/(2*beta) and rejected to 0;
+        # asserts IPO loss is 0.
         """IPO loss should be zero when per-token-averaged logits == 1/(2*beta).
 
         With all-response mask and shifted mask yielding 3 counted tokens per
@@ -423,6 +496,8 @@ class TestDPOLossIPO:
         )
 
     def test_ipo_differs_from_sigmoid(self, simple_pair_data):
+        # [FUNCTION DOC]
+        # Asserts sigmoid and IPO losses differ on the same random input.
         """IPO and sigmoid should produce different loss values for the same input."""
         logprobs = torch.randn(8)
         loss_sigmoid = compute_dpo_loss(
@@ -434,6 +509,9 @@ class TestDPOLossIPO:
         assert loss_sigmoid.item() != loss_ipo.item()
 
     def test_ipo_length_normalization(self):
+        # [FUNCTION DOC]
+        # Two inputs with equal per-token average log-ratios but different lengths (3 vs
+        # 7 counted tokens); asserts equal IPO losses.
         """IPO must normalize by completion length; two pairs with same per-token
         averages but different lengths should produce equal loss.
         """
@@ -463,6 +541,9 @@ class TestDPOLossIPO:
         torch.testing.assert_close(loss_a, loss_b, rtol=1e-5, atol=1e-5)
 
     def test_ipo_chosen_preferred_lower_loss(self):
+        # [FUNCTION DOC]
+        # Asserts IPO loss is lower when the policy favors chosen than when it favors
+        # rejected (beta 0.5).
         """When policy prefers chosen, IPO loss should be lower (closer to target)."""
         cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
         loss_mask = torch.ones(8, dtype=torch.bool)
@@ -486,6 +567,8 @@ class TestDPOLossIPO:
         assert loss_good.item() < loss_bad.item()
 
     def test_ipo_backward(self, simple_pair_data):
+        # [FUNCTION DOC]
+        # Asserts IPO loss backward yields finite gradients.
         """IPO loss should support backward pass."""
         logprobs = torch.randn(8, requires_grad=True)
         loss = compute_dpo_loss(
@@ -496,6 +579,8 @@ class TestDPOLossIPO:
         assert torch.isfinite(logprobs.grad).all()
 
     def test_invalid_loss_type_raises(self, simple_pair_data):
+        # [FUNCTION DOC]
+        # Asserts ValueError "Unsupported DPO loss_type" for an unknown loss_type.
         """Unsupported loss_type should raise ValueError."""
         logprobs = torch.randn(8)
         with pytest.raises(ValueError, match="Unsupported DPO loss_type"):
@@ -504,6 +589,8 @@ class TestDPOLossIPO:
             )
 
     def test_ipo_empty_pairs(self):
+        # [FUNCTION DOC]
+        # Asserts IPO loss is 0 when all sequences are empty.
         """When all sequences are empty, IPO loss should be zero."""
         cu_seqlens = torch.tensor([0, 0, 0], dtype=torch.int32)
         loss_mask = torch.zeros(0, dtype=torch.bool)

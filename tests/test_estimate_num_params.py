@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Tests estimate_stage_parameter_buckets (Megatron pipeline-parallel helper) against
+# real HF parameter counts. Requires mbridge, megatron-core and HF model configs (local
+# /storage/openpsi/models copy or hub download).
 import os
 
 import mbridge
@@ -25,6 +29,14 @@ from areal.utils.network import find_free_ports
     ],
 )
 def test_estimate_num_params(model_name_or_path):
+    # [FUNCTION DOC]
+    # Parametrized over Qwen2/Qwen3 dense and MoE models. Sets MASTER_ADDR/MASTER_PORT
+    # env vars, inits a single-rank gloo process group and Megatron model parallel state
+    # (plus CUDA RNG seed), builds HF/mcore configs via mbridge, estimates per-layer,
+    # embedding and output parameter counts, and compares their sum (output omitted when
+    # embeddings are tied) to the parameter count of the HF model instantiated on the
+    # meta device. Asserts relative difference < 5%. Always tears down model parallel
+    # state and the process group.
     try:
         # Dummy process group for mbridge initialization
         os.environ["MASTER_ADDR"] = "localhost"

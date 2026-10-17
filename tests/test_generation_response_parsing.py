@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tests parse_generation_response of the vLLM backends (VLLMBackend, VLLMBridgeBackend)
+# and the v2 SGLang bridge backend: every output token must carry a valid sampling
+# logprob ("evidence"), with sentinel -9999.0 rejected, except SGLang aborts before
+# prefill which may return no tokens.
 from typing import Any
 
 import pytest
@@ -9,6 +14,9 @@ from areal.v2.inference_service.vllm.bridge import VLLMBridgeBackend
 
 @pytest.fixture(params=[VLLMBackend, VLLMBridgeBackend])
 def vllm_backend(request: pytest.FixtureRequest) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Fixture parametrized over the two vLLM backend classes; returns a fresh
+    # instance.
     return request.param()
 
 
@@ -16,6 +24,10 @@ def vllm_backend(request: pytest.FixtureRequest) -> Any:
 def test_vllm_rejects_ambiguous_sampling_logprob(
     vllm_backend: Any, response_format: str
 ) -> None:
+    # [FUNCTION DOC]
+    # Parametrized over completion- and chat-style logprob payloads containing token
+    # "token:42" with logprob -9999.0; asserts ValueError naming output_logprobs[0] and
+    # the value.
     if response_format == "completion":
         logprobs = {
             "tokens": ["token:42"],
@@ -32,6 +44,9 @@ def test_vllm_rejects_ambiguous_sampling_logprob(
 
 
 def test_vllm_accepts_zero_sampling_logprob(vllm_backend: Any) -> None:
+    # [FUNCTION DOC]
+    # Completion-style payload with logprob 0.0; asserts parsing yields tokens [42] and
+    # logprobs [0.0] (zero is valid).
     response = {
         "choices": [
             {
@@ -51,6 +66,9 @@ def test_vllm_accepts_zero_sampling_logprob(vllm_backend: Any) -> None:
 
 
 def test_sglang_v2_accepts_abort_before_prefill_without_evidence() -> None:
+    # [FUNCTION DOC]
+    # SGLang response with abort finish_reason "Abort before prefill..." and no tokens;
+    # asserts empty tokens/logprobs and stop_reason "abort".
     response = {
         "meta_info": {
             "finish_reason": {
@@ -80,6 +98,9 @@ def test_sglang_v2_accepts_abort_before_prefill_without_evidence() -> None:
 def test_sglang_v2_requires_sampling_evidence_otherwise(
     finish_reason: dict[str, str],
 ) -> None:
+    # [FUNCTION DOC]
+    # Parametrized over normal stop and abort-after-prefill without
+    # output_token_logprobs; asserts ValueError mentioning output_token_logprobs.
     response = {"meta_info": {"finish_reason": finish_reason}}
 
     with pytest.raises(ValueError, match="output_token_logprobs"):

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Tests validation in HttpGenerationResult (areal.api.io_struct): construction requires
+# exactly one real, finite (non-bool) logprob per output token, raising ValueError
+# otherwise; empty results are allowed.
 import pytest
 
 from areal.api.io_struct import HttpGenerationResult
@@ -13,6 +17,9 @@ from areal.api.io_struct import HttpGenerationResult
 def test_http_generation_result_rejects_mismatched_evidence_counts(
     output_tokens: list[int], output_logprobs: list[float]
 ) -> None:
+    # [FUNCTION DOC]
+    # Parametrized with one missing and one extra logprob; asserts ValueError whose
+    # message reports both counts and "exactly one sampling logprob".
     """A parsed result requires one sampling logprob per output token."""
     with pytest.raises(ValueError) as exc_info:
         HttpGenerationResult(
@@ -38,6 +45,9 @@ def test_http_generation_result_rejects_mismatched_evidence_counts(
 def test_http_generation_result_rejects_non_finite_logprob(
     invalid_logprob: float,
 ) -> None:
+    # [FUNCTION DOC]
+    # Parametrized NaN, +inf, -inf at index 1; asserts ValueError "output_logprobs[1]
+    # must be a real, finite number".
     """A parsed result rejects non-finite sampling evidence."""
     with pytest.raises(
         ValueError,
@@ -54,6 +64,9 @@ def test_http_generation_result_rejects_non_finite_logprob(
 def test_http_generation_result_rejects_boolean_logprob(
     invalid_logprob: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # Parametrized True/False as logprob; asserts ValueError for index 0 (bools
+    # rejected).
     """Boolean JSON values are not sampling logprob evidence."""
     with pytest.raises(
         ValueError,
@@ -67,6 +80,9 @@ def test_http_generation_result_rejects_boolean_logprob(
 
 
 def test_http_generation_result_accepts_empty_evidence() -> None:
+    # [FUNCTION DOC]
+    # Asserts empty tokens/logprobs with stop_reason "abort" construct successfully and
+    # are preserved.
     """An empty result remains valid for abort-before-prefill paths."""
     result = HttpGenerationResult(
         output_tokens=[],
@@ -79,6 +95,8 @@ def test_http_generation_result_accepts_empty_evidence() -> None:
 
 
 def test_http_generation_result_accepts_complete_finite_evidence() -> None:
+    # [FUNCTION DOC]
+    # Asserts two tokens with two finite logprobs construct and are preserved unchanged.
     """A normal sampled result preserves its complete finite evidence."""
     result = HttpGenerationResult(
         output_tokens=[10, 11],

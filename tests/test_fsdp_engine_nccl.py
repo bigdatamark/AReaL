@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# GPU integration test (sglang marker) for NCCL/XCCL weight broadcast from an FSDPEngine
+# to a remote SGLang server. Uses a Qwen3-0.6B model from local storage or the hub.
 import os
 
 import pytest
@@ -26,6 +29,11 @@ GROUP_NAME = "test_nccl_group"
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC]
+    # HELPER: Module-scoped fixture. Builds SGLang server args (mem fraction 0.2, GPU 1,
+    # dist init on a free port of the host IP), launches the server through a
+    # RemoteSGLangEngine and yields the launch result (host/port info); always destroys
+    # the server manager afterward.
     host = network.gethostip()
     dist_port = network.find_free_ports(1)[0]
     sglang_args = SGLangConfig.build_args(
@@ -59,6 +67,13 @@ def sglang_server():
 # We have integration tests for this now. Skipping in CI.
 @pytest.mark.slow
 def test_fsdpengine_nccl_weight_update_to_remote(tmp_path_factory, sglang_server):
+    # [FUNCTION DOC]
+    # Sets single-rank torch.distributed and NCCL env vars, creates and initializes an
+    # FSDPEngine, initializes a RemoteSGLangEngine against the fixture server, builds an
+    # FSDP-XCCL WeightUpdateMeta with a named NCCL group, connects the engines and calls
+    # update_weights. Prints a message; always destroys the remote engine and the FSDP
+    # engine and asserts torch.distributed is no longer initialized. Succeeds if no
+    # exception occurs (no weight value check).
     # Set environment variables for torch distributed
     os.environ["WORLD_SIZE"] = "1"
     os.environ["RANK"] = "0"

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# CPU tests for evaluation-batch dispatch: _pad_eval_batch (pads item lists with dummy
+# items, attention_mask all zero, to a multiple of dp_size times group_size) and
+# _dispatch_tensors from the train controller, make_dummy_eval_item,
+# compute_total_loss_weight, reward-model (RW) pair grouping, RW loss/metrics with dummy
+# pairs, and explicit padding in LMController.evaluate_lm / RWController.evaluate_rw.
 from types import MethodType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
@@ -30,6 +36,9 @@ from areal.utils.stats_tracker import DistributedStatsTracker
 
 
 def _make_item(idx: int, seqlen: int = 2) -> dict[str, object]:
+    # [FUNCTION DOC]
+    # HELPER: Builds one batch item with input_ids filled with idx+1 of shape [1,
+    # seqlen], all-True attention and loss masks, and meta {"id": idx}.
     return {
         "input_ids": torch.full((1, seqlen), idx + 1, dtype=torch.long),
         "attention_mask": torch.ones((1, seqlen), dtype=torch.bool),
@@ -39,10 +48,14 @@ def _make_item(idx: int, seqlen: int = 2) -> dict[str, object]:
 
 
 def _flatten_splits(splits: list[list[dict[str, object]]]) -> list[dict[str, object]]:
+    # [FUNCTION DOC]
+    # HELPER: Flattens per-rank item lists into one list.
     return [item for group in splits for item in group]
 
 
 def _count_dummies(items: list[dict[str, object]]) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Counts dummy items, i.e. items whose attention_mask sums to zero.
     return sum(
         int(cast(torch.Tensor, item["attention_mask"]).sum().item() == 0)
         for item in items
@@ -52,6 +65,9 @@ def _count_dummies(items: list[dict[str, object]]) -> int:
 def _make_rw_pair(
     pair_idx: int, chosen_len: int = 3, rejected_len: int = 2
 ) -> tuple[dict[str, object], dict[str, object]]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a (chosen, rejected) item pair of given lengths with distinct token
+    # fills and meta recording pair index and role.
     chosen: dict[str, object] = {
         "input_ids": torch.full((1, chosen_len), pair_idx * 2 + 1, dtype=torch.long),
         "attention_mask": torch.ones((1, chosen_len), dtype=torch.bool),
@@ -66,6 +82,8 @@ def _make_rw_pair(
 
 
 def _build_rw_batch(n_pairs: int, chosen_len: int = 3, rejected_len: int = 2):
+    # [FUNCTION DOC]
+    # HELPER: Returns a flat list of n_pairs chosen/rejected items in interleaved order.
     items: list[dict[str, object]] = []
     for p in range(n_pairs):
         c, r = _make_rw_pair(p, chosen_len, rejected_len)
@@ -74,6 +92,9 @@ def _build_rw_batch(n_pairs: int, chosen_len: int = 3, rejected_len: int = 2):
 
 
 def _make_rw_input(seqlens: list[int]) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Returns {"cu_seqlens": int32 tensor} with cumulative offsets for the given
+    # sequence lengths.
     cu_seqlens = [0]
     for seqlen in seqlens:
         cu_seqlens.append(cu_seqlens[-1] + seqlen)
@@ -81,30 +102,43 @@ def _make_rw_input(seqlens: list[int]) -> dict[str, torch.Tensor]:
 
 
 class TestEvalBatchPadding:
+    # [CLASS DOC]
+    # Groups tests of eval-batch padding and dispatch.
     def test_pad_eval_batch_no_padding_when_divisible(self):
+        # [FUNCTION DOC]
+        # 8 items, dp 4: asserts no padding added.
         items = [_make_item(i) for i in range(8)]
         (padded,) = _pad_eval_batch((items,), dp_size=4)
         assert len(padded) == 8
         assert _count_dummies(padded) == 0
 
     def test_pad_eval_batch_pads_when_not_divisible(self):
+        # [FUNCTION DOC]
+        # 7 items, dp 4: asserts padded to 8 with one dummy.
         items = [_make_item(i) for i in range(7)]
         (padded,) = _pad_eval_batch((items,), dp_size=4)
         assert len(padded) == 8
         assert _count_dummies(padded) == 1
 
     def test_pad_eval_batch_pads_when_n_less_than_dp(self):
+        # [FUNCTION DOC]
+        # 2 items, dp 4: asserts padded to 4 with two dummies.
         items = [_make_item(i) for i in range(2)]
         (padded,) = _pad_eval_batch((items,), dp_size=4)
         assert len(padded) == 4
         assert _count_dummies(padded) == 2
 
     def test_dispatch_tensors_raises_when_not_divisible(self):
+        # [FUNCTION DOC]
+        # Asserts _dispatch_tensors raises ValueError "divisible" for 7 items over dp 4.
         items = [_make_item(i) for i in range(7)]
         with pytest.raises(ValueError, match="divisible"):
             _dispatch_tensors(items, dp_size=4)
 
     def test_pad_then_dispatch_end_to_end(self):
+        # [FUNCTION DOC]
+        # Pads 7 items then dispatches over dp 4; asserts each rank gets 2 items and
+        # exactly one dummy overall.
         items = [_make_item(i) for i in range(7)]
         (padded,) = _pad_eval_batch((items,), dp_size=4)
         splits, _ = _dispatch_tensors(padded, dp_size=4)
@@ -112,6 +146,11 @@ class TestEvalBatchPadding:
         assert _count_dummies(_flatten_splits(splits)) == 1
 
     def test_make_dummy_eval_item_schema(self):
+        # [FUNCTION DOC]
+        # Asserts make_dummy_eval_item keeps the template keys, uses [{}] for
+        # multi_modal_input, produces [1,1] zero tensors with the template dtypes for
+        # masks and input_ids, and deep-copies meta (later template mutation does not
+        # leak).
         template: dict[str, object] = {
             "input_ids": torch.tensor([[2, 3, 4]], dtype=torch.long),
             "attention_mask": torch.tensor([[True, True, False]], dtype=torch.bool),
@@ -145,6 +184,10 @@ class TestEvalBatchPadding:
         assert dummy["meta"] == {"tag": ["x"]}
 
     def test_pad_eval_batch_keeps_multimodal_payload_aligned(self):
+        # [FUNCTION DOC]
+        # Pads 3 multimodal items to 4, concatenates and splits into micro-batches;
+        # asserts the dummy has multi_modal_input [{}] and the multimodal list length
+        # matches batch size in the batch and in every micro-batch.
         items: list[dict[str, object]] = []
         for _ in range(3):
             items.append(
@@ -176,6 +219,8 @@ class TestEvalBatchPadding:
             assert len(mb["multi_modal_input"]) == mb["attention_mask"].shape[0]
 
     def test_pad_eval_batch_group_size_odd_dp(self):
+        # [FUNCTION DOC]
+        # 2 items, dp 3, group_size 2: asserts padding to 6 with 4 dummies.
         items = [_make_item(i) for i in range(2)]
         (padded,) = _pad_eval_batch((items,), dp_size=3, group_size=2)
         assert len(padded) == 6
@@ -184,6 +229,8 @@ class TestEvalBatchPadding:
         assert _count_dummies(padded) == 4
 
     def test_pad_eval_batch_group_size_even_dp(self):
+        # [FUNCTION DOC]
+        # 6 items, dp 4, group_size 2: asserts padding to 8 with 2 dummies.
         items = [_make_item(i) for i in range(6)]
         (padded,) = _pad_eval_batch((items,), dp_size=4, group_size=2)
         assert len(padded) == 8
@@ -192,12 +239,16 @@ class TestEvalBatchPadding:
         assert _count_dummies(padded) == 2
 
     def test_pad_eval_batch_group_size_no_pad_needed(self):
+        # [FUNCTION DOC]
+        # 6 items, dp 3, group_size 2: asserts no padding.
         items = [_make_item(i) for i in range(6)]
         (padded,) = _pad_eval_batch((items,), dp_size=3, group_size=2)
         assert len(padded) == 6
         assert _count_dummies(padded) == 0
 
     def test_pad_eval_batch_default_group_size_unchanged(self):
+        # [FUNCTION DOC]
+        # Asserts default group_size behaves like plain dp padding (7 -> 8).
         items = [_make_item(i) for i in range(7)]
         (padded,) = _pad_eval_batch((items,), dp_size=4)
         assert len(padded) == 8
@@ -206,6 +257,9 @@ class TestEvalBatchPadding:
     def test_compute_total_loss_weight_allows_local_zero(
         self, monkeypatch: pytest.MonkeyPatch
     ):
+        # [FUNCTION DOC]
+        # Monkeypatches dist.all_reduce to add 3; asserts compute_total_loss_weight
+        # returns 3 even though the local weight is 0 (no local-zero error).
         mb_list = MicroBatchList(
             data={},
             mb_spec=MicroBatchSpec(),
@@ -216,6 +270,8 @@ class TestEvalBatchPadding:
         def _mock_all_reduce(
             tensor: torch.Tensor, group: dist.ProcessGroup | None = None
         ):
+            # [FUNCTION DOC]
+            # HELPER: Fake all_reduce adding 3.0 in place.
             del group
             tensor.add_(3.0)
 
@@ -231,7 +287,13 @@ class TestEvalBatchPadding:
 
 
 class TestRWDispatchGrouping:
+    # [CLASS DOC]
+    # Groups tests that RW chosen/rejected pairs stay together through padding and
+    # dispatch.
     def test_dispatch_group_size_preserves_rw_pairs(self):
+        # [FUNCTION DOC]
+        # 8 pairs, dp 4, group_size 2: asserts every shard has an even count and
+        # consecutive items form same-pair (chosen, rejected) couples.
         dp_size = 4
         items = _build_rw_batch(n_pairs=8)
         (padded,) = _pad_eval_batch((items,), dp_size=dp_size, group_size=2)
@@ -253,6 +315,9 @@ class TestRWDispatchGrouping:
                     assert r_meta["role"] == "rejected"
 
     def test_dispatch_group_size_rw_5_examples_dp4(self):
+        # [FUNCTION DOC]
+        # 5 pairs (10 items), dp 4: asserts padding to 16 and every shard gets an even
+        # number of items.
         dp_size = 4
         items = _build_rw_batch(n_pairs=5)
         assert len(items) == 10
@@ -269,12 +334,17 @@ class TestRWDispatchGrouping:
             )
 
     def test_dispatch_group_size_not_divisible_raises(self):
+        # [FUNCTION DOC]
+        # Asserts _dispatch_tensors raises "divisible by group_size" for 7 items with
+        # group_size 2.
         items = _build_rw_batch(n_pairs=3)
         items.append(items[0])
         with pytest.raises(ValueError, match="divisible by group_size"):
             _dispatch_tensors(items, dp_size=2, group_size=2)
 
     def test_dispatch_group_size_1_unchanged(self):
+        # [FUNCTION DOC]
+        # Asserts group_size=1 yields the same dispatch indices as the default.
         items = [_make_item(i, seqlen=i + 1) for i in range(8)]
         _, indices_default = _dispatch_tensors(items, dp_size=4)
         _, indices_gs1 = _dispatch_tensors(items, dp_size=4, group_size=1)
@@ -294,6 +364,9 @@ class TestRWDispatchGrouping:
     def test_pad_and_dispatch_group_matrix(
         self, dp_size: int, group_size: int, n_items: int
     ):
+        # [FUNCTION DOC]
+        # Parametrized dp/group/n combos: asserts padded length is a multiple of
+        # dp*group_size and every shard length is a multiple of group_size.
         items = [_make_item(i, seqlen=i % 5 + 1) for i in range(n_items)]
         (padded,) = _pad_eval_batch((items,), dp_size=dp_size, group_size=group_size)
         assert len(padded) % (dp_size * group_size) == 0
@@ -315,6 +388,9 @@ class TestRWDispatchGrouping:
     def test_pad_aligns_non_divisible_input(
         self, dp_size: int, group_size: int, n_raw: int
     ):
+        # [FUNCTION DOC]
+        # Parametrized non-divisible inputs: asserts padded length is a multiple of
+        # dp*group_size and not shorter than the input.
         items = [_make_item(i) for i in range(n_raw)]
         (padded,) = _pad_eval_batch((items,), dp_size=dp_size, group_size=group_size)
         target = dp_size * group_size
@@ -323,7 +399,11 @@ class TestRWDispatchGrouping:
 
 
 class TestRWDummyPairSemantics:
+    # [CLASS DOC]
+    # Groups tests that dummy (empty) RW pairs do not affect loss or metrics.
     def test_rw_loss_weight_counts_only_valid_pairs(self):
+        # [FUNCTION DOC]
+        # Seqlens [5,4,0,0]: asserts _rw_loss_weight counts only the one valid pair.
         input_data = _make_rw_input([5, 4, 0, 0])
 
         loss_weight = _rw_loss_weight(input_data)
@@ -331,6 +411,10 @@ class TestRWDummyPairSemantics:
         torch.testing.assert_close(loss_weight, torch.tensor(1.0), rtol=0.0, atol=0.0)
 
     def test_compute_rw_loss_ignores_dummy_pairs_in_loss_and_metrics(self):
+        # [FUNCTION DOC]
+        # With the stats tracker patched, scores for one valid pair (3.0 vs 1.0 at
+        # sequence ends): asserts loss is -logsigmoid(2) and n_pairs, correct_ratio,
+        # pos/neg score and loss stats reflect only the valid pair.
         tracker = DistributedStatsTracker()
         input_data = _make_rw_input([5, 4, 0, 0])
         scores = torch.tensor([0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 1.0])
@@ -354,6 +438,9 @@ class TestRWDummyPairSemantics:
         )
 
     def test_compute_rw_loss_returns_zero_for_all_dummy_pairs(self):
+        # [FUNCTION DOC]
+        # All-dummy pairs with empty scores: asserts loss 0, n_pairs 0 and no loss/avg
+        # stat.
         tracker = DistributedStatsTracker()
         input_data = _make_rw_input([0, 0])
 
@@ -368,7 +455,13 @@ class TestRWDummyPairSemantics:
 
 
 class TestExplicitEvalDispatchControllers:
+    # [CLASS DOC]
+    # Groups tests that controllers pad eval batches explicitly before dispatch.
     def test_lm_controller_evaluate_lm_explicitly_pads_batch(self):
+        # [FUNCTION DOC]
+        # Creates an LMController without __init__ (dp 4), replaces
+        # _custom_function_call with a capturer; asserts evaluate_lm on 7 items calls
+        # "evaluate_lm" with 8 padded items and rpc_meta broadcast True.
         controller = LMController.__new__(LMController)
         cast(Any, controller).train_alloc = SimpleNamespace(
             parallel=SimpleNamespace(dp_size=4)
@@ -376,6 +469,8 @@ class TestExplicitEvalDispatchControllers:
         captured: dict[str, Any] = {}
 
         def _capture_call(self, method: str, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records method name, args and kwargs; returns None.
             captured["method"] = method
             captured["args"] = args
             captured["kwargs"] = kwargs
@@ -392,6 +487,9 @@ class TestExplicitEvalDispatchControllers:
         assert captured["kwargs"] == {"rpc_meta": {"broadcast": True}}
 
     def test_rw_controller_evaluate_rw_explicitly_pads_pairs(self):
+        # [FUNCTION DOC]
+        # Same capture approach for RWController; asserts evaluate_rw on 5 pairs calls
+        # "evaluate_rw" with group_size 2 and 16 padded items.
         controller = RWController.__new__(RWController)
         cast(Any, controller).train_alloc = SimpleNamespace(
             parallel=SimpleNamespace(dp_size=4)
@@ -399,6 +497,8 @@ class TestExplicitEvalDispatchControllers:
         captured: dict[str, Any] = {}
 
         def _capture_call(self, method: str, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records method name, args and kwargs; returns None.
             captured["method"] = method
             captured["args"] = args
             captured["kwargs"] = kwargs
@@ -415,13 +515,22 @@ class TestExplicitEvalDispatchControllers:
         assert len(padded_items) == 16
 
     def test_evaluate_rw_logs_zero_pair_denominator_for_all_dummy_local_batch(self):
+        # [FUNCTION DOC]
+        # Runs RWEngine._evaluate_rw on an all-dummy input with a no-op engine and
+        # patched tracker; asserts n_pairs logged as 0 and no loss/avg.
         tracker = DistributedStatsTracker()
 
         class _DummyEngine:
+            # [CLASS DOC]
+            # HELPER: Fake train engine with no-op eval and eval_batch.
             def eval(self) -> None:
+                # [FUNCTION DOC]
+                # HELPER: No-op.
                 return None
 
             def eval_batch(self, **kwargs) -> None:
+                # [FUNCTION DOC]
+                # HELPER: Ignores kwargs; returns None.
                 del kwargs
                 return None
 

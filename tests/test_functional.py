@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# CPU unit tests for policy-loss functions in areal.utils.functional: ppo_actor_loss_fn
+# with sequence-level importance sampling (ratio is the per-sequence geometric mean,
+# i.e. exp of the masked mean log-ratio, broadcast to tokens; advantages averaged per
+# sequence over valid tokens; packed 1D inputs need cu_seqlens) plus edge cases, and
+# sapo_loss_fn (soft sigmoid gate scaled by 4/tau, separate tau for positive/negative
+# advantages).
 import pytest
 import torch
 
@@ -9,10 +16,15 @@ from areal.utils.functional import (
 
 
 class TestPPOActorLossFnSequenceLevel:
+    # [CLASS DOC]
+    # Groups sequence-level importance-sampling tests for ppo_actor_loss_fn.
     """Test cases for ppo_actor_loss_fn with importance_sampling_level='sequence'."""
 
     @pytest.fixture
     def basic_2d_data(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture with random 4x8 logprobs/proximal/old/advantages, all-True
+        # mask and eps_clip 0.2.
         """Basic 2D tensor test data for sequence-level importance sampling."""
         batch_size = 4
         seq_len = 8
@@ -28,6 +40,9 @@ class TestPPOActorLossFnSequenceLevel:
 
     @pytest.fixture
     def basic_1d_data(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture with random packed 32-token tensors (3 sequences of 8,12,12
+        # via cu_seqlens), all-True mask and eps_clip 0.2.
         """Basic 1D tensor test data for sequence-level importance sampling (packed)."""
         # 3 sequences with lengths [8, 12, 12]
         total_tokens = 32
@@ -44,6 +59,9 @@ class TestPPOActorLossFnSequenceLevel:
         }
 
     def test_sequence_level_2d_shape(self, basic_2d_data):
+        # [FUNCTION DOC]
+        # Asserts 2D sequence-level loss is a float32 scalar and importance_weight,
+        # approx_kl and clip_mask stats match the input shape.
         """Test that sequence-level loss returns correct shape for 2D tensors."""
         loss, stat = ppo_actor_loss_fn(
             logprobs=basic_2d_data["logprobs"],
@@ -65,6 +83,8 @@ class TestPPOActorLossFnSequenceLevel:
         assert stat["clip_mask"].shape == basic_2d_data["logprobs"].shape
 
     def test_sequence_level_1d_shape(self, basic_1d_data):
+        # [FUNCTION DOC]
+        # Same shape checks for packed 1D input with cu_seqlens.
         """Test that sequence-level loss returns correct shape for 1D tensors."""
         loss, stat = ppo_actor_loss_fn(
             logprobs=basic_1d_data["logprobs"],
@@ -87,6 +107,9 @@ class TestPPOActorLossFnSequenceLevel:
         assert stat["clip_mask"].shape == basic_1d_data["logprobs"].shape
 
     def test_sequence_level_geometric_mean_2d(self):
+        # [FUNCTION DOC]
+        # Constant per-sequence log-ratios 0.5 and 1.0: asserts every token's importance
+        # weight equals exp(0.5) and exp(1.0) respectively (2D).
         """Test that geometric mean is computed correctly for 2D tensors."""
         batch_size = 2
         seq_len = 4
@@ -139,6 +162,8 @@ class TestPPOActorLossFnSequenceLevel:
         )
 
     def test_sequence_level_geometric_mean_1d(self):
+        # [FUNCTION DOC]
+        # Same geometric-mean check for packed 1D input with two 4-token sequences.
         """Test that geometric mean is computed correctly for 1D tensors (packed sequences)."""
         # Two sequences: [4 tokens, 4 tokens]
         total_tokens = 8
@@ -177,6 +202,9 @@ class TestPPOActorLossFnSequenceLevel:
         )
 
     def test_sequence_level_advantage_averaging_2d(self):
+        # [FUNCTION DOC]
+        # Ratio 1 everywhere with varying advantages: asserts the loss is finite and
+        # equals -1.5 (negative token-weighted mean of per-sequence mean advantages).
         """Test that advantages are averaged per sequence for 2D tensors."""
         batch_size = 2
         seq_len = 4
@@ -218,6 +246,9 @@ class TestPPOActorLossFnSequenceLevel:
         assert torch.allclose(loss, torch.tensor(-1.5))
 
     def test_sequence_level_with_mask_2d(self):
+        # [FUNCTION DOC]
+        # Partial masks: asserts masked positions have zero importance weight and valid
+        # positions in a sequence share one ratio.
         """Test sequence-level with partial masking for 2D tensors."""
         batch_size = 2
         seq_len = 8
@@ -259,6 +290,9 @@ class TestPPOActorLossFnSequenceLevel:
         )
 
     def test_sequence_level_2d_advantage_average_ignores_masked_values(self):
+        # [FUNCTION DOC]
+        # Asserts changing advantages only at masked positions changes neither the loss
+        # nor valid per-token loss stats, and masked per-token loss stats are zero.
         """Masked padding advantages must not change valid-token sequence loss."""
         loss_mask = torch.tensor([[True, True, False, False]])
         logprobs = torch.zeros(1, 4)
@@ -296,6 +330,9 @@ class TestPPOActorLossFnSequenceLevel:
         )
 
     def test_sequence_level_with_mask_1d(self):
+        # [FUNCTION DOC]
+        # Packed 1D input with masked tail: asserts zero weights for masked tokens and a
+        # shared ratio within each sequence's valid tokens.
         """Test sequence-level with partial masking for 1D tensors (packed sequences)."""
         # Two sequences: [4 tokens, 4 tokens]
         total_tokens = 8
@@ -334,6 +371,9 @@ class TestPPOActorLossFnSequenceLevel:
         )
 
     def test_sequence_level_batch_size_1_2d(self):
+        # [FUNCTION DOC]
+        # Single 2D sequence: asserts finite scalar loss and a constant ratio across
+        # tokens.
         """Test batch_size=1 edge case for 2D tensors."""
         batch_size = 1
         seq_len = 10
@@ -364,6 +404,9 @@ class TestPPOActorLossFnSequenceLevel:
         assert torch.allclose(ratios, ratios[0].expand(seq_len), atol=1e-5)
 
     def test_sequence_level_batch_size_1_1d(self):
+        # [FUNCTION DOC]
+        # Single packed sequence: asserts finite scalar loss and a constant ratio across
+        # tokens.
         """Test batch_size=1 edge case for 1D tensors (single sequence)."""
         total_tokens = 10
         cu_seqlens = torch.tensor([0, 10], dtype=torch.int32)
@@ -395,6 +438,9 @@ class TestPPOActorLossFnSequenceLevel:
         assert torch.allclose(ratios, ratios[0].expand(total_tokens), atol=1e-5)
 
     def test_sequence_level_with_clipping_2d(self):
+        # [FUNCTION DOC]
+        # Sequence ratios far outside the clip band: asserts some clip_mask is set and
+        # the loss is finite.
         """Test that clipping works correctly with sequence-level importance sampling."""
         batch_size = 2
         seq_len = 4
@@ -430,6 +476,9 @@ class TestPPOActorLossFnSequenceLevel:
         assert not torch.isinf(loss)
 
     def test_sequence_level_with_dual_clip(self):
+        # [FUNCTION DOC]
+        # With c_clip=3.0: asserts dual_clip_mask stat exists with the input shape and
+        # the loss is finite.
         """Test sequence-level with dual clip (c_clip parameter)."""
         batch_size = 2
         seq_len = 4
@@ -460,6 +509,10 @@ class TestPPOActorLossFnSequenceLevel:
         assert not torch.isinf(loss)
 
     def test_sequence_level_with_rejection_sampling(self):
+        # [FUNCTION DOC]
+        # With a RejectionSamplingConfig (ratio metric, upper 10): asserts
+        # behave_imp_weight, behave_approx_kl, behave_mask and filtered_fraction stats
+        # exist and the loss is finite.
         """Test sequence-level with rejection sampling (replaces behave_imp_weight_cap)."""
         batch_size = 2
         seq_len = 4
@@ -493,6 +546,9 @@ class TestPPOActorLossFnSequenceLevel:
         assert not torch.isinf(loss)
 
     def test_no_rejection_sampling_excludes_behave_stats(self):
+        # [FUNCTION DOC]
+        # With rejection_sampling None: asserts core PPO stats exist, behavior/rejection
+        # stats are absent and the loss is finite.
         """When rejection_sampling=None, stat should not contain behave keys."""
         batch_size = 2
         seq_len = 4
@@ -530,6 +586,9 @@ class TestPPOActorLossFnSequenceLevel:
         assert not torch.isinf(loss)
 
     def test_sequence_level_vs_token_level_different(self):
+        # [FUNCTION DOC]
+        # Non-uniform log-ratios and advantages: asserts sequence-level and token-level
+        # losses and importance weights differ.
         """Verify that sequence-level and token-level produce different results."""
         batch_size = 2
         seq_len = 4
@@ -581,6 +640,8 @@ class TestPPOActorLossFnSequenceLevel:
         )
 
     def test_sequence_level_all_masked(self):
+        # [FUNCTION DOC]
+        # All tokens masked: asserts loss 0 and all importance weights 0.
         """Test edge case where all tokens are masked."""
         batch_size = 2
         seq_len = 4
@@ -612,6 +673,9 @@ class TestPPOActorLossFnSequenceLevel:
         )
 
     def test_sequence_level_consistency_across_calls(self):
+        # [FUNCTION DOC]
+        # Asserts two calls with identical inputs give identical loss, importance
+        # weights and clip masks.
         """Test that multiple calls with same input produce same output."""
         batch_size = 2
         seq_len = 4
@@ -650,6 +714,9 @@ class TestPPOActorLossFnSequenceLevel:
         assert torch.equal(stat1["clip_mask"], stat2["clip_mask"])
 
     def test_sequence_level_1d_requires_cu_seqlens(self):
+        # [FUNCTION DOC]
+        # Asserts ValueError "cu_seqlens is required for 1D tensors" for packed input
+        # without cu_seqlens.
         """Test that cu_seqlens is required for 1D tensors with sequence-level."""
         total_tokens = 8
 
@@ -676,6 +743,9 @@ class TestPPOActorLossFnSequenceLevel:
             )
 
     def test_sequence_level_1d_variable_lengths(self):
+        # [FUNCTION DOC]
+        # Three packed sequences of lengths 3, 5, 4 with log-ratios 0.5, 1.0, 1.5:
+        # asserts each sequence's tokens get the matching exp ratio.
         """Test packed sequences with variable lengths."""
         # Three sequences with lengths [3, 5, 4]
         cu_seqlens = torch.tensor([0, 3, 8, 12], dtype=torch.int32)
@@ -746,9 +816,13 @@ class TestPPOActorLossFnSequenceLevel:
 
 
 class TestPPOActorLossFnEdgeCases:
+    # [CLASS DOC]
+    # Groups extra ppo_actor_loss_fn edge cases.
     """Additional edge case tests for ppo_actor_loss_fn."""
 
     def test_invalid_importance_sampling_level(self):
+        # [FUNCTION DOC]
+        # Asserts ValueError "Invalid importance_sampling_level" for an unknown level.
         """Test that invalid importance_sampling_level raises ValueError."""
         batch_size = 2
         seq_len = 4
@@ -771,6 +845,9 @@ class TestPPOActorLossFnEdgeCases:
             )
 
     def test_batch_size_1_with_full_mask(self):
+        # [FUNCTION DOC]
+        # Single fully valid sequence: asserts both sequence- and token-level losses are
+        # finite.
         """Test batch_size=1 with complete sequence (no padding)."""
         batch_size = 1
         seq_len = 5
@@ -808,6 +885,9 @@ class TestPPOActorLossFnEdgeCases:
         assert not torch.isnan(loss_tok) and not torch.isinf(loss_tok)
 
     def test_batch_size_1_with_partial_mask(self):
+        # [FUNCTION DOC]
+        # Single sequence with 3 padded tokens: asserts zero weights at padding and a
+        # constant ratio over valid tokens.
         """Test batch_size=1 with partial masking (some padding)."""
         batch_size = 1
         seq_len = 10
@@ -842,10 +922,15 @@ class TestPPOActorLossFnEdgeCases:
 
 
 class TestSAPOLossFn:
+    # [CLASS DOC]
+    # Groups sapo_loss_fn tests.
     """Test cases for sapo_loss_fn (Soft Adaptive Policy Optimization)."""
 
     @pytest.fixture
     def basic_2d_data(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture with random 4x8 logprobs/old/advantages, all-True mask,
+        # tau_pos 1.0, tau_neg 1.05.
         """Basic 2D tensor test data for SAPO."""
         batch_size = 4
         seq_len = 8
@@ -861,6 +946,9 @@ class TestSAPOLossFn:
 
     @pytest.fixture
     def basic_1d_data(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture with random packed 32-token tensors, cu_seqlens for 3
+        # sequences, all-True mask, tau_pos 1.0, tau_neg 1.05.
         """Basic 1D tensor test data for SAPO (packed)."""
         # 3 sequences with lengths [8, 12, 12]
         total_tokens = 32
@@ -877,6 +965,9 @@ class TestSAPOLossFn:
         }
 
     def test_2d_shape(self, basic_2d_data):
+        # [FUNCTION DOC]
+        # Asserts token-level SAPO loss is a float32 scalar and gate/clip stats match
+        # the input shape (2D).
         """Test that SAPO loss returns correct shape for 2D tensors."""
         loss, stat = sapo_loss_fn(
             logprobs=basic_2d_data["logprobs"],
@@ -899,6 +990,8 @@ class TestSAPOLossFn:
         assert stat["clip_mask"].shape == basic_2d_data["logprobs"].shape
 
     def test_1d_shape(self, basic_1d_data):
+        # [FUNCTION DOC]
+        # Same shape checks on packed 1D input (token level, cu_seqlens not passed).
         """Test that SAPO loss returns correct shape for 1D tensors."""
         loss, stat = sapo_loss_fn(
             logprobs=basic_1d_data["logprobs"],
@@ -921,6 +1014,9 @@ class TestSAPOLossFn:
         assert stat["clip_mask"].shape == basic_1d_data["logprobs"].shape
 
     def test_known_value(self):
+        # [FUNCTION DOC]
+        # Ratio 1, advantage 1, tau 1: asserts gate is 2.0 (sigmoid(0) times 4/tau) and
+        # loss -2.0.
         """Test SAPO loss with known input values."""
         # Simple case: ratio = 1.0, advantages = 1.0
         logprobs = torch.tensor([[1.0, 1.0]])
@@ -954,6 +1050,9 @@ class TestSAPOLossFn:
         )
 
     def test_gate_selection_positive_advantages(self):
+        # [FUNCTION DOC]
+        # All-positive advantages with different taus: asserts the soft gate equals the
+        # scaled positive gate.
         """Test that positive gate is selected for positive advantages."""
         # Create data with positive advantages
         logprobs = torch.tensor([[0.5, 0.5]])
@@ -979,6 +1078,9 @@ class TestSAPOLossFn:
         )
 
     def test_gate_selection_negative_advantages(self):
+        # [FUNCTION DOC]
+        # All-negative advantages: asserts the soft gate equals the scaled negative
+        # gate.
         """Test that negative gate is selected for negative advantages."""
         # Create data with negative advantages
         logprobs = torch.tensor([[0.5, 0.5]])
@@ -1004,6 +1106,9 @@ class TestSAPOLossFn:
         )
 
     def test_gate_selection_mixed_advantages(self):
+        # [FUNCTION DOC]
+        # Mixed-sign advantages: asserts per-token gate selection follows each
+        # advantage's sign.
         """Test gate selection with mixed positive and negative advantages."""
         logprobs = torch.tensor([[0.5, 0.5, 0.5]])
         old_logprobs = torch.tensor([[0.0, 0.0, 0.0]])
@@ -1036,6 +1141,8 @@ class TestSAPOLossFn:
         )
 
     def test_zero_tau_raises_error(self):
+        # [FUNCTION DOC]
+        # Asserts ValueError "must be positive" for tau_pos 0.
         """Test that zero tau_pos raises ValueError."""
         logprobs = torch.tensor([[1.0]])
         old_logprobs = torch.tensor([[1.0]])
@@ -1054,6 +1161,8 @@ class TestSAPOLossFn:
             )
 
     def test_negative_tau_raises_error(self):
+        # [FUNCTION DOC]
+        # Asserts ValueError "must be positive" for negative tau_neg.
         """Test that negative tau_neg raises ValueError."""
         logprobs = torch.tensor([[1.0]])
         old_logprobs = torch.tensor([[1.0]])
@@ -1072,6 +1181,8 @@ class TestSAPOLossFn:
             )
 
     def test_token_level_importance_sampling(self):
+        # [FUNCTION DOC]
+        # Token-level random input: asserts finite loss and gate stat shapes.
         """Test SAPO with token-level importance sampling."""
         batch_size = 2
         seq_len = 4
@@ -1100,6 +1211,8 @@ class TestSAPOLossFn:
         assert stat["sapo_scaled_gate_neg"].shape == logprobs.shape
 
     def test_sequence_level_importance_sampling_2d(self):
+        # [FUNCTION DOC]
+        # Sequence-level 2D random input: asserts finite loss and gate stat shapes.
         """Test SAPO with sequence-level importance sampling (2D)."""
         batch_size = 2
         seq_len = 4
@@ -1128,6 +1241,9 @@ class TestSAPOLossFn:
         assert stat["sapo_scaled_gate_neg"].shape == logprobs.shape
 
     def test_sequence_level_importance_sampling_1d(self):
+        # [FUNCTION DOC]
+        # Sequence-level packed input with cu_seqlens (lengths 4, 6): asserts finite
+        # loss and gate stat shapes.
         """Test SAPO with sequence-level importance sampling (1D packed)."""
         # 2 sequences with lengths [4, 6]
         total_tokens = 10
@@ -1158,6 +1274,9 @@ class TestSAPOLossFn:
         assert stat["sapo_scaled_gate_neg"].shape == logprobs.shape
 
     def test_gradient_normalization(self):
+        # [FUNCTION DOC]
+        # At ratio 1, asserts the gradient wrt logprobs is identical for tau 1 and tau 2
+        # (4/tau normalization).
         """Test that 4/tau normalization provides consistent gradients."""
         logprobs = torch.tensor([[0.0]], requires_grad=True)
         old_logprobs = torch.tensor([[0.0]])
@@ -1195,6 +1314,9 @@ class TestSAPOLossFn:
         assert torch.allclose(grad1, grad2, atol=1e-6)
 
     def test_loss_mask(self):
+        # [FUNCTION DOC]
+        # Only first 2 of 4 tokens valid: asserts loss equals minus the mean over valid
+        # tokens of 4*sigmoid(ratio-1) times advantage.
         """Test that loss_mask correctly excludes masked tokens."""
         logprobs = torch.randn(1, 4)
         old_logprobs = torch.randn(1, 4)

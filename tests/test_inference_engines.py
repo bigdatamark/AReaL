@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# GPU integration tests for remote inference engines (RemotevLLMEngine and
+# RemoteSGLangEngine): batch rollout, staleness (off-policyness) control, wait_for_task,
+# and disk-based weight updates from an FSDPEngine. A module-scoped fixture launches one
+# server per backend/construction-method combination using a small Qwen3-0.6B model.
 """Test suite for remote inference engines (vLLM and SGLang)."""
 
 import os
@@ -28,6 +33,8 @@ IS_SGLANG_INSTALLED = is_available("sglang")
 
 
 def _dummy_reward_fn(*args, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Reward function stub; ignores all arguments and returns 1.0.
     """Dummy reward function for testing."""
     return 1.0
 
@@ -48,6 +55,16 @@ def _dummy_reward_fn(*args, **kwargs):
     scope="module",
 )
 def inference_engine(request):
+    # [FUNCTION DOC]
+    # HELPER: Module-scoped fixture parametrized over (vllm|sglang) x
+    # (init|from_pretrained). Skips when the backend package is missing. Seeds RNGs,
+    # builds SGLang args (if installed) and vLLM args with small memory fractions and
+    # context 128, creates a server manager via the constructor or from_pretrained,
+    # launches the server, sets AREAL_LLM_SERVER_ADDRS to its host:port (process env
+    # mutation), and yields a dict with engine_class, expr_name, trial_name, host and
+    # port. Always destroys the server manager on teardown.
+    # KNOWN ISSUE: the "init" path passes backend "sglang:d1" in the config even for the
+    # vLLM engine, and AREAL_LLM_SERVER_ADDRS is never restored.
     """Fixture for remote inference engines only (vLLM and SGLang)."""
     backend = request.param["backend"]
     method = request.param["method"]
@@ -155,6 +172,11 @@ def inference_engine(request):
 @pytest.mark.slow
 @pytest.mark.ci
 def test_rollout(inference_engine, n_samples):
+    # [FUNCTION DOC]
+    # Parametrized n_samples 1, 2, 4. Creates and initializes an engine, runs
+    # rollout_batch on 2 prompts with an RLVRWorkflow and asserts the concatenated batch
+    # size is 2*n_samples; then runs a workflow returning None and asserts an empty
+    # list. Destroys the engine and asserts torch.distributed is not initialized.
     """Test engine rollout with different sample sizes."""
     from areal.workflow import RLVRWorkflow
 
@@ -192,7 +214,11 @@ def test_rollout(inference_engine, n_samples):
     assert bs == 2 * n_samples
 
     class NullWorkflow(RolloutWorkflow):
+        # [CLASS DOC]
+        # HELPER: Workflow whose episodes always return None (rejected trajectory).
         async def arun_episode(self, engine, data):
+            # [FUNCTION DOC]
+            # HELPER: Returns None.
             return None
 
     # Test workflow returning None
@@ -212,6 +238,12 @@ def test_rollout(inference_engine, n_samples):
 @pytest.mark.slow
 @pytest.mark.ci
 def test_staleness_control(inference_engine, bs, ofp, n_samples):
+    # [FUNCTION DOC]
+    # Parametrized max_head_offpolicyness (0,1,4,16), batch size (2,4), n_samples (2,1).
+    # Submits 2*bs requests; with ofp<1 asserts wait times out, otherwise asserts
+    # 2*bs*n_samples rows. Bumps the version to 1, submits again; with ofp<2 asserts a
+    # wait for 4*bs times out, else asserts another 2*bs*n_samples rows. Destroys the
+    # engine.
     """Test engine staleness control mechanism."""
     from areal.workflow import RLVRWorkflow
 
@@ -277,6 +309,12 @@ def test_staleness_control(inference_engine, bs, ofp, n_samples):
 @pytest.mark.slow
 @pytest.mark.ci
 def test_wait_for_task(inference_engine):
+    # [FUNCTION DOC]
+    # Submits three tasks and retrieves them out of order with wait_for_task; asserts
+    # ValueError "never submitted" for an unknown id; checks raise_timeout=False returns
+    # None or a result on a tiny timeout (then waits properly); finally mixes
+    # wait_for_task for one of four tasks with wait(count=3) for the rest. Destroys the
+    # engine.
     """Test wait_for_task functionality with real inference engines."""
     from areal.workflow import RLVRWorkflow
 
@@ -354,6 +392,13 @@ def test_wait_for_task(inference_engine):
 @pytest.mark.slow
 @pytest.mark.ci
 def test_disk_update_weights_from_fsdp_engine(tmp_path_factory, inference_engine):
+    # [FUNCTION DOC]
+    # Sets single-rank distributed env vars (fixed MASTER_PORT 7777), creates and
+    # initializes an FSDPEngine at version 100, reconfigures name_resolve to an NFS dir
+    # in tmp, initializes the inference engine at version 100, connects it with a disk
+    # WeightUpdateMeta and calls update_weights. Always destroys both engines and
+    # asserts torch.distributed is uninitialized. Passes if no exception is raised.
+    # KNOWN ISSUE: the hardcoded MASTER_PORT may collide with other processes.
     """Test disk-based weight updates from FSDP engine to inference engine."""
 
     # setup FSDP engine

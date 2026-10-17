@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# CPU (gloo, multiprocessing) test that replicated params are counted once in a TP-
+# reduced global grad norm, mirroring Megatron's duplicate-param selection that
+# MegatronEngine._mark_duplicated_params relies on.
 # SPDX-License-Identifier: Apache-2.0
 
 """Verify that duplicated (replicated) params are not double-counted in the
@@ -25,17 +29,26 @@ import torch.multiprocessing as mp
 
 
 def _find_free_port() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Binds a TCP socket to localhost port 0 and returns the OS-assigned free
+    # port (socket closed afterward).
     with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("localhost", 0))
         return s.getsockname()[1]
 
 
 def _param_included_on_rank(param: torch.nn.Parameter, tp_rank: int) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if param.tensor_model_parallel is truthy (sharded) or tp_rank
+    # is 0.
     """Mirror Megatron's param_is_not_tensor_parallel_duplicate."""
     return bool(getattr(param, "tensor_model_parallel", False)) or tp_rank == 0
 
 
 def _tp_global_grad_norm(params, group, tp_rank: int) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Sums squared grads (float64) of params included on this rank, all-reduces
+    # the sum over group, and returns its square root as a Python float.
     local_sq = torch.zeros((), dtype=torch.float64)
     for p in params:
         if _param_included_on_rank(p, tp_rank):
@@ -45,6 +58,12 @@ def _tp_global_grad_norm(params, group, tp_rank: int) -> float:
 
 
 def _worker(rank: int, world_size: int, port: int) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Spawned per rank. Inits a gloo process group via tcp on the port, builds a
+    # 4x4 Linear weight with all-ones grad, computes the TP norm with
+    # tensor_model_parallel False (expect single-copy norm) and True (expect single-copy
+    # norm times sqrt(world_size)), asserts both with tight tolerance, and always
+    # destroys the process group.
     dist.init_process_group(
         backend="gloo",
         init_method=f"tcp://localhost:{port}",
@@ -82,6 +101,9 @@ def _worker(rank: int, world_size: int, port: int) -> None:
 
 @pytest.mark.parametrize("world_size", [2, 4])
 def test_duplicated_param_not_double_counted_in_tp_grad_norm(world_size: int):
+    # [FUNCTION DOC]
+    # Parametrized world_size 2 and 4: picks a free port and spawns world_size worker
+    # processes with torch.multiprocessing.spawn (join=True).
     """A replicated param counts once when tensor_model_parallel is False, and
     is inflated by sqrt(tp) when it is (incorrectly) left True."""
     port = _find_free_port()

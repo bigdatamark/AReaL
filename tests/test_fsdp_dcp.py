@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Multi-GPU tests for FSDP distributed checkpoint (DCP) save/load, delegated to
+# tests/torchrun/run_fsdp_dcp_distributed.py which writes "Passed" to an output file on
+# success.
 import subprocess
 
 import pytest
@@ -8,6 +12,11 @@ from areal.utils.network import find_free_ports
 
 
 def _run_test_with_torchrun(test_type: str, alloc_mode: str, output: str):
+    # [FUNCTION DOC]
+    # HELPER: Runs the DCP torchrun script with nproc_per_node equal to the world size
+    # parsed from alloc_mode (ModelAllocation), on a free port, passing backend, output
+    # path and test_type. pytest.fail with captured stdout/stderr on non-zero exit; then
+    # asserts the output file content is "Passed".
     port = find_free_ports(1)[0]
     n_gpus = ModelAllocation.from_str(alloc_mode).parallel.world_size
     try:
@@ -37,6 +46,8 @@ def _run_test_with_torchrun(test_type: str, alloc_mode: str, output: str):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_fsdp_dcp_distributed_simple(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with <2 GPUs; runs "simple_dcp_save_load" with fsdp:d2t1c1.
     if current_platform.device_count() < 2:
         pytest.skip("Distributed test requires 2 GPUs to run")
     output = tmp_path_factory.mktemp("test_output") / "fsdp_dcp_simple_distributed.out"
@@ -46,6 +57,8 @@ def test_fsdp_dcp_distributed_simple(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_fsdp_dcp_distributed_train(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with <2 GPUs; runs "train_dcp_save_load" with fsdp:d2t1c1.
     if current_platform.device_count() < 2:
         pytest.skip("Distributed test requires 2 GPUs to run")
     output = tmp_path_factory.mktemp("test_output") / "fsdp_dcp_train_distributed.out"

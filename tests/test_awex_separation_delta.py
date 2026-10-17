@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Separation-topology tests for the AWEX Megatron (sender) and SGLang (receiver)
+# adapters with DTE delta transfer: group initialization (NCCL data group plus gloo
+# control group), wire-dtype caching, world-size gating order, per-dtype exchange
+# rounds, gloo completion barriers, delta-tracker commit ordering, TP metadata on
+# reconstructed tensors, and AdamW inversion collective behavior. Adapters are loaded
+# via the stubbing loaders in test_awex_delta_common and instantiated with
+# object.__new__ (bypassing __init__), setting only needed attributes. Skipped when dte
+# or awex is not installed.
 # SPDX-License-Identifier: Apache-2.0
 """Separation-specific distributed ordering tests for AWEX delta transfer."""
 
@@ -19,18 +28,31 @@ pytestmark = pytest.mark.skipif(
 
 
 class _FakeTransferPlanBuilder:
+    # [CLASS DOC]
+    # HELPER: Stand-in for awex TransferPlanBuilder that records constructor kwargs.
     def __init__(self, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Stores kwargs.
         self.kwargs = kwargs
 
     def build_local_transfer_plan(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Ignores arguments and returns a fresh opaque object as the plan.
         del args, kwargs
         return object()
 
 
 def _capture_weight_update_groups(monkeypatch, mod):
+    # [FUNCTION DOC]
+    # HELPER: Monkeypatches mod.init_weights_update_group to record kwargs and return
+    # the requested backend name (default "nccl"), fetch_kv_metadata to return empty
+    # lists, and TransferPlanBuilder to the fake. Returns the list of recorded init-
+    # group calls.
     calls = []
 
     def _init_group(**kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Records kwargs and returns the backend string as a fake group handle.
         calls.append(kwargs)
         return kwargs.get("backend", "nccl")
 
@@ -41,6 +63,10 @@ def _capture_weight_update_groups(monkeypatch, mod):
 
 
 def test_megatron_full_transfer_initializes_gloo_control_group(monkeypatch):
+    # [FUNCTION DOC]
+    # DTE disabled Megatron adapter: asserts init_weight_update_group creates an NCCL
+    # then a gloo group and stores them as _weights_update_group and
+    # _weights_update_group_gloo.
     """Separated Full sync must not fall back to a NCCL control barrier."""
     mod = common._load_megatron_adapter(monkeypatch)
     calls = _capture_weight_update_groups(monkeypatch, mod)
@@ -65,6 +91,9 @@ def test_megatron_full_transfer_initializes_gloo_control_group(monkeypatch):
 
 
 def test_sglang_full_transfer_initializes_gloo_control_group(monkeypatch):
+    # [FUNCTION DOC]
+    # Same as the Megatron case for the SGLang adapter, with a faked model context (tp
+    # 4, pp 1).
     """SGLang Full sync creates the same CPU control group as training."""
     mod = common._load_sglang_adapter(monkeypatch)
     calls = _capture_weight_update_groups(monkeypatch, mod)
@@ -95,6 +124,10 @@ def test_sglang_full_transfer_initializes_gloo_control_group(monkeypatch):
 
 
 def test_megatron_dte_init_caches_global_wire_dtypes_once(monkeypatch):
+    # [FUNCTION DOC]
+    # DTE enabled Megatron adapter: asserts synchronize_wire_dtypes is called exactly
+    # once with the transfer plan and the gloo group, and its result is cached in
+    # _separation_wire_dtypes.
     mod = common._load_megatron_adapter(monkeypatch)
     _capture_weight_update_groups(monkeypatch, mod)
     calls = []
@@ -124,6 +157,8 @@ def test_megatron_dte_init_caches_global_wire_dtypes_once(monkeypatch):
 
 
 def test_sglang_dte_init_caches_global_wire_dtypes_once(monkeypatch):
+    # [FUNCTION DOC]
+    # Same as the Megatron wire-dtype caching test for the SGLang adapter.
     mod = common._load_sglang_adapter(monkeypatch)
     _capture_weight_update_groups(monkeypatch, mod)
     calls = []
@@ -168,10 +203,16 @@ def test_sglang_dte_init_caches_global_wire_dtypes_once(monkeypatch):
 def test_dte_world_size_fails_before_group_or_metadata_init(
     monkeypatch, loader_name, adapter_name
 ):
+    # [FUNCTION DOC]
+    # Parametrized over both adapters with DTE enabled: validate_dte_world_size is
+    # patched to record and raise; asserts ValueError propagates and only the validate
+    # event occurred (no metadata fetch or group init before validation).
     mod = getattr(common, loader_name)(monkeypatch)
     events = []
 
     def _reject(*args):
+        # [FUNCTION DOC]
+        # HELPER: Records the validation args and raises ValueError("combined=5").
         events.append(("validate", args))
         raise ValueError("combined=5")
 
@@ -206,6 +247,9 @@ def test_dte_world_size_fails_before_group_or_metadata_init(
 
 
 def test_non_dte_megatron_keeps_odd_world_size_compatibility(monkeypatch):
+    # [FUNCTION DOC]
+    # DTE disabled Megatron adapter with odd world size 5: asserts the DTE world-size
+    # gate is never called and both NCCL and gloo groups are still created.
     mod = common._load_megatron_adapter(monkeypatch)
     calls = _capture_weight_update_groups(monkeypatch, mod)
     monkeypatch.setattr(
@@ -232,6 +276,11 @@ def test_non_dte_megatron_keeps_odd_world_size_compatibility(monkeypatch):
 
 
 def test_megatron_enters_empty_local_dtype_round(monkeypatch):
+    # [FUNCTION DOC]
+    # Requires dte. Megatron sender with only BF16 ops and global dtypes (bf16, fp32):
+    # patches two_round_delta_exchange to record and build_send_payloads_by_op to count
+    # ops. Asserts _execute_separation_delta_send runs one exchange per global dtype,
+    # the FP32 round has zero operations and an empty send plan.
     """A sender with only BF16 ops must still enter the global FP32 round."""
     mod = common._load_megatron_adapter(monkeypatch)
     from dte.core import colocate_protocol, delta_p2p
@@ -242,6 +291,8 @@ def test_megatron_enters_empty_local_dtype_round(monkeypatch):
     calls = []
 
     def _exchange(**kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Records exchange kwargs.
         calls.append(kwargs)
 
     monkeypatch.setattr(colocate_protocol, "two_round_delta_exchange", _exchange)
@@ -273,6 +324,10 @@ def test_megatron_enters_empty_local_dtype_round(monkeypatch):
 
 
 def test_sglang_enters_empty_local_dtype_round(monkeypatch):
+    # [FUNCTION DOC]
+    # Requires dte. SGLang receiver with only FP32 ops: asserts
+    # _execute_separation_delta_recv runs the BF16 round with an empty recv plan and the
+    # FP32 round with the real ops.
     """A receiver with only FP32 ops must still enter the global BF16 round."""
     mod = common._load_sglang_adapter(monkeypatch)
     from dte.core import colocate_protocol
@@ -308,6 +363,10 @@ def test_sglang_enters_empty_local_dtype_round(monkeypatch):
 
 
 def test_megatron_full_transfer_uses_gloo_completion_barrier(monkeypatch):
+    # [FUNCTION DOC]
+    # Megatron full (non-delta) transfer with send-op building and batch_send_recv
+    # stubbed: asserts execute_weight_update finishes with one dist.barrier on the gloo
+    # group.
     """Full payload P2P completes through the sideband control group."""
     mod = common._load_megatron_adapter(monkeypatch)
     monkeypatch.setattr(
@@ -331,6 +390,9 @@ def test_megatron_full_transfer_uses_gloo_completion_barrier(monkeypatch):
 
 
 def test_sglang_full_transfer_uses_gloo_completion_barrier(monkeypatch):
+    # [FUNCTION DOC]
+    # SGLang full transfer: asserts execute_weight_update completes with a single gloo
+    # barrier (not the NCCL group).
     """Receiver Full payload completion avoids the NCCL data group."""
     mod = common._load_sglang_adapter(monkeypatch)
     monkeypatch.setattr(
@@ -355,12 +417,19 @@ def test_sglang_full_transfer_uses_gloo_completion_barrier(monkeypatch):
 def test_megatron_separation_delta_commits_tracker_after_receiver_barrier(
     monkeypatch,
 ):
+    # [FUNCTION DOC]
+    # Megatron separation delta path with stubbed masks/detector/send: asserts event
+    # order send, gloo barrier, tracker commit, detector mark_synced, all at version 2.
     """A successful direct sparse transfer advances the periodic anchor."""
     mod = common._load_megatron_adapter(monkeypatch)
     events = []
 
     class _Tracker:
+        # [CLASS DOC]
+        # HELPER: Fake delta tracker recording commits in events.
         def mark_delta_committed(self, version):
+            # [FUNCTION DOC]
+            # HELPER: Appends ("commit", version) to events.
             events.append(("commit", version))
 
     monkeypatch.setattr(mod.dist, "all_reduce", lambda *args, **kwargs: None)
@@ -401,12 +470,19 @@ def test_megatron_separation_delta_commits_tracker_after_receiver_barrier(
 
 
 def test_megatron_separation_failed_delta_does_not_advance_tracker(monkeypatch):
+    # [FUNCTION DOC]
+    # Megatron separation delta path whose send raises RuntimeError: asserts the error
+    # propagates, the barrier is never reached and the tracker is not committed.
     """A failed sparse transfer must leave the anchor counter unchanged."""
     mod = common._load_megatron_adapter(monkeypatch)
     commits = []
 
     class _Tracker:
+        # [CLASS DOC]
+        # HELPER: Fake delta tracker recording committed versions.
         def mark_delta_committed(self, version):
+            # [FUNCTION DOC]
+            # HELPER: Appends version to commits.
             commits.append(version)
 
     monkeypatch.setattr(mod.dist, "all_reduce", lambda *args, **kwargs: None)
@@ -442,6 +518,12 @@ def test_megatron_separation_failed_delta_does_not_advance_tracker(monkeypatch):
 
 
 def test_reconstructed_override_preserves_tensor_parallel_metadata(monkeypatch):
+    # [FUNCTION DOC]
+    # Stubs areal.engine.megatron_utils.megatron (named params, all_gather_param
+    # capturing its tensor, convert_to_hf). Asserts _iter_hf_params with an override map
+    # and consume_overrides uses the override tensor, which carries the live param's
+    # tensor_model_parallel/partition_dim/partition_stride metadata, yields it
+    # unchanged, and empties the overrides dict.
     """A plain theta_old tensor must gather like its live TP parameter."""
     mod = common._load_megatron_adapter(monkeypatch)
     param = torch.nn.Parameter(torch.arange(8, dtype=torch.float32))
@@ -456,6 +538,9 @@ def test_reconstructed_override_preserves_tensor_parallel_metadata(monkeypatch):
     megatron_mod.get_named_parameters = lambda model, experts: [("qkv", param)]
 
     def _all_gather_param(name, tensor, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Records whether the given tensor is the override and its TP metadata;
+        # returns the tensor.
         del name, kwargs
         captured["uses_override"] = tensor is override
         captured["metadata"] = (
@@ -490,6 +575,11 @@ def test_reconstructed_override_preserves_tensor_parallel_metadata(monkeypatch):
 
 
 def test_streaming_generator_waits_async_batch_before_yield(monkeypatch):
+    # [FUNCTION DOC]
+    # Sets a tiny all-reduce window env var and loads delta_detect. With a fake async
+    # all_reduce tracking in-flight work, asserts the first item yielded by
+    # _iter_reconstruct_pre_step_mcore is for the param, is a real reconstruction, and
+    # no async all-reduce is outstanding at yield time.
     """HF conversion never starts with inversion all-reduces in flight."""
     monkeypatch.setenv("DTE_INVERSION_ALLREDUCE_WINDOW_MB", "0.000001")
     dd = common._load_delta_detect(monkeypatch)
@@ -499,11 +589,19 @@ def test_streaming_generator_waits_async_batch_before_yield(monkeypatch):
     in_flight = 0
 
     class _FakeWork:
+        # [CLASS DOC]
+        # HELPER: Fake async work handle.
         def wait(self):
+            # [FUNCTION DOC]
+            # HELPER: Decrements the shared in-flight counter.
             nonlocal in_flight
             in_flight -= 1
 
     def _fake_all_reduce(tensor, op=None, group=None, async_op=False):
+        # [FUNCTION DOC]
+        # HELPER: Fake all_reduce asserting the dp group; fills int64 tensors with fixed
+        # stats; when async_op increments in-flight and returns a fake work, else
+        # returns None.
         nonlocal in_flight
         del op
         assert group is dp_group
@@ -517,6 +615,9 @@ def test_streaming_generator_waits_async_batch_before_yield(monkeypatch):
     monkeypatch.setattr(dd.torch.distributed, "all_reduce", _fake_all_reduce)
 
     class _FakeDistOpt:
+        # [CLASS DOC]
+        # HELPER: Minimal Megatron distributed-optimizer stand-in for a single param on
+        # the fake dp group.
         optimizer = base_opt
         shard_fp32_from_float16_groups = [[param]]
         model_float16_groups = [[param]]
@@ -524,6 +625,8 @@ def test_streaming_generator_waits_async_batch_before_yield(monkeypatch):
         data_parallel_group = dp_group
 
         def _get_model_param_range_map(self, model_param):
+            # [FUNCTION DOC]
+            # HELPER: Asserts the expected param and returns a full-range map.
             assert model_param is param
             return {"param": SimpleNamespace(start=0, end=param.numel())}
 
@@ -539,6 +642,11 @@ def test_streaming_generator_waits_async_batch_before_yield(monkeypatch):
 
 
 def test_missing_watermark_finishes_all_collectives_before_abort(monkeypatch):
+    # [FUNCTION DOC]
+    # Two params stepped with AdamW (no recorded step LR, so the verdict is dense).
+    # Wraps the reconstruction generator in _LazyReconstructDict, calls finish(), and
+    # asserts it aborted while still issuing two all-reduces per param (keeping
+    # collective counts consistent across ranks).
     """A dense verdict cannot reduce the per-parameter collective count."""
     monkeypatch.setenv("DTE_INVERSION_ALLREDUCE_WINDOW_MB", "0.000001")
     dd = common._load_delta_detect(monkeypatch)
@@ -554,10 +662,17 @@ def test_missing_watermark_finishes_all_collectives_before_abort(monkeypatch):
     calls = 0
 
     class _FakeWork:
+        # [CLASS DOC]
+        # HELPER: Fake async work whose wait does nothing.
         def wait(self):
+            # [FUNCTION DOC]
+            # HELPER: No-op wait.
             return None
 
     def _fake_all_reduce(tensor, op=None, group=None, async_op=False):
+        # [FUNCTION DOC]
+        # HELPER: Fake all_reduce asserting the dp group and counting calls; returns a
+        # fake work when async_op.
         nonlocal calls
         del tensor, op
         assert group is dp_group
@@ -567,6 +682,8 @@ def test_missing_watermark_finishes_all_collectives_before_abort(monkeypatch):
     monkeypatch.setattr(dd.torch.distributed, "all_reduce", _fake_all_reduce)
 
     class _FakeDistOpt:
+        # [CLASS DOC]
+        # HELPER: Distributed-optimizer stand-in covering both params.
         optimizer = base_opt
         shard_fp32_from_float16_groups = [params]
         model_float16_groups = [params]
@@ -574,6 +691,8 @@ def test_missing_watermark_finishes_all_collectives_before_abort(monkeypatch):
         data_parallel_group = dp_group
 
         def _get_model_param_range_map(self, model_param):
+            # [FUNCTION DOC]
+            # HELPER: Returns a full-range map for the given param.
             return {"param": SimpleNamespace(start=0, end=model_param.numel())}
 
     inv = dd.AdamWInversionDetector(SimpleNamespace(_offloaded_optimizer_states={}))

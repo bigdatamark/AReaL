@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# CUDA deterministic-mode regression tests: checks bit-identical results across repeated
+# runs for torch._grouped_mm, Inductor-compiled modules, the compiled
+# _gather_logprobs_entropy helper, and activation checkpointing combined with
+# torch.compile. All tests require CUDA; most are marked slow.
 """CUDA deterministic mode regression tests.
 
 Validates reproducibility of key PyTorch CUDA operations under
@@ -25,6 +30,14 @@ GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 
 @pytest.fixture
 def deterministic_env():
+    # [FUNCTION DOC]
+    # HELPER: Fixture. Saves torch deterministic settings and the
+    # CUBLAS_WORKSPACE_CONFIG / TORCH_COMPILE_DETERMINISTIC env vars, sets them to
+    # ":4096:8" / "1" and enables deterministic algorithms with warn_only. After the
+    # test restores previous settings (deleting env vars that were previously
+    # empty/unset) and empties the CUDA cache.
+    # KNOWN ISSUE: a previously set but empty env var is deleted rather than restored to
+    # "".
     """Set up and tear down a deterministic CUDA environment for testing."""
     prev_deterministic = torch.are_deterministic_algorithms_enabled()
     prev_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
@@ -60,6 +73,11 @@ def deterministic_env():
     reason="torch._grouped_mm not available (requires PyTorch 2.4+)",
 )
 def test_grouped_mm_deterministic(deterministic_env):
+    # [FUNCTION DOC]
+    # Requires torch._grouped_mm. Builds bf16 tokens (64x128), expert weights
+    # (4x128x256) and int32 cumulative offsets; asserts two forward calls are bit-
+    # identical, two backward passes give bit-identical weight grads, and no warning
+    # mentioning determinism was emitted during the forward calls.
     """Verify torch._grouped_mm produces bit-identical results under deterministic mode.
 
     Exercises the same call pattern as grouped_experts.py:
@@ -136,6 +154,9 @@ def test_grouped_mm_deterministic(deterministic_env):
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 def test_compile_deterministic(deterministic_env):
+    # [FUNCTION DOC]
+    # Builds a small MLP, compiles it with Inductor and runs forward+backward twice on
+    # the same input; asserts outputs and all parameter gradients are bit-identical.
     """Verify torch.compile with Inductor produces reproducible forward/backward results.
 
     Creates a small MLP, compiles with Inductor, and checks that two runs
@@ -145,6 +166,8 @@ def test_compile_deterministic(deterministic_env):
     hidden = 64
 
     def _make_mlp():
+        # [FUNCTION DOC]
+        # HELPER: Returns a Linear-SiLU-Linear MLP of width hidden on the CUDA device.
         return nn.Sequential(
             nn.Linear(hidden, hidden * 2),
             nn.SiLU(),
@@ -197,6 +220,10 @@ def test_compile_deterministic(deterministic_env):
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 def test_compile_gather_logprobs_entropy_deterministic(deterministic_env):
+    # [FUNCTION DOC]
+    # Calls the compiled _gather_logprobs_entropy
+    # (areal.utils.functional.vocab_parallel) twice on the same random logits/labels;
+    # asserts log-probs and entropies are bit-identical.
     """Verify compiled _gather_logprobs_entropy is bit-identical across calls.
 
     This function is compiled at import time via torch.compile() in
@@ -228,6 +255,15 @@ def test_compile_gather_logprobs_entropy_deterministic(deterministic_env):
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA required")
 def test_ac_recompute_compile_deterministic(deterministic_env):
+    # [FUNCTION DOC]
+    # Wraps a dropout-containing block with checkpoint_wrapper(preserve_rng_state=True),
+    # compiles it, runs two seeded forward+backward passes and asserts bit-identical
+    # outputs and grads; any exception turns into xfail. Then runs a
+    # preserve_rng_state=False baseline and only checks output shapes, ignoring all
+    # errors.
+    # KNOWN ISSUE: the broad except also catches the AssertionError from the bit-
+    # identity checks, so a real determinism failure is reported as xfail instead of
+    # failing.
     """Verify activation checkpointing + compile produces deterministic recompute.
 
     Tests the checkpoint_wrapper API with preserve_rng_state=True,
@@ -238,9 +274,14 @@ def test_ac_recompute_compile_deterministic(deterministic_env):
     )
 
     class LinearSiLUBlock(torch.nn.Module):
+        # [CLASS DOC]
+        # HELPER: Small Linear-SiLU-Dropout-Linear module (32->64->32, dropout 0.1) used
+        # to exercise RNG-dependent recompute.
         """Small block with RNG-sensitive dropout for AC testing."""
 
         def __init__(self):
+            # [FUNCTION DOC]
+            # HELPER: Creates the two linear layers, SiLU and dropout submodules.
             super().__init__()
             self.linear1 = torch.nn.Linear(32, 64)
             self.silu = torch.nn.SiLU()
@@ -248,6 +289,8 @@ def test_ac_recompute_compile_deterministic(deterministic_env):
             self.drop = torch.nn.Dropout(0.1)
 
         def forward(self, x):
+            # [FUNCTION DOC]
+            # HELPER: Applies linear1, SiLU, dropout, linear2 and returns the result.
             return self.linear2(self.drop(self.silu(self.linear1(x))))
 
     device = torch.device("cuda")

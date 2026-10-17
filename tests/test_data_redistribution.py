@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Multi-GPU test for data redistribution across ranks. Launches
+# tests/torchrun/redistribute.py via torchrun, which pickles per-rank results (objects
+# with all_data, group_indices, data attributes) to redistributed{rank}.pkl, then checks
+# consistency on the host.
 import pickle
 import subprocess
 import sys
@@ -12,6 +17,11 @@ from areal.utils.network import find_free_ports
 
 
 def assert_tensor_container_close(x1, x2):
+    # [FUNCTION DOC]
+    # HELPER: Recursively asserts two containers are equal: same type, tensors compared
+    # with torch.testing.assert_close, lists compared element-wise (same length), dicts
+    # by identical keys then per-value, anything else by ==. Raises AssertionError on
+    # mismatch; returns None.
     assert type(x1) is type(x2), (type(x1), type(x2))
     if torch.is_tensor(x1):
         assert_close(x1, x2)
@@ -32,6 +42,14 @@ def assert_tensor_container_close(x1, x2):
 @pytest.mark.multi_gpu
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 def test_redistribute(world_size, tmp_path):
+    # [FUNCTION DOC]
+    # Parametrized world_size in {2,4,8}; skipped in CI and when fewer GPUs are
+    # available. Picks a free port, runs torchrun with --dump-path=tmp_path (pytest.fail
+    # on non-zero exit), loads every rank's pickle, asserts all ranks agree on all_data
+    # and group_indices, and that each rank's data equals the all_data items selected by
+    # its group_indices entry.
+    # KNOWN ISSUE: stderr is redirected to sys.stdout so e.stderr in the failure message
+    # is always None.
     if current_platform.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs")
     port = find_free_ports(1)[0]

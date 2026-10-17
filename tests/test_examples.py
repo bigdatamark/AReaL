@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Slow end-to-end smoke tests for the example training scripts under examples/. Each
+# test builds Hydra-style CLI overrides (backends, small batch sizes, local scheduler,
+# temp fileroot and name_resolve dirs, model/dataset paths from local storage or the
+# hub) and runs the script as a subprocess until the first training step's log line
+# (SUCCESS_PATTERN) or another success pattern appears. Requires GPUs; markers indicate
+# inference backend and GPU count.
 import asyncio
 import os
 import re
@@ -30,6 +37,16 @@ async def run_example(
     timeout: int = 480,
     success_pattern=SUCCESS_PATTERN,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Async. Launches "python3 <example_file> --config <config_name> <additional_args>"
+    # with stdout and stderr merged into a pipe. Loops reading lines with a 0.1 s
+    # timeout, logging non-empty ones and checking success_pattern; on match sends
+    # SIGINT. Stops early if the process exits or the overall timeout (seconds, default
+    # 480) elapses (sending SIGINT on timeout). Always kills the process tree at the
+    # end. Returns True iff the pattern was matched.
+    # KNOWN ISSUE: at EOF readline returns empty bytes immediately, so the loop busy-
+    # spins until the exit is detected; a ValueError from an over-long line is treated
+    # like a read timeout.
     """
     Run a single example in single-controller mode and return the result.
 
@@ -108,6 +125,10 @@ async def run_example(
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_countdown_example(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Copies examples/countdown/countdown.py to a temp dir and runs it to generate a
+    # countdown dataset with the model tokenizer, then runs the countdown training
+    # example with sglang:d1 rollout and fsdp:d1 actor on 2 GPUs; asserts success.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     tmp_path = tmp_path_factory.mktemp("countdown_data")
@@ -165,6 +186,10 @@ def test_countdown_example(tmp_path_factory):
 @pytest.mark.ci
 @pytest.mark.parametrize("_version", ["v1", "v2"])
 def test_gsm8k_grpo(tmp_path_factory, _version, monkeypatch):
+    # [FUNCTION DOC]
+    # Parametrized _version v1/v2. Allows the default admin key via env, runs the GSM8K
+    # GRPO example (sglang:d1 rollout, megatron:d1 actor, 2 GPUs, timeout 900 s) with
+    # the version override for actor and rollout; asserts success.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -214,6 +239,9 @@ def test_gsm8k_grpo(tmp_path_factory, _version, monkeypatch):
 @pytest.mark.gpu
 @pytest.mark.ci
 def test_gsm8k_sft(tmp_path_factory, actor_backend):
+    # [FUNCTION DOC]
+    # Parametrized actor backend fsdp:d1 / megatron:d1. Runs the GSM8K SFT example on 1
+    # GPU; asserts success.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -246,6 +274,9 @@ def test_gsm8k_sft(tmp_path_factory, actor_backend):
 @pytest.mark.sglang
 @pytest.mark.gpu
 def test_gsm8k_eval(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Runs the GSM8K evaluation script with sglang:d1 on 1 GPU and asserts that
+    # "Evaluation Results:" appears.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -284,6 +315,12 @@ def test_gsm8k_eval(tmp_path_factory):
     ],
 )
 def test_vlm_grpo(tmp_path_factory, rollout_backend, actor_backend):
+    # [FUNCTION DOC]
+    # Parametrized rollout backend sglang/vllm with fsdp actor. Runs the geometry3k VLM
+    # GRPO example with Qwen2.5-VL-3B on 2 GPUs (timeout 1800 s, bf16 optimizer);
+    # asserts success.
+    # KNOWN ISSUE: the failure message says "CLEVR Count 70k GRPO" although the
+    # geometry3k example is run.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -324,6 +361,9 @@ def test_vlm_grpo(tmp_path_factory, rollout_backend, actor_backend):
 @pytest.mark.skip("Currently VLM dataloading is too slow. Needs to be fixed.")
 @pytest.mark.gpu
 def test_vlm_sft(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skipped (VLM data loading too slow). Runs the CLEVR count 70k SFT example with
+    # fsdp:d1 on 1 GPU; asserts success.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -360,6 +400,9 @@ def test_vlm_sft(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_gsm8k_ppo(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Runs the GSM8K PPO example (actor plus critic, sglang:d1 / fsdp:d1, 2 GPUs);
+    # asserts success.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -396,6 +439,10 @@ def test_gsm8k_ppo(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.gpu
 def test_gsm8k_ppo_colocate(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Runs GSM8K PPO with rollout, actor, critic and ref colocated on 2-way data
+    # parallel, disk weight updates, offload enabled and reduced inference memory
+    # fractions, with n_gpus_per_node=1; asserts success.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -442,6 +489,11 @@ def test_gsm8k_ppo_colocate(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_gsm8k_grpo_awex_colocate(tmp_path_factory, monkeypatch):
+    # [FUNCTION DOC]
+    # Allows the default admin key, runs GSM8K GRPO with megatron:d2 actor and
+    # sglang:d1t2p1 rollout colocated via AWEX weight updates, offload and SGLang memory
+    # saver (TMS auto-init disabled through actor env vars), on 2 GPUs with timeout 900
+    # s; asserts success.
     """Actor and rollout time-share the GPUs, syncing weights through AWEX."""
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
@@ -498,6 +550,10 @@ def test_gsm8k_grpo_awex_colocate(tmp_path_factory, monkeypatch):
 )
 @pytest.mark.multi_gpu
 def test_gsm8k_grpo_lora(tmp_path_factory, rollout_backend, actor_backend, monkeypatch):
+    # [FUNCTION DOC]
+    # Parametrized sglang/vllm rollout with fsdp actor. Allows the default admin key and
+    # runs the GSM8K GRPO LoRA example with disk weight updates and lora_name forced to
+    # "default_lora" (client workaround); asserts success.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -544,6 +600,9 @@ def test_gsm8k_grpo_lora(tmp_path_factory, rollout_backend, actor_backend, monke
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_multi_turn_math(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Runs the multi-turn math GRPO example (sglang:d1 / fsdp:d1, 2 GPUs); asserts
+    # success.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -576,6 +635,9 @@ def test_multi_turn_math(tmp_path_factory):
 
 @pytest.mark.gpu
 def test_hhrlhf_rw(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Runs the HH-RLHF reward-model training example with fsdp:d1 on 1 GPU (timeout 1800
+    # s); asserts success.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -610,6 +672,9 @@ def test_hhrlhf_rw(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_tir_grpo(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Runs the tool-integrated reasoning (TIR) GRPO example with short generations and
+    # tir.max_length 1024 on 2 GPUs; asserts success.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -645,6 +710,11 @@ def test_tir_grpo(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_search_agent_deepresearch(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with fewer than 3 GPUs or if the ASearcher dataset file is missing. Runs the
+    # Tongyi DeepResearch search-agent example with an sglang judge engine (random
+    # experiment/trial names), sglang rollout and megatron actor; raises RuntimeError on
+    # failure.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     if current_platform.device_count() < 3:
@@ -699,6 +769,9 @@ def test_search_agent_deepresearch(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_openai_agents(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Runs the OpenAI Agents SDK training example (sglang:d1 / fsdp:d1, 2 GPUs); raises
+    # RuntimeError on failure.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -733,6 +806,9 @@ def test_openai_agents(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_camel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips if camel-ai is not installed; runs the CAMEL math agent example; raises
+    # RuntimeError on failure.
     try:
         import camel.agents  # noqa
     except ImportError:
@@ -769,6 +845,9 @@ def test_camel(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_openai_proxy(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Runs the agent_workflow (OpenAI proxy) example with Qwen2.5-1.5B and xccl weight
+    # updates on 2 GPUs; raises RuntimeError on failure.
     experiments_path = tmp_path_factory.mktemp("experiments")
     name_resolve_path = tmp_path_factory.mktemp("name_resolve")
     model_path = get_model_path(
@@ -806,6 +885,14 @@ def test_openai_proxy(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_tau2(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips unless tau2 is installed, TAU2_DATA_DIR exists, the chat template file
+    # exists and at least 3 GPUs are visible. Starts a user-simulator SGLang server on
+    # the last visible GPU (port 30080, output discarded), sleeps 60 s, runs the tau2
+    # airline training example (megatron actor, 3 max steps, wandb disabled) pointing at
+    # that server, asserts success, and always force-kills the server process tree.
+    # KNOWN ISSUE: server readiness is assumed after a fixed 60 s sleep rather than a
+    # health check.
     """Test tau2 airline domain training with a user LLM server.
 
     This test requires at least 3 GPUs:
@@ -933,6 +1020,13 @@ def test_tau2(tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.multi_gpu
 def test_openclaw_online_rl(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with fewer than 2 GPUs. Starts the openclaw online-RL service as a
+    # subprocess, waits for the "Proxy gateway available at" URL, health-checks it, then
+    # runs batch_size+1 episodes over HTTP (start or refresh session with the admin key,
+    # one chat completion with the session key, set reward 1.0), asserting HTTP 200 for
+    # each call, and finally waits for SUCCESS_PATTERN. Always force-kills the process
+    # tree.
     """Test openclaw online RL training via demo lifecycle (HTTP requests).
 
     Starts the online RL service, runs 3 episodes via HTTP (start_session →
@@ -950,6 +1044,12 @@ def test_openclaw_online_rl(tmp_path_factory):
     TRAINING_STEP_TIMEOUT = 300  # 5 min for training step
 
     def wait_for_pattern(process, pattern, timeout, raise_on_exit=True):
+        # [FUNCTION DOC]
+        # HELPER: Reads process stdout line by line until timeout (seconds), logging
+        # non-empty lines; returns the first regex match. If the process exits, raises
+        # RuntimeError when raise_on_exit else returns None; returns None on timeout.
+        # KNOWN ISSUE: readline blocks, so the timeout is only checked between lines and
+        # may be exceeded if the process stays silent.
         """Wait for a regex pattern in process stdout.
 
         Returns the match object if found, None if timeout or process exits.

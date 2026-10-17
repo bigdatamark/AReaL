@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tests get_env_var and get_bool_env_var from areal/utils/environ.py, loaded from its
+# file path with stub areal/areal.utils/areal.utils.logging modules injected into
+# sys.modules (via monkeypatch) so the real package is not imported. Env vars are
+# mutated only through monkeypatch.
 # SPDX-License-Identifier: Apache-2.0
 """Tests for shared environment-variable parsing helpers."""
 
@@ -11,6 +16,11 @@ _ENVIRON_PATH = Path(__file__).parents[1] / "areal/utils/environ.py"
 
 
 def _load_environ(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Installs stub modules "areal", "areal.utils" and "areal.utils.logging"
+    # (whose getLogger is stdlib logging.getLogger) into sys.modules via monkeypatch,
+    # then executes areal/utils/environ.py as module "areal_test_environ" and returns
+    # it.
     logging_mod = types.ModuleType("areal.utils.logging")
     logging_mod.getLogger = stdlib_logging.getLogger
     utils_mod = types.ModuleType("areal.utils")
@@ -27,6 +37,9 @@ def _load_environ(monkeypatch):
 
 
 def test_get_env_var_uses_primary_then_fallback(monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts get_env_var returns the fallback name's value when the primary is unset,
+    # and the primary's value once set.
     environ = _load_environ(monkeypatch)
     monkeypatch.delenv("AREAL_TEST_PRIMARY", raising=False)
     monkeypatch.setenv("AREAL_TEST_LEGACY", "legacy")
@@ -50,6 +63,9 @@ def test_get_env_var_uses_primary_then_fallback(monkeypatch):
 
 
 def test_get_env_var_empty_value_fallback_is_configurable(monkeypatch):
+    # [FUNCTION DOC]
+    # With primary set to empty string: asserts the fallback is used by default, but ""
+    # is returned when allow_empty=True.
     environ = _load_environ(monkeypatch)
     monkeypatch.setenv("AREAL_TEST_PRIMARY", "")
     monkeypatch.setenv("AREAL_TEST_LEGACY", "legacy")
@@ -72,6 +88,9 @@ def test_get_env_var_empty_value_fallback_is_configurable(monkeypatch):
 
 
 def test_get_bool_env_var_preserves_defaults_and_supports_opt_in_values(monkeypatch):
+    # [FUNCTION DOC]
+    # With value "yes": asserts get_bool_env_var returns False with default truthy set,
+    # and True when custom truthy/falsy values including "yes" are passed.
     environ = _load_environ(monkeypatch)
     monkeypatch.setenv("AREAL_TEST_BOOL", "yes")
 
@@ -87,6 +106,9 @@ def test_get_bool_env_var_preserves_defaults_and_supports_opt_in_values(monkeypa
 
 
 def test_get_bool_env_var_can_strip_legacy_dte_values(monkeypatch):
+    # [FUNCTION DOC]
+    # With value " on " and strip_value=True plus custom truthy values, asserts True
+    # (whitespace stripped before matching).
     environ = _load_environ(monkeypatch)
     monkeypatch.setenv("AREAL_TEST_BOOL", " on ")
 

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Unit tests for attention-implementation string validation: is_valid_attn_impl and
+# get_attn_impl_validation_error from areal.engine.fsdp_utils.attn_impl, plus the
+# --attn-impl argument of the profile_fsdp CLI parser. Accepted forms are builtin names
+# or HF kernel repo ids "org/repo[@rev][:entry]", optionally prefixed with "wrapper|".
+# Pure CPU, no side effects.
 import pytest
 
 from areal.engine.fsdp_utils.attn_impl import (
@@ -20,6 +26,9 @@ from areal.tools.profile_fsdp import parse_args
     ],
 )
 def test_is_valid_attn_impl_accepts_builtin_and_kernel_repo_ids(attn_impl):
+    # [FUNCTION DOC]
+    # Parametrized over builtin impls and valid kernel repo id variants (revision, entry
+    # point, wrapper prefix); asserts each is accepted.
     assert is_valid_attn_impl(attn_impl)
 
 
@@ -33,10 +42,16 @@ def test_is_valid_attn_impl_accepts_builtin_and_kernel_repo_ids(attn_impl):
     ],
 )
 def test_is_valid_attn_impl_rejects_invalid_values(attn_impl):
+    # [FUNCTION DOC]
+    # Parametrized over malformed ids (no repo, extra path segment, two colons, empty
+    # repo); asserts each is rejected.
     assert not is_valid_attn_impl(attn_impl)
 
 
 def test_get_attn_impl_validation_error_includes_invalid_value():
+    # [FUNCTION DOC]
+    # Asserts the validation error message echoes the bad value ("got '...'") and
+    # mentions the optional "wrapper|" prefix.
     assert "got 'bad/impl:too:many'" in get_attn_impl_validation_error(
         "bad/impl:too:many"
     )
@@ -46,12 +61,18 @@ def test_get_attn_impl_validation_error_includes_invalid_value():
 
 
 def test_profile_fsdp_parse_args_accepts_valid_kernel_repo_id():
+    # [FUNCTION DOC]
+    # Asserts parse_args accepts a kernel repo id with revision and stores it verbatim
+    # in args.attn_impl.
     args = parse_args(["--attn-impl", "kernels-community/flash-attn@main"])
 
     assert args.attn_impl == "kernels-community/flash-attn@main"
 
 
 def test_profile_fsdp_parse_args_accepts_wrapper_prefixed_kernel_repo_id():
+    # [FUNCTION DOC]
+    # Asserts parse_args accepts a wrapper-prefixed kernel id with revision and entry
+    # point unchanged.
     args = parse_args(
         [
             "--attn-impl",
@@ -66,5 +87,8 @@ def test_profile_fsdp_parse_args_accepts_wrapper_prefixed_kernel_repo_id():
 
 
 def test_profile_fsdp_parse_args_rejects_invalid_kernel_repo_id():
+    # [FUNCTION DOC]
+    # Asserts parse_args exits via SystemExit with code 2 (argparse error) for an id
+    # with two colons.
     with pytest.raises(SystemExit, match="2"):
         parse_args(["--attn-impl", "kernels-community/flash-attn:entry:extra"])

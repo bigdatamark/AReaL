@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for deterministic sampling across the rollout stack: per-request seed derivation
+# in the OpenAI proxy (_deterministic_sampling_seed, SessionData request indices),
+# concurrent grouped rollout ordering, SGLang request/seed forwarding (v1 and v2
+# backends), ArealOpenAI seed passthrough, SGLang deterministic-inference server args,
+# PPOConfig seed validation, and deterministic result selection in the workflow
+# executor. CPU-only, using fakes and monkeypatching.
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -36,12 +43,17 @@ from areal.v2.inference_service.sglang.bridge import SGLangBridgeBackend
 
 
 def test_sampling_seed_is_stable_across_calls():
+    # [FUNCTION DOC]
+    # Asserts the derived seed for the same identity and sample index is identical
+    # across calls.
     assert _deterministic_sampling_seed("17:3", 0) == _deterministic_sampling_seed(
         "17:3", 0
     )
 
 
 def test_sampling_seed_differs_per_request_and_per_sample():
+    # [FUNCTION DOC]
+    # Asserts seeds differ when only the sample index or only the identity changes.
     assert _deterministic_sampling_seed("17:3", 0) != _deterministic_sampling_seed(
         "17:3", 1
     )
@@ -51,6 +63,9 @@ def test_sampling_seed_differs_per_request_and_per_sample():
 
 
 def test_sampling_seed_identity_ignores_physical_session_suffix():
+    # [FUNCTION DOC]
+    # Two sessions with different physical ids but the same sampling_seed_identity:
+    # asserts their first derived seeds are equal.
     sessions = [
         SessionData("17:3-0", sampling_seed_identity="17:3"),
         SessionData("17:3-1", sampling_seed_identity="17:3"),
@@ -68,6 +83,9 @@ def test_sampling_seed_identity_ignores_physical_session_suffix():
 
 
 def test_sampling_request_indices_are_unique_under_concurrency():
+    # [FUNCTION DOC]
+    # Calls next_sampling_request_index 32 times from 8 threads on a proxy SessionData;
+    # asserts indices are exactly 0..31 (thread-safe, unique).
     session = SessionData("17:3-0", sampling_seed_identity="17:3")
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -79,6 +97,8 @@ def test_sampling_request_indices_are_unique_under_concurrency():
 
 
 def test_v2_sampling_request_indices_are_unique_under_concurrency():
+    # [FUNCTION DOC]
+    # Same concurrency uniqueness check for the v2 data-proxy SessionData.
     session = V2SessionData("17:3-0", sampling_seed_identity="17:3")
 
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -91,6 +111,10 @@ def test_v2_sampling_request_indices_are_unique_under_concurrency():
 
 @pytest.mark.asyncio
 async def test_proxy_allocates_unique_seeds_before_concurrent_generation(monkeypatch):
+    # [FUNCTION DOC]
+    # Registers a session in the proxy cache with deterministic sampling enabled and
+    # runs 8 concurrent _call_client_create calls with a fake create_fn returning its
+    # seed; asserts the seeds are exactly those derived for indices 0..7.
     session = SessionData("17:3-0", sampling_seed_identity="17:3")
     monkeypatch.setattr(proxy_rollout_server, "_openai_client", object())
     monkeypatch.setattr(proxy_rollout_server, "_deterministic_sampling", True)
@@ -99,6 +123,9 @@ async def test_proxy_allocates_unique_seeds_before_concurrent_generation(monkeyp
     )
 
     async def create_fn(*, areal_cache, seed, temperature, top_p):
+        # [FUNCTION DOC]
+        # HELPER: Fake async create function that yields once and returns the seed it
+        # received.
         await asyncio.sleep(0)
         return seed
 
@@ -122,6 +149,9 @@ async def test_proxy_allocates_unique_seeds_before_concurrent_generation(monkeyp
 
 @pytest.mark.asyncio
 async def test_proxy_explicit_seed_still_consumes_request_index(monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts a request with explicit seed 123 keeps it but still consumes request index
+    # 0, so the next seedless request gets the seed derived for index 1.
     session = SessionData("17:3-0", sampling_seed_identity="17:3")
     monkeypatch.setattr(proxy_rollout_server, "_openai_client", object())
     monkeypatch.setattr(proxy_rollout_server, "_deterministic_sampling", True)
@@ -130,6 +160,8 @@ async def test_proxy_explicit_seed_still_consumes_request_index(monkeypatch):
     )
 
     async def create_fn(*, areal_cache, seed, temperature, top_p):
+        # [FUNCTION DOC]
+        # HELPER: Fake async create function returning the seed it received.
         return seed
 
     explicit_seed = await proxy_rollout_server._call_client_create(
@@ -151,11 +183,22 @@ async def test_proxy_explicit_seed_still_consumes_request_index(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_grouped_rollout_is_concurrent_and_sample_ordered():
+    # [FUNCTION DOC]
+    # Runs GroupedRolloutWorkflow (group_size 3, engine with deterministic_sampling)
+    # over a workflow whose episodes sleep inversely to sample_idx; asserts all 3 ran
+    # concurrently and results are concatenated in sample index order.
     class _Workflow:
+        # [CLASS DOC]
+        # HELPER: Fake workflow tracking concurrent activity (active/max_active
+        # counters).
         active = 0
         max_active = 0
 
         async def arun_episode(self, engine, data):
+            # [FUNCTION DOC]
+            # HELPER: Reads sample_idx from workflow_context, updates concurrency
+            # counters, sleeps longer for lower indices and returns a dict with a 1x1
+            # tensor of the sample index.
             sample_idx = workflow_context.get().sample_idx
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -179,6 +222,9 @@ async def test_grouped_rollout_is_concurrent_and_sample_ordered():
 
 
 def test_sglang_request_forwards_sampling_seed_when_set():
+    # [FUNCTION DOC]
+    # Asserts SGLangBackend.build_generation_request forwards gconfig.seed as
+    # sampling_params.sampling_seed.
     req = ModelRequest(
         input_ids=[1, 2, 3],
         gconfig=GenerationHyperparameters(seed=12345),
@@ -190,6 +236,8 @@ def test_sglang_request_forwards_sampling_seed_when_set():
 
 
 def test_sglang_request_omits_sampling_seed_by_default():
+    # [FUNCTION DOC]
+    # Asserts no sampling_seed is sent when gconfig.seed is unset.
     req = ModelRequest(input_ids=[1, 2, 3], gconfig=GenerationHyperparameters())
 
     request = SGLangBackend().build_generation_request(req, with_lora=False, version=0)
@@ -198,6 +246,8 @@ def test_sglang_request_omits_sampling_seed_by_default():
 
 
 def test_sglang_v2_request_forwards_sampling_seed_when_set():
+    # [FUNCTION DOC]
+    # Same seed-forwarding check for the v2 SGLangBridgeBackend.
     req = ModelRequest(
         input_ids=[1, 2, 3],
         gconfig=GenerationHyperparameters(seed=12345),
@@ -211,6 +261,8 @@ def test_sglang_v2_request_forwards_sampling_seed_when_set():
 
 
 def test_sglang_v2_request_omits_sampling_seed_by_default():
+    # [FUNCTION DOC]
+    # Same default-omission check for the v2 SGLangBridgeBackend.
     req = ModelRequest(input_ids=[1, 2, 3], gconfig=GenerationHyperparameters())
 
     request = SGLangBridgeBackend().build_generation_request(
@@ -222,6 +274,10 @@ def test_sglang_v2_request_omits_sampling_seed_by_default():
 
 @pytest.mark.asyncio
 async def test_areal_openai_forwards_seed_into_model_request(monkeypatch):
+    # [FUNCTION DOC]
+    # Patches a version check, builds a mocked tokenizer and a capturing engine, calls
+    # ArealOpenAI chat.completions.create with seed=12345 and asserts the resulting
+    # ModelRequest gconfig.seed is 12345. Always closes the client.
     monkeypatch.setattr(
         "areal.utils.hf_utils.pkg_version.is_version_greater_or_equal",
         lambda *_: False,
@@ -233,7 +289,11 @@ async def test_areal_openai_forwards_seed_into_model_request(monkeypatch):
     tokenizer.pad_token_id = 0
 
     class CapturingEngine:
+        # [CLASS DOC]
+        # HELPER: Fake inference engine recording the last request.
         async def agenerate(self, req):
+            # [FUNCTION DOC]
+            # HELPER: Stores req and returns a one-token ModelResponse.
             self.request = req
             return ModelResponse(
                 input_tokens=req.input_ids,
@@ -259,6 +319,9 @@ async def test_areal_openai_forwards_seed_into_model_request(monkeypatch):
 
 
 def test_sglang_server_args_enable_deterministic_inference(monkeypatch):
+    # [FUNCTION DOC]
+    # With version check patched True, asserts SGLangConfig.build_args passes
+    # enable_deterministic_inference=True through.
     monkeypatch.setattr(
         "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
         lambda *_: True,
@@ -279,6 +342,9 @@ def test_sglang_server_args_enable_deterministic_inference(monkeypatch):
 def test_sglang_deterministic_inference_supported_backend_does_not_warn(
     monkeypatch, attention_backend
 ):
+    # [FUNCTION DOC]
+    # Parametrized over supported attention backends (and None); asserts build_args with
+    # deterministic inference logs no warning.
     monkeypatch.setattr(
         "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
         lambda *_: True,
@@ -300,6 +366,9 @@ def test_sglang_deterministic_inference_supported_backend_does_not_warn(
 
 
 def test_sglang_deterministic_inference_unsupported_backend_warns(monkeypatch):
+    # [FUNCTION DOC]
+    # With attention_backend "torch_native", asserts exactly one warning whose args
+    # include the backend name.
     monkeypatch.setattr(
         "areal.api.cli_args.pkg_version.is_version_greater_or_equal",
         lambda *_: True,
@@ -326,6 +395,9 @@ def _deterministic_ppo_config(
     gconfig: GenerationHyperparameters,
     eval_gconfig: GenerationHyperparameters | None = None,
 ) -> PPOConfig:
+    # [FUNCTION DOC]
+    # HELPER: Builds a PPOConfig with sglang:d1 rollout, deterministic_sampling=True and
+    # the given gconfig/eval_gconfig. May raise ValueError from config validation.
     return PPOConfig(
         rollout=InferenceEngineConfig(
             backend="sglang:d1",
@@ -337,6 +409,9 @@ def _deterministic_ppo_config(
 
 
 def test_grouped_deterministic_training_rejects_shared_gconfig_seed():
+    # [FUNCTION DOC]
+    # Asserts ValueError "shared gconfig.seed" for n_samples=4 with a fixed seed under
+    # deterministic sampling.
     with pytest.raises(ValueError, match=r"shared gconfig\.seed"):
         _deterministic_ppo_config(
             gconfig=GenerationHyperparameters(n_samples=4, seed=42),
@@ -344,6 +419,9 @@ def test_grouped_deterministic_training_rejects_shared_gconfig_seed():
 
 
 def test_grouped_deterministic_evaluation_rejects_shared_gconfig_seed():
+    # [FUNCTION DOC]
+    # Asserts ValueError "shared eval_gconfig.seed" for a grouped eval config with a
+    # fixed seed.
     with pytest.raises(ValueError, match=r"shared eval_gconfig\.seed"):
         _deterministic_ppo_config(
             gconfig=GenerationHyperparameters(n_samples=1),
@@ -352,6 +430,8 @@ def test_grouped_deterministic_evaluation_rejects_shared_gconfig_seed():
 
 
 def test_single_sample_deterministic_config_allows_explicit_seed():
+    # [FUNCTION DOC]
+    # Asserts a single-sample config may keep an explicit seed.
     config = _deterministic_ppo_config(
         gconfig=GenerationHyperparameters(n_samples=1, seed=42),
     )
@@ -360,6 +440,8 @@ def test_single_sample_deterministic_config_allows_explicit_seed():
 
 
 def test_grouped_deterministic_config_allows_derived_seeds():
+    # [FUNCTION DOC]
+    # Asserts grouped config with seed None is accepted (seeds derived per sample).
     config = _deterministic_ppo_config(
         gconfig=GenerationHyperparameters(n_samples=4, seed=None),
     )
@@ -368,6 +450,8 @@ def test_grouped_deterministic_config_allows_derived_seeds():
 
 
 def test_grouped_nondeterministic_config_preserves_explicit_seed():
+    # [FUNCTION DOC]
+    # Asserts without deterministic sampling a grouped config keeps its explicit seed.
     config = PPOConfig(
         rollout=InferenceEngineConfig(
             backend="sglang:d1",
@@ -381,6 +465,9 @@ def test_grouped_nondeterministic_config_preserves_explicit_seed():
 
 @dataclass
 class _FakeTimedResult:
+    # [CLASS DOC]
+    # HELPER: Minimal timed-result dataclass with task_id, create_time and optional data
+    # payload.
     task_id: int
     create_time: float
     data: object | None = None
@@ -389,6 +476,9 @@ class _FakeTimedResult:
 def test_select_results_is_task_ordered_without_shuffle_when_deterministic(
     monkeypatch,
 ):
+    # [FUNCTION DOC]
+    # Patches random.shuffle; asserts deterministic _select_results picks the lowest
+    # task ids, leaves the rest pending, and never shuffles.
     mock_shuffle = Mock()
     monkeypatch.setattr(workflow_executor_module.random, "shuffle", mock_shuffle)
     # Arrival order (create_time) deliberately disagrees with task id order.
@@ -406,6 +496,9 @@ def test_select_results_is_task_ordered_without_shuffle_when_deterministic(
 
 
 def test_select_results_is_arrival_ordered_and_shuffled_by_default(monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts non-deterministic selection takes the oldest by create_time, keeps the
+    # newest pending, and shuffles the selected list once.
     mock_shuffle = Mock()
     monkeypatch.setattr(workflow_executor_module.random, "shuffle", mock_shuffle)
     drained = [
@@ -424,6 +517,10 @@ def test_select_results_is_arrival_ordered_and_shuffled_by_default(monkeypatch):
 
 
 def test_wait_results_selects_completed_tasks_when_deterministic():
+    # [FUNCTION DOC]
+    # Builds a BatchTaskDispatcher via object.__new__ with deterministic order and two
+    # pending results; asserts wait_results(2, timeout=0) returns them in task order,
+    # clears pending and removes them from active ids.
     dispatcher = object.__new__(BatchTaskDispatcher)
     dispatcher.deterministic_order = True
     dispatcher._result_cv = threading.Condition()
@@ -442,6 +539,9 @@ def test_wait_results_selects_completed_tasks_when_deterministic():
 
 
 def test_wait_for_task_removes_result_before_deterministic_batch_selection():
+    # [FUNCTION DOC]
+    # Asserts wait_for_task(1) removes task 1's result so a subsequent deterministic
+    # wait_results(2) returns tasks 0 and 2.
     dispatcher = object.__new__(BatchTaskDispatcher)
     dispatcher.deterministic_order = True
     dispatcher._result_cv = threading.Condition()
@@ -457,6 +557,9 @@ def test_wait_for_task_removes_result_before_deterministic_batch_selection():
 
 
 def test_responses_and_completions_both_accept_seed():
+    # [FUNCTION DOC]
+    # Asserts both AsyncCompletionsWithReward.create and AsyncResponsesWithReward.create
+    # accept a "seed" parameter.
     import inspect
 
     from areal.experimental.openai.client import (
