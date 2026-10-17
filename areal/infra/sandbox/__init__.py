@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Sandbox package for remote code execution (currently Daytona cloud sandboxes,
+# installed via the "sandbox" extra). Re-exports DaytonaClientManager, DaytonaRunner and
+# DaytonaRunResult.
 # SPDX-License-Identifier: Apache-2.0
 
 """Sandbox backends for code execution in rollouts and user scripts.

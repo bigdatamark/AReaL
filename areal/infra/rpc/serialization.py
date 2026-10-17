@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# JSON-compatible serialization for RPC payloads. serialize_value recursively converts
+# tensors, numpy arrays, PIL images, dataclasses, HF tokenizers/processors, torch dtypes
+# and enums into tagged dicts (with a "type" marker) that can be dumped with orjson, and
+# deserialize_value reverses it. Binary payloads are base64-encoded; tokenizers and
+# processors are shipped as zipped save_pretrained directories (zstd-compressed when
+# very large and zstandard is installed). Tuples become lists; gradients are not
+# preserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Tensor and dataclass serialization utilities for RPC communication.
@@ -47,6 +55,9 @@ logger = logging.getLogger("RPCSerialization")
 
 
 class SerializedTensor(BaseModel):
+    # [CLASS DOC]
+    # Pydantic model for a tensor: type "tensor", data (base64 of the raw CPU buffer, or
+    # None for meta tensors), shape and dtype string (e.g. "torch.float32").
     """Pydantic model for serialized tensor with metadata.
 
     Attributes
@@ -68,6 +79,12 @@ class SerializedTensor(BaseModel):
 
     @classmethod
     def from_tensor(cls, tensor: torch.Tensor) -> "SerializedTensor":
+        # [FUNCTION DOC]
+        # Meta tensors are encoded with data None (shape/dtype only). Otherwise detaches
+        # and moves to CPU, upcasts bfloat16 to float32 for the raw buffer (original
+        # dtype kept in metadata), and base64-encodes the numpy bytes.
+        # KNOWN ISSUE: dtypes NumPy cannot represent (other than bfloat16, e.g. float8)
+        # will fail in numpy conversion.
         """Create SerializedTensor from a PyTorch tensor.
 
         Assumes tensor is on CPU or will be moved to CPU for serialization.
@@ -111,6 +128,11 @@ class SerializedTensor(BaseModel):
         )
 
     def to_tensor(self) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Resolves the dtype from its string; for data None returns an empty meta tensor
+        # of that shape. Otherwise base64-decodes, reads the buffer with the mapped
+        # numpy dtype, copies it (writable), reshapes and casts to the original torch
+        # dtype. Returns a CPU tensor.
         """Reconstruct PyTorch tensor from serialized data.
 
         Returns CPU tensor without gradient tracking.
@@ -142,6 +164,11 @@ class SerializedTensor(BaseModel):
 
     @staticmethod
     def _torch_dtype_to_numpy(torch_dtype: torch.dtype):
+        # [FUNCTION DOC]
+        # HELPER: Maps a torch dtype to the numpy dtype used for the raw buffer
+        # (bfloat16 maps to float32). Unknown dtypes fall back to float32.
+        # KNOWN ISSUE: The silent float32 fallback misreads buffers of unmapped dtypes
+        # (e.g. uint16, complex), producing wrong values or a reshape error.
         """Convert torch dtype to numpy dtype for buffer reading.
 
         Parameters
@@ -175,6 +202,9 @@ class SerializedTensor(BaseModel):
 
 
 class SerializedNDArray(BaseModel):
+    # [CLASS DOC]
+    # Pydantic model for a numpy array: type "ndarray", base64 data, shape and dtype
+    # string (numpy dtype.str such as "<f4").
     """Pydantic model for serialized NumPy ndarrays.
 
     Attributes
@@ -196,6 +226,9 @@ class SerializedNDArray(BaseModel):
 
     @classmethod
     def from_array(cls, array: np.ndarray) -> "SerializedNDArray":
+        # [FUNCTION DOC]
+        # Encodes a C-contiguous copy's bytes. Raises ValueError for object or void
+        # dtypes.
         """Serialize a NumPy array into base64-encoded payload."""
 
         if array.dtype.kind in {"O", "V"}:
@@ -208,6 +241,8 @@ class SerializedNDArray(BaseModel):
         return cls(data=data_b64, shape=list(array.shape), dtype=array.dtype.str)
 
     def to_array(self) -> np.ndarray:
+        # [FUNCTION DOC]
+        # Decodes the bytes into a writable copy with the stored dtype and reshapes it.
         """Reconstruct a NumPy array from serialized payload."""
 
         buffer = base64.b64decode(self.data.encode("utf-8"))
@@ -219,6 +254,9 @@ class SerializedNDArray(BaseModel):
 
 
 class SerializedPILImage(BaseModel):
+    # [CLASS DOC]
+    # Pydantic model for a PIL image: type "pil_image", base64 PNG data and original
+    # mode.
     """Pydantic model for serialized PIL images."""
 
     type: Literal["pil_image"] = Field(default="pil_image")
@@ -227,6 +265,8 @@ class SerializedPILImage(BaseModel):
 
     @classmethod
     def from_image(cls, image: "ImageObject") -> "SerializedPILImage":
+        # [FUNCTION DOC]
+        # Saves the image as PNG into memory, base64-encodes it and records its mode.
         with io.BytesIO() as buffer:
             # Always use PNG to avoid format-specific save issues
             image.save(buffer, format="PNG")
@@ -234,6 +274,9 @@ class SerializedPILImage(BaseModel):
         return cls(data=data_b64, mode=image.mode)
 
     def to_image(self) -> "ImageObject":
+        # [FUNCTION DOC]
+        # Decodes and fully loads the PNG; converts back to the recorded mode if it
+        # differs. Raises RuntimeError if Pillow is not installed.
         if Image is None:  # pragma: no cover - depends on optional pillow dependency
             raise RuntimeError(
                 "Pillow is required to deserialize PIL images but is not installed"
@@ -250,6 +293,10 @@ class SerializedPILImage(BaseModel):
 
 
 class SerializedDataclass(BaseModel):
+    # [CLASS DOC]
+    # Pydantic model for a dataclass: type "dataclass", class_path ("module.ClassName")
+    # and data (field name to value; values are serialized separately by
+    # serialize_value).
     """Pydantic model for serialized dataclass with metadata.
 
     Attributes
@@ -268,6 +315,9 @@ class SerializedDataclass(BaseModel):
 
     @classmethod
     def from_dataclass(cls, dataclass_instance: Any) -> "SerializedDataclass":
+        # [FUNCTION DOC]
+        # Records the instance's module-qualified class name and a shallow dict of all
+        # its fields (nested values are left as-is for the caller to serialize).
         """Create SerializedDataclass from a dataclass instance.
 
         Parameters
@@ -293,6 +343,12 @@ class SerializedDataclass(BaseModel):
         return cls(class_path=class_path, data=data)
 
     def to_dataclass(self) -> Any:
+        # [FUNCTION DOC]
+        # Imports the module from class_path and returns a (dataclass_type, data) tuple;
+        # the caller builds the instance. Raises ImportError/AttributeError if the class
+        # cannot be found.
+        # KNOWN ISSUE: Docstring says it returns a reconstructed instance, but it
+        # returns a (type, data) tuple.
         """Reconstruct dataclass instance from serialized data.
 
         Returns
@@ -317,6 +373,9 @@ class SerializedDataclass(BaseModel):
 
 
 class SerializedTokenizer(BaseModel):
+    # [CLASS DOC]
+    # Pydantic model for a Hugging Face tokenizer: type "tokenizer", name_or_path,
+    # base64 data of a zip of its saved files, and compression ("zip" or "zstd").
     """Pydantic model for serialized Hugging Face tokenizers.
 
     Attributes
@@ -338,6 +397,10 @@ class SerializedTokenizer(BaseModel):
 
     @classmethod
     def from_tokenizer(cls, tokenizer: Any) -> "SerializedTokenizer":
+        # [FUNCTION DOC]
+        # Archives the tokenizer (save_pretrained into a temp dir, zipped), optionally
+        # zstd compresses it, base64-encodes it and records name_or_path (class name
+        # fallback).
         """Create a serialized representation from a Hugging Face tokenizer."""
 
         name_or_path = getattr(tokenizer, "name_or_path", tokenizer.__class__.__name__)
@@ -347,6 +410,9 @@ class SerializedTokenizer(BaseModel):
         return cls(name_or_path=name_or_path, data=data_b64, compression=compression)
 
     def to_tokenizer(self) -> Any:
+        # [FUNCTION DOC]
+        # Decodes and decompresses the blob, extracts the zip into a temp dir, loads it
+        # with AutoTokenizer.from_pretrained, and restores the original name_or_path.
         """Reconstruct a Hugging Face tokenizer from serialized data."""
 
         blob = base64.b64decode(self.data.encode("utf-8"))
@@ -365,6 +431,9 @@ class SerializedTokenizer(BaseModel):
 
     @staticmethod
     def _is_tokenizer(obj: Any) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if obj is a transformers slow or fast pretrained tokenizer; False
+        # if transformers is unavailable.
         try:
             from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
         except ImportError:  # pragma: no cover - optional dependency
@@ -374,6 +443,9 @@ class SerializedTokenizer(BaseModel):
 
     @staticmethod
     def _archive_tokenizer(tokenizer: Any) -> bytes:
+        # [FUNCTION DOC]
+        # HELPER: Saves the tokenizer into a temp dir and returns zip bytes of all its
+        # files (stored uncompressed under 512KB total, otherwise deflate level 6).
         zip_buffer = io.BytesIO()
         with tempfile.TemporaryDirectory() as tmpdir:
             tokenizer.save_pretrained(tmpdir)
@@ -402,6 +474,9 @@ class SerializedTokenizer(BaseModel):
 
     @staticmethod
     def _maybe_compress(blob: bytes) -> tuple[bytes, TokenizerCompression]:
+        # [FUNCTION DOC]
+        # HELPER: Zstd-compresses (level 3) blobs larger than 20MB when zstandard is
+        # installed; returns (blob, "zstd") or the original (blob, "zip").
         if (
             len(blob) > TOKENIZER_ZSTD_THRESHOLD
             and importlib.util.find_spec("zstandard") is not None
@@ -412,6 +487,9 @@ class SerializedTokenizer(BaseModel):
         return blob, "zip"
 
     def _maybe_decompress(self, blob: bytes) -> bytes:
+        # [FUNCTION DOC]
+        # HELPER: Returns blob unchanged for "zip", zstd-decompresses for "zstd", else
+        # raises ValueError.
         if self.compression == "zip":
             return blob
         if self.compression == "zstd":
@@ -423,6 +501,9 @@ class SerializedTokenizer(BaseModel):
 
 
 class SerializedProcessor(BaseModel):
+    # [CLASS DOC]
+    # Pydantic model for a Hugging Face processor (e.g. VLM processors); same fields and
+    # archive scheme as SerializedTokenizer with type "processor".
     """Pydantic model for serialized Hugging Face processors.
 
     Attributes
@@ -444,6 +525,9 @@ class SerializedProcessor(BaseModel):
 
     @classmethod
     def from_processor(cls, processor: Any) -> "SerializedProcessor":
+        # [FUNCTION DOC]
+        # Gets name_or_path from the processor, else from its inner tokenizer, else the
+        # class name; archives, optionally compresses and base64-encodes it.
         """Create a serialized representation from a Hugging Face processor."""
         name_or_path = getattr(processor, "name_or_path", None)
         if name_or_path is None:
@@ -458,6 +542,10 @@ class SerializedProcessor(BaseModel):
         return cls(name_or_path=name_or_path, data=data_b64, compression=compression)
 
     def to_processor(self) -> Any:
+        # [FUNCTION DOC]
+        # Decodes, decompresses and extracts the archive into a temp dir, loads it via
+        # AutoProcessor.from_pretrained, and restores name_or_path if the attribute
+        # exists.
         """Reconstruct a Hugging Face processor from serialized data."""
         blob = base64.b64decode(self.data.encode("utf-8"))
         blob = self._maybe_decompress(blob)
@@ -475,6 +563,9 @@ class SerializedProcessor(BaseModel):
 
     @staticmethod
     def _is_processor(obj: Any) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if obj is a transformers ProcessorMixin; False if transformers is
+        # missing.
         try:
             from transformers import ProcessorMixin
         except ImportError:  # pragma: no cover - optional dependency
@@ -483,6 +574,9 @@ class SerializedProcessor(BaseModel):
 
     @staticmethod
     def _archive_processor(processor: Any) -> bytes:
+        # [FUNCTION DOC]
+        # HELPER: Same as the tokenizer archiver but calling the processor's
+        # save_pretrained.
         zip_buffer = io.BytesIO()
         with tempfile.TemporaryDirectory() as tmpdir:
             processor.save_pretrained(tmpdir)
@@ -511,6 +605,8 @@ class SerializedProcessor(BaseModel):
 
     @staticmethod
     def _maybe_compress(blob: bytes) -> tuple[bytes, ProcessorCompression]:
+        # [FUNCTION DOC]
+        # HELPER: Zstd-compresses blobs over 20MB when zstandard is available.
         if (
             len(blob) > TOKENIZER_ZSTD_THRESHOLD
             and importlib.util.find_spec("zstandard") is not None
@@ -521,6 +617,8 @@ class SerializedProcessor(BaseModel):
         return blob, "zip"
 
     def _maybe_decompress(self, blob: bytes) -> bytes:
+        # [FUNCTION DOC]
+        # HELPER: Inverse of _maybe_compress; ValueError for unknown compression.
         if self.compression == "zip":
             return blob
         if self.compression == "zstd":
@@ -532,6 +630,14 @@ class SerializedProcessor(BaseModel):
 
 
 def serialize_value(value: Any) -> Any:
+    # [FUNCTION DOC]
+    # Recursively converts value into a JSON-compatible structure. Order of checks:
+    # None; tensor; ndarray; PIL image; dataclass instance (fields serialized
+    # recursively into a "dataclass" dict); tokenizer; processor; dict (values recursed,
+    # keys unchanged); list and tuple (both become lists); subprocess.Popen (becomes
+    # None); torch.dtype ({"type": "torch_dtype"}); Enum ({"type": "enum", class_path
+    # with qualname, value}). Anything else is returned unchanged (and may not be JSON-
+    # serializable).
     """Recursively serialize a value, converting tensors and dataclasses to serialized dicts.
 
     This function transparently handles:
@@ -627,6 +733,17 @@ def serialize_value(value: Any) -> Any:
 
 
 def deserialize_value(value: Any) -> Any:
+    # [FUNCTION DOC]
+    # Recursively reverses serialize_value. For dicts, checks the "type" marker:
+    # dataclass (imports the class and creates an instance without calling
+    # __init__/__post_init__, setting each deserialized field directly), tokenizer,
+    # processor, ndarray, pil_image, tensor, torch_dtype and enum (imports class from
+    # class_path and constructs from value). Failures in the first six cases log a
+    # warning and fall back to treating the payload as a plain dict. Plain dicts and
+    # lists are recursed; other values returned unchanged.
+    # KNOWN ISSUE: Enums nested inside classes produce a qualname class_path
+    # (Outer.Inner) whose rsplit yields an unimportable module path. Ordinary user dicts
+    # that happen to have a matching "type" key are misinterpreted.
     """Recursively deserialize a value, converting SerializedTensor and SerializedDataclass dicts back.
 
     This function transparently handles:

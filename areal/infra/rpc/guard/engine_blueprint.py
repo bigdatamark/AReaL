@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Flask Blueprint ("engine") that hosts TrainEngine/InferenceEngine instances inside the
+# RPC server process. Keeps module-global engines keyed by name and a single dedicated
+# engine thread fed by a work queue so all engine operations (including NCCL
+# collectives) run serially in one thread while data endpoints stay concurrent. Also
+# provides GuardState hooks for /health, /configure and shutdown cleanup.
 # SPDX-License-Identifier: Apache-2.0
 
 """Engine Blueprint: engine lifecycle and method invocation.
@@ -50,10 +56,16 @@ NonEmptyStr = Annotated[str, StringConstraints(min_length=1)]
 
 
 class SetEnvRequest(BaseModel):
+    # [CLASS DOC]
+    # Pydantic body for /set_env: env is a dict of variable names to values.
     env: dict[str, Any]
 
 
 class CreateEngineRequest(BaseModel):
+    # [CLASS DOC]
+    # Pydantic body for /create_engine: engine (non-empty import path), engine_name
+    # (non-empty key such as "actor/0"), init_args list and init_kwargs dict (both
+    # serialize_value-encoded, default empty).
     engine: NonEmptyStr
     engine_name: NonEmptyStr
     init_args: list[Any] = []
@@ -61,6 +73,10 @@ class CreateEngineRequest(BaseModel):
 
 
 class CallEngineRequest(BaseModel):
+    # [CLASS DOC]
+    # Pydantic body for /call: method and engine_name (non-empty), args list and kwargs
+    # dict (serialize_value-encoded), and optional rpc_meta dict (e.g. {"broadcast":
+    # bool}).
     method: NonEmptyStr
     engine_name: NonEmptyStr
     args: list[Any] = []
@@ -74,6 +90,11 @@ class CallEngineRequest(BaseModel):
 def _should_broadcast_payload(
     engine: TrainEngine | InferenceEngine, rpc_meta: dict[str, Any] | None
 ) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Decides whether call arguments must be broadcast from the data-parallel
+    # head to the other ranks. Default is True only for an initialized TrainEngine. If
+    # rpc_meta is given, its "broadcast" key overrides the default. Raises ValueError if
+    # rpc_meta is not a dict or broadcast is not a bool.
     default_broadcast = isinstance(engine, TrainEngine) and engine.initialized
     if rpc_meta is None:
         return default_broadcast
@@ -92,6 +113,11 @@ def _should_broadcast_payload(
 def resolve_broadcast_target(
     engine: TrainEngine | InferenceEngine, device: Any
 ) -> tuple[Any, Any]:
+    # [FUNCTION DOC]
+    # Returns the (process group, device) to broadcast call payloads over. If the engine
+    # is offloaded (is_offload) and exposes a cpu_model_parallel_group, returns that
+    # gloo group with device "cpu"; otherwise the engine's
+    # context_and_model_parallel_group with the given device.
     """Offloaded engines gave the accelerator to the inference engine, so device
     collectives are unusable and a gloo mirror is used. The mirror must span the
     ranks of ``context_and_model_parallel_group`` or the broadcast deadlocks;
@@ -126,6 +152,10 @@ _engine_thread_lock = Lock()
 
 
 def _init_engine_thread() -> None:
+    # [FUNCTION DOC]
+    # HELPER: Under the module lock, creates the work queue and starts the daemon
+    # "EngineWorker" thread if not already running. Returns immediately if alive; raises
+    # RuntimeError if the thread exists but has died.
     """Lazily initialize the engine worker thread."""
     global _engine_thread, _engine_work_queue
 
@@ -139,6 +169,13 @@ def _init_engine_thread() -> None:
         _engine_work_queue = Queue()
 
         def engine_worker():
+            # [FUNCTION DOC]
+            # HELPER: Engine thread loop. Takes (func, args, kwargs, future, name) items
+            # off the queue until a None sentinel; runs func and sets the future's
+            # result or exception, marking the task done. Unexpected errors are logged
+            # and forwarded to the item's future.
+            # KNOWN ISSUE: If the outer handler triggers before func_name is assigned in
+            # the first iteration, the log line references an unbound variable.
             logger.info("Engine thread started")
             while True:
                 try:
@@ -171,6 +208,10 @@ def _init_engine_thread() -> None:
 def _submit_to_engine_thread(
     func_name: str, func: Callable, *args: Any, **kwargs: Any
 ) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Ensures the engine thread exists, enqueues func with args/kwargs and a new
+    # Future, and blocks the calling (request) thread until the result is available, re-
+    # raising any exception from func. func_name is only used for logging.
     """Submit work to the engine thread and block until result is available."""
     global _engine_work_queue
 
@@ -187,6 +228,13 @@ def _submit_to_engine_thread(
 
 
 def register_engine_hooks(state: GuardState) -> None:
+    # [FUNCTION DOC]
+    # Registers on state: a health hook (engine count and names), a configure hook
+    # (seeding in the engine thread), and cleanup hooks that stop the engine thread and
+    # then destroy engines (in that order).
+    # KNOWN ISSUE: Docstring implies engines are destroyed before the thread stops;
+    # actually the thread is shut down first, so engine.destroy runs on the server
+    # thread.
     """Register engine-specific hooks on the :class:`GuardState`.
 
     Must be called after creating the Flask app and before starting
@@ -203,11 +251,18 @@ def register_engine_hooks(state: GuardState) -> None:
 
 
 def _engine_health_hook() -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Returns {"engine_count": number of engines, "engines": list of names}.
     """Contribute engine info to the /health response."""
     return {"engine_count": len(_engines), "engines": list(_engines.keys())}
 
 
 def _engine_configure_hook(data: dict) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: /configure hook. Requires "config" (serialized, must have a seed
+    # attribute) and "rank" keys, raising ValueError if missing. Deserializes config,
+    # reads role from the GuardState, then in the engine thread seeds all RNGs with
+    # config.seed and key "<role><rank>". Returns a success status dict.
     """Handle /configure by setting random seeds in the engine thread.
 
     Raises
@@ -230,6 +285,9 @@ def _engine_configure_hook(data: dict) -> dict:
     role = state.role
 
     def execute_configure():
+        # [FUNCTION DOC]
+        # HELPER: Runs in the engine thread: sets the random seed and returns the
+        # success dict.
         seeding.set_random_seed(config.seed, key=f"{role}{rank}")
         return {
             "status": "success",
@@ -246,6 +304,9 @@ def _engine_configure_hook(data: dict) -> dict:
 
 
 def cleanup_engines() -> None:
+    # [FUNCTION DOC]
+    # Calls destroy() on every registered engine (errors logged, not raised) and clears
+    # the registry.
     """Destroy all engine instances."""
     global _engines
     if _engines:
@@ -259,6 +320,10 @@ def cleanup_engines() -> None:
 
 
 def cleanup_engine_thread() -> None:
+    # [FUNCTION DOC]
+    # Under the module lock, sends the None shutdown sentinel and drops the queue, then
+    # joins the engine thread for up to 5s (warning if still alive) and drops the
+    # reference.
     """Shut down the engine worker thread."""
     global _engine_thread, _engine_work_queue
 
@@ -283,6 +348,13 @@ def cleanup_engine_thread() -> None:
 
 @engine_bp.route("/set_env", methods=["POST"])
 def set_env():
+    # [FUNCTION DOC]
+    # Route POST /set_env on the blueprint: validates SetEnvRequest (400 on failure),
+    # then in the engine thread writes each entry into os.environ (stringified, each
+    # logged). Returns the success dict; unexpected errors -> 500.
+    # KNOWN ISSUE: The core Guard app already registers POST /set_env before this
+    # blueprint is added, so Flask/werkzeug dispatches to the guard's handler and this
+    # one is effectively shadowed.
     """Set environment variables for the worker process.
 
     This endpoint is routed to the engine thread for serial execution.
@@ -299,6 +371,9 @@ def set_env():
         env_payload = payload.env
 
         def execute_set_env():
+            # [FUNCTION DOC]
+            # HELPER: Engine-thread body that sets each env var and returns {"status":
+            # "success"}.
             for key, value in env_payload.items():
                 os.environ[key] = str(value)
                 logger.info(f"Set {key}={value}")
@@ -314,6 +389,15 @@ def set_env():
 
 @engine_bp.route("/create_engine", methods=["POST"])
 def create_engine():
+    # [FUNCTION DOC]
+    # Route POST /create_engine: validates the body (400), deserializes init
+    # args/kwargs, and returns 400 if engine_name already exists. Imports the class from
+    # its dotted path and checks it subclasses TrainEngine or InferenceEngine (400 on
+    # import or type errors). Instantiates it in the engine thread (constructor may
+    # start NCCL); on success stores it under engine_name and returns
+    # status/message/engine_name; instantiation failure -> 500.
+    # KNOWN ISSUE: issubclass raises TypeError (reported as invalid engine type) when
+    # the imported object is not a class.
     """Create and initialize an engine instance on this worker.
 
     This endpoint is routed to the engine thread for serial execution.
@@ -382,6 +466,9 @@ def create_engine():
 
         # Instantiate engine in engine thread (may involve NCCL init)
         def create_engine_in_engine_thread():
+            # [FUNCTION DOC]
+            # HELPER: Engine-thread body that constructs the engine with the
+            # deserialized args, logging success or the traceback before re-raising.
             """Create engine in engine thread."""
             try:
                 engine_obj = engine_class(*init_args, **init_kwargs)
@@ -424,6 +511,19 @@ def create_engine():
 
 @engine_bp.route("/call", methods=["POST"])
 def call_engine_method():
+    # [FUNCTION DOC]
+    # Route POST /call: validates the body (400), returns 404 if the engine is unknown,
+    # deserializes args/kwargs and localizes any RTensor references (fetching remote
+    # shards over HTTP). In the engine thread: optionally broadcasts the payload from
+    # the DP head over the resolved group/device, re-sets the current device for
+    # initialized TrainEngines on accelerators, classifies the method name into a perf-
+    # trace category (scheduler, comm, io, compute or misc), calls the method inside a
+    # trace scope, and waits on the result if it is a Future. Missing method -> 400;
+    # other failures -> 500. On success, unless this is an initialized TrainEngine on a
+    # non-DP-head rank (where the result is replaced by None to avoid unreclaimable
+    # storage), tensors in the result are remotized (stored locally as shards tagged
+    # with this node's address) and the serialized result is returned as {"status":
+    # "success", "result"}.
     """Call a method on an engine instance.
 
     This endpoint is routed to the engine thread to ensure all engine
@@ -477,6 +577,12 @@ def call_engine_method():
         kwargs = RTensor.localize(raw_kwargs)
 
         def execute_in_engine_thread():
+            # [FUNCTION DOC]
+            # HELPER: Engine-thread body described above. Converts AttributeError into
+            # ValueError("Engine does not have method ..."), printing tracebacks for all
+            # errors.
+            # KNOWN ISSUE: Any AttributeError raised inside the engine method itself is
+            # also reported as a missing method (HTTP 400), masking the real bug.
             try:
                 args_bcast = args
                 kwargs_bcast = kwargs

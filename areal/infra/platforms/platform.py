@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Defines the Platform base class: a device-agnostic description of an accelerator
+# (PyTorch dispatch key, Ray resource key, visibility env var, comm backend) plus hooks
+# for memory management and worker environment setup.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -10,6 +14,12 @@ logger = logging.getLogger("Platform")
 
 
 class Platform:
+    # [CLASS DOC]
+    # Abstract base for hardware platforms. Subclasses set class attributes device_name,
+    # device_type (torch submodule name), dispatch_key, ray_device_key,
+    # device_control_env_var, ray_experimental_noset and communication_backend, and
+    # override the NotImplemented hooks. Unknown attributes are delegated to the
+    # torch.<device_type> module.
     """
     A unified abstraction for different hardware platforms (e.g., GPU, NPU).
     Design Overview
@@ -66,6 +76,10 @@ class Platform:
     communication_backend: str
 
     def __getattr__(self, key: str):
+        # [FUNCTION DOC]
+        # Fallback attribute lookup: fetches torch.<device_type>; if it exists and has
+        # the attribute key, returns it, else raises AttributeError naming the class and
+        # key.
         """Fallback attribute accessor for device-specific Torch modules.
         This method is called when the requested attribute `key` is not found
         in the current instance. It attempts to retrieve the attribute from
@@ -88,29 +102,43 @@ class Platform:
             )
 
     def clear_memory(self) -> None:
+        # [FUNCTION DOC]
+        # Abstract: free device memory. Raises NotImplementedError.
         raise NotImplementedError()
 
     @classmethod
     def clear_cublas_workspaces(cls) -> None:
+        # [FUNCTION DOC]
+        # Abstract: release low-level BLAS workspaces. Raises NotImplementedError.
         raise NotImplementedError()
 
     @classmethod
     def get_vllm_worker_class(cls):
+        # [FUNCTION DOC]
+        # Abstract: return the vLLM worker class for this device. Raises
+        # NotImplementedError.
         """Return the custom vLLM WorkerWrapper class used in Ray."""
         raise NotImplementedError()
 
     @classmethod
     def set_allocator_settings(cls) -> None:
+        # [FUNCTION DOC]
+        # Abstract: configure the device memory allocator. Raises NotImplementedError.
         """Configure memory allocator settings based on the device type."""
         raise NotImplementedError()
 
     @classmethod
     def set_numa_affinity(cls, local_rank: int) -> None:
+        # [FUNCTION DOC]
+        # Default no-op for binding the process to CPU cores near device local_rank.
         """Bind the current process to CPU cores near the assigned device."""
         return
 
     @classmethod
     def get_custom_env_vars(cls) -> dict:
+        # [FUNCTION DOC]
+        # Abstract: return extra env vars (dict) for worker processes. Raises
+        # NotImplementedError.
         """
         Return custom environment variables specific to the platform.
         Returns:
@@ -122,6 +150,11 @@ class Platform:
     def update_env_vars_for_visible_devices(
         cls, env_vars: dict, gpu_ranks: list
     ) -> None:
+        # [FUNCTION DOC]
+        # Mutates env_vars in place: sets device_control_env_var to the comma-joined
+        # gpu_ranks and sets ray_experimental_noset to "1". Returns None.
+        # KNOWN ISSUE: If a subclass leaves ray_experimental_noset empty, an empty-
+        # string key is inserted into env_vars.
         """
         Update environment variables to control device visibility.
         Args:
@@ -139,6 +172,11 @@ class Platform:
 
     @classmethod
     def get_visible_devices(cls) -> list:
+        # [FUNCTION DOC]
+        # Returns the comma-split value of device_control_env_var from os.environ
+        # (missing var yields [""], not an empty list). Returns [] only if the env var
+        # name is None.
+        # KNOWN ISSUE: An unset variable returns [""] rather than an empty list.
         """
         Return the list of currently visible device IDs.
         Returns:

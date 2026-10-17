@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Synchronous wrapper around the async Daytona SDK for running code in a single remote
+# sandbox from non-async code. Runs a private event loop on a daemon thread and submits
+# coroutines to it; lazily imports SDK types into module globals.
 # SPDX-License-Identifier: Apache-2.0
 
 """Synchronous Daytona sandbox runner for non-async user code."""
@@ -28,6 +32,10 @@ DaytonaTimeoutError = None
 
 
 def _load_daytona_sdk() -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Lazily imports the Daytona sandbox-creation param classes and error
+    # classes, caching them in module globals. Returns a dict mapping their names to the
+    # classes. Raises ImportError with install instructions if daytona is missing.
     global CreateSandboxFromImageParams
     global CreateSandboxFromSnapshotParams
     global DaytonaError
@@ -83,6 +91,8 @@ def _load_daytona_sdk() -> dict[str, Any]:
 
 
 def _last_non_empty_line(text: str) -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns the last non-blank line of text (stripped), or None if all blank.
     for line in reversed(text.splitlines()):
         stripped = line.strip()
         if stripped:
@@ -92,6 +102,10 @@ def _last_non_empty_line(text: str) -> str | None:
 
 @dataclass
 class DaytonaRunResult:
+    # [CLASS DOC]
+    # Dataclass result of a code run: stdout, stderr, exit_code (0 ok, 124 timeout, 1
+    # SDK error, else the process code), charts produced by the run, and error (short
+    # message, None on success).
     stdout: str = ""
     stderr: str = ""
     exit_code: int = 0
@@ -100,6 +114,10 @@ class DaytonaRunResult:
 
 
 class DaytonaRunner:
+    # [CLASS DOC]
+    # Owns one Daytona sandbox (created from either a snapshot or an image) plus its own
+    # AsyncDaytona client and background event loop thread. Usable as a context manager;
+    # start creates the sandbox, run executes code, close deletes it and stops the loop.
     def __init__(
         self,
         *,
@@ -114,6 +132,13 @@ class DaytonaRunner:
         language: str = "python",
         ephemeral: bool = True,
     ):
+        # [FUNCTION DOC]
+        # Loads SDK types, validates arguments (ValueError if both snapshot and image
+        # are given, or if resources are given without image), and stores sandbox
+        # settings: env_vars and labels (copied), network_block_all, create_timeout
+        # (seconds for create/delete), default_timeout (seconds per code run), language,
+        # ephemeral. Initializes loop/thread, client, sandbox id and locks to empty.
+        # Does no network I/O.
         self._sdk = _load_daytona_sdk()
         if image is not None and snapshot is not None:
             raise ValueError("Pass either snapshot or image, not both")
@@ -141,6 +166,9 @@ class DaytonaRunner:
         self._sandbox_lock: asyncio.Lock | None = None
 
     def _build_create_params(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds image-based creation params (with resources) if image is set,
+        # else snapshot-based params; empty env_vars/labels are passed as None.
         if self.image is not None:
             return self._sdk["CreateSandboxFromImageParams"](
                 image=self.image,
@@ -162,6 +190,11 @@ class DaytonaRunner:
         )
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        # [FUNCTION DOC]
+        # HELPER: Raises RuntimeError if closed. Under a thread lock, returns the
+        # existing loop or creates a new event loop running forever on a daemon thread
+        # named DaytonaRunnerLoop (which on stop shuts down async generators and closes
+        # the loop), waiting until it started.
         if self._closed:
             raise RuntimeError("DaytonaRunner is closed")
 
@@ -173,6 +206,9 @@ class DaytonaRunner:
             ready = threading.Event()
 
             def run_loop() -> None:
+                # [FUNCTION DOC]
+                # HELPER: Thread target: sets the loop as current, signals readiness,
+                # runs it until stopped, then shuts down async generators and closes it.
                 asyncio.set_event_loop(loop)
                 ready.set()
                 loop.run_forever()
@@ -190,6 +226,11 @@ class DaytonaRunner:
             return loop
 
     def _run(self, coro):
+        # [FUNCTION DOC]
+        # HELPER: Submits coro to the background loop and blocks for its result. If the
+        # loop cannot be obtained the coroutine is closed and the error re-raised; if
+        # waiting raises (including KeyboardInterrupt), cancels the future and re-
+        # raises.
         try:
             loop = self._ensure_loop()
         except BaseException:
@@ -204,6 +245,10 @@ class DaytonaRunner:
             raise
 
     async def _aget_client(self):
+        # [FUNCTION DOC]
+        # HELPER: Async. Lazily creates this runner's own AsyncDaytona client using
+        # DaytonaClientManager's config overrides and connection_pool_maxsize=None;
+        # returns it.
         if self._client is None:
             async_daytona_cls, daytona_config_cls = _load_daytona_client_sdk()
             config = daytona_config_cls(
@@ -215,6 +260,9 @@ class DaytonaRunner:
         return self._client
 
     async def _acreate(self):
+        # [FUNCTION DOC]
+        # HELPER: Async. Creates a sandbox with the built params and create_timeout,
+        # records its id, returns the sandbox.
         client = await self._aget_client()
         sandbox = await client.create(
             self._build_create_params(),
@@ -225,6 +273,10 @@ class DaytonaRunner:
         return sandbox
 
     async def _aget_sandbox(self):
+        # [FUNCTION DOC]
+        # HELPER: Async. If no sandbox exists, creates one under a lazily created
+        # asyncio lock (double-checked) and returns it; otherwise fetches the sandbox by
+        # id from the client.
         if self._sandbox_id is None:
             if self._sandbox_lock is None:
                 self._sandbox_lock = asyncio.Lock()
@@ -236,6 +288,9 @@ class DaytonaRunner:
         return await client.get(self._sandbox_id)
 
     def start(self) -> DaytonaRunner:
+        # [FUNCTION DOC]
+        # Synchronously ensures the sandbox exists and returns self. On any failure
+        # closes the runner and re-raises.
         try:
             self._run(self._aget_sandbox())
             return self
@@ -251,6 +306,11 @@ class DaytonaRunner:
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
     ) -> DaytonaRunResult:
+        # [FUNCTION DOC]
+        # Synchronously executes code in the sandbox via _arun and returns a
+        # DaytonaRunResult. timeout defaults to default_timeout; on_stdout/on_stderr are
+        # optional callbacks invoked with the whole output text (from the loop thread).
+        # Creates the sandbox if needed.
         return self._run(
             self._arun(code, timeout=timeout, on_stdout=on_stdout, on_stderr=on_stderr)
         )
@@ -263,6 +323,15 @@ class DaytonaRunner:
         on_stdout: Callable[[str], None] | None = None,
         on_stderr: Callable[[str], None] | None = None,
     ) -> DaytonaRunResult:
+        # [FUNCTION DOC]
+        # HELPER: Async implementation of run. Gets the sandbox and runs code. Daytona
+        # timeout errors yield exit_code 124; other Daytona errors yield exit_code 1;
+        # other exceptions with HTTP status 408 or "timeout" in the message yield 124
+        # (error = last line), and anything else is re-raised. For error cases the
+        # message is sent to on_stderr. On exit_code 0, output goes to stdout (and
+        # on_stdout); otherwise output goes to stderr (and on_stderr) with error set to
+        # its last non-empty line or a generic exit-code message. Charts come from the
+        # response artifacts.
         timeout = timeout if timeout is not None else self.default_timeout
 
         try:
@@ -326,6 +395,10 @@ class DaytonaRunner:
         )
 
     def close(self) -> None:
+        # [FUNCTION DOC]
+        # If no loop was ever started just marks closed. Otherwise synchronously deletes
+        # the sandbox and closes the client, then always marks closed and stops the loop
+        # thread.
         if self._loop is None:
             self._closed = True
             return
@@ -337,6 +410,10 @@ class DaytonaRunner:
             self._stop_loop()
 
     async def _aclose(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Async. Clears the sandbox id; if one existed, fetches and deletes the
+        # sandbox (create_timeout), ignoring not-found errors. Always closes and drops
+        # the client.
         sandbox_id = self._sandbox_id
         self._sandbox_id = None
 
@@ -354,6 +431,9 @@ class DaytonaRunner:
                 await client.close()
 
     def _stop_loop(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Clears loop/thread references, stops the loop thread-safely if
+        # running, and joins the thread if alive.
         loop = self._loop
         thread = self._thread
         self._loop = None
@@ -365,7 +445,11 @@ class DaytonaRunner:
             thread.join()
 
     def __enter__(self) -> DaytonaRunner:
+        # [FUNCTION DOC]
+        # Starts the runner (creating the sandbox) and returns it.
         return self.start()
 
     def __exit__(self, *exc) -> None:
+        # [FUNCTION DOC]
+        # Closes the runner; does not suppress exceptions.
         self.close()

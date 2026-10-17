@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Hardware platform abstraction package. Exposes the Platform base class, the
+# is_npu_available flag (computed at import via transformers' torch_npu check), and
+# current_platform: a lazily-initialized proxy that detects the accelerator (CUDA, NPU,
+# or CPU fallback) on first attribute access so importing does not initialize CUDA.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -20,6 +25,12 @@ is_npu_available = is_torch_npu_available()
 
 
 def _init_platform() -> Platform:
+    # [FUNCTION DOC]
+    # HELPER: Detects hardware and returns a Platform instance. If CUDA is available,
+    # reads the device name (uppercased); returns CudaPlatform if it contains "NVIDIA",
+    # else logs a warning and returns UnknownPlatform. Otherwise returns NPUPlatform if
+    # NPU is available, else CpuPlatform. Logs the decision at INFO.
+    # KNOWN ISSUE: Docstring lists NPU as a TODO, but NPU detection is implemented.
     """
     Detect and initialize the appropriate platform based on available devices.
     Priority:
@@ -46,6 +57,11 @@ def _init_platform() -> Platform:
 
 
 class _LazyPlatform:
+    # [CLASS DOC]
+    # Proxy that defers platform detection until first use. Holds _platform (None until
+    # initialized) and _initialized flag; public attribute reads/writes are forwarded to
+    # the real platform. Not a subclass of Platform, so isinstance checks against
+    # Platform fail.
     """
     Lazy initialization wrapper for platform detection.
 
@@ -54,10 +70,16 @@ class _LazyPlatform:
     """
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Sets _platform to None and _initialized to False (via the private-attr path of
+        # __setattr__, so no detection is triggered).
         self._platform: Platform | None = None
         self._initialized = False
 
     def _ensure_initialized(self) -> Platform:
+        # [FUNCTION DOC]
+        # HELPER: On first call runs _init_platform and caches the result; returns the
+        # cached Platform. Asserts it is not None.
         """Ensure the platform is initialized and return it."""
         if not self._initialized:
             self._platform = _init_platform()
@@ -66,11 +88,18 @@ class _LazyPlatform:
         return self._platform
 
     def __getattr__(self, name: str):
+        # [FUNCTION DOC]
+        # Called for attributes not found on the wrapper; triggers initialization and
+        # returns the same-named attribute from the real platform (which may itself fall
+        # back to torch.<device>).
         """Delegate attribute access to the underlying platform."""
         platform = self._ensure_initialized()
         return getattr(platform, name)
 
     def __setattr__(self, name: str, value):
+        # [FUNCTION DOC]
+        # Names starting with underscore are set on the wrapper itself; all others
+        # trigger initialization and are set on the underlying platform object.
         """Handle setting attributes on the wrapper."""
         if name.startswith("_"):
             # Allow setting private attributes on the wrapper itself
@@ -81,6 +110,9 @@ class _LazyPlatform:
             setattr(platform, name, value)
 
     def __repr__(self) -> str:
+        # [FUNCTION DOC]
+        # Returns "LazyPlatform(<platform repr>)" if initialized, else
+        # "LazyPlatform(uninitialized)". Does not trigger detection.
         """Return string representation."""
         if self._initialized:
             return f"LazyPlatform({self._platform!r})"

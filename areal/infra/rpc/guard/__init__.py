@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Guard package: shared HTTP process-management layer (Flask app, global state, forked
+# child tracking, port allocation, server startup) reused by the RPC server and
+# inference service guards. Re-exports the public helpers from the app module.
 # SPDX-License-Identifier: Apache-2.0
 
 """Shared Guard: reusable process management for RPC and inference services.

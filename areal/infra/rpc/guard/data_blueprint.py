@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Flask Blueprint ("data") exposing the process-local RTensor shard store over HTTP.
+# Payloads are serialize_value-encoded structures sent as orjson bytes; the store itself
+# lives in the rtensor module (CPU tensors keyed by shard id).
 # SPDX-License-Identifier: Apache-2.0
 
 """Data Blueprint: RTensor ``/data/*`` storage endpoints.
@@ -37,16 +41,22 @@ data_bp = Blueprint("data", __name__)
 
 
 class ShardListRequest(BaseModel):
+    # [CLASS DOC]
+    # Pydantic request model with a single field shard_ids (list of strings).
     """Base model for requests containing a list of shard IDs."""
 
     shard_ids: list[str]
 
 
 class BatchShardRequest(ShardListRequest):
+    # [CLASS DOC]
+    # Request body for POST /data/batch (inherits shard_ids).
     """Request to retrieve multiple tensor shards."""
 
 
 class ClearShardRequest(ShardListRequest):
+    # [CLASS DOC]
+    # Request body for DELETE /data/clear (inherits shard_ids).
     """Request to clear specific tensor shards."""
 
 
@@ -57,6 +67,11 @@ class ClearShardRequest(ShardListRequest):
 
 @data_bp.route("/data/<shard_id>", methods=["PUT"])
 def store_batch_data(shard_id: str):
+    # [FUNCTION DOC]
+    # Route PUT /data/<shard_id>: parses the raw body as JSON, deserializes it into the
+    # value (tensor or nested structure), stores it in the rtensor store under shard_id
+    # (overwriting), and returns {"status": "ok", "shard_id"}. Any error -> 500 with
+    # message.
     """Store batch data shard."""
     try:
         data_bytes = request.get_data()
@@ -77,6 +92,9 @@ def store_batch_data(shard_id: str):
 
 @data_bp.route("/data/<shard_id>", methods=["GET"])
 def retrieve_batch_data(shard_id: str):
+    # [FUNCTION DOC]
+    # Route GET /data/<shard_id>: fetches the shard (404 JSON if missing), serializes it
+    # and returns orjson bytes with octet-stream mimetype. Other errors -> 500.
     """Retrieve batch data shard."""
     logger.debug(f"Received data get request for shard {shard_id}")
     try:
@@ -106,6 +124,11 @@ def retrieve_batch_data(shard_id: str):
 
 @data_bp.route("/data/batch", methods=["POST"])
 def retrieve_batch_data_many():
+    # [FUNCTION DOC]
+    # Route POST /data/batch with JSON {"shard_ids": [...]}: 400 if the body is not an
+    # object or fails validation. Fetches every shard in order; if any are missing
+    # returns 400 with missing_shard_ids. Otherwise returns the serialized list of
+    # values as orjson bytes (octet-stream). Other errors -> 500.
     """Retrieve multiple batch data shards in one request."""
     try:
         raw_payload = request.get_json(silent=True) or {}
@@ -165,6 +188,13 @@ def retrieve_batch_data_many():
 
 @data_bp.route("/data/clear", methods=["DELETE"])
 def clear_batch_data():
+    # [FUNCTION DOC]
+    # Route DELETE /data/clear with JSON {"shard_ids": [...]}: removes each shard from
+    # the store, counting those that existed, and returns status "ok", cleared_count and
+    # the store's storage stats merged in. Logs at INFO. Validation errors -> 400.
+    # KNOWN ISSUE: A non-object JSON body (e.g. a list) raises TypeError on model
+    # construction, which is not caught by the validation handler and yields 500 instead
+    # of 400.
     """Clear specified batch data shards."""
     try:
         raw_data = request.get_json(silent=True) or {}

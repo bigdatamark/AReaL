@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Generic HTTP client-side inference engine (RemoteInfEngine) that talks to remote LLM
+# servers (SGLang, vLLM, ...) through an injected backend object implementing
+# RemoteInfBackendProtocol. Handles server discovery and health waits, round-robin
+# routing with per-request-id stickiness, interruptible multi-segment generation,
+# logprob scoring, weight updates (disk or NCCL/XCCL) executed on a background executor,
+# pause/resume/offload control requests, local server launching, and rollout submission
+# via a WorkflowExecutor. Also defines GroupedRolloutWorkflow for running a workflow
+# several times per prompt, and module-level helpers that run async HTTP fan-outs.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -68,6 +77,12 @@ logger = logging.getLogger("RemoteInfEngine")
 
 
 class GroupedRolloutWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow wrapper that runs the inner workflow group_size times concurrently
+    # on the same input and merges the results. Holds the inner workflow, group size, a
+    # logger, and flags reward_normalization (per-group reward normalization for
+    # agent/OpenAI interaction results) and drop_incomplete_group (drop the whole group
+    # if any sample returned None).
     def __init__(
         self,
         workflow: RolloutWorkflow,
@@ -76,6 +91,8 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Stores arguments; raises ValueError if group_size < 1.
         if group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
         self.workflow = workflow
@@ -87,9 +104,23 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None:
+        # [FUNCTION DOC]
+        # Async. Runs group_size copies of the inner workflow concurrently, each under a
+        # child WorkflowContext inheriting is_eval and task_id with its own sample_idx;
+        # sorts results by index (RuntimeError if indices are not exactly 0..n-1).
+        # Returns None if all results are None. If some are None: returns None when
+        # drop_incomplete_group, otherwise warns (unless normalizing) and continues with
+        # the valid ones. If results are dicts of InteractionWithTokenLogpReward,
+        # optionally normalizes rewards across the group (returning None if
+        # normalization fails) and returns the merged dict (None if empty). Otherwise
+        # treats results as padded tensor dicts and returns their concatenation (None if
+        # empty).
         from areal.experimental.openai import InteractionWithTokenLogpReward
 
         async def run_sample(sample_idx: int) -> tuple[int, Any]:
+            # [FUNCTION DOC]
+            # HELPER: Async. Sets a per-sample workflow context derived from the parent
+            # context and runs the inner workflow once, returning (sample_idx, result).
             from areal.infra import workflow_context
             from areal.infra.workflow_context import WorkflowContext
 
@@ -166,6 +197,11 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
         self,
         results: list[dict[str, InteractionWithTokenLogpReward] | None],
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Applies normalize_group_rewards (from the OpenAI types module) to the
+        # full result list, mutating rewards in place. Returns True on success;
+        # otherwise counts rollouts that are missing or whose last interaction has no
+        # reward, warns, and returns False so the caller drops the group.
         """Apply per-prompt reward normalization across the n_samples rollouts.
 
         One scalar reward per rollout is taken from the last interaction in
@@ -191,6 +227,13 @@ class GroupedRolloutWorkflow(RolloutWorkflow):
 
 
 class RemoteInfBackendProtocol(Protocol):
+    # [CLASS DOC]
+    # Protocol of backend-specific operations: building/parsing generation and scoring
+    # requests, building disk and distributed weight-update requests and the weight
+    # group init request, control requests (pause, resume, health, abort-all, offload,
+    # onload) and launching a server subprocess. Backends may raise NotImplementedError
+    # for unsupported features. A backend may additionally provide get_pause_requests
+    # returning several pause requests.
     """Protocol defining backend-specific operations for remote inference engines.
 
     This protocol abstracts the differences between various remote inference servers
@@ -207,6 +250,9 @@ class RemoteInfBackendProtocol(Protocol):
     def build_generation_request(
         self, req: ModelRequest, with_lora: bool, version: int
     ) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Protocol: build the HTTP generation request for req, optionally targeting the
+        # LoRA adapter for the given weight version.
         """Build HTTP request for text generation.
 
         Parameters
@@ -228,6 +274,9 @@ class RemoteInfBackendProtocol(Protocol):
     def parse_generation_response(
         self, response: dict[str, Any]
     ) -> HttpGenerationResult:
+        # [FUNCTION DOC]
+        # Protocol: parse a server JSON response into output tokens, logprobs, stop
+        # reason and optional routed experts.
         """Parse generation response into standard format.
 
         Parameters
@@ -245,18 +294,24 @@ class RemoteInfBackendProtocol(Protocol):
     def build_score_request(
         self, input_ids: list[int], target_len: int, with_lora: bool, version: int
     ) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Protocol: build a request scoring the last target_len tokens of input_ids.
         """Build HTTP request for token log-prob scoring."""
         ...
 
     def parse_score_response(
         self, response: dict[str, Any], target_len: int
     ) -> list[float]:
+        # [FUNCTION DOC]
+        # Protocol: extract target_len per-token logprobs from the scoring response.
         """Parse token log-prob scoring response."""
         ...
 
     def build_disk_weight_update_requests(
         self, meta: WeightUpdateMeta
     ) -> WeightUpdateRequests:
+        # [FUNCTION DOC]
+        # Protocol: build the ordered requests that load weights from meta.path.
         """Build requests for loading weights from disk.
 
         Parameters
@@ -276,6 +331,9 @@ class RemoteInfBackendProtocol(Protocol):
         meta: WeightUpdateMeta,
         param_specs: list[ParamSpec],
     ) -> WeightUpdateRequests:
+        # [FUNCTION DOC]
+        # Protocol: build the ordered requests that receive the given parameters via
+        # collective broadcast.
         """Build requests for distributed weight update via NCCL/XCCL.
 
         Parameters
@@ -295,6 +353,9 @@ class RemoteInfBackendProtocol(Protocol):
     def build_init_weights_group_request(
         self, addr: str, server_idx: int, meta: WeightUpdateMeta
     ) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Protocol: build the request making server addr join the weight-update group
+        # with rank server_idx.
         """Build request to initialize weight update xccl group.
 
         Parameters
@@ -314,6 +375,8 @@ class RemoteInfBackendProtocol(Protocol):
         ...
 
     def get_pause_request(self) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Protocol: request pausing generation (may raise NotImplementedError).
         """Get request to pause generation.
 
         Returns
@@ -329,6 +392,8 @@ class RemoteInfBackendProtocol(Protocol):
         ...
 
     def get_resume_request(self) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Protocol: request resuming generation (may raise NotImplementedError).
         """Get request to resume generation.
 
         Returns
@@ -344,6 +409,8 @@ class RemoteInfBackendProtocol(Protocol):
         ...
 
     def get_health_check_request(self) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Protocol: request used for health checks (200 means healthy).
         """Get the health check request.
 
         Returns
@@ -354,10 +421,14 @@ class RemoteInfBackendProtocol(Protocol):
         ...
 
     def get_abort_all_request(self) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Protocol: request aborting all in-flight generations.
         """Get request to abort all in-flight requests."""
         ...
 
     def get_offload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Protocol: request releasing model memory (optionally only tagged components).
         """Get request to offload model memory.
 
         Returns
@@ -373,6 +444,8 @@ class RemoteInfBackendProtocol(Protocol):
         ...
 
     def get_onload_request(self, tags: list[str] | None = None) -> HttpRequest:
+        # [FUNCTION DOC]
+        # Protocol: request restoring model memory (optionally only tagged components).
         """Get request to onload model memory.
 
         Parameters
@@ -393,6 +466,8 @@ class RemoteInfBackendProtocol(Protocol):
         ...
 
     def launch_server(self, server_args: dict[str, Any]) -> subprocess.Popen:
+        # [FUNCTION DOC]
+        # Protocol: start a server subprocess from server_args and return its Popen.
         """Launch inference server subprocess.
 
         Parameters
@@ -409,6 +484,12 @@ class RemoteInfBackendProtocol(Protocol):
 
 
 class RemoteInfEngine(InferenceEngine):
+    # [CLASS DOC]
+    # InferenceEngine implementation over HTTP, parameterized by a backend (composition,
+    # not subclassing). State: config, backend, server addresses and round-robin index,
+    # a bounded rid-to-server map (RID_CACHE_SIZE most recent request ids) for KV-cache
+    # reuse, the current weight version guarded by a lock, the WorkflowExecutor, an
+    # optional proxy gateway address, and locally launched server processes.
     """
     Base implementation for HTTP-based remote inference engines.
 
@@ -430,6 +511,10 @@ class RemoteInfEngine(InferenceEngine):
     def __init__(
         self, config: InferenceEngineConfig, backend: RemoteInfBackendProtocol
     ):
+        # [FUNCTION DOC]
+        # Stores config and backend and initializes empty routing state, version 0, a
+        # lock, no executor, uninitialized flag and empty local server list. No network
+        # I/O.
         self.config = config
         self.backend = backend
 
@@ -449,6 +534,11 @@ class RemoteInfEngine(InferenceEngine):
         self.local_server_processes: list[LocalInfServerInfo] = []
 
     def _wait_for_server(self, address: str, process: subprocess.Popen | None = None):
+        # [FUNCTION DOC]
+        # HELPER: Polls check_health on the (IPv6-normalized) address every second until
+        # healthy or config.setup_timeout elapses (TimeoutError). If process is given
+        # and has exited, raises RuntimeError with its exit code. Logs a progress
+        # message every 60s.
         """Wait for a server to become healthy."""
         try:
             host, port = split_hostport(address)
@@ -485,6 +575,9 @@ class RemoteInfEngine(InferenceEngine):
         )
 
     def check_health(self, base_url):
+        # [FUNCTION DOC]
+        # Sends the backend health request to base_url with a 30s timeout; returns True
+        # on HTTP 200, False on other statuses or request exceptions.
         """Check if server is healthy."""
         try:
             health_req = self.backend.get_health_check_request()
@@ -502,6 +595,17 @@ class RemoteInfEngine(InferenceEngine):
         addr: str | list[str] | None = None,
         train_data_parallel_size: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Sets engine_id (given, else the torch.distributed rank, else a random hex) and
+        # a per-rank logger. Resolves server addresses in priority order: addr argument
+        # (string or list), locally launched servers, name_resolve lookup for the
+        # experiment/trial (1s timeout), then the AREAL_LLM_SERVER_ADDRS env var (comma-
+        # separated) as fallback when name_resolve fails. Raises RuntimeError if none
+        # found. Waits for each server to be healthy, picks a random starting round-
+        # robin index, creates and initializes the WorkflowExecutor (with
+        # train_data_parallel_size), and marks initialized.
+        # KNOWN ISSUE: The env-var fallback is only consulted when experiment and trial
+        # names are set and name_resolve fails, not when those names are None.
         """Initialize the engine by discovering and connecting to servers.
 
         Parameters
@@ -575,6 +679,9 @@ class RemoteInfEngine(InferenceEngine):
         self._initialized = True
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Marks uninitialized, destroys the workflow executor if present, and tears down
+        # any locally launched servers.
         """Destroy the engine and clean up resources."""
         self._initialized = False
         if self._workflow_executor is not None:
@@ -584,6 +691,9 @@ class RemoteInfEngine(InferenceEngine):
 
     @property
     def workflow_executor(self) -> WorkflowExecutor:
+        # [FUNCTION DOC]
+        # Property: returns the WorkflowExecutor; raises RuntimeError if not
+        # initialized.
         """Get the workflow executor of the inference engine."""
         if self._workflow_executor is None:
             raise RuntimeError("WorkflowExecutor is not initialized")
@@ -591,24 +701,44 @@ class RemoteInfEngine(InferenceEngine):
 
     @workflow_executor.setter
     def workflow_executor(self, workflow_executor: WorkflowExecutor):
+        # [FUNCTION DOC]
+        # Setter: replaces the WorkflowExecutor.
         """Set the workflow executor of the inference engine."""
         self._workflow_executor = workflow_executor
 
     @property
     def initialized(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: whether initialize completed and destroy has not been called.
         return self._initialized
 
     def set_version(self, version):
+        # [FUNCTION DOC]
+        # Sets the current weight version under the lock.
         """Set the current weight version."""
         with self.lock:
             self._version = version
 
     def get_version(self):
+        # [FUNCTION DOC]
+        # Returns the current weight version under the lock.
         """Get the current weight version."""
         with self.lock:
             return self._version
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Scores trajectories with the remote servers. For each trajectory dict (2D
+        # input_ids and loss_mask; ValueError otherwise) builds a float32 output shaped
+        # like loss_mask. For each row with a positive number of loss-masked tokens,
+        # takes the token ids (filtered by attention_mask when present), sends a
+        # blocking scoring request to the next round-robin server, checks that exactly
+        # target_len logprobs came back (ValueError otherwise), and writes them at the
+        # loss-mask positions. Returns one tensor per trajectory. HTTP errors raise via
+        # raise_for_status.
+        # KNOWN ISSUE: Assumes the loss-masked tokens are exactly the last target_len
+        # scored tokens; masks with gaps would misalign. Requests are sequential and
+        # synchronous.
         results: list[torch.Tensor] = []
         timeout = self.config.request_timeout
         version = self.get_version()
@@ -658,6 +788,8 @@ class RemoteInfEngine(InferenceEngine):
         return results
 
     def set_proxy_gateway_addr(self, addr: str) -> None:
+        # [FUNCTION DOC]
+        # Stores the proxy gateway address later passed to OpenAIProxyWorkflow wrappers.
         """Set the proxy gateway address.
 
         Called by ``RolloutController.start_proxy_gateway()`` via
@@ -668,6 +800,11 @@ class RemoteInfEngine(InferenceEngine):
         self._proxy_gateway_addr = addr
 
     def _wrap_openai_agent(self, agent: Any, proxy_addr: str) -> RolloutWorkflow:
+        # [FUNCTION DOC]
+        # HELPER: Wraps an agent object (or None in online mode) in an
+        # OpenAIProxyWorkflow configured from config.agent (mode, admin key, turn
+        # discount, export style, subprocess workers, retry-orphan dropping) plus
+        # proxy_addr and the stored proxy gateway address.
         """Wrap an agent workflow in OpenAIProxyWorkflow (HTTP mode only).
 
         Parameters
@@ -703,6 +840,17 @@ class RemoteInfEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> RolloutWorkflow:
+        # [FUNCTION DOC]
+        # HELPER: Normalizes a WorkflowLike into a RolloutWorkflow. None means online
+        # agent mode (requires config.agent.mode == "online" and proxy_addr, else
+        # ValueError). A RolloutWorkflow instance is used directly (kwargs ignored with
+        # warning). A RolloutWorkflow subclass is instantiated with workflow_kwargs
+        # (required). A string is imported: RolloutWorkflow classes are instantiated
+        # (kwargs required), instances used directly, and anything else is treated as an
+        # agent (instantiated with kwargs if a class) and wrapped via the OpenAI proxy
+        # (proxy_addr required). Other classes and other objects are treated as agents
+        # likewise. If group_size > 1 the result is wrapped in GroupedRolloutWorkflow
+        # with the normalization/drop flags. Import failures raise ValueError.
         resolved: RolloutWorkflow
 
         # 0. None workflow = online mode (config-driven)
@@ -827,6 +975,10 @@ class RemoteInfEngine(InferenceEngine):
     def _resolve_should_accept_fn(
         self, should_accept_fn: Callable[[dict[str, Any]], bool] | str | None
     ) -> Callable[[dict[str, Any]], bool] | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns None or a callable unchanged; imports a dotted-path string and
+        # checks it is callable. Raises ValueError on import failure and TypeError for
+        # non-callables or unsupported types.
         """Resolve should_accept_fn parameter to a callable or None.
 
         Parameters
@@ -868,6 +1020,10 @@ class RemoteInfEngine(InferenceEngine):
         )
 
     def choose_server(self) -> str:
+        # [FUNCTION DOC]
+        # Returns the next server address in round-robin order, advancing the index.
+        # Raises NotImplementedError for any routing strategy other than "round_robin".
+        # KNOWN ISSUE: The index update is not protected by a lock.
         """Choose a server based on the routing strategy.
 
         Returns
@@ -887,6 +1043,22 @@ class RemoteInfEngine(InferenceEngine):
         raise NotImplementedError("Only round-robin scheduling is implemented.")
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
+        # [FUNCTION DOC]
+        # Async. Generates a completion for a single-sample request. Copies req, sets
+        # return_routed_experts metadata if configured, rejects n_samples != 1
+        # (ValueError), and clamps max_new_tokens to max_tokens minus prompt length
+        # (RuntimeError if non-positive). Picks a server, reusing the one previously
+        # used for the same rid (bounded FIFO cache). Then loops until stop reason is
+        # stop/tool_calls/length or the token budget is used: waits while the workflow
+        # executor is paused, pins the current weight version, sends the backend
+        # generation request with retries via the shared aiohttp session, requires a
+        # dict response, parses it, validates routed experts were returned when
+        # requested (unless aborted), accumulates tokens, logprobs, per-token versions
+        # and routed experts, and appends the new tokens to the prompt while reducing
+        # the remaining budget (so aborted requests resume after weight updates). A
+        # final "abort" stop reason is reported as "length". Returns a ModelResponse
+        # with the original prompt tokens, outputs, versions, latency (ttft equals
+        # latency) and concatenated routed experts.
         """Asynchronously generate a response for the given request.
 
         Parameters
@@ -1062,6 +1234,10 @@ class RemoteInfEngine(InferenceEngine):
     def init_weights_update_group(
         self, meta: WeightUpdateMeta, xccl_group_ranks: list[int] | None = None
     ) -> Future[None]:
+        # [FUNCTION DOC]
+        # Asserts meta.type is "xccl" and submits _init_weights_update_group_remote to
+        # the shared executor for all addresses (optional explicit per-address ranks).
+        # Attaches a callback logging success or failure and returns the Future.
         """Initialize the weight update process group for distributed weight updates.
 
         Parameters
@@ -1100,6 +1276,9 @@ class RemoteInfEngine(InferenceEngine):
         )
 
         def callback(fut):
+            # [FUNCTION DOC]
+            # HELPER: Done-callback logging failure (with the exception) or success;
+            # ignores cancellation.
             if fut.cancelled():
                 return
             if fut.exception() is not None:
@@ -1121,6 +1300,9 @@ class RemoteInfEngine(InferenceEngine):
     def update_weights_from_distributed(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ) -> Future[None]:
+        # [FUNCTION DOC]
+        # Asserts meta.type is "xccl" and submits _update_weights_from_distributed for
+        # all servers to the shared executor; returns the Future.
         """Update weights in the inference engine from distributed memory.
 
         Parameters
@@ -1149,6 +1331,15 @@ class RemoteInfEngine(InferenceEngine):
         return fut
 
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
+        # [FUNCTION DOC]
+        # Asserts meta.type is "disk"; raises RuntimeError if experiment/trial names are
+        # missing. Submits _update_weights_from_disk (current version, all servers) to
+        # the shared executor and attaches a callback that logs timing and deletes
+        # meta.path when clear_checkpoint_after_load. Returns the Future (resolving to
+        # load-minus-save seconds).
+        # KNOWN ISSUE: Comment mentions a ProcessPool but the shared executor is used;
+        # the callback calls result(), so a failed update raises inside the callback
+        # (logged by the Future machinery) rather than being reported here.
         """Update weights in the inference engine from disk.
 
         Parameters
@@ -1184,6 +1375,9 @@ class RemoteInfEngine(InferenceEngine):
         )
 
         def callback(fut):
+            # [FUNCTION DOC]
+            # HELPER: Logs total and respond time and optionally removes the checkpoint
+            # directory.
             respond_time = fut.result()
             self.logger.info(
                 f"Loading weights from disk done "
@@ -1210,6 +1404,12 @@ class RemoteInfEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> int:
+        # [FUNCTION DOC]
+        # Submits one rollout task and returns its task id immediately. Raises
+        # ValueError if workflow is None outside online agent mode. Registers
+        # callback_addr for task_id with the dispatcher if given, resolves the workflow
+        # (grouping, proxy) and should_accept_fn, and delegates to
+        # WorkflowExecutor.submit with task_id and is_eval.
         """Submit a request to the inference engine and return immediately.
 
         Parameters
@@ -1265,6 +1465,10 @@ class RemoteInfEngine(InferenceEngine):
     def wait(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> list[dict[str, Any] | None]:
+        # [FUNCTION DOC]
+        # Delegates to WorkflowExecutor.wait: blocks until count accepted trajectories
+        # are ready or timeout (raising TimeoutError if raise_timeout, else returning
+        # what is available).
         """Wait for a specified number of requests to complete.
 
         Parameters
@@ -1289,6 +1493,8 @@ class RemoteInfEngine(InferenceEngine):
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
+        # [FUNCTION DOC]
+        # Delegates to WorkflowExecutor.wait_for_task for a single task id.
         """Wait for a specific submitted task to complete."""
         return self.workflow_executor.wait_for_task(task_id, timeout, raise_timeout)
 
@@ -1301,6 +1507,10 @@ class RemoteInfEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Synchronously rolls out a list of inputs: resolves the workflow (no proxy
+        # address, so agent workflows fail) and delegates to
+        # WorkflowExecutor.rollout_batch. Asserts workflow is not None.
         """Submit a batch of requests and wait for results.
 
         This method does not support asynchronous rollout and should be used for offline
@@ -1352,6 +1562,11 @@ class RemoteInfEngine(InferenceEngine):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Resolves workflow and should_accept_fn and delegates to
+        # WorkflowExecutor.prepare_batch, which keeps submitting from dataloader until a
+        # full (optionally dynamic-size) batch of accepted trajectories is ready.
+        # Asserts workflow is not None.
         """Asynchronously submit and wait until a full batch is ready.
 
         Parameters
@@ -1398,6 +1613,10 @@ class RemoteInfEngine(InferenceEngine):
 
     @trace_perf("remote_inf_engine.pause_generation", category="misc")
     def pause_generation(self):
+        # [FUNCTION DOC]
+        # Sends pause request(s) (backend get_pause_requests if available, else a single
+        # get_pause_request) to all servers, then sleeps config.pause_grace_period so
+        # in-flight requests are aborted. Traced with perf_tracer.
         """Pause request submission for async rollout."""
         get_pause_requests = getattr(self.backend, "get_pause_requests", None)
         pause_requests = (
@@ -1414,21 +1633,31 @@ class RemoteInfEngine(InferenceEngine):
 
     @trace_perf("remote_inf_engine.continue_generation", category="misc")
     def continue_generation(self):
+        # [FUNCTION DOC]
+        # Sends the backend resume request to all servers. Traced with perf_tracer.
         """Resume request submission for async rollout."""
         resume_req = self.backend.get_resume_request()
         self._run_request_on_all_servers(resume_req)
 
     def pause(self):
+        # [FUNCTION DOC]
+        # Pauses new rollout submission in the WorkflowExecutor (used during
+        # evaluation).
         """Pause request submission for async rollout.
         Used during evaluation to prevent data over generation.
         """
         return self.workflow_executor.pause()
 
     def resume(self):
+        # [FUNCTION DOC]
+        # Resumes rollout submission in the WorkflowExecutor.
         """Resume request submission for async rollout."""
         return self.workflow_executor.resume()
 
     def offload(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Sends the backend offload request (optional tags) to all servers, logging
+        # before and after.
         """Offload model memory on all servers."""
         offload_req = self.backend.get_offload_request(tags=tags)
         self.logger.info(
@@ -1441,17 +1670,29 @@ class RemoteInfEngine(InferenceEngine):
         self.logger.info("RemoteInfEngine.offload(tags=%s) completed", tags)
 
     def abort_all_requests(self) -> None:
+        # [FUNCTION DOC]
+        # Sends the backend abort-all request to all servers.
         """Abort all in-flight requests on all servers."""
         abort_req = self.backend.get_abort_all_request()
         self._run_request_on_all_servers(abort_req)
 
     def onload(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Sends the backend onload request (optional tags) to all servers.
         """Onload model memory on all servers."""
         onload_req = self.backend.get_onload_request(tags=tags)
         self._run_request_on_all_servers(onload_req)
 
     def _run_request_on_all_servers(self, req: HttpRequest):
+        # [FUNCTION DOC]
+        # HELPER: Blocking. Runs a fresh uvloop event loop that opens an aiohttp session
+        # (request timeout, 10MB read buffer) and concurrently sends req to every
+        # address with retries; the first failure propagates.
+        # KNOWN ISSUE: uvloop.run fails if called from a thread that already runs an
+        # event loop.
         async def _fn():
+            # [FUNCTION DOC]
+            # HELPER: Async body issuing the concurrent requests.
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=self.config.request_timeout),
                 read_bufsize=1024 * 1024 * 10,
@@ -1475,6 +1716,12 @@ class RemoteInfEngine(InferenceEngine):
         uvloop.run(_fn())
 
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
+        # [FUNCTION DOC]
+        # Sets server_args host to this host's IP and port to a free port, launches the
+        # server via the backend, and waits for it to become healthy (failing fast if
+        # the process exits). On success records and returns a LocalInfServerInfo; on
+        # TimeoutError/RuntimeError logs a warning, shuts the server down and re-raises.
+        # Mutates server_args.
         """Launch a local inference server."""
         server_args["host"] = gethostip()
         server_args["port"] = find_free_ports(1)[0]
@@ -1495,6 +1742,9 @@ class RemoteInfEngine(InferenceEngine):
             raise
 
     def _shutdown_one_server(self, server_info: LocalInfServerInfo):
+        # [FUNCTION DOC]
+        # HELPER: Removes the server's address from the routing list and, if its process
+        # is still running, kills its process tree gracefully.
         addr = format_hostport(server_info.host, server_info.port)
         if addr in self.addresses:
             self.addresses.remove(addr)
@@ -1503,6 +1753,8 @@ class RemoteInfEngine(InferenceEngine):
         kill_process_tree(server_info.process.pid, graceful=True)
 
     def teardown_server(self):
+        # [FUNCTION DOC]
+        # Shuts down every locally launched server and clears the list.
         """Teardown all locally launched servers."""
         for server_info in self.local_server_processes:
             self._shutdown_one_server(server_info)
@@ -1522,9 +1774,18 @@ def _update_weights_from_disk(
     request_retries: int,
     request_timeout: float,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Runs in an executor worker. Waits (up to 120s) on name_resolve for the
+    # trainer's save timestamp for model_version, records the load start time, builds
+    # the backend's disk weight update requests, and sends each request (in order) to
+    # all servers concurrently with retries. Best-effort requests have failures logged
+    # and ignored; others propagate. Returns load timestamp minus save timestamp
+    # (seconds).
     """Helper to update weights from disk in a separate process."""
 
     async def _fn():
+        # [FUNCTION DOC]
+        # HELPER: Async body of the disk update.
         update_name = names.update_weights_from_disk(
             experiment_name, trial_name, model_version
         )
@@ -1578,6 +1839,11 @@ def _init_weights_update_group_remote(
     request_timeout: float,
     xccl_group_ranks: list[int] | None = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Runs in an executor worker. Validates xccl_group_ranks length matches
+    # addresses (ValueError). Concurrently sends each server its group-init request
+    # (rank from xccl_group_ranks or the address index, a single attempt), logs every
+    # failure, then re-raises the first exception if any.
     """Helper to initialize weight update group in a separate process.
 
     If xccl_group_ranks is provided, it must have the same length as addresses and will be
@@ -1592,6 +1858,8 @@ def _init_weights_update_group_remote(
         )
 
     async def _fn():
+        # [FUNCTION DOC]
+        # HELPER: Async body issuing the init requests.
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=request_timeout),
             read_bufsize=1024 * 1024 * 10,
@@ -1640,9 +1908,15 @@ def _update_weights_from_distributed(
     addresses: list[str],
     request_timeout: float,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Runs in an executor worker. Builds the backend's distributed update
+    # requests and sends them in order, each to all servers concurrently (single
+    # attempt); any failure propagates.
     """Helper to update weights from distributed memory in a separate process."""
 
     async def _fn():
+        # [FUNCTION DOC]
+        # HELPER: Async body issuing the update requests.
         # Get requests from backend
         weight_reqs = backend.build_distributed_weight_update_requests(
             meta, param_specs

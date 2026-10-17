@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Full synchronous RPC server for training/inference workers: composes the Guard app
+# with the data blueprint (tensor shard storage) and the engine blueprint (engine
+# creation and method calls). Run as a module with experiment/trial/role/worker-index
+# arguments.
 # SPDX-License-Identifier: Apache-2.0
 
 """AReaL Sync RPC Server — Guard + Data + Engine composition.
@@ -31,6 +36,12 @@ logger = logging.getLogger("SyncRPCServer")
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses base guard args plus --werkzeug-log-level (default WARNING) and sets the
+    # werkzeug logger level accordingly. Creates GuardState, configures it, builds the
+    # app, registers data and engine blueprints and engine hooks, registers a cleanup
+    # hook that force-saves perf_tracer output, logs the werkzeug level, then runs the
+    # server (blocking).
     parser = make_base_parser(
         description="AReaL Sync RPC Server for TrainEngine/InferenceEngine"
     )

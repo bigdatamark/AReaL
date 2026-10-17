@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# SPMD launcher entrypoint that starts one or more local vLLM OpenAI-compatible servers
+# on this node, registers their addresses in name_resolve, and supervises them (exits if
+# any server dies, cleans up on SIGTERM/SIGINT). Uses the deprecated _AllocationMode
+# parser.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -34,6 +39,13 @@ logger = logging.getLogger("VLLMWrapper")
 def launch_server_cmd(
     command: list[str], custom_env: dict[str, str] | None = None
 ) -> subprocess.Popen:
+    # [FUNCTION DOC]
+    # Spawns command (argv list) as a subprocess with a copy of os.environ plus: a
+    # unique TRITON_CACHE_PATH subdirectory (uuid) to avoid triton cache races, a unique
+    # VLLM_CACHE_ROOT subdirectory if that var was set,
+    # VLLM_ALLOW_RUNTIME_LORA_UPDATING=True, and then custom_env overrides. stdout goes
+    # to this process's stdout, stderr merged into it. Logs the command. Returns the
+    # Popen handle without waiting.
     """
     Launch inference server in a new process and return its process handle.
     """
@@ -62,6 +74,13 @@ def launch_server_cmd(
 
 
 def wait_for_server(base_url: str, timeout: int | None = None) -> None:
+    # [FUNCTION DOC]
+    # Polls GET base_url/v1/models (dummy bearer auth) until it returns 200, then sleeps
+    # 5s and returns. On connection errors sleeps 1s and retries. Raises TimeoutError if
+    # timeout seconds elapsed (None/0 means wait forever).
+    # KNOWN ISSUE: The timeout is only checked after a non-200 HTTP response; connection
+    # failures skip the check, so an unreachable server waits forever. Non-200
+    # responses also loop without any sleep (busy loop).
     """Wait for the server to be ready by polling the /v1/models endpoint.
 
     Args:
@@ -86,6 +105,11 @@ def wait_for_server(base_url: str, timeout: int | None = None) -> None:
 
 
 class vLLMServerWrapper:
+    # [CLASS DOC]
+    # Manages the set of vLLM servers launched by one process. Stores experiment/trial
+    # names, vLLM config, allocation mode, GPUs per node, cpu_per_gpu, the list of
+    # server Popen handles and shutdown flags. Installs SIGTERM/SIGINT handlers on
+    # construction.
     def __init__(
         self,
         experiment_name: str,
@@ -95,6 +119,11 @@ class vLLMServerWrapper:
         n_gpus_per_node: int,
         cpu_per_gpu: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores arguments, initializes empty server_processes and shutdown flags, and
+        # registers _handle_shutdown_signal for SIGTERM and SIGINT (process-global side
+        # effect).
+        # KNOWN ISSUE: cpu_per_gpu is stored but never used.
         self.experiment_name = experiment_name
         self.trial_name = trial_name
         self.config = vllm_config
@@ -110,6 +139,9 @@ class vLLMServerWrapper:
         signal.signal(signal.SIGINT, self._handle_shutdown_signal)
 
     def _handle_shutdown_signal(self, signum, frame):
+        # [FUNCTION DOC]
+        # HELPER: Signal handler. Ignores repeated signals once shutdown started;
+        # otherwise sets shutdown flags, kills all servers and calls sys.exit(0).
         """Handle shutdown signals by cleaning up all server processes."""
         if self._is_shutting_down:
             logger.warning("Shutdown already in progress, ignoring redundant signal.")
@@ -123,6 +155,10 @@ class vLLMServerWrapper:
         sys.exit(0)
 
     def _cleanup_all_servers(self):
+        # [FUNCTION DOC]
+        # HELPER: Snapshots and clears server_processes (re-entrancy safe), then for
+        # each still running process kills its process tree gracefully (10s timeout).
+        # Logs progress.
         """Clean up all server processes and their children."""
         # To prevent race conditions from re-entrant calls (e.g., from a signal handler),
         # we first copy the list of processes and then clear the original list.
@@ -144,6 +180,19 @@ class vLLMServerWrapper:
         logger.info("All vLLM server processes cleaned up")
 
     def run(self):
+        # [FUNCTION DOC]
+        # Main supervision routine. gpus_per_server = allocation gen instance size;
+        # raises NotImplementedError if larger than GPUs per node. Determines visible
+        # devices from the platform visibility env var (if set: count servers from
+        # visible devices and compute a node-local server index offset from the minimum
+        # visible id; else all node GPUs). Splits ports 10000-32767 evenly per node-
+        # local server index, and for each server picks a free server port and dist-init
+        # port in its range, slices its GPUs into the visibility env var, deep-copies
+        # the config with seed = base seed + server index, and builds the vLLM command
+        # (tp/pp sizes from allocation). Launches all servers in parallel threads
+        # (launch_one_server), appending handles as they come up. Then polls every
+        # second; if any process exits, logs, cleans up and sys.exit(1). Any exception
+        # cleans up and re-raises.
         gpus_per_server = self.allocation_mode.gen_instance_size
         if gpus_per_server > self.n_gpus_per_node:
             raise NotImplementedError("Cross-node vllm is not supported")
@@ -241,6 +290,11 @@ class vLLMServerWrapper:
         server_port: int,
         custom_env: dict[str, str] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Launches one server process with custom_env, blocks until its /v1/models
+        # endpoint is ready, registers "host:port" as a subentry under the experiment's
+        # servers name in name_resolve, logs the URL and returns the Popen handle.
+        # KNOWN ISSUE: cmd is annotated str but is actually an argv list.
         server_process = launch_server_cmd(cmd, custom_env=custom_env)
         wait_for_server(f"http://{format_hostport(host_ip, server_port)}")
         name = names.gen_servers(self.experiment_name, self.trial_name)
@@ -252,6 +306,11 @@ class vLLMServerWrapper:
 
 
 def launch_vllm_server(argv):
+    # [FUNCTION DOC]
+    # Parses CLI args into config, converts vllm/cluster/name_resolve/rollout sections
+    # to structured configs, reconfigures name_resolve, emits a FutureWarning about the
+    # deprecated allocation parser, parses allocation_mode (asserting the gen backend is
+    # vllm), reads rollout scheduling spec CPU, and runs a vLLMServerWrapper (blocking).
     config, _ = parse_cli_args(argv)
     config.vllm = to_structured_cfg(config.vllm, vLLMConfig)
     config.cluster = to_structured_cfg(config.cluster, ClusterSpecConfig)
@@ -290,6 +349,9 @@ def launch_vllm_server(argv):
 
 
 def main(argv):
+    # [FUNCTION DOC]
+    # Runs launch_vllm_server(argv); on any exception logs the traceback and exits with
+    # code 1. Always kills the current process tree gracefully in finally.
     try:
         launch_vllm_server(argv)
     except Exception:

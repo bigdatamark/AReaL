@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Remote tensors (RTensor): lightweight handles to tensors stored in another process's
+# in-memory shard store, addressed by (shard_id, node_addr). Tensors returned from
+# engine RPCs are "remotized" (stored locally, replaced by meta-device placeholders) and
+# "localized" by consumers, which fetch the bytes over HTTP from the owning node's /data
+# endpoints. Contains the pluggable backend (HTTP by default), a client-side fetch cache
+# keyed by shard id, and the process-local storage dict used by the data blueprint.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -22,7 +29,13 @@ logger = logging.getLogger("HttpRTensor")
 
 
 class RTensorBackend(Protocol):
+    # [CLASS DOC]
+    # Protocol for storage backends: fetch a list of shards (returning tensors in input
+    # order), store a tensor and return its shard id, and asynchronously delete shard
+    # ids on a node.
     def fetch(self, shards: list[TensorShardInfo]) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Protocol: fetch tensors for the given shards, preserving order.
         """Fetch multiple tensors concurrently.
 
         Parameters
@@ -38,6 +51,8 @@ class RTensorBackend(Protocol):
         ...
 
     def store(self, tensor: torch.Tensor) -> Any:
+        # [FUNCTION DOC]
+        # Protocol: store tensor and return its shard id.
         """Store a tensor and return its shard ID.
 
         Parameters
@@ -53,6 +68,8 @@ class RTensorBackend(Protocol):
         ...
 
     async def delete(self, node_addr: str, shard_ids: list[Any]) -> None:
+        # [FUNCTION DOC]
+        # Protocol (async): delete the shard ids stored on node_addr.
         """Delete shards from storage.
 
         Parameters
@@ -67,6 +84,9 @@ class RTensorBackend(Protocol):
 
 @dataclass
 class TensorShardInfo:
+    # [CLASS DOC]
+    # Dataclass identifying one stored shard: shard_id and node_addr ("host:port" of the
+    # RPC server holding it).
     """Metadata for a single shard of an RTensor.
 
     This is a pure data class containing only shard metadata.
@@ -85,12 +105,22 @@ class TensorShardInfo:
 
 
 class HttpRTensorBackend:
+    # [CLASS DOC]
+    # Default backend. Stores into this process's local storage with UUID shard ids;
+    # fetches by grouping shards per node and POSTing batched requests (at most
+    # max_shards_per_request ids each) to /data/batch, with nodes fetched concurrently
+    # on a single aiohttp session; deletes via DELETE /data/clear.
     def __init__(self, max_shards_per_request: int = 32) -> None:
+        # [FUNCTION DOC]
+        # Stores max_shards_per_request (default 32); raises ValueError if not positive.
         if max_shards_per_request <= 0:
             raise ValueError("max_shards_per_request must be positive")
         self.max_shards_per_request = max_shards_per_request
 
     def _create_session(self) -> aiohttp.ClientSession:
+        # [FUNCTION DOC]
+        # HELPER: Returns an aiohttp ClientSession with total/connect timeouts of
+        # DEFAULT_REQUEST_TIMEOUT, a 10MB read buffer and the shared default connector.
         """Create a properly configured aiohttp session for large tensor transfers."""
         timeout = aiohttp.ClientTimeout(
             total=DEFAULT_REQUEST_TIMEOUT,
@@ -111,6 +141,13 @@ class HttpRTensorBackend:
         max_retries: int = 3,
         retry_delay: float = 1.0,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Async. GETs /data/<shard_id> from node_addr (normalized for IPv6 when
+        # parseable), decodes orjson and deserializes the value. Retries up to
+        # max_retries times with retry_delay seconds on timeouts/aiohttp errors, then
+        # raises RuntimeError.
+        # KNOWN ISSUE: Non-200 responses raise RuntimeError immediately (not retried).
+        # This method is not used by fetch, which uses the batch endpoint.
         # Avoid circular import
         from areal.infra.rpc.serialization import deserialize_value
         from areal.utils.network import format_hostport, split_hostport
@@ -161,6 +198,14 @@ class HttpRTensorBackend:
         max_retries: int = 3,
         retry_delay: float = 1.0,
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Async. POSTs {"shard_ids": [...]} for one chunk to
+        # http://<node_addr>/data/batch, deserializes the returned list and checks its
+        # length matches the request (RuntimeError otherwise). Non-200 raises
+        # RuntimeError immediately; timeouts/client errors are retried up to max_retries
+        # with retry_delay, then RuntimeError.
+        # KNOWN ISSUE: Unlike _fetch_tensor and delete, node_addr is not normalized via
+        # split/format_hostport, so bare IPv6 addresses would form an invalid URL.
         from areal.infra.rpc.serialization import deserialize_value
 
         shard_ids = [shard.shard_id for _, shard in grouped]
@@ -206,11 +251,19 @@ class HttpRTensorBackend:
         )
 
     def fetch(self, shards: list[TensorShardInfo]) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Synchronously fetches all shards and returns tensors in input order (empty
+        # list for no shards). Runs an async task (via run_async_task) that groups
+        # shards by node, opens one session, and concurrently fetches each node's shards
+        # in sequential chunks.
         """Fetch multiple shards concurrently via HTTP using a single session."""
         if not shards:
             return []
 
         async def _fetch():
+            # [FUNCTION DOC]
+            # HELPER: Async body: group by node, gather per-node fetches, fill results
+            # by original index and return them.
             indexed_shards = list(enumerate(shards))
             shards_by_node: dict[str, list[tuple[int, TensorShardInfo]]] = defaultdict(
                 list
@@ -225,6 +278,9 @@ class HttpRTensorBackend:
                 async def _fetch_node(
                     node_addr: str, grouped: list[tuple[int, TensorShardInfo]]
                 ) -> None:
+                    # [FUNCTION DOC]
+                    # HELPER: Async. Fetches one node's shards chunk by chunk and writes
+                    # tensors into the shared results list at their original indices.
                     for start in range(0, len(grouped), self.max_shards_per_request):
                         chunk = grouped[start : start + self.max_shards_per_request]
                         tensors = await self._fetch_shard_group(
@@ -247,12 +303,19 @@ class HttpRTensorBackend:
         return run_async_task(_fetch)
 
     def store(self, tensor: torch.Tensor) -> str:
+        # [FUNCTION DOC]
+        # Generates a UUID4 shard id, stores the tensor in local storage, returns the
+        # id.
         """Store tensor in local storage, return UUID shard_id."""
         shard_id = str(uuid.uuid4())
         _store_local(shard_id, tensor)
         return shard_id
 
     async def delete(self, node_addr: str, shard_ids: list[str]) -> None:
+        # [FUNCTION DOC]
+        # Async. Sends DELETE /data/clear with the shard ids to node_addr
+        # (IPv6-normalized) and reads the JSON response on 200; non-200 responses are
+        # silently ignored.
         """Delete shards via HTTP DELETE request."""
         from areal.utils.network import format_hostport, split_hostport
 
@@ -273,6 +336,8 @@ _backend: RTensorBackend | None = None
 
 
 def get_backend() -> RTensorBackend:
+    # [FUNCTION DOC]
+    # Returns the module-global backend, lazily creating an HttpRTensorBackend.
     global _backend
     if _backend is None:
         _backend = HttpRTensorBackend()
@@ -280,6 +345,8 @@ def get_backend() -> RTensorBackend:
 
 
 def set_backend(backend: RTensorBackend | None) -> None:
+    # [FUNCTION DOC]
+    # Replaces the module-global backend (None resets to lazy default).
     global _backend
     _backend = backend
 
@@ -303,6 +370,9 @@ _fetch_buffer_lock = Lock()
 
 
 def clear_fetch_buffer(shard_ids: Iterable[Any] | None = None) -> int:
+    # [FUNCTION DOC]
+    # Evicts the given shard ids from the client-side fetch cache (or everything when
+    # None) under its lock; returns the number of entries removed.
     """Evict entries from the local client-side fetch buffer.
 
     Parameters
@@ -324,12 +394,18 @@ def clear_fetch_buffer(shard_ids: Iterable[Any] | None = None) -> int:
 
 
 def fetch_buffer_stats() -> dict[str, int]:
+    # [FUNCTION DOC]
+    # Returns {"num_entries": cache size}.
     """Return observability stats for the local client-side fetch buffer."""
     with _fetch_buffer_lock:
         return {"num_entries": len(_fetch_buffer)}
 
 
 def flatten_shard_ids(obj: Any) -> list[Any]:
+    # [FUNCTION DOC]
+    # Returns a flat list of every RTensor shard id found anywhere in a nested
+    # dict/list/tuple structure (ordering grouped by node). Used to build clear_batches
+    # payloads without sending RTensors that would be re-fetched.
     """Collect all RTensor shard IDs from a nested structure as a flat list.
 
     Convenience helper used by :class:`TrainController` to build the shard-id
@@ -350,10 +426,18 @@ def flatten_shard_ids(obj: Any) -> list[Any]:
 
 @dataclass
 class RTensor:
+    # [CLASS DOC]
+    # Dataclass handle for a remote tensor: shard (TensorShardInfo) and data, which is a
+    # meta-device tensor (shape/dtype only) until fetched and then the real CPU tensor.
+    # Static helpers convert nested structures between local tensors and RTensors.
     shard: TensorShardInfo
     data: torch.Tensor
 
     def to_local(self) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Returns the real tensor: if data is not meta returns it; otherwise checks the
+        # fetch cache, then fetches the single shard from the backend, caches it, stores
+        # it in data and returns it (network I/O on miss).
         if not self.data.is_meta:
             return self.data
         # Check client-side fetch buffer before making a network request.
@@ -370,6 +454,14 @@ class RTensor:
 
     @staticmethod
     def remotize(obj: Any, node_addr: str) -> Any:
+        # [FUNCTION DOC]
+        # Recursively converts tensors in obj to RTensors stored on this process
+        # (node_addr is the address advertised for later fetches). Tensors are detached
+        # and moved to CPU, stored via the backend, and replaced by RTensors with meta
+        # data. Dicts whose attention_mask is a tensor of ndim >= 2 are first compacted
+        # by trimming trailing padding (one trajectory group of batch size), then each
+        # value is remotized. Lists and tuples are mapped; None and other values are
+        # returned unchanged.
         """Convert tensors to RTensors in nested structures.
 
         For dict objects that look like trajectory dicts (contain attention_mask),
@@ -425,6 +517,11 @@ class RTensor:
 
     @staticmethod
     def localize(obj: Any) -> Any:
+        # [FUNCTION DOC]
+        # Inverse of remotize. Collects all RTensors in obj, resolves meta ones from the
+        # fetch cache, batch-fetches the remaining misses in one backend call (caching
+        # them), then returns a copy of the structure with RTensors replaced by local
+        # tensors. Mutates the RTensors' data in place.
         """Convert RTensors to local tensors in nested structures.
 
         Inverse of remotize() - fetches remote data and converts to local tensors.
@@ -469,6 +566,8 @@ class RTensor:
 
     @staticmethod
     def _collect_all(obj: Any, result: list[RTensor]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Appends every RTensor found in nested dict/list/tuple obj to result.
         """Collect all RTensor instances from a nested structure."""
         if isinstance(obj, RTensor):
             result.append(obj)
@@ -481,6 +580,9 @@ class RTensor:
 
     @staticmethod
     def _localize_recursive(obj: Any) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: Rebuilds nested dict/list/tuple obj with each RTensor replaced by
+        # to_local().
         """Recursively replace RTensors with their local tensor data."""
         if isinstance(obj, RTensor):
             return obj.to_local()
@@ -498,6 +600,9 @@ class RTensor:
 
     @staticmethod
     def collect_shards(obj: Any) -> dict[str, list[Any]]:
+        # [FUNCTION DOC]
+        # Returns a dict mapping node_addr to the list of shard ids of all RTensors in
+        # obj (traversal order).
         """Collect shard IDs grouped by node address from nested structure.
 
         Parameters
@@ -513,6 +618,8 @@ class RTensor:
         shards_by_node: dict[str, list[Any]] = {}
 
         def _collect(o: Any) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Recursive visitor appending shard ids to the per-node lists.
             if isinstance(o, RTensor):
                 if o.shard.node_addr not in shards_by_node:
                     shards_by_node[o.shard.node_addr] = []
@@ -529,6 +636,9 @@ class RTensor:
 
     @staticmethod
     async def clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+        # [FUNCTION DOC]
+        # Async. Evicts shard_ids from the local fetch cache, then asks the backend to
+        # delete them on node_addr.
         """Clear shards from a node and evict them from the fetch buffer.
 
         Parameters
@@ -545,21 +655,29 @@ class RTensor:
 
     @property
     def shape(self) -> torch.Size:
+        # [FUNCTION DOC]
+        # Property: shape of data (valid even for meta placeholders).
         """Shape of the data tensor."""
         return self.data.shape
 
     @property
     def dtype(self) -> torch.dtype:
+        # [FUNCTION DOC]
+        # Property: dtype of data.
         """Data type of the tensor."""
         return self.data.dtype
 
     @property
     def device(self) -> torch.device:
+        # [FUNCTION DOC]
+        # Property: device of data ("meta" until localized).
         """Device of the tensor."""
         return self.data.device
 
     @property
     def ndim(self) -> int:
+        # [FUNCTION DOC]
+        # Property: number of dimensions of data.
         """Number of dimensions."""
         return self.data.ndim
 
@@ -576,6 +694,9 @@ _storage_stats: dict[str, int] = defaultdict(int)
 
 
 def _store_local(shard_id: str, tensor: torch.Tensor) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Under the storage lock, stores tensor under shard_id and records its
+    # nbytes in the stats dict (overwriting any previous entry).
     """Store a tensor shard in local storage (internal use)."""
     global _storage, _storage_lock, _storage_stats
     with _storage_lock:
@@ -584,11 +705,17 @@ def _store_local(shard_id: str, tensor: torch.Tensor) -> None:
 
 
 def store(shard_id: str, tensor: torch.Tensor) -> None:
+    # [FUNCTION DOC]
+    # Public alias for storing a shard in process-local storage (used by PUT /data).
+    # KNOWN ISSUE: Annotated for tensors, but the data blueprint may pass any
+    # deserialized value; non-tensors lack nbytes and raise AttributeError.
     """Store a tensor shard in global storage."""
     _store_local(shard_id, tensor)
 
 
 def fetch(shard_id: str) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Returns the stored shard under the storage lock; raises KeyError if absent.
     """Retrieve a tensor shard from global storage."""
     global _storage, _storage_lock
     with _storage_lock:
@@ -599,6 +726,9 @@ def fetch(shard_id: str) -> torch.Tensor:
 
 
 def remove(shard_id: str) -> int:
+    # [FUNCTION DOC]
+    # Evicts shard_id from the fetch cache and deletes it from local storage and stats.
+    # Returns 1 if it was stored, else 0.
     """Remove a tensor shard from global storage.
 
     Also evicts the shard from this process's client-side ``_fetch_buffer``.
@@ -620,6 +750,8 @@ def remove(shard_id: str) -> int:
 
 
 def storage_stats() -> dict[str, int]:
+    # [FUNCTION DOC]
+    # Returns {"num_tensors": count, "total_bytes": sum of recorded nbytes}.
     """Get current storage stats."""
     global _storage_stats, _storage_lock, _storage
     with _storage_lock:

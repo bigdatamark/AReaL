@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Command-line entrypoint that runs a standalone Guard (process-management endpoints
+# only, no data or engine blueprints).
 # SPDX-License-Identifier: Apache-2.0
 
 """CLI entrypoint: ``python -m areal.infra.rpc.guard``
@@ -18,6 +21,10 @@ from areal.infra.rpc.guard.app import (
 
 
 def main():
+    # [FUNCTION DOC]
+    # Builds the base argument parser, parses known args (ignoring unknown ones),
+    # creates a GuardState, configures it from args (which returns the bind host),
+    # creates the Flask app and runs the server on args.port. Blocks until shutdown.
     """Main entry point for the standalone Guard service."""
     parser = make_base_parser(
         description=("AReaL Guard — HTTP gateway for coordinating forked workers")

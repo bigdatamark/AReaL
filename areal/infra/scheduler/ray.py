@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Ray-based scheduler. For each role it reserves resources with a placement group (one
+# bundle per node, PACK strategy), places one RayWorkerProcessLauncher actor per bundle,
+# and has those actors spawn RPC-server worker subprocesses on their nodes with the
+# right visible devices. Worker addresses are discovered via name_resolve (servers bind
+# port 0), then the scheduler health-checks, configures, and drives engines over HTTP
+# like the local scheduler. Supports colocation (reuse, fork via Guard, or grouped
+# multi-GPU workers over a target's GPUs) and multi-node rollout servers (SGLang/vLLM)
+# whose non-head node processes are started by additional launchers.
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -74,6 +83,9 @@ DEVICE_CONTROL_ENV_VARS = {
 
 
 def _read_log_tail(log_file: str, lines: int = 50) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the last lines (default 50) of log_file, or a placeholder message
+    # on read errors.
     try:
         with open(log_file) as f:
             all_lines = f.readlines()
@@ -83,6 +95,10 @@ def _read_log_tail(log_file: str, lines: int = 50) -> str:
 
 
 class RayBackendWorkerProcessManager:
+    # [CLASS DOC]
+    # Lives inside a launcher actor and manages non-head node processes of multi-node
+    # inference servers. Holds role, log paths, device env var name, env vars, visible
+    # devices and host, plus a map from (group key, backend, node_rank) to Popen.
     def __init__(
         self,
         role: str,
@@ -93,6 +109,8 @@ class RayBackendWorkerProcessManager:
         visible_devices: list[str],
         host: str,
     ):
+        # [FUNCTION DOC]
+        # Stores the arguments and initializes an empty process map.
         self.role = role
         self.log_file = log_file
         self.merged_log = merged_log
@@ -108,6 +126,14 @@ class RayBackendWorkerProcessManager:
         backend: str,
         server_args: dict[str, Any],
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Builds the server command and environment for backend "sglang" or "vllm" from
+        # a copy of server_args (RuntimeError for other backends), using os.environ plus
+        # the launcher env vars. Kills any running process previously registered under
+        # the same (group_key, backend, node_rank), sets the device visibility var to
+        # this node's devices, launches the command with streaming logs, and raises
+        # RuntimeError with the log tail if it exits within 0.1s. Records and returns
+        # {"host", "pid", "key"}.
         server_args = server_args.copy()
         base_env = os.environ.copy()
         base_env.update(self.env_vars)
@@ -153,6 +179,9 @@ class RayBackendWorkerProcessManager:
     def drain_worker_processes(
         self, group_key: tuple[str, str] | None = None
     ) -> list[tuple[str, Any]]:
+        # [FUNCTION DOC]
+        # Removes and returns (label, process) pairs for all tracked processes, or only
+        # those of group_key when given. Does not kill them.
         processes = []
         for process_key in list(self.backend_worker_processes):
             if group_key is not None and process_key[0] != group_key:
@@ -164,6 +193,12 @@ class RayBackendWorkerProcessManager:
 
 @ray.remote
 class RayWorkerProcessLauncher:
+    # [CLASS DOC]
+    # Ray actor (one per placement-group bundle or pinned node) that spawns and
+    # supervises worker subprocesses on its node. Records its host IP, visible device
+    # ids (from Ray's accelerator assignment or the visibility env var), worker
+    # processes by id, and an optional backend process manager. Kills all processes on
+    # actor shutdown.
     def __init__(
         self,
         role: str,
@@ -173,6 +208,9 @@ class RayWorkerProcessLauncher:
         device_control_env_var: str,
         env_vars: dict[str, str] | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores role, log paths, Ray device resource name, visibility env var name and
+        # base env vars; detects host IP and visible devices.
         self.role = role
         self.log_file = log_file
         self.merged_log = merged_log
@@ -185,6 +223,11 @@ class RayWorkerProcessLauncher:
         self.backend_process_manager: RayBackendWorkerProcessManager | None = None
 
     def _get_visible_devices(self) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Returns sorted device ids assigned to this actor by Ray for the device
+        # resource, falling back to the visibility env var; [] if neither.
+        # KNOWN ISSUE: Sorting with integer keys fails if ids are not numeric (e.g. GPU
+        # UUIDs).
         devices = []
         try:
             ids = ray.get_runtime_context().get_accelerator_ids()
@@ -202,6 +245,8 @@ class RayWorkerProcessLauncher:
         return sorted(devices, key=int)
 
     def get_node_info(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns {"host", "visible_devices", "node_id"} for this actor's node.
         return {
             "host": self.host,
             "visible_devices": self.visible_devices,
@@ -222,6 +267,14 @@ class RayWorkerProcessLauncher:
         fileroot: str | None,
         extra_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Builds the launch spec for worker role/worker_index: splits cmd
+        # (default the rpc_server module; RuntimeError if it already contains --port),
+        # replaces a leading "python" with the current interpreter, appends --host
+        # 0.0.0.0 --port 0 (auto-assign) and experiment/trial/role/index/name-
+        # resolve/fileroot args, and builds env from os.environ, launcher env, extra_env
+        # and the visibility var set to gpu_devices. Returns a dict with worker_id,
+        # role, gpu_devices, cmd and env.
         worker_id = f"{role}/{worker_index}"
         if not cmd:
             cmd = "python -m areal.infra.rpc.rpc_server"
@@ -275,6 +328,11 @@ class RayWorkerProcessLauncher:
         }
 
     def start_workers(self, worker_specs: list[dict[str, Any]]) -> None:
+        # [FUNCTION DOC]
+        # Spawns all given worker specs with streaming logs, waits 0.1s and raises
+        # RuntimeError (with log tail) if any exited immediately; otherwise records them
+        # by worker id. On any failure kills the already started processes and re-
+        # raises.
         workers = [self._build_worker_spec(**spec) for spec in worker_specs]
         started = []
         try:
@@ -329,6 +387,8 @@ class RayWorkerProcessLauncher:
             raise
 
     def worker_statuses(self, worker_ids: list[str]) -> dict[str, dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Returns per worker id {"exists": bool, "returncode": poll result or None}.
         statuses = {}
         for worker_id in worker_ids:
             process = self.worker_processes.get(worker_id)
@@ -341,6 +401,9 @@ class RayWorkerProcessLauncher:
     def start_backend_worker(
         self, group_key: tuple[str, str], backend: str, server_args: dict[str, Any]
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Lazily creates the backend process manager and delegates start_backend_worker
+        # to it.
         if self.backend_process_manager is None:
             self.backend_process_manager = RayBackendWorkerProcessManager(
                 self.role,
@@ -356,7 +419,13 @@ class RayWorkerProcessLauncher:
         )
 
     def _stop_processes(self, processes: list[tuple[str, Any]]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Kills all given still-running processes concurrently (process tree,
+        # graceful, 5s) via threads inside an async task; failures are logged.
         async def stop_process(name: str, process: Any) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Async; kills one process tree in a thread if still running,
+            # logging errors.
             try:
                 if process.poll() is None:
                     await asyncio.to_thread(
@@ -369,6 +438,8 @@ class RayWorkerProcessLauncher:
             return
 
         async def stop_processes() -> None:
+            # [FUNCTION DOC]
+            # HELPER: Async; gathers stop_process over all processes.
             await asyncio.gather(
                 *(stop_process(name, process) for name, process in processes)
             )
@@ -376,6 +447,9 @@ class RayWorkerProcessLauncher:
         run_async_task(stop_processes)
 
     def stop_backend_worker_group(self, group_key: tuple[str, str]) -> None:
+        # [FUNCTION DOC]
+        # Drains and kills backend node processes of one group key (no-op without
+        # manager).
         if self.backend_process_manager is None:
             return
 
@@ -384,6 +458,9 @@ class RayWorkerProcessLauncher:
         )
 
     def stop_all_processes(self) -> None:
+        # [FUNCTION DOC]
+        # Drains backend processes and all worker processes, kills them, and clears the
+        # worker map. Errors are logged, not raised.
         try:
             processes = []
             if self.backend_process_manager is not None:
@@ -398,11 +475,17 @@ class RayWorkerProcessLauncher:
             logger.warning("Failed to stop Ray launcher processes", exc_info=True)
 
     def __ray_shutdown__(self) -> None:
+        # [FUNCTION DOC]
+        # Ray actor shutdown hook; stops all processes.
         self.stop_all_processes()
 
 
 @dataclass
 class RayWorkerInfo:
+    # [CLASS DOC]
+    # Dataclass for a scheduled worker: public Worker (ip/ports empty until discovered),
+    # role, task_index, the launcher actors serving it (head first; more than one for
+    # multi-node workers) and its SchedulingSpec.
     """Ray worker information."""
 
     worker: Worker
@@ -415,6 +498,11 @@ class RayWorkerInfo:
 def group_colocated_gpus(
     node_infos: list[dict[str, Any]], gpus_per_worker: int
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Splits each node's visible devices into contiguous groups of gpus_per_worker,
+    # never crossing nodes. Returns a list of {"host", "node_id", "gpu_devices"}. Raises
+    # ValueError if gpus_per_worker is not positive or a node's device count is not a
+    # multiple of it.
     """Chunk each target node's physical GPUs into per-worker groups.
 
     Groups are contiguous within a node and never cross nodes, so every
@@ -443,11 +531,18 @@ def group_colocated_gpus(
 
 
 class RayMultiNodeRolloutCoordinator:
+    # [CLASS DOC]
+    # Coordinates rollout inference servers spanning several nodes: derives the rollout
+    # backend from exp_config.rollout.backend, builds per-node server args, starts the
+    # non-head node processes through the extra launchers, and stops them.
     def __init__(
         self,
         exp_config: BaseExperimentConfig | None,
         startup_timeout: float,
     ):
+        # [FUNCTION DOC]
+        # Stores startup_timeout and parses the rollout inference backend name (None if
+        # the config has no rollout section).
         self.startup_timeout = startup_timeout
         rollout_config = getattr(exp_config, "rollout", None)
         self._rollout_inference_backend = (
@@ -462,6 +557,13 @@ class RayMultiNodeRolloutCoordinator:
         backend: str,
         server_args: dict[str, Any],
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        # [FUNCTION DOC]
+        # HELPER: Async. Allocates one port on the head worker's guard (/alloc_ports) as
+        # the distributed init port and returns (head args, list of per-node args). For
+        # sglang sets nnodes, node_rank and dist_init_addr "host:port"; for vllm sets
+        # nnodes, node_rank, master_addr and master_port, with headless=True on non-head
+        # nodes. Non-head args drop host/port. Other backends raise EngineCallError.
+        # KNOWN ISSUE: dist_init_addr is built without IPv6 bracket formatting.
         port = int(worker_info.worker.worker_ports[0])
         timeout = aiohttp.ClientTimeout(total=self.startup_timeout)
         async with aiohttp.ClientSession(
@@ -522,6 +624,9 @@ class RayMultiNodeRolloutCoordinator:
     async def _stop_backend_workers_on_launchers(
         self, backend_worker_group_key: tuple[str, str], launchers: list[ActorHandle]
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Async. Asks each launcher to stop the given backend group, waiting up
+        # to 30s; failures are logged.
         if not launchers:
             return
         try:
@@ -542,6 +647,13 @@ class RayMultiNodeRolloutCoordinator:
         engine_name: str,
         kwargs: dict[str, Any],
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Async. If kwargs has a server_args dict and the worker spans multiple
+        # launchers, builds multi-node args, starts non-head node processes on
+        # launchers[1:] (startup_timeout; on any failure stops them and re-raises), and
+        # returns kwargs with head server_args. Returns kwargs unchanged for single-node
+        # workers. Raises EngineCallError for non-rollout roles or an unknown rollout
+        # backend.
         server_args = kwargs.get("server_args")
         if not isinstance(server_args, dict) or len(worker_info.launchers) <= 1:
             return kwargs
@@ -578,6 +690,8 @@ class RayMultiNodeRolloutCoordinator:
     async def stop_backend_workers(
         self, worker_info: RayWorkerInfo, engine_name: str
     ) -> None:
+        # [FUNCTION DOC]
+        # Async. Stops the non-head node processes for (worker id, engine_name).
         backend_worker_group_key = (worker_info.worker.id, engine_name)
         await self._stop_backend_workers_on_launchers(
             backend_worker_group_key, worker_info.launchers[1:]
@@ -585,6 +699,12 @@ class RayMultiNodeRolloutCoordinator:
 
 
 class RayScheduler(Scheduler):
+    # [CLASS DOC]
+    # Scheduler implementation backed by Ray. Holds GPUs per node,
+    # experiment/trial/fileroot (exp_config overrides), Ray device resource and its
+    # visibility env var, name-resolve config, timeouts, and registries: role to
+    # RayWorkerInfo list, role to launcher actors, role to placement group, colocated
+    # role to target role, plus a multi-node rollout coordinator.
     def __init__(
         self,
         n_gpus_per_node: int = 8,
@@ -599,6 +719,12 @@ class RayScheduler(Scheduler):
         etcd3_addr: str = "localhost:2379",
         exp_config: BaseExperimentConfig | None = None,
     ):
+        # [FUNCTION DOC]
+        # Initializes Ray, applies exp_config overrides (GPUs per node, names, fileroot,
+        # TMS offload, name-resolve), raises ValueError without experiment/trial names
+        # and RuntimeError if the cluster's accelerator resource is not GPU or NPU.
+        # Validates shared paths, reconfigures name_resolve and clears this trial's
+        # subtree, and initializes empty registries.
         initialize_ray()
 
         # Get n_gpus_per_node from parameter or config
@@ -676,9 +802,14 @@ class RayScheduler(Scheduler):
 
     @property
     def n_gpus_per_node(self) -> int:
+        # [FUNCTION DOC]
+        # Property: configured GPUs per node.
         return self._n_gpus_per_node
 
     def _log_path_of(self, role: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns (creating the directory)
+        # <fileroot>/logs/<user>/<exp>/<trial>/<role>.log.
         log_path = (
             Path(self.fileroot)
             / "logs"
@@ -690,6 +821,9 @@ class RayScheduler(Scheduler):
         return str(log_path / f"{role}.log")
 
     def _merged_log_path(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns (creating the directory) the merged.log path in the same
+        # directory.
         log_path = (
             Path(self.fileroot)
             / "logs"
@@ -701,9 +835,13 @@ class RayScheduler(Scheduler):
         return str(log_path / "merged.log")
 
     def _read_log_tail(self, role: str, lines: int = 50) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the tail of the role's log file.
         return _read_log_tail(self._log_path_of(role), lines=lines)
 
     def _find_worker_by_id(self, worker_id: str) -> RayWorkerInfo | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns the RayWorkerInfo with the given id across roles, or None.
         """Find worker by ID across all roles."""
         for workers in self._workers.values():
             for worker_info in workers:
@@ -712,6 +850,9 @@ class RayScheduler(Scheduler):
         return None
 
     def _stop_launchers(self, role: str, timeout: float) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Asks every launcher of role to stop all processes and waits up to
+        # timeout per launcher; errors are logged.
         refs = []
         for launcher in self._launchers.get(role, []):
             try:
@@ -726,6 +867,12 @@ class RayScheduler(Scheduler):
                 logger.error(f"Error stopping Ray launcher for role {role}: {e}")
 
     def _check_worker_process_status(self, role: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For colocated roles checks the target role. Raises WorkerNotFoundError
+        # if the role has no launchers. Groups workers by head launcher, queries
+        # worker_statuses (2s timeout; timeouts are ignored), and raises
+        # WorkerFailedError (with log tail) if the launcher actor died, a process is
+        # missing, or a process has exited.
         """Check Ray worker process status and raise if failed."""
         # For colocated/forked roles, check the target role's process status instead
         if role in self._colocated_roles:
@@ -795,6 +942,9 @@ class RayScheduler(Scheduler):
                     )
 
     def _verify_worker_alive(self, worker_id: str) -> RayWorkerInfo:
+        # [FUNCTION DOC]
+        # HELPER: Returns the worker info after checking its role's process status;
+        # raises WorkerNotFoundError or WorkerFailedError.
         """Verify worker exists and job is running."""
         worker_info = self._find_worker_by_id(worker_id)
         if worker_info is None:
@@ -806,6 +956,9 @@ class RayScheduler(Scheduler):
         return worker_info
 
     def _wait_worker_ready(self, worker_info: RayWorkerInfo, timeout: int = 60):
+        # [FUNCTION DOC]
+        # HELPER: Polls health once per second for up to timeout seconds; returns
+        # silently even if never ready.
         tik = time.time()
         while time.time() - tik < timeout:
             if self._is_worker_ready(worker_info):
@@ -813,6 +966,9 @@ class RayScheduler(Scheduler):
             time.sleep(1)
 
     def _is_worker_ready(self, worker_info: RayWorkerInfo) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: False if the worker has no known port; otherwise True if GET /health
+        # returns 200 within 2s.
         """Check if worker is ready via health endpoint."""
         if not worker_info.worker.worker_ports:
             return False
@@ -832,6 +988,12 @@ class RayScheduler(Scheduler):
         worker_info: RayWorkerInfo,
         worker_rank: int,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Async. POSTs serialized {config: exp_config, role, rank} to the
+        # worker's /configure (300s). 400/500/other statuses raise
+        # WorkerConfigurationError; connection errors re-check process status (may raise
+        # WorkerFailedError) then raise RPCConnectionError; timeouts/other errors raise
+        # WorkerConfigurationError.
         worker_id = worker_info.worker.id
         port = int(worker_info.worker.worker_ports[0])
         url = f"http://{format_hostport(worker_info.worker.ip, port)}/configure"
@@ -885,6 +1047,9 @@ class RayScheduler(Scheduler):
             ) from e
 
     async def _configure_workers(self, workers: list[RayWorkerInfo]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Async. Configures all workers concurrently (rank = list index) in one
+        # session and raises the first failure.
         """Configure workers concurrently and wait for all responses."""
         if not workers:
             return
@@ -906,6 +1071,12 @@ class RayScheduler(Scheduler):
                 raise result
 
     def _discover_worker_network(self, role: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For each worker of role without ports, looks up its "host:port" from
+        # name_resolve (skipping if not yet registered), sets ip and first port, waits
+        # up to 60s for health, and requests port_count-1 extra ports from its guard.
+        # Raises WorkerNotFoundError for unknown roles; HTTP errors from port allocation
+        # propagate.
         if role not in self._workers:
             raise WorkerNotFoundError(f"Role '{role}' is not created yet")
 
@@ -942,6 +1113,12 @@ class RayScheduler(Scheduler):
     def _prepare_worker_specs(
         self, role: str, num_workers: int, schedulings: list[SchedulingSpec] | None
     ) -> list[SchedulingSpec]:
+        # [FUNCTION DOC]
+        # HELPER: Validates and expands scheduling specs. Raises ValueError if none are
+        # given or a spec uses additional_bash_cmds. Mutates each spec's env_vars in
+        # place, adding TMS offload vars (if enabled), AReaL forwarded env vars and
+        # thread-count vars. Returns one spec per worker (single spec repeated, or the
+        # matching-length list; ValueError otherwise).
         """Prepare scheduling specs for workers."""
         if schedulings is None or len(schedulings) == 0:
             raise ValueError(f"No scheduling specs provided for role '{role}'")
@@ -981,6 +1158,9 @@ class RayScheduler(Scheduler):
         port: int,
         timeout: float = 60,
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Async. Polls GET /health every 0.5s until 200 or timeout; returns
+        # bool.
         url = f"http://{format_hostport(host, port)}/health"
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -1004,6 +1184,12 @@ class RayScheduler(Scheduler):
         target_role: str,
         command: str | None = None,
     ) -> RayWorkerInfo:
+        # [FUNCTION DOC]
+        # HELPER: Async. Same fork flow as the local scheduler (allocate port on target
+        # guard, POST /fork with an rpc_server-style command, wait for readiness, kill
+        # and raise on timeout), except extra ports are allocated from the forked
+        # worker's own guard. Returns a RayWorkerInfo sharing the target's launchers and
+        # spec. Errors raise WorkerCreationError.
         """Fork a single worker asynchronously.
 
         Parameters
@@ -1155,6 +1341,9 @@ class RayScheduler(Scheduler):
         idx: int,
         target_wi: RayWorkerInfo,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Async. Asks the parent guard to kill forked worker role/idx; logs the
+        # outcome and never raises.
         """Kill a single forked worker via its parent's RPC server."""
         target_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}/kill_forked_worker"
 
@@ -1184,6 +1373,9 @@ class RayScheduler(Scheduler):
         target_role: str,
         workers: list[RayWorkerInfo],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Async. Kills the given forked workers through their matching target
+        # workers' guards concurrently; warns if the target role is unknown.
         """Cleanup forked workers by calling kill endpoint on parent workers."""
         target_workers = self._workers.get(target_role, [])
         if not target_workers:
@@ -1215,6 +1407,11 @@ class RayScheduler(Scheduler):
         target_workers: list[RayWorkerInfo],
         command: str | None = None,
     ) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Async. Forks one worker per target worker concurrently; on partial
+        # failure kills the successful forks and raises WorkerCreationError. Otherwise
+        # registers the role as forked from target_role, configures the workers if
+        # exp_config is set, and returns ids.
         """Create forked workers concurrently using async requests.
 
         Parameters
@@ -1288,6 +1485,11 @@ class RayScheduler(Scheduler):
         target_role: str,
         command: str | None = None,
     ) -> list[str]:
+        # [FUNCTION DOC]
+        # Synchronously forks new workers colocated with each worker of target_role
+        # (optional custom module command) and returns their ids. Raises
+        # WorkerNotFoundError for an unknown target; removes partial registrations on
+        # failure.
         """Fork new worker processes from existing workers.
 
         Creates new worker processes by forking from existing workers of the target role.
@@ -1331,6 +1533,11 @@ class RayScheduler(Scheduler):
     def _create_placement_group(
         self, role: str, bundles: list[dict[str, Any]], timeout: float
     ) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: Creates a PACK placement group from bundles and waits for it, logging
+        # available and cluster resources every health_check_interval. On timeout or
+        # other failure removes the group and raises WorkerCreationError (timeout logs a
+        # detailed resource dump). Returns the ready placement group.
         """Generate Ray placement group for worker job with bundle-per-node layout."""
         pg = placement_group(bundles=bundles, strategy="PACK")
         try:
@@ -1389,6 +1596,15 @@ class RayScheduler(Scheduler):
     def _build_node_plan(
         self, replicas: int, spec: SchedulingSpec
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+        # [FUNCTION DOC]
+        # HELPER: Computes placement bundles and a launch plan for replicas workers of
+        # one spec. Returns (bundles, plan entries with bundle_index/node_rank/workers
+        # count, nodes per worker). CPU-only specs get a single bundle hosting all
+        # workers. Specs needing more GPUs than a node must use whole nodes (ValueError
+        # otherwise) and evenly divisible CPU/memory; each worker gets nodes_per_worker
+        # full-node bundles, with only node_rank 0 hosting the worker process. Otherwise
+        # workers are packed per node (as many as fit), warning when the last node is
+        # partial. Memory is given in GB in the spec and converted to bytes.
         if spec.gpu <= 0:
             bundles = [
                 {"CPU": spec.cpu * replicas, "memory": spec.mem * replicas * 1024**3}
@@ -1471,6 +1687,22 @@ class RayScheduler(Scheduler):
         return bundles, plan, 1
 
     def create_workers(self, job: Job, *args, **kwargs) -> list[str]:
+        # [FUNCTION DOC]
+        # Creates workers for a Job and returns their ids (worker processes start
+        # asynchronously; addresses are discovered later in get_workers). Rejects roles
+        # containing ":" (ValueError), existing roles and non-positive replicas
+        # (WorkerCreationError). Colocation: requires an existing target; if replica
+        # counts differ but total GPUs match, creates grouped colocated workers;
+        # otherwise errors on mismatch; with fork forks workers, else reuses the
+        # target's ids and records the mapping. Separation: builds the node plan,
+        # creates and waits for the placement group, starts one launcher actor per
+        # bundle with the bundle's resources, collects node infos and orders launchers
+        # by host, lowest device id and bundle index. Multi-node workers start their
+        # process on the head launcher with that node's devices and keep all node
+        # launchers; single-node workers are assigned consecutive device slices on their
+        # launcher and started in batches. Waits for all starts (startup_timeout). On
+        # failure stops launchers, removes the placement group and raises
+        # WorkerCreationError with the log tail.
         """Create workers via Ray placement group creation.
 
         Parameters
@@ -1630,6 +1862,9 @@ class RayScheduler(Scheduler):
             def build_worker_spec(
                 worker_idx: int, gpu_devices: list[str], worker_spec: SchedulingSpec
             ) -> dict[str, Any]:
+                # [FUNCTION DOC]
+                # HELPER: Returns the keyword dict for a launcher's _build_worker_spec
+                # for one worker.
                 return dict(
                     role=role,
                     worker_index=worker_idx,
@@ -1648,6 +1883,9 @@ class RayScheduler(Scheduler):
                 worker_launchers: list[ActorHandle],
                 worker_spec: SchedulingSpec,
             ) -> RayWorkerInfo:
+                # [FUNCTION DOC]
+                # HELPER: Returns a RayWorkerInfo with an undiscovered Worker (empty
+                # ip/ports).
                 worker_id = f"{role}/{worker_idx}"
                 worker = Worker(
                     id=worker_id,
@@ -1747,6 +1985,19 @@ class RayScheduler(Scheduler):
         colocate_role: str,
         schedulings: list[SchedulingSpec],
     ) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Creates multi-GPU workers that together reuse all GPUs of
+        # colocate_role. Queries the target launchers' node infos, splits each node's
+        # devices into groups of spec.gpu (WorkerCreationError if the group count
+        # differs from the replica count), and per target node starts a zero-resource
+        # launcher pinned to that node, launching one worker per group with the whole
+        # node's devices visible plus SLURM_LOCALID/SLURM_NODEID/SLURM_NNODES env vars
+        # so downstream code selects its GPU range like under Slurm. On failure stops
+        # and kills those launchers and raises WorkerCreationError. Registers launchers
+        # and workers and returns ids.
+        # KNOWN ISSUE: Docstring says workers receive explicit per-worker physical GPU
+        # ids, but each worker sees all of the node's devices and relies on
+        # SLURM_LOCALID to select its slice.
         """Create multi-GPU workers colocated over the target role's GPUs.
 
         One zero-GPU launcher is pinned to each target node via node
@@ -1874,6 +2125,9 @@ class RayScheduler(Scheduler):
         return worker_ids
 
     def _stop_launchers_of(self, launchers: list[ActorHandle]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Stops all processes on each launcher (10s) and kills the actor,
+        # ignoring errors.
         for launcher in launchers:
             try:
                 ray.get(launcher.stop_all_processes.remote(), timeout=10)
@@ -1885,6 +2139,14 @@ class RayScheduler(Scheduler):
                 pass
 
     def get_workers(self, role: str, timeout: float | None = None) -> list[Worker]:
+        # [FUNCTION DOC]
+        # Returns ready Worker records for role. Forked roles are only health-checked
+        # (WorkerFailedError if any does not respond); plain colocated roles delegate to
+        # the target. Otherwise loops until timeout (default startup_timeout): checks
+        # process status (raising WorkerFailedError), discovers addresses via
+        # name_resolve, and once all are discovered and healthy configures them (if
+        # exp_config) and returns. Raises WorkerNotFoundError for unknown roles and
+        # WorkerTimeoutError on timeout.
         """Wait for workers to be ready and return their information.
 
         Parameters
@@ -1992,6 +2254,12 @@ class RayScheduler(Scheduler):
     def _destroy_engines_on_workers(
         self, workers: list[RayWorkerInfo], timeout: float = 30.0
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Concurrently POSTs a "destroy" call to each worker's engine named
+        # after its worker id (bounded by timeout) so all ranks reach their teardown
+        # barrier together; failures are logged and never raised.
+        # KNOWN ISSUE: Engines registered under names other than the worker id are not
+        # destroyed here.
         """Call ``engine.destroy()`` on every worker via HTTP before killing jobs.
 
         All calls are dispatched concurrently so that the engine-side CPU
@@ -2003,6 +2271,9 @@ class RayScheduler(Scheduler):
             return
 
         async def _destroy_all():
+            # [FUNCTION DOC]
+            # HELPER: Async body issuing all destroy requests and logging failures per
+            # worker.
             destroy_timeout = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(
                 timeout=destroy_timeout,
@@ -2044,6 +2315,11 @@ class RayScheduler(Scheduler):
 
     @staticmethod
     async def _safe_destroy_request(coro):
+        # [FUNCTION DOC]
+        # HELPER: Async. Awaits a pending aiohttp request context and reads the body;
+        # wraps any error in RuntimeError.
+        # KNOWN ISSUE: Docstring says errors are suppressed, but they are re-raised as
+        # RuntimeError (the caller's gather then collects them).
         """Await an aiohttp context-manager response, suppressing errors."""
         try:
             async with coro as resp:
@@ -2052,6 +2328,12 @@ class RayScheduler(Scheduler):
             raise RuntimeError(str(e)) from e
 
     def delete_workers(self, role: str | None = None, reverse_order: bool = False):
+        # [FUNCTION DOC]
+        # Deletes one role or all roles (colocated first); reverse_order is ignored.
+        # Forked roles: kills forked processes via the parent guards and drops the
+        # registration. Plain colocated roles: drops the mapping. Normal roles: destroys
+        # engines over HTTP, stops and kills the launcher actors, removes the placement
+        # group, and clears registries. Unknown roles log a warning.
         """Delete workers and stop Ray launchers.
 
         Teardown follows a two-phase protocol analogous to the Ray and Local
@@ -2141,6 +2423,13 @@ class RayScheduler(Scheduler):
         logger.info(f"Successfully deleted workers for role '{role}'")
 
     async def set_worker_env(self, worker_id: str, env: dict[str, str]) -> None:
+        # [FUNCTION DOC]
+        # Async. Verifies the worker is alive and POSTs {"env": env} to /set_env (30s)
+        # when env is non-empty. Non-200 raises SchedulerError; connection errors re-
+        # check process status then raise RPCConnectionError; timeouts raise
+        # SchedulerError.
+        # KNOWN ISSUE: SchedulerError is given two positional args, yielding a tuple-
+        # like message.
         """Set environment variables on a worker before engine creation.
 
         Parameters
@@ -2192,6 +2481,14 @@ class RayScheduler(Scheduler):
         *args,
         **kwargs,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Async. Same contract as LocalScheduler.create_engine: verifies the worker,
+        # requires a string import path, POSTs to /create_engine (300s) and maps 400 to
+        # EngineImportError or EngineCreationError and 500/others to
+        # EngineCreationError. Connection errors re-check process status then raise
+        # RPCConnectionError; timeouts raise EngineCreationError.
+        # KNOWN ISSUE: Unlike the local scheduler, other unexpected exceptions are not
+        # wrapped in EngineCreationError.
         """Create an engine instance on a remote worker.
 
         Parameters
@@ -2308,6 +2605,9 @@ class RayScheduler(Scheduler):
         retry_delay: float = 1.0,
         **kwargs,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Synchronous wrapper running async_call_engine to completion via
+        # run_async_task.
         """Call a method on an engine instance (synchronous)."""
         return run_async_task(
             self.async_call_engine,
@@ -2334,6 +2634,13 @@ class RayScheduler(Scheduler):
         retry_delay: float = 1.0,
         **kwargs,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Async. Looks up the worker (WorkerNotFoundError if unknown) and defaults
+        # engine_name to the worker id. For "launch_server" on a multi-node worker,
+        # first starts the non-head node processes and swaps in head server args,
+        # stopping them again if the call fails. After "destroy" or "teardown_server" on
+        # multi-node workers, stops the non-head processes. Delegates the HTTP call to
+        # _async_call_engine_rpc.
         """Call a method on an engine instance (asynchronous).
 
         Parameters
@@ -2435,6 +2742,16 @@ class RayScheduler(Scheduler):
         max_retries: int,
         retry_delay: float,
     ) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: Async. POSTs the serialized call to /call with up to max_retries
+        # attempts and exponential backoff (retry_delay doubled each time). Checks
+        # process status before each attempt. 200 returns the deserialized result; 500
+        # with "timeout" in the error is retried (except on the last attempt), other
+        # 500s and non-503 statuses raise EngineCallError; 503, timeouts and connection
+        # errors are retried. Raises EngineCallError after exhausting retries.
+        # KNOWN ISSUE: EngineCallError raised inside the try block is caught by the
+        # generic exception handler and retried, so non-retryable failures are retried
+        # and finally reported as "Unexpected error".
         serialized_args = serialize_value(list(args))
         serialized_kwargs = serialize_value(kwargs)
         payload = {
@@ -2528,6 +2845,9 @@ class RayScheduler(Scheduler):
         )
 
     def __del__(self):
+        # [FUNCTION DOC]
+        # Best-effort deletion of all workers on garbage collection; errors are
+        # swallowed.
         try:
             self.delete_workers()
         except Exception:

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Single-node scheduler that launches RPC-server worker subprocesses (one Guard + data +
+# engine server per worker), assigns GPUs round-robin via the platform visibility env
+# var, allocates ports, supports colocated roles (sharing or forking from another role's
+# workers through the Guard /fork endpoint), waits for health, pushes experiment config,
+# and drives remote engines over HTTP (/set_env, /create_engine, /call).
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -61,6 +67,10 @@ _MAX_STARTUP_PORT_CONFLICT_RETRIES = 3
 
 @dataclass
 class WorkerInfo:
+    # [CLASS DOC]
+    # Dataclass tracking one launched worker: the public Worker record (id "role/idx",
+    # ip, ports), its Popen (None for forked workers managed by their parent guard),
+    # role, GPU ids, creation time, log file path and the env vars it was started with.
     worker: Worker
     process: subprocess.Popen | None  # None for forked workers (managed by parent)
     role: str
@@ -71,6 +81,10 @@ class WorkerInfo:
 
 
 def _get_device_count_safely() -> int | None:
+    # [FUNCTION DOC]
+    # HELPER: Counts accelerator device nodes in /dev (names like nvidiaN or davinciN)
+    # without initializing CUDA; returns the count for the first type found, or None if
+    # none found or listing fails.
     """
     Safely get device count without initializing CUDA context.
     """
@@ -90,6 +104,12 @@ def _get_device_count_safely() -> int | None:
 
 
 class LocalScheduler(Scheduler):
+    # [CLASS DOC]
+    # Scheduler implementation for one machine. Holds GPU ids, experiment/trial/fileroot
+    # (overridden by exp_config if given), name-resolve config, log dir, startup timeout
+    # and health interval, a role-to-WorkerInfo-list map, a round-robin GPU counter, the
+    # set of allocated ports, and a map of colocated role to target role. Not thread-
+    # safe.
     """Local scheduler that manages worker subprocesses on a single GPU node.
 
     This scheduler spawns worker processes running RPC servers and manages their lifecycle.
@@ -113,6 +133,13 @@ class LocalScheduler(Scheduler):
         etcd3_addr: str = "localhost:2379",
         exp_config: BaseExperimentConfig | None = None,
     ):
+        # [FUNCTION DOC]
+        # Determines GPU ids (argument or auto-detect), applies exp_config overrides for
+        # names, fileroot, TMS offload flag and name-resolve config, validates that
+        # fileroot and the NFS record root are shared paths, reconfigures name_resolve
+        # and clears this trial's subtree when names are set, and sets log_dir (given,
+        # else <fileroot>/logs/<user>/<exp>/<trial>, asserting names and fileroot exist)
+        # and creates it. Initializes empty registries.
         self.gpu_devices = gpu_devices or self._detect_gpus()
 
         # Resolve experiment/trial names (exp_config overwrites direct params)
@@ -183,9 +210,15 @@ class LocalScheduler(Scheduler):
 
     @property
     def n_gpus_per_node(self) -> int:
+        # [FUNCTION DOC]
+        # Property: number of GPU ids managed.
         return len(self.gpu_devices)
 
     def _detect_gpus(self) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Parses the platform visibility env var as integer ids if set (falls
+        # back to [0] with a warning if invalid); otherwise counts /dev device nodes,
+        # defaulting to [0].
         cuda_visible = os.environ.get(current_platform.device_control_env_var)
         if current_platform.device_control_env_var and cuda_visible:
             try:
@@ -201,6 +234,10 @@ class LocalScheduler(Scheduler):
         return list(range(cnt))
 
     def _allocate_gpus(self, num_gpus: int) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Returns num_gpus ids taken round-robin from gpu_devices (advancing a
+        # persistent counter, so allocations may overlap across workers). Returns [] for
+        # 0; raises GPUAllocationError if more are requested than exist.
         if num_gpus == 0:
             return []
 
@@ -218,6 +255,12 @@ class LocalScheduler(Scheduler):
         return allocated
 
     def _get_colocated_gpus(self, target_role: str, worker_idx: int) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Returns the GPU ids of worker worker_idx of target_role. Raises
+        # WorkerNotFoundError if the role is unknown, ValueError if the index is out of
+        # range.
+        # KNOWN ISSUE: WorkerNotFoundError is given a sentence instead of a worker id,
+        # producing a message like "Worker 'Cannot colocate ...' not found".
         if target_role not in self._workers:
             raise WorkerNotFoundError(
                 f"Cannot colocate with role '{target_role}' - role not found"
@@ -232,6 +275,10 @@ class LocalScheduler(Scheduler):
         return target_workers[worker_idx].gpu_devices
 
     def _allocate_ports(self, count: int) -> list[int]:
+        # [FUNCTION DOC]
+        # HELPER: Finds count free ports not already allocated by this scheduler,
+        # records them and returns them; ValueError from the finder becomes
+        # PortAllocationError.
         # Workers are on the same node, so we can directly allocate ports in the scheduler
         try:
             ports = find_free_ports(count, exclude_ports=set(self._allocated_ports))
@@ -241,11 +288,17 @@ class LocalScheduler(Scheduler):
             raise PortAllocationError(str(e)) from e
 
     def _release_ports(self, ports: list[int]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Removes ports from the allocated set.
         for port in ports:
             self._allocated_ports.discard(port)
 
     @staticmethod
     def _is_port_conflict_error(details: str) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if the log text contains a typical "address already in use" /
+        # errno 98/48 / "port ... is in use by another program" message (case-
+        # insensitive).
         lowered = details.lower()
         return (
             "address already in use" in lowered
@@ -257,6 +310,11 @@ class LocalScheduler(Scheduler):
     def _prepare_worker_specs(
         self, role: str, num_workers: int, schedulings: list[SchedulingSpec] | None
     ) -> list[SchedulingSpec]:
+        # [FUNCTION DOC]
+        # HELPER: Expands scheduling specs to one per worker: none given yields a
+        # default spec (1 CPU, 1024MB, 0 GPU, 2 ports, rpc_server cmd) per worker; one
+        # spec is repeated; a list of matching length is used as-is; otherwise raises
+        # WorkerCreationError.
         if not schedulings:
             return [
                 SchedulingSpec(
@@ -287,6 +345,9 @@ class LocalScheduler(Scheduler):
         port: int,
         timeout: float = 60,
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Async. Polls GET /health on host:port every 0.5s (2s per request)
+        # until 200 or timeout seconds; returns True if ready, False on timeout.
         url = f"http://{format_hostport(host, port)}/health"
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -310,6 +371,16 @@ class LocalScheduler(Scheduler):
         target_role: str,
         command: str | None = None,
     ) -> WorkerInfo:
+        # [FUNCTION DOC]
+        # HELPER: Async. Forks worker role/idx next to target worker target_wi via its
+        # guard: allocates one port through /alloc_ports, builds a command running
+        # command (default the rpc_server module) with host 0.0.0.0, that port,
+        # experiment/trial/role/index and name-resolve/fileroot args, POSTs it to /fork,
+        # and waits for the new server's health (killing it via /kill_forked_worker and
+        # raising on timeout). Non-200 or non-success responses and aiohttp errors raise
+        # WorkerCreationError. Allocates extra local ports if the target role's workers
+        # have more than one port. Returns a WorkerInfo with no process, inheriting GPUs
+        # and env vars from the target.
         """Fork a single worker asynchronously.
 
         Parameters
@@ -452,6 +523,9 @@ class LocalScheduler(Scheduler):
         idx: int,
         target_wi: WorkerInfo,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Async. Asks the parent guard to kill forked worker role/idx; logs the
+        # result. Never raises (errors become warnings).
         """Kill a single forked worker via its parent's RPC server."""
         target_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}/kill_forked_worker"
 
@@ -481,6 +555,10 @@ class LocalScheduler(Scheduler):
         target_role: str,
         workers: list[WorkerInfo],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Async. For each given forked worker, derives its index from its id and
+        # asks the matching target worker's guard to kill it, concurrently (30s session
+        # timeout). Warns and returns if the target role is unknown.
         """Cleanup forked workers by calling kill endpoint on parent workers."""
         target_workers = self._workers.get(target_role, [])
         if not target_workers:
@@ -512,6 +590,12 @@ class LocalScheduler(Scheduler):
         target_workers: list[WorkerInfo],
         command: str | None = None,
     ) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: Async. Forks one worker per target worker concurrently (120s session
+        # timeout). If any fail, logs them, kills the successful ones and raises
+        # WorkerCreationError. Otherwise registers the workers under role, records role
+        # as colocated with target_role, pushes configuration to each if exp_config is
+        # set, and returns the new worker ids.
         """Create forked workers concurrently using async requests.
 
         Parameters
@@ -586,6 +670,11 @@ class LocalScheduler(Scheduler):
         target_role: str,
         command: str | None = None,
     ) -> list[str]:
+        # [FUNCTION DOC]
+        # Synchronously forks one new worker per worker of target_role (same GPUs/nodes)
+        # by running the async creation; optional command replaces the rpc_server
+        # module. Returns the new worker ids. Raises WorkerNotFoundError for an unknown
+        # target; on any failure removes partial registrations and re-raises.
         """Fork new worker processes from existing workers.
 
         Creates new worker processes by forking from existing workers of the target role.
@@ -627,6 +716,23 @@ class LocalScheduler(Scheduler):
             raise
 
     def create_workers(self, job: Job, *args, **kwargs) -> list[str]:
+        # [FUNCTION DOC]
+        # Creates the workers of a Job and returns their ids. Raises WorkerCreationError
+        # if the role exists or replicas is 0. Colocation strategy: requires an existing
+        # target role with equal replica count; with fork=True forks new processes,
+        # otherwise reuses the target's worker ids; records the colocation mapping.
+        # Separation strategy: for each worker allocates GPUs, builds env (spec env
+        # vars, visibility var set to its GPUs, thread-count vars from CPU count, TMS
+        # offload vars if enabled, spec env vars again to win), validates the spec
+        # command (required, must not contain --port), and launches it via
+        # run_with_streaming_logs with an allocated --port plus
+        # experiment/trial/role/index/ name-resolve/fileroot args (a leading "python" is
+        # replaced by the current interpreter), logging to <role>.log and merged.log. If
+        # the process dies within 0.1s, reads the log tail; port conflicts are retried
+        # with new ports up to the retry limit, other exits raise WorkerCreationError.
+        # Registers all workers, then configures each if exp_config is set. Any failure
+        # kills already-started workers; non-scheduler errors are wrapped in
+        # WorkerCreationError. Other strategy types raise ValueError.
         """Create worker subprocesses.
 
         Parameters
@@ -915,6 +1021,12 @@ class LocalScheduler(Scheduler):
         return worker_ids
 
     def get_workers(self, role: str, timeout: float | None = None) -> list[Worker]:
+        # [FUNCTION DOC]
+        # Returns the Worker records of role once all are healthy. Colocated (non-
+        # forked) roles delegate to the target role. Raises WorkerNotFoundError for
+        # unknown roles, WorkerFailedError (with log tail) if a process has exited, and
+        # WorkerTimeoutError if not all /health checks succeed within timeout (default
+        # startup_timeout), polling every health_check_interval.
         """Get workers and wait for them to be ready.
 
         Parameters
@@ -996,6 +1108,8 @@ class LocalScheduler(Scheduler):
         return [w.worker for w in workers]
 
     def _is_worker_ready(self, worker_info: WorkerInfo) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if GET /health on the worker's first port returns 200 within 2s.
         port = int(worker_info.worker.worker_ports[0])
         url = f"http://{format_hostport(worker_info.worker.ip, port)}/health"
 
@@ -1006,6 +1120,14 @@ class LocalScheduler(Scheduler):
             return False
 
     def _configure_worker(self, worker_info: WorkerInfo, worker_rank: int):
+        # [FUNCTION DOC]
+        # HELPER: Busy-waits (0.1s) until the worker is healthy, then POSTs the
+        # serialized {config: exp_config, role, rank} to /configure (300s timeout).
+        # 400/500/other statuses raise WorkerConfigurationError; connection errors raise
+        # WorkerFailedError if the process died, else RPCConnectionError; timeouts and
+        # unexpected errors raise WorkerConfigurationError.
+        # KNOWN ISSUE: The readiness wait has no timeout, so a worker that never becomes
+        # healthy hangs the scheduler forever.
         while not self._is_worker_ready(worker_info):
             time.sleep(0.1)
 
@@ -1070,6 +1192,9 @@ class LocalScheduler(Scheduler):
             ) from e
 
     def _check_worker_health(self, role: str):
+        # [FUNCTION DOC]
+        # HELPER: Raises WorkerFailedError (with log tail) if any owned process of role
+        # has exited; forked workers and unknown roles are skipped.
         if role not in self._workers:
             return
 
@@ -1087,6 +1212,14 @@ class LocalScheduler(Scheduler):
                 )
 
     def delete_workers(self, role: str | None = None, reverse_order: bool = False):
+        # [FUNCTION DOC]
+        # Deletes one role or (role None) all roles, colocated ones first. For colocated
+        # roles, forked workers' ports are released and the registration removed, while
+        # plain colocated roles only drop the mapping. For normal roles, kills all
+        # worker processes (optionally in reverse rank order so rank 0 is signalled
+        # last) and removes the role. Unknown roles log a warning.
+        # KNOWN ISSUE: Deleting a forked role does not ask the parent guard to kill the
+        # forked processes; they live until the parent worker is cleaned up.
         """Delete workers and clean up resources.
 
         Parameters
@@ -1143,6 +1276,12 @@ class LocalScheduler(Scheduler):
         logger.info(f"Successfully deleted workers for role '{role}'")
 
     def _cleanup_workers(self, workers: list[WorkerInfo]):
+        # [FUNCTION DOC]
+        # HELPER: Tears down a batch of workers: releases their ports, then starts one
+        # daemon thread per worker owning a process (in list order) that kills its
+        # process tree gracefully (SIGTERM, wait up to 3s, then SIGKILL), and joins each
+        # thread for up to 10s, warning about stragglers. Parallel teardown lets all
+        # ranks reach their destroy-time barrier together.
         """Tear down a batch of workers with coordinated teardown semantics.
 
         The previous implementation iterated ``workers`` serially and called
@@ -1203,6 +1342,8 @@ class LocalScheduler(Scheduler):
         # rank-0 is the last thread to be started, which keeps the
         # "rank-0 dies last" property while staying non-blocking.
         def _finalize(worker_info: WorkerInfo) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Thread body killing one worker's process tree, logging any error.
             try:
                 kill_process_tree(worker_info.process.pid, timeout=3, graceful=True)
                 logger.debug(f"Cleaned up worker {worker_info.worker.id}")
@@ -1237,6 +1378,9 @@ class LocalScheduler(Scheduler):
                 )
 
     def _read_log_tail(self, log_file: str, lines: int = 50) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the last lines (default 50) of log_file, or a placeholder
+        # message if it cannot be read.
         try:
             with open(log_file) as f:
                 all_lines = f.readlines()
@@ -1245,6 +1389,12 @@ class LocalScheduler(Scheduler):
             return f"[Could not read log file: {e}]"
 
     async def set_worker_env(self, worker_id: str, env: dict[str, str]) -> None:
+        # [FUNCTION DOC]
+        # Async. Verifies the worker is alive, then (if env non-empty) POSTs {"env":
+        # env} to its /set_env endpoint (30s timeout). Non-200 raises SchedulerError;
+        # connection errors raise RPCConnectionError; timeouts raise SchedulerError.
+        # KNOWN ISSUE: SchedulerError is constructed with two positional arguments, so
+        # the message is a tuple-like string rather than a formatted message.
         """Set environment variables on a worker before engine creation."""
         worker_info = self._verify_worker_alive(worker_id)
         if not env:
@@ -1287,6 +1437,15 @@ class LocalScheduler(Scheduler):
         *args,
         **kwargs,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Async. Verifies the worker is alive, requires engine to be an import-path
+        # string (EngineCreationError otherwise), and POSTs engine, engine_name (default
+        # worker_id) and serialized init args/kwargs to /create_engine (300s timeout).
+        # Returns the response's "result" on 200. 400 raises EngineImportError if the
+        # error mentions import failure, else EngineCreationError; 500 and other
+        # statuses raise EngineCreationError. Connection errors raise WorkerFailedError
+        # if the process died, else RPCConnectionError; timeouts and unexpected errors
+        # raise EngineCreationError.
         """Create an engine instance on a remote worker.
 
         The engine parameter is a string import path (e.g., "areal.engine.fsdp_engine.FSDPPPOActor")
@@ -1423,6 +1582,15 @@ class LocalScheduler(Scheduler):
         retry_delay: float = 1.0,
         **kwargs,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Synchronously calls method on engine engine_name (default worker_id) of a
+        # worker via POST /call with serialized args/kwargs and rpc_meta, http_timeout
+        # seconds per request. Before each attempt raises WorkerFailedError if the
+        # process died. 200 returns the deserialized result; 400/500 raise
+        # EngineCallError immediately; 503, other statuses, connection errors and
+        # timeouts are retried up to max_retries with exponential backoff starting at
+        # retry_delay, then EngineCallError. Raises WorkerNotFoundError for unknown
+        # workers.
         """Call a method on an engine.
 
         Parameters
@@ -1552,6 +1720,9 @@ class LocalScheduler(Scheduler):
         retry_delay: float = 1.0,
         **kwargs,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Async equivalent of call_engine using a fresh aiohttp session per attempt,
+        # with the same status handling, retry/backoff policy and error types.
         """Async version of call_engine for calling engine methods asynchronously.
 
         Parameters
@@ -1716,6 +1887,9 @@ class LocalScheduler(Scheduler):
         )
 
     def _find_worker_by_id(self, worker_id: str) -> WorkerInfo | None:
+        # [FUNCTION DOC]
+        # HELPER: Linear search over all roles for the WorkerInfo with the given id;
+        # None if none.
         for workers in self._workers.values():
             for worker_info in workers:
                 if worker_info.worker.id == worker_id:
@@ -1723,6 +1897,9 @@ class LocalScheduler(Scheduler):
         return None
 
     def _verify_worker_alive(self, worker_id: str) -> WorkerInfo:
+        # [FUNCTION DOC]
+        # HELPER: Returns the WorkerInfo; raises WorkerNotFoundError if unknown,
+        # WorkerFailedError (with log tail) if its process exited.
         worker_info = self._find_worker_by_id(worker_id)
         if worker_info is None:
             raise WorkerNotFoundError(worker_id)
@@ -1741,6 +1918,10 @@ class LocalScheduler(Scheduler):
     def _handle_call_response(
         self, response, worker_id: str, method: str, attempt: int
     ):
+        # [FUNCTION DOC]
+        # HELPER: Interprets a requests response from /call: returns (deserialized
+        # result, False, None) on 200; raises EngineCallError on 400/500; returns (None,
+        # True, message) for 503 and other statuses so the caller retries.
         if response.status_code == 200:
             result = response.json().get("result")
             # Deserialize result (convert SerializedTensor dicts back to tensors)
@@ -1764,6 +1945,10 @@ class LocalScheduler(Scheduler):
     def _handle_call_exception(
         self, e: Exception, worker_info: WorkerInfo, worker_id: str
     ) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Maps an exception from a /call attempt to a retry message: connection
+        # errors (raising WorkerFailedError if the process died), timeouts and others;
+        # re-raises EngineCallError.
         if isinstance(e, requests.exceptions.ConnectionError):
             # Check if worker died (forked workers have process=None)
             if (
@@ -1785,6 +1970,9 @@ class LocalScheduler(Scheduler):
             return f"Unexpected error: {e}"
 
     def __del__(self):
+        # [FUNCTION DOC]
+        # Best-effort deletion of all workers on garbage collection; errors are
+        # swallowed.
         try:
             self.delete_workers()
         except Exception:
