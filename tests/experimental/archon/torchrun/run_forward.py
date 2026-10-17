@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Standalone script (torchrun or plain python) checking ArchonEngine.forward_batch on a
+# real Qwen3-0.6B checkpoint (local storage path or HF hub id via get_model_path):
+# builds an engine, feeds the same random padded batch on all ranks and checks output
+# shape and cross-rank consistency. Prints progress; no result file.
+# KNOWN ISSUE: The module docstring references tests/torchrun/run_archon_forward.py, but
+# the file lives at tests/experimental/archon/torchrun/run_forward.py.
 """Test script for Archon Engine forward_batch functionality.
 
 Run with torchrun for multi-GPU testing:
@@ -33,6 +40,10 @@ MODEL_PATHS = {
 
 
 def setup_distributed_environment():
+    # [FUNCTION DOC]
+    # HELPER: If no process group exists, initializes NCCL via tcp init using RANK,
+    # WORLD_SIZE, MASTER_ADDR, MASTER_PORT env vars (defaults 0, 1, localhost, 29500)
+    # and sets the current device to the global rank (assumes single node).
     """Set up distributed environment for torchrun."""
     if dist.is_initialized():
         return
@@ -56,6 +67,12 @@ def mock_input(
     min_seqlen: int = 4,
     max_seqlen: int = 16,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Creates a padded batch on device: random lengths in [min_seqlen,
+    # max_seqlen) per sample, input_ids random in [10000, 50000) of shape [batch_size,
+    # max_len], a bool attention_mask that is True for valid prefix positions, and
+    # padding filled with id 0. Returns dict with input_ids and attention_mask. Uses
+    # global RNG; int(max()) syncs GPU.
     """Create mock padded input data for testing."""
     pad_token_id = 0
     seqlens = torch.randint(
@@ -79,6 +96,13 @@ def mock_input(
 
 
 def make_engine(model_type: str, mb_spec: MicroBatchSpec):
+    # [FUNCTION DOC]
+    # HELPER: Builds a TrainEngineConfig (backend "archon:d1", no optimizer, given
+    # mb_spec, model path from MODEL_PATHS[model_type]), prints it, creates an
+    # ArchonEngine, creates its process group with data_parallel_size = world size, and
+    # initializes it with a small FinetuneSpec. Returns the engine.
+    # KNOWN ISSUE: backend string says d1 while the ParallelStrategy uses
+    # data_parallel_size=world_size; with >1 ranks these disagree.
     """Create and initialize a ArchonEngine."""
     config = TrainEngineConfig(
         backend="archon:d1",
@@ -104,6 +128,13 @@ def make_engine(model_type: str, mb_spec: MicroBatchSpec):
 
 
 def test_archon_forward(model_type: str):
+    # [FUNCTION DOC]
+    # Main test body: sets up distributed, seeds 42, builds the engine with 2 micro-
+    # batches, rank 0 creates a 4-sample input that is broadcast as objects to all ranks
+    # and moved to the local device, runs engine.eval() then forward_batch concatenating
+    # micro-batch outputs, asserts the first dim equals batch size, and with >1 ranks
+    # all-gathers logprobs and prints a warning (does not fail) if ranks differ.
+    # Destroys the engine, then barriers and destroys the process group.
     """Test ArchonEngine forward_batch."""
     setup_distributed_environment()
 
@@ -180,6 +211,8 @@ def test_archon_forward(model_type: str):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --model_type (only "qwen3") and runs test_archon_forward.
     parser = argparse.ArgumentParser(description="Run Archon Engine Forward Test")
     parser.add_argument(
         "--model_type",

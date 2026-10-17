@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# torchrun script for Qwen3 parallelization smoke tests on tiny random models (from
+# dist_utils): dense with TP, MoE with TP, EP, TP+EP, each optionally with
+# torch.compile. Models are built on every rank, parallelized with parallelize_qwen3
+# (bf16 params, fp32 reduce, loss parallel), run forward+backward on packed random input
+# and are checked for NaN/Inf outputs and missing gradients. Selected via --test_type
+# from TEST_REGISTRY; rank 0 writes "Passed"/"Failed" to --output.
 """Qwen3 parallelization tests for dense and MoE models.
 
 This script tests forward/backward passes with various parallelization strategies:
@@ -51,6 +58,9 @@ from areal.experimental.models.archon.qwen3 import Qwen3Model, parallelize_qwen3
 
 
 def get_parallel_dims_tp_only(world_size: int, tp: int) -> ArchonParallelDims:
+    # [FUNCTION DOC]
+    # HELPER: Returns ArchonParallelDims with tp as given, dp_shard = world_size // tp,
+    # cp 1, ep 1 on CUDA.
     """Get parallel dims for TP only configuration (for dense models)."""
     dp_shard = world_size // tp
     return ArchonParallelDims(
@@ -64,6 +74,9 @@ def get_parallel_dims_tp_only(world_size: int, tp: int) -> ArchonParallelDims:
 
 
 def get_parallel_dims_ep_only(world_size: int, ep: int) -> ArchonParallelDims:
+    # [FUNCTION DOC]
+    # HELPER: Returns ArchonParallelDims with dp_shard = world_size, tp 1, cp 1, ep as
+    # given (EP borrows from the dp_shard dimension).
     """Get parallel dims for EP only configuration (for MoE models)."""
     return ArchonParallelDims(
         dp_shard=world_size,
@@ -76,6 +89,9 @@ def get_parallel_dims_ep_only(world_size: int, ep: int) -> ArchonParallelDims:
 
 
 def get_parallel_dims_tp_ep(world_size: int, tp: int, ep: int) -> ArchonParallelDims:
+    # [FUNCTION DOC]
+    # HELPER: Returns ArchonParallelDims with dp_shard = world_size // tp, given tp and
+    # ep, cp 1.
     """Get parallel dims for TP + EP configuration (for MoE models)."""
     dp_shard = world_size // tp
     return ArchonParallelDims(
@@ -100,6 +116,12 @@ def create_and_parallelize_model(
     enable_compile: bool = False,
     seed: int = 42,
 ) -> Qwen3Model:
+    # [FUNCTION DOC]
+    # HELPER: Seeds the RNG, builds Qwen3Model(model_args), initializes weights and
+    # buffers on device, moves it to device and applies parallelize_qwen3 in place
+    # (bfloat16 params, float32 reductions, loss_parallel True, no CPU offload, default
+    # reshard policy, no activation checkpointing, optional torch.compile). Returns the
+    # model.
     """Create model, initialize weights, and apply parallelization."""
     torch.manual_seed(seed)
     model = Qwen3Model(model_args)
@@ -134,6 +156,14 @@ def run_forward_backward_test(
     test_name: str,
     multi_microbatch: bool = False,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Zeroes grads, then for each micro-batch config, a list of (num_seqs, seq_len)
+    # pairs ((4,8) by default, or (4,16) then (8,8) when multi_microbatch so cu_seqlens
+    # shape changes at fixed 64 tokens), creates seeded packed input (seed 123+index),
+    # runs the model, returns False if output has NaN/Inf, and backpropagates
+    # output.sum() to accumulate grads. Finally runs validate_gradients and returns
+    # False on any missing gradient, else True. Logs progress on rank 0; loss.item()
+    # syncs GPU.
     """Run forward and backward pass, validate output and gradients.
 
     Args:
@@ -214,6 +244,9 @@ def run_forward_backward_test(
 
 
 def run_dense_tp_forward_backward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Dense model with TP = world_size (no compile); runs the forward/backward check,
+    # barriers and has rank 0 write the result. Returns success.
     """Run dense model with TP forward/backward test."""
     print_rank0("\n=== Dense TP Forward/Backward Test ===")
 
@@ -245,6 +278,8 @@ def run_dense_tp_forward_backward(output: str | None = None) -> bool:
 
 
 def run_dense_tp_compile_forward_backward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Same as the dense TP test but with torch.compile enabled.
     """Run dense model with TP + torch.compile forward/backward test."""
     print_rank0("\n=== Dense TP + Compile Forward/Backward Test ===")
 
@@ -283,6 +318,9 @@ def run_dense_tp_compile_forward_backward(output: str | None = None) -> bool:
 
 
 def run_moe_tp_forward_backward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # MoE model (4 experts) with TP = world_size and EP 1, no compile; checks and writes
+    # the result like the dense tests.
     """Run MoE model with TP forward/backward test."""
     print_rank0("\n=== MoE TP Forward/Backward Test ===")
 
@@ -317,6 +355,9 @@ def run_moe_tp_forward_backward(output: str | None = None) -> bool:
 
 
 def run_moe_ep_forward_backward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # MoE model with 2*world_size experts and EP = world_size (TP 1, dp_shard =
+    # world_size); runs the check and writes the result.
     """Run MoE model with EP only forward/backward test."""
     print_rank0("\n=== MoE EP Forward/Backward Test ===")
 
@@ -351,6 +392,9 @@ def run_moe_ep_forward_backward(output: str | None = None) -> bool:
 
 
 def run_moe_tp_ep_forward_backward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # MoE model with 2*world_size experts, TP = EP = world_size (dp_shard 1); runs the
+    # check and writes the result.
     """Run MoE model with TP + EP forward/backward test."""
     print_rank0("\n=== MoE TP+EP Forward/Backward Test ===")
 
@@ -385,6 +429,9 @@ def run_moe_tp_ep_forward_backward(output: str | None = None) -> bool:
 
 
 def run_moe_tp_compile_forward_backward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # MoE model (4 experts) with TP = world_size and torch.compile enabled; runs the
+    # check and writes the result.
     """Run MoE model with TP + torch.compile forward/backward test."""
     print_rank0("\n=== MoE TP + Compile Forward/Backward Test ===")
 
@@ -421,6 +468,11 @@ def run_moe_tp_compile_forward_backward(output: str | None = None) -> bool:
 
 
 def run_moe_tp_ep_compile_forward_backward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Production-like MoE config: 4 experts, tp 2, ep 2, dp_shard = world_size // 2,
+    # with torch.compile and multi_microbatch=True to exercise dynamic shapes. Only
+    # warns (does not skip) when world_size < 4, in which case FSDP sharding is not
+    # exercised. Barriers and writes the result on rank 0; returns success.
     """Run MoE model with TP + EP + torch.compile forward/backward test.
 
     This test covers the scenario where TP, EP, and torch.compile are all enabled,
@@ -506,6 +558,11 @@ TEST_REGISTRY = {
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --test_type (required) and --output, initializes NCCL, sets the CUDA device
+    # to the global rank, runs the registered test, barriers and prints a summary; rank
+    # 0 writes "Failed" on failure or exception (exceptions re-raised after a
+    # traceback). Always destroys the process group.
     parser = argparse.ArgumentParser(description="Qwen3 Parallelize Tests")
     parser.add_argument(
         "--test_type",

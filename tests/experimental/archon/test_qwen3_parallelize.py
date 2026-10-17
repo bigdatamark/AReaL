@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Multi-GPU pytest wrappers for Qwen3 (dense and MoE) parallelization tests. Each test
+# launches torchrun/run_qwen3_parallelize.py as a subprocess with a test_type name and
+# checks a result file containing "Passed". Whole module is skipped when CUDA is absent;
+# individual tests skip when too few devices are present.
 """Tests for Qwen3 parallelization (dense and MoE).
 
 These tests verify forward/backward passes with various parallelization strategies:
@@ -34,6 +39,13 @@ pytestmark = pytest.mark.skipif(
 
 
 def _run_qwen3_parallelize_test(n_gpus: int, test_type: str, output: str):
+    # [FUNCTION DOC]
+    # HELPER: Picks a free port, runs torchrun (single node, n_gpus processes, localhost
+    # master) on run_qwen3_parallelize.py with --test_type and --output, capturing
+    # output. Inputs: n_gpus (int), test_type (registry key in the runner), output (file
+    # path str). On non-zero exit calls pytest.fail with the subprocess stderr. Then
+    # reads the output file and asserts its stripped content equals "Passed". Side
+    # effects: spawns processes, uses GPUs, reads a file.
     """Run qwen3 parallelize test with torchrun.
 
     Args:
@@ -75,6 +87,8 @@ def _run_qwen3_parallelize_test(n_gpus: int, test_type: str, output: str):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_dense_qwen3_tp2_forward_backward(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with <2 devices; runs "dense_tp_forward_backward" on 2 GPUs.
     """Test dense Qwen3 with TP=2 forward/backward (2 GPUs)."""
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
@@ -85,6 +99,8 @@ def test_dense_qwen3_tp2_forward_backward(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_dense_qwen3_tp2_compile_forward_backward(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with <2 devices; runs "dense_tp_compile_forward_backward" on 2 GPUs.
     """Test dense Qwen3 with TP=2 + torch.compile forward/backward (2 GPUs)."""
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
@@ -100,6 +116,8 @@ def test_dense_qwen3_tp2_compile_forward_backward(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_moe_qwen3_tp2_forward_backward(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with <2 devices; runs "moe_tp_forward_backward" on 2 GPUs.
     """Test MoE Qwen3 with TP=2 forward/backward (2 GPUs)."""
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
@@ -110,6 +128,8 @@ def test_moe_qwen3_tp2_forward_backward(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_moe_qwen3_ep2_forward_backward(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with <2 devices; runs "moe_ep_forward_backward" on 2 GPUs.
     """Test MoE Qwen3 with EP=2 forward/backward (2 GPUs)."""
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
@@ -120,6 +140,9 @@ def test_moe_qwen3_ep2_forward_backward(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_moe_qwen3_tp2_ep2_forward_backward(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with <2 devices; runs "moe_tp_ep_forward_backward" on 2 GPUs (TP and EP
+    # share the same 2 ranks).
     """Test MoE Qwen3 with TP=2, EP=2 forward/backward (2 GPUs)."""
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
@@ -130,6 +153,8 @@ def test_moe_qwen3_tp2_ep2_forward_backward(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_moe_qwen3_tp2_compile_forward_backward(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with <2 devices; runs "moe_tp_compile_forward_backward" on 2 GPUs.
     """Test MoE Qwen3 with TP=2 + torch.compile forward/backward (2 GPUs)."""
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
@@ -140,6 +165,9 @@ def test_moe_qwen3_tp2_compile_forward_backward(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_moe_qwen3_tp2_ep2_compile_forward_backward(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Skips with <4 devices; runs "moe_tp_ep_compile_forward_backward" on 4 GPUs so FSDP
+    # sharding is exercised together with TP=2, EP=2 and torch.compile.
     """Test MoE Qwen3 with TP=2 + EP=2 + torch.compile forward/backward (4 GPUs).
 
     This test covers the production scenario where TP, EP, and torch.compile

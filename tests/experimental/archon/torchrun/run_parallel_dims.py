@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# torchrun script checking ArchonParallelDims device-mesh construction: EP mesh without
+# expert TP, 2D ep_tp mesh when etp == tp, and inclusion of the PP dimension. Selected
+# with --test_type from TEST_REGISTRY; rank 0 writes "Passed"/"Failed" to --output.
+# Checks print diagnostics on rank 0 and accumulate a success flag instead of asserting
+# (except world-size preconditions).
 """Distributed tests for ArchonParallelDims mesh building.
 
 These tests require a distributed environment (torchrun) because
@@ -32,6 +38,11 @@ from areal.experimental.models.archon import ArchonParallelDims
 
 
 def test_ep_mesh_when_etp_disabled(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Requires world_size 2 (assert). Builds ArchonParallelDims(dp_shard 1, tp 2, cp 1,
+    # ep 2, etp 1) and checks ep_enabled True, etp_enabled False, the "ep" mesh exists
+    # and is 1D, and the "ep_tp" mesh is None. Barriers, rank 0 writes the result to
+    # output if given; returns success.
     """Test that ep mesh is 1D and ep_tp mesh is None when etp=1.
 
     Configuration: dp_shard=1, tp=2, cp=1, ep=2, etp=1 (2 GPU)
@@ -109,6 +120,12 @@ def test_ep_mesh_when_etp_disabled(output: str | None = None) -> bool:
 
 
 def test_etp_mesh_is_2d(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Requires world_size 4. Builds dims (dp_shard 2, tp 2, cp 1, ep 2, etp 2) and
+    # checks ep_enabled and etp_enabled, "ep" and "tp" meshes exist and are 1D, and
+    # "ep_tp" exists, is 2D, has dim names ("ep", "tp") and supports indexing sub-meshes
+    # by name (regression for a placements/ndim mismatch). Barriers, writes result on
+    # rank 0, returns success.
     """Test that ep_tp mesh is 2D when etp=tp.
 
     Configuration: dp_shard=2, tp=2, cp=1, ep=2, etp=2 (4 GPU)
@@ -237,6 +254,11 @@ def test_etp_mesh_is_2d(output: str | None = None) -> bool:
 
 
 def test_pp_mesh(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Requires world_size 4. Builds dims (pp 2, dp_shard 1, tp 2, cp 1) and checks
+    # pp_enabled, context_and_model_parallel_size == cp*tp*pp, world mesh dim names
+    # ("pp", "dp_shard", "cp", "tp"), a 1D pp mesh of size 2, and existence of dp_shard
+    # and tp meshes. Barriers, writes result on rank 0, returns success.
     """Test that PP mesh dimension is correctly included.
 
     Configuration: pp=2, dp_shard=1, tp=2, cp=1 (4 GPU)
@@ -349,6 +371,11 @@ TEST_REGISTRY = {
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --test_type (required) and --output, initializes NCCL, sets the CUDA device
+    # to the global rank, runs the selected test, barriers and prints a summary; on
+    # failure or exception rank 0 writes "Failed" (exceptions are re-raised after
+    # printing a traceback). Always destroys the process group.
     parser = argparse.ArgumentParser(description="Parallel Dims Mesh Tests")
     parser.add_argument(
         "--test_type",

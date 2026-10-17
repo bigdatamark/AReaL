@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests that Archon <-> HF weight conversion used for weight sync is complete and
+# correct: meta-device completeness/shape checks for dense and (slow) MoE models loaded
+# from local model paths in tests.experimental.archon.utils, a CUDA value-match test
+# against a real HF checkpoint, and CPU tests that per-parameter convert_single_to_hf
+# (used by update_weights_from_dist) agrees with batch to_hf. Defines mock adapter
+# configs and small CPU model fixtures.
 """Tests for weight synchronization and completeness verification.
 
 These tests verify:
@@ -26,6 +33,9 @@ from areal.experimental.models.archon.qwen3 import Qwen3StateDictAdapter
 
 
 class MockDenseConfig:
+    # [CLASS DOC]
+    # HELPER: Adapter config stub for a dense Qwen3 (model_type "qwen3", no experts,
+    # untied embeddings).
     """Mock Qwen3 dense model config."""
 
     model_type = "qwen3"
@@ -34,6 +44,9 @@ class MockDenseConfig:
 
 
 class MockMoEConfig:
+    # [CLASS DOC]
+    # HELPER: Adapter config stub for Qwen3 MoE (model_type "qwen3_moe", 4 local
+    # experts, untied embeddings); expert count matches small_moe_model_args.
     """Mock Qwen3 MoE model config."""
 
     model_type = "qwen3_moe"
@@ -48,6 +61,9 @@ class MockMoEConfig:
 
 @pytest.fixture
 def small_dense_model_args():
+    # [FUNCTION DOC]
+    # HELPER: Fixture returning tiny dense Qwen3ModelArgs (dim 64, FFN 128, 4 heads/2
+    # KV, head_dim 16, 2 layers, vocab 1000, SDPA, MoE off).
     """Create small dense model args for CPU testing."""
     from areal.experimental.models.archon.qwen3 import Qwen3ModelArgs
 
@@ -67,6 +83,9 @@ def small_dense_model_args():
 
 @pytest.fixture
 def small_moe_model_args():
+    # [FUNCTION DOC]
+    # HELPER: Fixture returning tiny MoE Qwen3ModelArgs (same dims as dense,
+    # moe_inter_dim 128, 4 experts top-2, every layer MoE).
     """Create small MoE model args for CPU testing."""
     from areal.experimental.models.archon.moe import MoEArgs
     from areal.experimental.models.archon.qwen3 import Qwen3ModelArgs
@@ -90,6 +109,9 @@ def small_moe_model_args():
 
 @pytest.fixture
 def small_dense_model(small_dense_model_args):
+    # [FUNCTION DOC]
+    # HELPER: Fixture building a Qwen3Model from small_dense_model_args on CPU with
+    # initialized weights and CPU buffers.
     """Create and initialize small dense model on CPU."""
     from areal.experimental.models.archon.qwen3 import Qwen3Model
 
@@ -101,6 +123,8 @@ def small_dense_model(small_dense_model_args):
 
 @pytest.fixture
 def small_moe_model(small_moe_model_args):
+    # [FUNCTION DOC]
+    # HELPER: Fixture building and initializing the tiny MoE Qwen3Model on CPU.
     """Create and initialize small MoE model on CPU."""
     from areal.experimental.models.archon.qwen3 import Qwen3Model
 
@@ -112,12 +136,16 @@ def small_moe_model(small_moe_model_args):
 
 @pytest.fixture
 def dense_adapter():
+    # [FUNCTION DOC]
+    # HELPER: Fixture returning Qwen3StateDictAdapter(MockDenseConfig()).
     """Create adapter for dense model."""
     return Qwen3StateDictAdapter(MockDenseConfig())
 
 
 @pytest.fixture
 def moe_adapter():
+    # [FUNCTION DOC]
+    # HELPER: Fixture returning Qwen3StateDictAdapter(MockMoEConfig()).
     """Create adapter for MoE model."""
     return Qwen3StateDictAdapter(MockMoEConfig())
 
@@ -128,6 +156,9 @@ def moe_adapter():
 
 
 class TestWeightCompletenessWithMetaDevice:
+    # [CLASS DOC]
+    # Dense-model completeness checks that instantiate HF and Archon models on the meta
+    # device (no real memory) for every available entry in DENSE_MODEL_PATHS.
     """Tests that verify weight completeness using meta device (no GPU memory).
 
     These tests create models on meta device to check key names and shapes
@@ -140,6 +171,14 @@ class TestWeightCompletenessWithMetaDevice:
 
     @pytest.fixture(scope="class")
     def model_configs_and_specs(self):
+        # [FUNCTION DOC]
+        # HELPER: Class-scoped fixture: for each non-None DENSE_MODEL_PATHS entry, loads
+        # the HF AutoConfig (trust_remote_code) and the Archon model spec via
+        # get_model_spec; returns {model_type: {config, spec, path}}. Reads config files
+        # from disk.
+        # KNOWN ISSUE: Any exception is silently swallowed, so if no model is available
+        # the dependent tests iterate over nothing and pass vacuously instead of
+        # skipping.
         """Load configs and specs for dense model types only."""
         from transformers import AutoConfig
 
@@ -164,6 +203,11 @@ class TestWeightCompletenessWithMetaDevice:
         return results
 
     def test_all_archon_params_have_hf_mapping(self, model_configs_and_specs):
+        # [FUNCTION DOC]
+        # For each model: builds Archon model args from the HF config (is_critic False),
+        # builds the model on meta device, and for each named parameter feeds an empty
+        # CPU tensor of the same shape to adapter.convert_single_to_hf; asserts no
+        # parameter yields an empty list.
         """Verify that ALL Archon model parameters can be converted to HF format.
 
         This is the lightweight equivalent of test_archon_all_params_converted.
@@ -199,6 +243,12 @@ class TestWeightCompletenessWithMetaDevice:
             )
 
     def test_hf_weight_keys_bidirectional_completeness(self, model_configs_and_specs):
+        # [FUNCTION DOC]
+        # For each model: gets HF state-dict key names from a meta-device
+        # AutoModelForCausalLM (skips the model if that fails), collects all HF names
+        # produced by converting every Archon parameter, and asserts no HF key is
+        # missing (ignoring rotary_emb keys and lm_head.weight when embeddings are tied)
+        # and no extra key is produced.
         """Verify bidirectional completeness: HF keys <-> Archon keys.
 
         This is the lightweight equivalent of test_archon_hf_weight_completeness.
@@ -261,6 +311,10 @@ class TestWeightCompletenessWithMetaDevice:
             )
 
     def test_weight_shapes_match_hf(self, model_configs_and_specs):
+        # [FUNCTION DOC]
+        # For each model: compares shapes of HF tensors produced by convert_single_to_hf
+        # against the meta HF model's state-dict shapes for names present in both;
+        # asserts no mismatch.
         """Verify that converted weight shapes match HF model shapes.
 
         This is the lightweight equivalent of test_archon_hf_weight_shape_match.
@@ -317,6 +371,9 @@ class TestWeightCompletenessWithMetaDevice:
 
 @pytest.mark.slow
 class TestMoEWeightCompletenessWithMetaDevice:
+    # [CLASS DOC]
+    # Slow-marked MoE variant of the meta-device completeness checks over
+    # MOE_MODEL_PATHS; models are built once in a class-scoped fixture.
     """MoE-specific weight completeness tests using meta device.
 
     These tests verify MoE models (qwen3_moe) separately from dense models
@@ -328,6 +385,13 @@ class TestMoEWeightCompletenessWithMetaDevice:
 
     @pytest.fixture(scope="class")
     def moe_models_and_data(self):
+        # [FUNCTION DOC]
+        # HELPER: Class-scoped fixture: for each available MoE model path loads the
+        # config and spec, builds the HF model and Archon model on meta device, records
+        # HF key names and shapes, and builds the adapter; returns a dict per model_type
+        # with those objects.
+        # KNOWN ISSUE: Exceptions are swallowed silently, so tests can pass with zero
+        # models.
         """Load configs, create models on meta device, and prepare test data.
 
         This fixture creates both HF and Archon models once for all tests,
@@ -380,6 +444,9 @@ class TestMoEWeightCompletenessWithMetaDevice:
         return results
 
     def test_all_archon_params_have_hf_mapping(self, moe_models_and_data):
+        # [FUNCTION DOC]
+        # Asserts every parameter of each prebuilt MoE Archon model converts to at least
+        # one HF tensor.
         """Verify that ALL Archon model parameters can be converted to HF format."""
         for model_type, info in moe_models_and_data.items():
             archon_model = info["archon_model"]
@@ -399,6 +466,9 @@ class TestMoEWeightCompletenessWithMetaDevice:
             )
 
     def test_hf_weight_keys_bidirectional_completeness(self, moe_models_and_data):
+        # [FUNCTION DOC]
+        # Same bidirectional key-set check as the dense version, using the precomputed
+        # HF key names of each MoE model.
         """Verify bidirectional completeness: HF keys <-> Archon keys."""
         for model_type, info in moe_models_and_data.items():
             config = info["config"]
@@ -438,6 +508,8 @@ class TestMoEWeightCompletenessWithMetaDevice:
             )
 
     def test_weight_shapes_match_hf(self, moe_models_and_data):
+        # [FUNCTION DOC]
+        # Same shape comparison as the dense version, using precomputed MoE HF shapes.
         """Verify that converted weight shapes match HF model shapes."""
         for model_type, info in moe_models_and_data.items():
             archon_model = info["archon_model"]
@@ -482,6 +554,13 @@ cuda_required = pytest.mark.skipif(
 
 @cuda_required
 def test_archon_weights_match_hf():
+    # [FUNCTION DOC]
+    # CUDA-only. Calls setup_environment, loads the "qwen2" model path as both HF and
+    # Archon models in bfloat16, and for a fixed list of Archon->HF key pairs
+    # (embeddings, layer 0 attention/MLP, final norm, output) asserts equal shapes and
+    # max abs difference < 1e-5; pairs missing from either model are skipped. Destroys
+    # the default process group if one was initialized. Side effects: GPU memory, model
+    # loading from disk, distributed teardown.
     """Verify Archon weight conversion from HuggingFace is correct.
 
     This test loads actual models and compares weights to ensure
@@ -543,6 +622,9 @@ def test_archon_weights_match_hf():
 
 
 class TestIterativeVsBatchConversion:
+    # [CLASS DOC]
+    # CPU tests that iterative per-parameter conversion matches batch to_hf and never
+    # emits duplicate HF keys, for dense and MoE tiny models.
     """Verify iterative convert_single_to_hf matches batch to_hf.
 
     This is critical for weight synchronization (update_weights_from_dist)
@@ -550,6 +632,13 @@ class TestIterativeVsBatchConversion:
     """
 
     def test_dense_iterative_equals_batch(self, small_dense_model, dense_adapter):
+        # [FUNCTION DOC]
+        # Builds an HF dict by calling convert_single_to_hf on each named parameter of
+        # the dense model, compares with to_hf(state_dict()): asserts identical key sets
+        # and torch.equal values.
+        # KNOWN ISSUE: Batch path uses state_dict() (parameters plus persistent buffers)
+        # while the iterative path uses only parameters; the test relies on no
+        # persistent buffer being converted to an HF key.
         """Dense: iterative convert_single_to_hf == batch to_hf."""
         # Method 1: Iterative conversion (simulates weight update flow)
         hf_iterative = {}
@@ -574,6 +663,9 @@ class TestIterativeVsBatchConversion:
             )
 
     def test_moe_iterative_equals_batch(self, small_moe_model, moe_adapter):
+        # [FUNCTION DOC]
+        # Same iterative-vs-batch comparison for the MoE model, reporting extra keys on
+        # either side on mismatch.
         """MoE: iterative convert_single_to_hf == batch to_hf."""
         # Method 1: Iterative conversion
         hf_iterative = {}
@@ -602,6 +694,9 @@ class TestIterativeVsBatchConversion:
     def test_dense_no_duplicate_keys_in_iteration(
         self, small_dense_model, dense_adapter
     ):
+        # [FUNCTION DOC]
+        # Collects all HF names produced iteratively for the dense model and asserts
+        # they are unique.
         """Dense: no duplicate HF keys produced during iteration."""
         hf_keys = []
         for name, param in small_dense_model.named_parameters():
@@ -613,6 +708,9 @@ class TestIterativeVsBatchConversion:
         )
 
     def test_moe_no_duplicate_keys_in_iteration(self, small_moe_model, moe_adapter):
+        # [FUNCTION DOC]
+        # Collects all HF names produced iteratively for the MoE model and asserts they
+        # are unique.
         """MoE: no duplicate HF keys produced during iteration."""
         hf_keys = []
         for name, param in small_moe_model.named_parameters():

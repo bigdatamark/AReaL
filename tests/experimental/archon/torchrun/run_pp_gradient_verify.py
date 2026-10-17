@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# torchrun script (exactly 2 GPUs) verifying that torch.distributed.pipelining's
+# Schedule1F1B.step() over a 2-stage toy model yields the same parameter gradients as
+# plain gradient accumulation over the same micro-batches on an unsplit model. Uses a
+# self-contained toy transformer (embedding, residual MLP blocks, LayerNorm, LM head)
+# whose stage forward signatures mimic Archon's packed-sequence interface. Config
+# constants: VOCAB_SIZE 1000, HIDDEN_SIZE 256, N_LAYERS_PER_STAGE 2, SEED 42.
 """PP vs non-PP gradient verification test.
 
 This test verifies that the step() API produces identical gradients
@@ -33,9 +40,15 @@ SEED = 42
 
 
 class SimpleBlock(nn.Module):
+    # [CLASS DOC]
+    # HELPER: Residual pre-norm MLP block: LayerNorm, Linear to 4x hidden, GELU, Linear
+    # back, added to the input. No attention.
     """A simple transformer-like block."""
 
     def __init__(self, hidden_size: int):
+        # [FUNCTION DOC]
+        # HELPER: Creates the LayerNorm, the two Linear layers (hidden_size <->
+        # 4*hidden_size) and the GELU activation.
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size)
         self.linear1 = nn.Linear(hidden_size, hidden_size * 4)
@@ -43,6 +56,8 @@ class SimpleBlock(nn.Module):
         self.act = nn.GELU()
 
     def forward(self, x):
+        # [FUNCTION DOC]
+        # HELPER: Returns x plus linear2(GELU(linear1(norm(x)))); shape preserved.
         h = self.norm(x)
         h = self.linear1(h)
         h = self.act(h)
@@ -51,12 +66,18 @@ class SimpleBlock(nn.Module):
 
 
 class FirstStageModel(nn.Module):
+    # [CLASS DOC]
+    # Pipeline stage 0 of the toy model: token embedding followed by n_layers
+    # SimpleBlocks.
     """First stage: embedding + first half of layers.
 
     Simulates Archon model with packed sequence inputs.
     """
 
     def __init__(self, vocab_size: int, hidden_size: int, n_layers: int):
+        # [FUNCTION DOC]
+        # HELPER: Creates the embedding (vocab_size x hidden_size) and a ModuleList of
+        # n_layers SimpleBlocks.
         super().__init__()
         self.embed = nn.Embedding(vocab_size, hidden_size)
         self.layers = nn.ModuleList([SimpleBlock(hidden_size) for _ in range(n_layers)])
@@ -68,6 +89,10 @@ class FirstStageModel(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int | torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Embeds input_ids and applies each block; returns hidden states [..., seq,
+        # hidden]. positions, cu_seqlens and max_seqlen are accepted only for interface
+        # parity and ignored.
         """Forward pass.
 
         Args:
@@ -88,6 +113,9 @@ class FirstStageModel(nn.Module):
 
 
 class LastStageModel(nn.Module):
+    # [CLASS DOC]
+    # Pipeline stage 1 of the toy model: n_layers SimpleBlocks, final LayerNorm and a
+    # Linear output head to vocab logits.
     """Last stage: second half of layers + norm + output.
 
     Like Archon, this model also requires positions/cu_seqlens/max_seqlen
@@ -95,6 +123,9 @@ class LastStageModel(nn.Module):
     """
 
     def __init__(self, vocab_size: int, hidden_size: int, n_layers: int):
+        # [FUNCTION DOC]
+        # HELPER: Creates the block list, final LayerNorm and output Linear(hidden,
+        # vocab).
         super().__init__()
         self.layers = nn.ModuleList([SimpleBlock(hidden_size) for _ in range(n_layers)])
         self.norm = nn.LayerNorm(hidden_size)
@@ -107,6 +138,9 @@ class LastStageModel(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int | torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Applies the blocks, final norm and output projection to hidden states h and
+        # returns logits [..., seq, vocab]; the packing arguments are ignored.
         """Forward pass.
 
         Args:
@@ -128,14 +162,24 @@ class LastStageModel(nn.Module):
 
 
 class FullModel(nn.Module):
+    # [CLASS DOC]
+    # Unsplit reference model composed of a FirstStageModel ("first") and a
+    # LastStageModel ("last"), so parameter names are the stage names prefixed with
+    # "first." / "last.".
     """Full model combining first and last stage (for non-PP and gradient verification)."""
 
     def __init__(self, vocab_size: int, hidden_size: int, n_layers_per_stage: int):
+        # [FUNCTION DOC]
+        # HELPER: Builds the first and last stage submodules with n_layers_per_stage
+        # blocks each.
         super().__init__()
         self.first = FirstStageModel(vocab_size, hidden_size, n_layers_per_stage)
         self.last = LastStageModel(vocab_size, hidden_size, n_layers_per_stage)
 
     def forward(self, input_ids, positions, cu_seqlens, max_seqlen):
+        # [FUNCTION DOC]
+        # Runs the first stage then the last stage, passing the packing arguments
+        # through; returns logits.
         h = self.first(input_ids, positions, cu_seqlens, max_seqlen)
         return self.last(h, positions, cu_seqlens, max_seqlen)
 
@@ -147,6 +191,14 @@ def generate_fixed_data(
     seed: int,
     n_microbatches: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Seeds the global RNG and builds n_microbatches packed samples of seq_len
+    # tokens on device. Micro-batch i is split into 2+i sequences (equal segments,
+    # remainder in the last); builds int32 cu_seqlens, per-sequence restarting
+    # positions, random input_ids and labels in [0, vocab_size). Returns stacked
+    # tensors: input_ids, positions, labels of shape [n_mb, seq_len]; cu_seqlens [n_mb,
+    # max_len] right-padded by repeating the final cumulative value; and max_seqlen as a
+    # CPU int tensor [n_mb].
     """Generate fixed data for gradient verification (deterministic).
 
     Returns batched data for n_microbatches:
@@ -229,6 +281,12 @@ def run_non_pp_forward_backward(
     batched_labels: torch.Tensor,
     vocab_size: int,
 ) -> tuple[dict[str, torch.Tensor], float]:
+    # [FUNCTION DOC]
+    # HELPER: Zeroes grads, then for each micro-batch runs the full model on a [1,
+    # seq_len] slice (cu_seqlens row and max_seqlen scalar extracted), computes mean
+    # cross-entropy against labels and calls backward without zeroing (sum of per-micro-
+    # batch mean losses). Returns (dict of cloned grads by parameter name, sum of losses
+    # as float).
     """Run non-PP forward/backward on multiple microbatches and return accumulated gradients."""
     model.zero_grad()
 
@@ -266,6 +324,11 @@ def compare_gradients(
     prefix: str,
     atol: float,
 ) -> tuple[bool, list[str]]:
+    # [FUNCTION DOC]
+    # HELPER: For each key in pp_grads looks up prefix+key in non_pp_grads; records an
+    # error if missing, or if the max absolute difference is >= atol (message includes
+    # max/mean absolute and max relative difference). Returns (all_match, error
+    # messages).
     """Compare PP gradients against non-PP gradients.
 
     Args:
@@ -310,6 +373,23 @@ def verify_gradients(
     seq_len: int = 64,
     atol: float = 1e-5,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Main check. Asserts world_size == 2. Both ranks seed SEED and build a FullModel on
+    # their GPU and generate the same fixed data (seed SEED+100); rank 0 computes
+    # reference grads via run_non_pp_forward_backward. Rank 0 builds FirstStageModel
+    # loaded from full_model.first; rank 1 builds LastStageModel and receives
+    # full_model.last's tensors from rank 0 by per-tensor broadcast. Builds a 1D "pp"
+    # device mesh, wraps each model in a PipelineStage (index = rank), and runs
+    # Schedule1F1B with a cross-entropy loss and scale_grads False: rank 0 feeds
+    # input_ids plus packing kwargs, rank 1 feeds labels as target and collects losses
+    # (printing their mean). Rank 0 compares its grads with the "first." reference
+    # grads; rank 0 then broadcasts each "last." reference grad and rank 1 receives them
+    # in its own parameter order and compares. Results are exchanged via
+    # all_gather_object; prints a summary (first errors per rank) and returns True only
+    # if both stages matched within atol.
+    # KNOWN ISSUE: The grad broadcast pairs tensors by iteration order and assumes every
+    # last-stage parameter has a reference grad; a parameter with None grad on rank 0
+    # would desynchronize the collectives.
     """Verify PP gradients match non-PP gradients.
 
     Args:
@@ -408,6 +488,9 @@ def verify_gradients(
 
     # 3. Run PP forward/backward with n_microbatches
     def loss_fn(logits, labels):
+        # [FUNCTION DOC]
+        # HELPER: Flattens logits to [N, VOCAB_SIZE] and labels to [N] and returns mean
+        # cross-entropy.
         logits = logits.view(-1, VOCAB_SIZE)
         labels = labels.view(-1)
         return nn.functional.cross_entropy(logits, labels)
@@ -528,6 +611,12 @@ def verify_gradients(
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --output (optional), --n_microbatches (2), --seq_len (64), --atol (1e-5),
+    # initializes NCCL, sets the CUDA device to the rank and runs verify_gradients. Rank
+    # 0 writes the result to --output or prints it in standalone mode; on exception rank
+    # 0 writes "Failed" and the exception is re-raised. Destroys the process group at
+    # the end.
     parser = argparse.ArgumentParser(
         description="PP vs non-PP gradient verification test"
     )

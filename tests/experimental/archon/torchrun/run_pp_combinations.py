@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# torchrun script (4 GPUs) testing pipeline parallelism combined with TP, DP or EP on
+# tiny random Qwen3 models. PP forward is simulated manually: the first-stage model part
+# runs, its hidden state is broadcast within the PP group, and the last stage finishes
+# the forward; results are compared to an unsplit golden model (TP/DP) or checked for
+# NaN/Inf (EP). Per-rank success flags are all-gathered and rank 0 writes the result.
 """Test script for Pipeline Parallelism combined with TP, DP, or EP.
 
 This test verifies that PP works correctly when combined with other parallelism
@@ -40,6 +46,22 @@ from areal.experimental.models.archon.qwen3 import Qwen3Model, parallelize_qwen3
 
 
 def test_pp_tp_forward(out_file: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Asserts world_size 4; builds a 4-layer dense model args and a seeded golden model,
+    # and ArchonParallelDims(pp 2, dp_shard 1, tp 2, cp 1). Returns False if the pp or
+    # tp mesh is missing. Builds the model on meta device, splits it into 2 stages with
+    # pipeline_module_split (1F1B), materializes each local part on device and copies
+    # matching tensors from the golden state dict. Rank 0 makes a 2x8-token packed input
+    # that is broadcast as objects. Under no_grad the first stage computes hidden states
+    # (others allocate a float32 zero buffer of [1, T, dim]), which are broadcast from
+    # the first PP rank within the PP group; the last stage runs its part on them. Last-
+    # stage ranks compare with golden output (rtol/atol 1e-3, max diff fallback 0.1).
+    # Success flags are all-gathered; rank 0 writes the overall result to out_file.
+    # Returns overall success.
+    # KNOWN ISSUE: Despite its name, no TP sharding is applied to the model parts (no
+    # parallelize call), so only the existence of the TP mesh is exercised.
+    # KNOWN ISSUE: Early returns on missing meshes skip writing the result file and
+    # leave other ranks waiting in later collectives.
     """Test PP+TP combination forward pass.
 
     Configuration: 4 GPU with pp=2, tp=2, dp_shard=1
@@ -253,6 +275,12 @@ def test_pp_tp_forward(out_file: str | None = None) -> bool:
 
 
 def test_pp_dp_forward(out_file: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Same procedure as test_pp_tp_forward but with ArchonParallelDims(pp 2, dp_shard 2,
+    # tp 1, cp 1), checking the pp and dp_shard meshes; every DP replica processes the
+    # same input and is compared to the golden output. Returns overall success.
+    # KNOWN ISSUE: No FSDP/DP wrapping is applied to model parts; only mesh construction
+    # and PP splitting are exercised.
     """Test PP+DP combination forward pass.
 
     Configuration: 4 GPU with pp=2, dp_shard=2, tp=1
@@ -463,6 +491,16 @@ def test_pp_dp_forward(out_file: str | None = None) -> bool:
 
 
 def test_pp_ep_forward(out_file: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Asserts world_size 4; builds a 4-layer MoE args (4 experts, top-2) and
+    # ArchonParallelDims(pp 2, dp_shard 2, tp 1, cp 1, ep 2). Builds the model on meta
+    # device and calls pipeline_llm with parallelize_qwen3 (1F1B, no compile); on error
+    # rank 0 writes failure and returns False. Materializes parts with to_empty,
+    # init_weights and init_buffers, broadcasts a 2x8-token input from rank 0, runs only
+    # the first stage under no_grad and flags NaN/Inf. Exceptions mark failure. Success
+    # flags are all-gathered and rank 0 writes the result. Returns overall success.
+    # KNOWN ISSUE: The docstring states dp_shard=1 but the code uses dp_shard=2; the
+    # last stage is never executed, so only first-stage output validity is verified.
     """Test PP+EP combination forward pass with MoE model.
 
     Configuration: 4 GPU with pp=2, ep=2, dp_shard=1, tp=1
@@ -665,6 +703,10 @@ TEST_REGISTRY = {
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --test_type (pp_tp, pp_dp, pp_ep; required) and --output, initializes NCCL,
+    # runs the selected test and always destroys the process group. The test's return
+    # value is ignored (exit code does not reflect failure).
     parser = argparse.ArgumentParser(description="PP Combination Tests")
     parser.add_argument(
         "--test_type",

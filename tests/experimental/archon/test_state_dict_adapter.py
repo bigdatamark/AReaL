@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Unit tests for Archon state-dict adapters (HF <-> Archon key/tensor conversion).
+# Covers Qwen3StateDictAdapter (dense and MoE roundtrips, plus a CUDA forward-equality
+# check after an Archon->HF->Archon roundtrip) and, when importable (transformers >=
+# 5.2), Qwen3_5StateDictAdapter (hybrid full/linear attention key mapping, MoE 2D<->3D
+# expert stacking, full-coverage and full state-dict roundtrips). Module-level
+# constants: _HAS_QWEN3_5_ADAPTER (import probe), _requires_qwen3_5 skip marker,
+# _QWEN3_5_EXACT tolerances (1e-6), and _QWEN3_5_LAYER_TYPES (3 linear_attention layers
+# then 1 full_attention layer).
 """Tests for Archon State Dict Adapter roundtrip conversion.
 
 These tests verify key conversion between HuggingFace and Archon formats
@@ -31,6 +40,11 @@ except ImportError:
 
 
 class MockQwen3Config:
+    # [CLASS DOC]
+    # HELPER: Minimal dense config stub for Qwen3StateDictAdapter (no experts, untied
+    # embeddings).
+    # KNOWN ISSUE: model_type is "qwen2" although it is described as a Qwen3 config;
+    # harmless only if the adapter ignores model_type.
     """Mock Qwen3 model config for testing."""
 
     model_type = "qwen2"
@@ -39,6 +53,9 @@ class MockQwen3Config:
 
 
 class MockQwen3MoEConfig:
+    # [CLASS DOC]
+    # HELPER: MoE config stub with model_type "qwen3_moe", 8 local experts, untied
+    # embeddings.
     """Mock Qwen3 MoE model config for testing."""
 
     model_type = "qwen3_moe"
@@ -52,13 +69,26 @@ class MockQwen3MoEConfig:
 
 
 class TestQwen3StateDictAdapterDense:
+    # [CLASS DOC]
+    # Roundtrip tests of Qwen3StateDictAdapter on a dense single-layer state dict.
     """Roundtrip tests for Qwen3StateDictAdapter with dense models."""
 
     @pytest.fixture
     def adapter(self):
+        # [FUNCTION DOC]
+        # HELPER: Pytest fixture returning a Qwen3StateDictAdapter built from
+        # MockQwen3Config.
         return Qwen3StateDictAdapter(MockQwen3Config())
 
     def test_roundtrip_dense_state_dict(self, adapter):
+        # [FUNCTION DOC]
+        # Builds a random HF state dict for one layer (embeddings, q/k/v/o, q/k norms,
+        # gate/up/ down MLP, two layer norms, final norm, lm_head), converts with
+        # from_hf and asserts the exact Archon key set (tok_embeddings,
+        # attention.wq/wk/wv/wo, q_norm/k_norm, feed_forward.w1/w3/w2, attention_norm,
+        # ffn_norm, norm, output). Converts back with to_hf and asserts each original
+        # key (except rotary_emb ones) exists with allclose values. Allocates several
+        # large CPU tensors (32000x4096 etc.).
         """Test full roundtrip conversion for dense model."""
         # Create a minimal HF state dict
         hf_state = {
@@ -119,13 +149,22 @@ class TestQwen3StateDictAdapterDense:
 
 
 class TestQwen3StateDictAdapterMoE:
+    # [CLASS DOC]
+    # Roundtrip tests for MoE expert and router weights of Qwen3StateDictAdapter.
     """Roundtrip tests for Qwen3StateDictAdapter with MoE models."""
 
     @pytest.fixture
     def adapter(self):
+        # [FUNCTION DOC]
+        # HELPER: Pytest fixture returning a Qwen3StateDictAdapter built from
+        # MockQwen3MoEConfig.
         return Qwen3StateDictAdapter(MockQwen3MoEConfig())
 
     def test_moe_roundtrip(self, adapter):
+        # [FUNCTION DOC]
+        # Starts from stacked 3D Archon expert tensors w1/w2/w3 for 8 experts, asserts
+        # to_hf yields 24 per-expert 2D keys, then from_hf restores each original key
+        # with allclose values.
         """Test roundtrip conversion for MoE experts."""
         # Create 3D Archon weight
         archon_state = {
@@ -149,6 +188,10 @@ class TestQwen3StateDictAdapterMoE:
             assert torch.allclose(archon_state[key], roundtrip_state[key])
 
     def test_full_moe_state_dict_roundtrip(self, adapter):
+        # [FUNCTION DOC]
+        # Like test_moe_roundtrip but adds the router gate weight; asserts 25 HF keys
+        # including "model.layers.0.mlp.gate.weight" and that experts and router
+        # roundtrip unchanged.
         """Test roundtrip for complete MoE layer state dict including router."""
         # Create full MoE layer state dict
         archon_state = {
@@ -192,9 +235,19 @@ class TestQwen3StateDictAdapterMoE:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 class TestMoEWeightLoadingRoundtrip:
+    # [CLASS DOC]
+    # CUDA-only test that adapter roundtrip preserves MoE model numerics end to end.
     """Test MoE weight loading roundtrip with forward pass verification."""
 
     def test_moe_weight_roundtrip_forward_match(self):
+        # [FUNCTION DOC]
+        # Builds a tiny Qwen3 MoE model (dim 64, 2 layers, 4 experts top-2, no grouped
+        # mm, SDPA) on CUDA, initializes weights/buffers, clones its state dict,
+        # converts Archon->HF->Archon with an adapter configured for 4 experts, loads
+        # the result non-strictly into a second freshly built model (expert_bias is
+        # Archon-only), then runs both on the same seeded 16-token packed sequence
+        # (cu_seqlens [0,16]) under no_grad and asserts outputs match within 1e-5. Side
+        # effects: GPU allocation, global RNG seeding.
         """Test MoE forward output matches after Archon->HF->Archon roundtrip.
 
         This test verifies that the state dict adapter correctly converts
@@ -234,6 +287,9 @@ class TestMoEWeightLoadingRoundtrip:
 
         # Create adapter config that matches the model's num_experts
         class AdapterConfig:
+            # [CLASS DOC]
+            # HELPER: Local adapter config stub (qwen3_moe, 4 experts, untied
+            # embeddings) matching the test model.
             model_type = "qwen3_moe"
             num_local_experts = 4  # Must match MoEArgs(num_experts=4)
             tie_word_embeddings = False
@@ -295,6 +351,11 @@ _QWEN3_5_LAYER_TYPES = [
 
 
 class _Qwen3_5DenseConfig:
+    # [CLASS DOC]
+    # HELPER: Minimal Qwen3.5 dense config: hidden 256, 4 layers using
+    # _QWEN3_5_LAYER_TYPES, 4 heads / 2 KV heads, head_dim 128, GatedDeltaNet linear-
+    # attention dims (conv kernel 4, key/value head dim 32, 4 key heads, 8 value heads),
+    # FFN 512, untied embeddings.
     """Minimal dense config for Qwen3.5 adapter tests."""
 
     hidden_size = 256
@@ -318,6 +379,9 @@ class _Qwen3_5DenseConfig:
 
 
 class _Qwen3_5MoEConfig:
+    # [CLASS DOC]
+    # HELPER: Same as the dense Qwen3.5 config plus MoE fields: 4 experts, top-2, expert
+    # FFN 128, shared expert FFN 512, moe_enabled True.
     """Minimal MoE config for Qwen3.5 adapter tests."""
 
     hidden_size = 256
@@ -350,6 +414,9 @@ class _Qwen3_5MoEConfig:
 # Qwen3.5 Helpers
 # ---------------------------------------------------------------------------
 def _all_full_attn_hf_keys(layer_idx: int) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the six HF key names (q/k/v/o proj weights and q/k norm weights)
+    # of a full_attention layer at layer_idx.
     """All HF keys for a Qwen3.5 full_attention layer."""
     suffixes = [
         "self_attn.q_proj.weight",
@@ -363,6 +430,10 @@ def _all_full_attn_hf_keys(layer_idx: int) -> list[str]:
 
 
 def _all_linear_attn_hf_keys(layer_idx: int) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns HF key names of a linear_attention (GatedDeltaNet) layer at
+    # layer_idx: seven ".weight" params (in_proj_qkv/z/a/b, conv1d, out_proj, norm)
+    # followed by the bare parameters A_log and dt_bias.
     """All HF keys for a Qwen3.5 linear_attention (GatedDeltaNet) layer."""
     weight_suffixes = [
         "linear_attn.in_proj_qkv.weight",
@@ -383,6 +454,11 @@ def _all_linear_attn_hf_keys(layer_idx: int) -> list[str]:
 
 
 def _common_per_layer_hf_keys(layer_idx: int, moe: bool = False) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns per-layer HF keys shared by all layer types: input and post-
+    # attention layernorm weights, plus either the MoE router gate weight (moe=True) or
+    # dense gate/up/down projection weights (moe=False, default). Expert weights are not
+    # included.
     """Common per-layer HF keys (norms + FFN)."""
     keys = [
         f"model.layers.{layer_idx}.input_layernorm.weight",
@@ -400,6 +476,9 @@ def _common_per_layer_hf_keys(layer_idx: int, moe: bool = False) -> list[str]:
 
 
 def _global_hf_keys() -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the non-layer HF keys: embed_tokens, final norm and lm_head
+    # weights.
     """Global (non-layer) HF keys for Qwen3.5."""
     return [
         "model.embed_tokens.weight",
@@ -411,6 +490,13 @@ def _global_hf_keys() -> list[str]:
 def _generate_qwen3_5_hf_state_dict(
     config: _Qwen3_5DenseConfig | _Qwen3_5MoEConfig,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a full random HF-format Qwen3.5 state dict for the given config:
+    # global tensors, per-layer norms, then per layer_types either gated full attention
+    # (q_proj has 2x output rows for the gate) or GatedDeltaNet tensors (qkv dim =
+    # 2*nk*dk + nv*dv, conv1d shaped [qkv, 1, kernel], A_log/dt_bias of size nv), and
+    # either per-expert 2D MoE weights plus router (if config has moe_enabled true) or
+    # dense MLP weights. Returns dict of key to CPU tensor. Uses global torch RNG.
     """Generate a complete dummy HF state dict with random tensors."""
     sd: dict[str, torch.Tensor] = {}
     dim = config.hidden_size
@@ -502,9 +588,16 @@ def _generate_qwen3_5_hf_state_dict(
 # =============================================================================
 @_requires_qwen3_5
 class TestQwen3_5KeyMapping:
+    # [CLASS DOC]
+    # Key-level roundtrip tests of Qwen3_5StateDictAdapter (skipped without the
+    # adapter).
     """Key mapping roundtrip for Qwen3.5 (full_attention + linear_attention)."""
 
     def test_key_mapping_full_attention_roundtrip(self):
+        # [FUNCTION DOC]
+        # For layer 3 (full_attention) asserts every HF key maps via the private
+        # _convert_key_from_hf to non-None and back to itself via _convert_key_to_hf;
+        # spot-checks q_proj -> attention.wq and q_norm -> attention.q_norm.
         """HF full_attention key → Archon → HF roundtrip."""
         adapter = Qwen3_5StateDictAdapter(_Qwen3_5DenseConfig())
 
@@ -526,6 +619,10 @@ class TestQwen3_5KeyMapping:
         assert q_norm == "layers.3.attention.q_norm.weight"
 
     def test_key_mapping_linear_attention_roundtrip(self):
+        # [FUNCTION DOC]
+        # For layer 0 (linear_attention) asserts all keys roundtrip and that A_log,
+        # dt_bias and conv1d map to "layers.0.linear_attn.*" names unchanged apart from
+        # the "model." prefix.
         """HF linear_attention key → Archon → HF roundtrip."""
         adapter = Qwen3_5StateDictAdapter(_Qwen3_5DenseConfig())
 
@@ -551,6 +648,8 @@ class TestQwen3_5KeyMapping:
         assert conv == "layers.0.linear_attn.conv1d.weight"
 
     def test_key_mapping_skip_rotary(self):
+        # [FUNCTION DOC]
+        # Asserts a rotary_emb.inv_freq key maps to None (dropped).
         """Rotary emb inv_freq should map to None (skipped)."""
         adapter = Qwen3_5StateDictAdapter(_Qwen3_5DenseConfig())
         result = adapter._convert_key_from_hf(
@@ -564,9 +663,16 @@ class TestQwen3_5KeyMapping:
 # =============================================================================
 @_requires_qwen3_5
 class TestQwen3_5MoEKeyMapping:
+    # [CLASS DOC]
+    # MoE expert 2D<->3D conversion tests for Qwen3_5StateDictAdapter.
     """MoE expert 2D↔3D conversion for Qwen3.5."""
 
     def test_key_mapping_moe_roundtrip(self):
+        # [FUNCTION DOC]
+        # Creates per-expert 2D gate/up/down weights for layer 1, asserts from_hf
+        # produces stacked w1 [E, moe, dim], w2 [E, dim, moe], w3 [E, moe, dim] with
+        # w1[e] equal to expert e's gate_proj, then asserts to_hf restores every
+        # original key exactly.
         """MoE expert weights 2D ↔ 3D roundtrip."""
         config = _Qwen3_5MoEConfig()
         adapter = Qwen3_5StateDictAdapter(config)
@@ -617,9 +723,14 @@ class TestQwen3_5MoEKeyMapping:
 # =============================================================================
 @_requires_qwen3_5
 class TestQwen3_5KeyCoverage:
+    # [CLASS DOC]
+    # Checks that no expected Qwen3.5 HF key is left unmapped by the adapter.
     """Verify complete HF key coverage for Qwen3.5."""
 
     def test_all_hf_keys_covered(self):
+        # [FUNCTION DOC]
+        # Collects all expected dense keys across the 4 layers plus global keys and
+        # asserts every one maps to a non-None Archon key.
         """All HF keys map to Archon keys (zero unmapped)."""
         config = _Qwen3_5DenseConfig()
         adapter = Qwen3_5StateDictAdapter(config)
@@ -638,6 +749,9 @@ class TestQwen3_5KeyCoverage:
         assert unmapped == [], f"Unmapped HF keys: {unmapped}"
 
     def test_all_hf_keys_covered_moe(self):
+        # [FUNCTION DOC]
+        # Asserts the MoE router key maps and that every per-expert projection key is
+        # recognized by the private _parse_expert_key.
         """All MoE HF keys map correctly (router + experts via parse)."""
         config = _Qwen3_5MoEConfig()
         adapter = Qwen3_5StateDictAdapter(config)
@@ -659,9 +773,14 @@ class TestQwen3_5KeyCoverage:
 # =============================================================================
 @_requires_qwen3_5
 class TestQwen3_5StateDictRoundtrip:
+    # [CLASS DOC]
+    # Full HF -> Archon -> HF state-dict roundtrips for Qwen3.5 (dense and MoE).
     """Full HF → Archon → HF roundtrip for Qwen3.5."""
 
     def test_state_dict_adapter_roundtrip(self):
+        # [FUNCTION DOC]
+        # Generates a dense dummy HF state dict, roundtrips it, asserts identical key
+        # sets (reporting missing/extra) and per-key exact tensor equality.
         """Complete state dict roundtrip with per-key exact match."""
         config = _Qwen3_5DenseConfig()
         adapter = Qwen3_5StateDictAdapter(config)
@@ -687,6 +806,9 @@ class TestQwen3_5StateDictRoundtrip:
             )
 
     def test_state_dict_adapter_roundtrip_moe(self):
+        # [FUNCTION DOC]
+        # Same as the dense roundtrip test but with the MoE config, exercising expert
+        # stacking and unstacking.
         """MoE state dict roundtrip with expert 2D↔3D."""
         config = _Qwen3_5MoEConfig()
         adapter = Qwen3_5StateDictAdapter(config)

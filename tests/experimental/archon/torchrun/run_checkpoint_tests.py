@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# torchrun integration tests for Archon checkpointing. Engine-level tests build an
+# ArchonLMEngine from a real HF model (--model_path) with TP = world_size and check HF
+# safetensors save, save->load forward equality (also with torch.compile + activation
+# checkpointing), MoE save memory behaviour, and sync vs async HF save equality. PP
+# tests (--pp_size == world_size) split a tiny random Qwen3 model with pipeline_llm and
+# check DCP save/load of weights, optimizer state and first-stage forward output via
+# DCPState. Temporary directories are created on rank 0, shared via object broadcast and
+# removed afterwards; rank 0 writes "Passed"/"Failed" to --output.
 """Engine checkpoint integration tests.
 
 Tests for ArchonEngine save/load methods with HF format using DCP infrastructure.
@@ -55,6 +64,13 @@ from areal.experimental.models.archon.qwen3 import Qwen3Model, parallelize_qwen3
 
 
 def create_engine_config(model_path: str) -> TrainEngineConfig:
+    # [FUNCTION DOC]
+    # HELPER: Returns a TrainEngineConfig for model_path with one micro-batch, Adam
+    # optimizer (lr 1e-5, weight decay 0.01, no warmup, constant schedule, clipping 1.0)
+    # and temperature 1.0.
+    # KNOWN ISSUE: backend is "fsdp:d1" although the config is consumed by
+    # ArchonLMEngine with a ParallelStrategy of TP = world_size; the backend string does
+    # not describe the layout actually used.
     """Create engine configuration for testing."""
     return TrainEngineConfig(
         backend="fsdp:d1",
@@ -75,6 +91,12 @@ def create_engine_config(model_path: str) -> TrainEngineConfig:
 
 
 def test_save_hf_dense(model_path: str, output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Initializes the engine (DP 1, TP = world_size), saves with
+    # SaveLoadMeta(weight_format "hf", no optimizer, tokenizer) into a shared temp dir,
+    # and on rank 0 checks at least one .safetensors file and config.json exist.
+    # Exceptions mark failure; the temp dir is removed in finally after a barrier. Rank
+    # 0 writes the result. Returns success (rank 0's view for file checks).
     """Test ArchonEngine.save() with weight_format="hf" on dense model.
 
     Steps:
@@ -170,6 +192,12 @@ def test_save_hf_dense(model_path: str, output: str | None = None) -> bool:
 
 
 def test_save_load_forward_match(model_path: str, output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Initializes the engine, builds a seeded packed input of 4 sequences of 32 tokens
+    # (positions continuous across sequences), records the eval-mode no_grad output of
+    # engine.model, saves in HF format, loads it back, re-runs forward and compares:
+    # passes if allclose at 1e-4 or max diff <= 1e-3 (warning). Cleans up the temp dir;
+    # rank 0 writes the result. Returns success.
     """Test that forward output matches before save and after load.
 
     This is the most important test for checkpoint correctness:
@@ -317,6 +345,12 @@ def test_save_load_forward_match(model_path: str, output: str | None = None) -> 
 def test_save_load_forward_match_with_compile_ac(
     model_path: str, output: str | None = None
 ) -> bool:
+    # [FUNCTION DOC]
+    # Same as test_save_load_forward_match but enables archon.enable_compile, gradient
+    # checkpointing and ac_mode "full" before building the engine, and logs whether
+    # parameter names carry "_orig_mod" / "_checkpoint_wrapped_module" wrapper prefixes
+    # (logged, not asserted). Verifies save/load handles wrapped names via forward
+    # equality.
     """Test forward match with torch.compile and activation checkpointing enabled.
 
     This test verifies that checkpoint save/load works correctly when the model
@@ -482,6 +516,14 @@ def test_save_load_forward_match_with_compile_ac(
 
 
 def test_moe_checkpoint(model_path: str, output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Requires world_size >= 4 (otherwise reports a skip as Passed). Initializes an
+    # engine on the given (MoE) model, records CUDA memory before and after an HF save
+    # to check it does not OOM, and on rank 0 verifies safetensors files exist (logging
+    # their total size). OOM and other exceptions mark failure. Cleans up and writes the
+    # result on rank 0.
+    # KNOWN ISSUE: The docstring says EP=4, but the ParallelStrategy only sets
+    # tensor_parallel_size=world_size; expert parallelism is never requested.
     """Test MoE model checkpoint with Expert Parallelism.
 
     This test requires 4 GPUs and tests:
@@ -611,6 +653,8 @@ def test_moe_checkpoint(model_path: str, output: str | None = None) -> bool:
 
 
 def _to_local(tensor: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns the local shard of a DTensor, or the tensor unchanged otherwise.
     """Convert DTensor to local tensor if needed."""
     if isinstance(tensor, DTensor):
         return tensor.to_local()
@@ -618,6 +662,14 @@ def _to_local(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def test_pp_dcp_checkpoint(pp_size: int, out_file: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Asserts world_size == pp_size. Builds tiny dense args (2 layers per stage), PP-
+    # only dims, a meta-device model, and splits/parallelizes it with pipeline_llm
+    # (1F1B, no compile); materializes parts with random init. Snapshots local parameter
+    # values, saves DCPState(model_parts) with dcp.save, overwrites all params with 999
+    # (checking the fill took effect), loads with dcp.load and counts parameters
+    # differing by > 1e-6. Cleans up, all-gathers per-rank success, rank 0 writes the
+    # result. Returns overall success.
     """Test PP checkpoint save/load using DCP format.
 
     Steps:
@@ -808,6 +860,15 @@ def test_pp_dcp_checkpoint(pp_size: int, out_file: str | None = None) -> bool:
 
 
 def test_pp_dcp_with_optim(pp_size: int, out_file: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Same setup as test_pp_dcp_checkpoint plus one AdamW over all local params.
+    # Populates optimizer state: the first-stage rank runs its part and backpropagates
+    # cross-entropy (if it is also last) or the sum of outputs, then steps; other ranks
+    # only call step. Snapshots exp_avg/exp_avg_sq, saves DCPState with the optimizer,
+    # fills every tensor state entry with 999, loads, and counts entries differing by >
+    # 1e-6. Gathers success across ranks and writes the result on rank 0.
+    # KNOWN ISSUE: On non-first stages optimizer.step() runs with no gradients, so AdamW
+    # creates no state; those ranks compare nothing and pass trivially.
     """Test PP checkpoint save/load with optimizer state using DCP format.
 
     Steps:
@@ -877,6 +938,9 @@ def test_pp_dcp_with_optim(pp_size: int, out_file: str | None = None) -> bool:
             model = Qwen3Model(model_args)
 
         def cross_entropy_loss_fn(output, target):
+            # [FUNCTION DOC]
+            # HELPER: Flattens output to [N, vocab] and target to [N]; returns mean
+            # cross-entropy.
             output_flat = output.view(-1, output.size(-1))
             target_flat = target.view(-1)
             return nn.functional.cross_entropy(output_flat, target_flat)
@@ -1038,6 +1102,14 @@ def test_pp_dcp_with_optim(pp_size: int, out_file: str | None = None) -> bool:
 
 
 def test_pp_forward_match(pp_size: int, out_file: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Builds the PP model as above (eval mode) and a seeded 2x8 input. The first-stage
+    # rank records its part's output, then all ranks save via DCP, zero all parameters,
+    # load the checkpoint and the first-stage rank re-runs its part; outputs are
+    # compared (allclose 1e-4 or max diff <= 1e-3). Gathers success across ranks; rank 0
+    # writes the result.
+    # KNOWN ISSUE: Only the first stage's output is checked (both branches of the
+    # has_last check do the same thing); later stages are never run and pass trivially.
     """Test forward output matches after PP checkpoint save/load.
 
     This verifies the checkpoint preserves model behavior:
@@ -1231,6 +1303,15 @@ def test_pp_forward_match(pp_size: int, out_file: str | None = None) -> bool:
 
 
 def test_async_save_hf_dense(model_path: str, output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Initializes the engine, saves an HF checkpoint synchronously with
+    # save_model_to_hf, then again through an AsyncCheckpointManager(AsyncMode.ASYNC)
+    # followed by finalize(). On rank 0 checks the async dir has safetensors files
+    # (warning if file names differ), loads both sets of tensors and requires identical
+    # key sets and torch.equal values, and checks config.json exists in the async dir.
+    # Cleans up both temp dirs; rank 0 writes the result. Returns success.
+    # KNOWN ISSUE: A comment says a gloo process group must be created for async saving,
+    # but none is created here.
     """Test async HF save produces the same output as sync save.
 
     Steps:
@@ -1403,6 +1484,13 @@ PP_TESTS = {"pp_dcp_checkpoint", "pp_dcp_with_optim", "pp_forward_match"}
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --test_type (required), --model_path, --pp_size (2) and --output;
+    # initializes NCCL and sets the CUDA device to the rank. PP tests receive pp_size;
+    # other tests require --model_path (if missing, rank 0 writes "Failed" and main
+    # returns). Runs the test, barriers and prints the summary; on exception rank 0
+    # writes "Failed" and the exception is re-raised. Destroys the process group at the
+    # end.
     parser = argparse.ArgumentParser(description="Engine Checkpoint Tests")
     parser.add_argument(
         "--test_type",

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# torchrun script testing ArchonEngine.forward_batch with Ulysses context parallelism on
+# a real Qwen3-0.6B checkpoint: runs a CP engine, checks parallel dims, output shape and
+# cross-rank agreement, then rebuilds a non-CP golden engine on the same input and
+# asserts on rank 0 that valid-token logprobs have cosine similarity > 0.9999. Failures
+# surface as assertion errors (non-zero exit); there is no result file.
 """Test script for Archon Engine forward_batch with Context Parallelism (Ulysses SP).
 
 Run with torchrun for multi-GPU testing (requires at least 2 GPUs for CP=2):
@@ -33,6 +39,10 @@ MODEL_PATHS = {
 
 
 def setup_distributed_environment():
+    # [FUNCTION DOC]
+    # HELPER: If no process group exists, initializes NCCL with tcp init from RANK,
+    # WORLD_SIZE, MASTER_ADDR, MASTER_PORT (defaults 0, 1, localhost, 29500) and sets
+    # the current device to the global rank.
     """Set up distributed environment for torchrun."""
     if dist.is_initialized():
         return
@@ -56,6 +66,11 @@ def mock_input(
     min_seqlen: int = 256,
     max_seqlen: int = 1024,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a padded batch on device with per-sample lengths in [min_seqlen,
+    # max_seqlen) (defaults 256..1024), random ids in [10000, 50000), a bool
+    # attention_mask of valid prefixes and pad id 0 elsewhere. Returns dict(input_ids,
+    # attention_mask). Uses global RNG.
     """Create mock padded input data for testing."""
     pad_token_id = 0
     seqlens = torch.randint(
@@ -79,6 +94,11 @@ def mock_input(
 
 
 def make_engine_with_cp(model_type: str, mb_spec: MicroBatchSpec, cp_size: int):
+    # [FUNCTION DOC]
+    # HELPER: Builds a forward-only TrainEngineConfig with backend "archon:c{cp_size}",
+    # creates ArchonEngine, creates the process group with data_parallel_size =
+    # world_size // cp_size and context_parallel_size = cp_size, initializes and returns
+    # it.
     """Create and initialize an ArchonEngine with Context Parallelism."""
     config = TrainEngineConfig(
         backend=f"archon:c{cp_size}",
@@ -108,6 +128,12 @@ def make_engine_with_cp(model_type: str, mb_spec: MicroBatchSpec, cp_size: int):
 
 
 def make_engine_no_cp(model_type: str, mb_spec: MicroBatchSpec):
+    # [FUNCTION DOC]
+    # HELPER: Builds a forward-only golden ArchonEngine (backend "archon:d1") whose
+    # process group uses data_parallel_size = world_size and no CP; initializes and
+    # returns it.
+    # KNOWN ISSUE: backend string d1 disagrees with data_parallel_size=world_size when
+    # world_size > 1.
     """Create and initialize an ArchonEngine without CP (for golden comparison)."""
     config = TrainEngineConfig(
         backend="archon:d1",
@@ -132,6 +158,18 @@ def make_engine_no_cp(model_type: str, mb_spec: MicroBatchSpec):
 
 
 def test_archon_cp_forward(model_type: str, cp_size: int):
+    # [FUNCTION DOC]
+    # Main body: sets up distributed, seeds 42, returns early (without tearing down the
+    # process group) if world_size < cp_size. Builds the CP engine and asserts
+    # cp_enabled, cp == cp_size and dp_shard == world_size // cp_size. Rank 0 creates a
+    # 4-sample batch that is broadcast as objects and moved to each rank's device. Runs
+    # forward_batch in eval mode (2 micro-batches, concatenated), asserts first dim ==
+    # 4, all-gathers outputs and only prints warnings for ranks differing from rank 0
+    # beyond atol 1e-4. Logs is_data_parallel_head, destroys the engine, builds the
+    # golden engine and runs the same forward. On rank 0 builds a mask of positions
+    # whose next token is also valid (last column excluded), prints max/mean diff and
+    # asserts cosine similarity of masked logprobs > 0.9999. Destroys the golden engine,
+    # synchronizes the device, barriers and destroys the process group.
     """Test ArchonEngine forward_batch with Context Parallelism (Ulysses)."""
     setup_distributed_environment()
 
@@ -279,6 +317,9 @@ def test_archon_cp_forward(model_type: str, cp_size: int):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --model_type (only "qwen3") and --cp_size (default 2) and runs
+    # test_archon_cp_forward.
     parser = argparse.ArgumentParser(description="Run Archon Engine CP Forward Test")
     parser.add_argument(
         "--model_type",

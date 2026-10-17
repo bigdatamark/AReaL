@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# torchrun end-to-end script for ArchonEngine with pipeline parallelism (optionally with
+# DP, TP, EP): builds a real engine on a small Qwen3 checkpoint, runs forward_batch,
+# eval_batch and train_batch on a random padded batch broadcast from rank 0, and rank 0
+# writes "Passed"/"Failed" to --out. Each step catches its own exceptions and prints a
+# traceback.
+# KNOWN ISSUE: The module docstring promises comparison of PP outputs with a golden non-
+# PP model, but no such comparison is performed; forward only checks output size.
 """End-to-end test for ArchonEngine with Pipeline Parallelism.
 
 This test directly instantiates ArchonEngine with PP enabled and verifies:
@@ -48,6 +56,12 @@ def create_mock_input(
     vocab_size: int = 151936,  # Qwen3 vocab size
     device: torch.device | str = "cuda",
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a padded batch on device: per-sample lengths uniform in
+    # [min_seqlen, max_seqlen), input_ids random in [1, vocab_size) with shape
+    # [batch_size, longest], a bool attention_mask marking valid prefixes, and padded
+    # slots set to id 0. Returns dict(input_ids, attention_mask). Uses global RNG; syncs
+    # GPU.
     """Create mock padded input data for testing.
 
     Returns a dict with input_ids and attention_mask (same format as HuggingFace).
@@ -91,11 +105,17 @@ def mock_loss_fn(
     input_data: dict,
     **kwargs,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Loss stub ignoring entropy/input_data/kwargs; returns the mean of
+    # logprobs.
     """Mock loss function for testing."""
     return torch.mean(logprobs)
 
 
 def mock_loss_weight_fn(input_data: dict) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns the total token count (last cu_seqlens entry as float) as the
+    # micro-batch loss weight.
     """Mock loss weight function for testing."""
     return input_data["cu_seqlens"][-1].float()
 
@@ -107,6 +127,12 @@ def create_archon_engine(
     tp_size: int = 1,
     ep_size: int = 1,
 ) -> ArchonEngine:
+    # [FUNCTION DOC]
+    # HELPER: Builds a TrainEngineConfig with backend "archon:d{dp}t{tp}p{pp}e{ep}", lr
+    # 1e-5 optimizer, 2 micro-batches capped at 256 tokens, no gradient checkpointing,
+    # bfloat16, and torch.compile disabled; constructs ArchonEngine, creates its process
+    # group from a matching ParallelStrategy and initializes it with a small
+    # FinetuneSpec. Returns the engine. Loads model weights to GPU.
     """Create and initialize ArchonEngine with PP enabled."""
     engine_config = TrainEngineConfig(
         backend=f"archon:d{dp_size}t{tp_size}p{pp_size}e{ep_size}",
@@ -141,6 +167,10 @@ def create_archon_engine(
 
 
 def test_forward_batch(engine: ArchonEngine, mock_input: dict) -> bool:
+    # [FUNCTION DOC]
+    # Puts the engine in eval mode, runs forward_batch on mock_input and returns True if
+    # the output has at least as many elements as unmasked tokens; returns False (with
+    # traceback) on exception or too-small output. Prints per-rank shape.
     """Test forward_batch with PP enabled."""
     rank = dist.get_rank()
     print_rank0("\n--- Testing forward_batch ---")
@@ -173,6 +203,10 @@ def test_forward_batch(engine: ArchonEngine, mock_input: dict) -> bool:
 
 
 def test_eval_batch(engine: ArchonEngine, mock_input: dict) -> bool:
+    # [FUNCTION DOC]
+    # Runs eval_batch in eval mode with the mock loss and weight functions; prints the
+    # loss or notes that None was returned (allowed under PP). Returns True unless an
+    # exception occurs.
     """Test eval_batch with PP enabled."""
     print_rank0("\n--- Testing eval_batch ---")
 
@@ -203,6 +237,13 @@ def test_eval_batch(engine: ArchonEngine, mock_input: dict) -> bool:
 
 
 def test_train_batch(engine: ArchonEngine, mock_input: dict) -> bool:
+    # [FUNCTION DOC]
+    # Runs train_batch in train mode with the mock loss functions, prints
+    # update_successful, grad_norm and lr from the result dict, and warns (does not
+    # fail) if grad_norm is None or non-finite. Returns True unless an exception occurs.
+    # KNOWN ISSUE: grad_norm and lr are formatted with float format specs before the
+    # None check, so a None grad_norm raises TypeError and is reported as a failure
+    # rather than a warning.
     """Test train_batch with PP enabled."""
     print_rank0("\n--- Testing train_batch ---")
 
@@ -244,6 +285,17 @@ def run_tests(
     ep_size: int,
     out_file: str | None = None,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Orchestrates the run: raises dp_size to ep_size if smaller (EP borrows DP ranks),
+    # checks world_size == pp*dp*tp (writing failure and returning False otherwise),
+    # creates the engine (failure handled likewise), broadcasts a 4-sample mock batch
+    # from rank 0 and moves it to the local CUDA device, runs the three step tests
+    # (engine destroyed in a finally block), barriers, prints a summary and has rank 0
+    # write the result to out_file if given. Returns whether all steps passed on this
+    # rank.
+    # KNOWN ISSUE: Pass/fail is tracked per rank but only rank 0's view is written, so
+    # failures on other ranks (most messages are printed only on rank 0) can go
+    # unreported.
     """Run all ArchonEngine PP tests."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -354,6 +406,11 @@ def run_tests(
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --model_path, --pp_size (2), --dp_size, --tp_size, --ep_size (1 each) and
+    # --out, initializes an NCCL process group from torchrun env vars, sets LOCAL_RANK
+    # to the global rank if missing, runs run_tests and always destroys the process
+    # group.
     parser = argparse.ArgumentParser(description="ArchonEngine PP E2E Test")
     parser.add_argument(
         "--model_path",

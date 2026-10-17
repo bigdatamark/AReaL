@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Unified torchrun entry point for expert-parallel (EP) tests of a tiny 4-expert Qwen3
+# MoE model under several layouts (EP+TP, EP only, EP+CP with Ulysses, expert tensor
+# parallel ETP, TP-only MoE). Checks forward numerics against an unparallelized golden
+# model, cross-rank output consistency, weight gathering/roundtrip, state after an
+# optimizer step, and DTensor-aware HF checkpoint conversion. Test chosen with
+# --test_type from TEST_REGISTRY; rank 0 writes "Passed"/"Failed" to --output.
+# KNOWN ISSUE: The module docstring lists EP+CP as ep=2, but get_parallel_dims_ep_cp
+# uses ep=world_size (4).
 """Unified EP (Expert Parallel) test entry point.
 
 This script consolidates all EP tests and supports different parallel configurations:
@@ -56,6 +65,8 @@ from areal.experimental.models.archon.ulysses import (
 
 
 def get_parallel_dims_ep_tp(world_size: int) -> ArchonParallelDims:
+    # [FUNCTION DOC]
+    # HELPER: ArchonParallelDims with dp_shard 1, tp = ep = world_size, cp 1.
     """EP+TP config: ep=ws, tp=ws."""
     return ArchonParallelDims(
         dp_shard=1,
@@ -68,6 +79,8 @@ def get_parallel_dims_ep_tp(world_size: int) -> ArchonParallelDims:
 
 
 def get_parallel_dims_ep_only(world_size: int) -> ArchonParallelDims:
+    # [FUNCTION DOC]
+    # HELPER: ArchonParallelDims with dp_shard = ep = world_size, tp 1, cp 1.
     """EP only config: ep=ws, tp=1. dp_shard * tp * cp must equal world_size."""
     return ArchonParallelDims(
         dp_shard=world_size,
@@ -80,6 +93,9 @@ def get_parallel_dims_ep_only(world_size: int) -> ArchonParallelDims:
 
 
 def get_parallel_dims_ep_cp(world_size: int) -> ArchonParallelDims:
+    # [FUNCTION DOC]
+    # HELPER: Asserts world_size == 4; returns dims with dp_shard 2, cp 2, tp 1 and ep =
+    # world_size (EP spans dp_shard x cp).
     """EP+CP config: ep=4, cp=2, requires 4 GPUs."""
     assert world_size == 4, "EP+CP requires 4 GPUs"
     return ArchonParallelDims(
@@ -93,6 +109,9 @@ def get_parallel_dims_ep_cp(world_size: int) -> ArchonParallelDims:
 
 
 def get_parallel_dims_etp(world_size: int) -> ArchonParallelDims:
+    # [FUNCTION DOC]
+    # HELPER: Asserts world_size is a positive multiple of 4; returns dims with tp 2, ep
+    # 2, etp 2, cp 1 and dp_shard = world_size / 2.
     """ETP config: tp=2, ep=2, etp=2, requires 4+ GPUs."""
     assert world_size >= 4 and world_size % 4 == 0, (
         "ETP requires at least 4 GPUs and world_size must be divisible by 4. "
@@ -111,6 +130,9 @@ def get_parallel_dims_etp(world_size: int) -> ArchonParallelDims:
 
 
 def get_parallel_dims_tp_only(world_size: int) -> ArchonParallelDims:
+    # [FUNCTION DOC]
+    # HELPER: Dims with tp = world_size and ep = etp = 1 (MoE experts sharded by TP
+    # only).
     """TP-only MoE config: ep=1, tp=ws."""
     return ArchonParallelDims(
         dp_shard=1,
@@ -129,6 +151,11 @@ def create_ep_model(
     device: torch.device,
     seed: int = 42,
 ) -> Qwen3Model:
+    # [FUNCTION DOC]
+    # HELPER: Seeds the RNG, builds and initializes a Qwen3Model on device and applies
+    # parallelize_qwen3 with float32 params and reductions, no loss parallel, no
+    # offload, no activation checkpointing and no compile. Returns the parallelized
+    # model.
     """Create and parallelize model with given parallel dims."""
     torch.manual_seed(seed)
     model = Qwen3Model(model_args)
@@ -162,6 +189,14 @@ def test_forward(
     output: str | None = None,
     ep_model: Qwen3Model | None = None,
 ) -> tuple[bool, Qwen3Model]:
+    # [FUNCTION DOC]
+    # Builds 4-expert MoE args, a seeded golden model and (unless ep_model is passed) a
+    # parallelized model with the same seed; creates a seeded 4x8-token packed input.
+    # With cp > 1, slices input_ids/position_ids for this CP rank via
+    # ulysses_slice_inputs (cu_seqlens kept full). Runs both models under no_grad,
+    # gathers CP outputs along the sequence dim, and compares with verify_outputs_match
+    # (defaults 1e-4 or max diff 1e-2). Prints diagnostics, barriers, rank 0 writes the
+    # result. Returns (success, ep_model).
     """Test forward correctness: EP model vs non-EP golden model. Returns (success, ep_model)."""
     rank = dist.get_rank()
     device = torch.device(f"cuda:{rank}")
@@ -231,6 +266,11 @@ def test_output_consistency_across_ranks(
     config_name: str,
     ep_model: Qwen3Model | None = None,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Runs the (given or newly created) parallel model on the same seeded input (CP
+    # slicing and gathering as in test_forward), all-gathers outputs from every rank and
+    # checks each matches rank 0 within 1e-5. Barriers and returns success; writes no
+    # file.
     """Test that all ranks produce the same gathered output."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -310,6 +350,13 @@ def test_weight_sync(
     config_name: str,
     output: str | None = None,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Builds and initializes a seeded model, snapshots its full state, parallelizes it,
+    # gathers a full state dict (DTensor full_tensor) and checks every "experts" tensor
+    # equals the snapshot. All-gathers the first two gathered experts.w1 tensors to
+    # verify cross-rank equality. Loads gathered tensors with matching names/shapes into
+    # a fresh model (non-strict) and checks its output on a new seeded input equals a
+    # golden model's within 1e-5. Barriers, rank 0 writes the result; returns success.
     """Test weight gather, roundtrip, and cross-rank consistency."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -427,6 +474,12 @@ def test_weight_sync(
 
 
 def test_state_dict_update(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Uses the EP+TP layout: runs forward on a seeded input, backpropagates
+    # output.sum(), applies one SGD step (lr 0.01), gathers the full state dict and
+    # loads it into a freshly built (differently seeded) model. Compares outputs of the
+    # parallel and reloaded models on a second input (rtol/atol 1e-4). Barriers, rank 0
+    # writes the result; returns success.
     """Test state dict correctness after optimizer step."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -506,6 +559,9 @@ def test_state_dict_update(output: str | None = None) -> bool:
 
 
 def run_ep_tp_forward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Runs test_forward with the EP+TP layout and, if it passed, the cross-rank
+    # consistency check on the same model. Returns combined success.
     """Run EP+TP forward test."""
     print_rank0("\n=== EP+TP Forward Test ===")
     world_size = dist.get_world_size()
@@ -517,6 +573,8 @@ def run_ep_tp_forward(output: str | None = None) -> bool:
 
 
 def run_ep_tp_weight_sync(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Runs test_weight_sync with the EP+TP layout.
     """Run EP+TP weight sync test."""
     print_rank0("\n=== EP+TP Weight Sync Test ===")
     world_size = dist.get_world_size()
@@ -525,6 +583,8 @@ def run_ep_tp_weight_sync(output: str | None = None) -> bool:
 
 
 def run_ep_only_forward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Forward plus consistency check with the EP-only layout.
     """Run EP only forward test."""
     print_rank0("\n=== EP Only Forward Test ===")
     world_size = dist.get_world_size()
@@ -538,6 +598,8 @@ def run_ep_only_forward(output: str | None = None) -> bool:
 
 
 def run_ep_only_weight_sync(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Weight-sync test with the EP-only layout.
     """Run EP only weight sync test."""
     print_rank0("\n=== EP Only Weight Sync Test ===")
     world_size = dist.get_world_size()
@@ -546,6 +608,8 @@ def run_ep_only_weight_sync(output: str | None = None) -> bool:
 
 
 def run_ep_cp_forward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Forward plus consistency check with the EP+CP layout (4 GPUs).
     """Run EP+CP forward test (requires 4 GPUs)."""
     print_rank0("\n=== EP+CP Forward Test ===")
     world_size = dist.get_world_size()
@@ -557,6 +621,8 @@ def run_ep_cp_forward(output: str | None = None) -> bool:
 
 
 def run_ep_cp_weight_sync(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Weight-sync test with the EP+CP layout (4 GPUs).
     """Run EP+CP weight sync test (requires 4 GPUs)."""
     print_rank0("\n=== EP+CP Weight Sync Test ===")
     world_size = dist.get_world_size()
@@ -565,12 +631,16 @@ def run_ep_cp_weight_sync(output: str | None = None) -> bool:
 
 
 def run_state_dict_update(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Runs test_state_dict_update.
     """Run state dict update test."""
     print_rank0("\n=== State Dict Update Test ===")
     return test_state_dict_update(output)
 
 
 def run_etp_forward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Forward plus consistency check with the ETP layout (4+ GPUs, 2D expert sharding).
     """Run ETP forward test (requires 4 GPUs).
 
     Tests ExpertTensorParallel with 2D weight sharding [Shard(0), Shard(1/2)].
@@ -585,6 +655,8 @@ def run_etp_forward(output: str | None = None) -> bool:
 
 
 def run_etp_weight_sync(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Weight-sync test with the ETP layout.
     """Run ETP weight sync test (requires 4 GPUs).
 
     Tests weight gather/roundtrip with ExpertTensorParallel.
@@ -596,6 +668,8 @@ def run_etp_weight_sync(output: str | None = None) -> bool:
 
 
 def run_tp_only_forward(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Forward plus consistency check with the TP-only MoE layout.
     """Run TP-only forward test for MoE experts (ep=1, tp>1).
 
     Tests TensorParallel class for MoE experts when EP is disabled.
@@ -621,6 +695,16 @@ def test_dtensor_checkpoint_roundtrip(
     config_name: str,
     output: str | None = None,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Builds a parallelized model, converts its (DTensor) parameters with
+    # Qwen3StateDictAdapter.to_hf and checks every ".mlp.experts." entry is 2D, then
+    # from_hf back and checks each "moe.experts.w*" tensor exists with identical local
+    # shard shape and values (rtol/atol 1e-5). All-gathers the full tensor of the first
+    # reconstructed experts.w1 to check cross-rank equality. Barriers, rank 0 writes the
+    # result; returns success.
+    # KNOWN ISSUE: The adapter is constructed from Qwen3ModelArgs rather than an HF
+    # config; this works only if the adapter reads attributes both objects share (e.g.
+    # expert count).
     """Test DTensor checkpoint roundtrip: to_hf() -> from_hf() preserves weights."""
     from torch.distributed.tensor import DTensor
 
@@ -727,6 +811,8 @@ def test_dtensor_checkpoint_roundtrip(
 
 
 def run_ep_tp_dtensor_checkpoint(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Runs the DTensor checkpoint roundtrip with the EP+TP layout.
     """Run EP+TP DTensor checkpoint roundtrip test."""
     print_rank0("\n=== EP+TP DTensor Checkpoint Roundtrip Test ===")
     world_size = dist.get_world_size()
@@ -735,6 +821,8 @@ def run_ep_tp_dtensor_checkpoint(output: str | None = None) -> bool:
 
 
 def run_ep_only_dtensor_checkpoint(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Runs the DTensor checkpoint roundtrip with the EP-only layout.
     """Run EP only DTensor checkpoint roundtrip test."""
     print_rank0("\n=== EP Only DTensor Checkpoint Roundtrip Test ===")
     world_size = dist.get_world_size()
@@ -743,6 +831,8 @@ def run_ep_only_dtensor_checkpoint(output: str | None = None) -> bool:
 
 
 def run_etp_dtensor_checkpoint(output: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # Runs the DTensor checkpoint roundtrip with the ETP layout.
     """Run ETP DTensor checkpoint roundtrip test (requires 4 GPUs)."""
     print_rank0("\n=== ETP DTensor Checkpoint Roundtrip Test ===")
     world_size = dist.get_world_size()
@@ -773,6 +863,11 @@ TEST_REGISTRY = {
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --test_type (required) and --output, initializes NCCL, sets CUDA device to
+    # the rank, runs the test, barriers and prints a summary; rank 0 overwrites the
+    # result with "Failed" on failure or exception (exception re-raised). Always
+    # destroys the process group.
     parser = argparse.ArgumentParser(description="EP Tests")
     parser.add_argument(
         "--test_type",

@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Unified torchrun entry point for low-level pipeline-parallel (PP) tests of a tiny
+# dense Qwen3 model split with pipeline_module_split: forward via manual activation
+# broadcast or via the schedule eval() API (compared against an unsplit golden model),
+# and backward via manual gradient broadcast or the schedule step() API (gradients
+# checked for presence and finiteness). world_size must equal pp_size; multi-stage
+# (V-style/looped) schedules place 2 stages per rank. Rank 0 writes "Passed"/"Failed".
 """Unified PP test entry point for low-level PP tests.
 
 This script consolidates PP forward and backward tests into a single file,
@@ -57,6 +64,11 @@ from areal.experimental.models.archon.qwen3 import Qwen3Model
 
 @dataclass
 class _PPTestContext:
+    # [CLASS DOC]
+    # HELPER: Dataclass bundling per-rank PP test state: rank, world_size, device, model
+    # args, total number of stages, schedule name, local PipelineStage objects and model
+    # parts, this rank's index in the PP mesh, whether it holds the first/last stage,
+    # and the PP process group with its global ranks.
     """Shared state for PP tests."""
 
     rank: int
@@ -75,6 +87,13 @@ class _PPTestContext:
 
 
 def _setup_pp_context(pp_size: int, pp_schedule: str) -> _PPTestContext:
+    # [FUNCTION DOC]
+    # HELPER: Sets the CUDA device to the rank, asserts world_size == pp_size,
+    # determines num_stages (2*pp_size if the schedule class is a PipelineScheduleMulti,
+    # else pp_size) and n_layers = 2*num_stages, builds tiny dense model args and
+    # ArchonParallelDims with only PP, constructs Qwen3Model on the meta device and
+    # splits it with pipeline_module_split using generated per-stage module names.
+    # Returns a _PPTestContext whose model parts are still on meta (not materialized).
     """Common setup: create model, split into PP stages (weights on meta device).
 
     Args:
@@ -173,6 +192,10 @@ def _broadcast_inputs(
     vocab_size: int,
     with_labels: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor | None]:
+    # [FUNCTION DOC]
+    # HELPER: Rank 0 creates a seeded 2x8-token packed input (and labels equal to tokens
+    # when with_labels); the list is broadcast as Python objects and tensors moved to
+    # device. Returns (tokens, positions, cu_seqlens, max_seqlen int, labels or None).
     """Create test inputs on rank 0 and broadcast to all ranks."""
     if rank == 0:
         tokens, positions, cu_seqlens, max_seqlen = create_test_input(
@@ -204,6 +227,10 @@ def _materialize_from_golden(
     golden_model: nn.Module,
     device: torch.device,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: For each part: allocates real storage on device (to_empty), initializes
+    # buffers, copies every tensor whose name also exists in the golden model's state
+    # dict, and reloads the state dict. Mutates parts in place.
     """Copy weights from golden model to PP model parts."""
     golden_state = golden_model.state_dict()
     for part in model_parts:
@@ -221,6 +248,9 @@ def _materialize_random(
     device: torch.device,
     seed: int = 42,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Seeds the RNG, then for each part allocates storage on device and runs
+    # init_weights and init_buffers.
     """Initialize model parts with random weights."""
     torch.manual_seed(seed)
     for part in model_parts:
@@ -230,6 +260,9 @@ def _materialize_random(
 
 
 def _get_last_stage_rank(pp_schedule: str, pp_group_ranks: list[int]) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the global rank holding the last stage: the first PP rank for
+    # V-shaped schedules (ZBVZeroBubble, DualPipeV), otherwise the last PP rank.
     """Get the global rank holding the last pipeline stage."""
     schedule_class = get_schedule_class(pp_schedule)
     v_style = schedule_class in (ScheduleZBVZeroBubble, ScheduleDualPipeV)
@@ -239,6 +272,9 @@ def _get_last_stage_rank(pp_schedule: str, pp_group_ranks: list[int]) -> int:
 def _report_test_result(
     test_name: str, success: bool, rank: int, out_file: str | None
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints PASSED/FAILED for test_name on rank 0 and has rank 0 write the
+    # result to out_file if given.
     """Print test result and optionally write to file."""
     status = "PASSED" if success else "FAILED"
     print_rank0(f"\n{'=' * 60}")
@@ -249,6 +285,10 @@ def _report_test_result(
 
 
 def validate_gradients_pp(model_parts: list[nn.Module]) -> tuple[bool, list[str]]:
+    # [FUNCTION DOC]
+    # Checks each trainable parameter of every model part: reports missing, NaN, Inf or
+    # all-zero gradients. Returns (no_errors, messages). Several GPU syncs per
+    # parameter.
     """Verify gradients flow through PP model parts.
 
     Args:
@@ -277,6 +317,10 @@ def validate_gradients_pp(model_parts: list[nn.Module]) -> tuple[bool, list[str]
 def _validate_and_gather_gradients(
     ctx: _PPTestContext,
 ) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Runs validate_gradients_pp locally, prints failures or the sum of per-
+    # parameter grad norms, all-gathers (success, errors) from all ranks, prints per-
+    # rank status on rank 0, and returns True only if all ranks passed.
     """Validate gradients on this rank and gather results from all ranks."""
     local_success, local_errors = validate_gradients_pp(ctx.model_parts)
 
@@ -319,6 +363,16 @@ def _validate_and_gather_gradients(
 
 
 def test_pp_forward_p2p(pp_size: int, out_file: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # 1F1B forward test. Sets up context, materializes parts from a seeded golden model,
+    # broadcasts inputs, computes golden output, then iterates stages in order: the rank
+    # owning stage i runs its part (tokens for stage 0, received hidden state
+    # otherwise), barriers on the PP group and broadcasts the float32 hidden state from
+    # that rank to the group (except after the last stage). The last-stage rank compares
+    # with golden (1e-4 tolerances, 1e-2 max-diff fallback); its verdict is broadcast
+    # from the last PP rank to all ranks and reported. Returns success.
+    # KNOWN ISSUE: Comparison details are printed via print_rank0 but are computed on
+    # the last-stage rank, which is not rank 0 for pp_size > 1, so they never appear.
     """Test PP forward pass via manual activation passing (1F1B only).
 
     Verifies that a model split across PP stages produces the same output
@@ -446,6 +500,17 @@ def test_pp_forward_p2p(pp_size: int, out_file: str | None = None) -> bool:
 def test_pp_forward_schedule(
     pp_size: int, out_file: str | None = None, pp_schedule: str = "1F1B"
 ) -> bool:
+    # [FUNCTION DOC]
+    # Schedule eval test for any schedule. Materializes from golden, broadcasts inputs,
+    # builds a schedule via build_pipeline_schedule with n_microbatches =
+    # max(num_stages, 2), replicates the same input across micro-batches (positions,
+    # cu_seqlens, max_seqlen passed as batched kwargs) and calls schedule.eval (first
+    # stage supplies tokens). The last-stage rank asserts outputs exist, takes the first
+    # micro-batch output (or the whole output if not a list/tuple) and compares with
+    # golden as in the p2p test. The verdict is broadcast from _get_last_stage_rank and
+    # reported. Returns success.
+    # KNOWN ISSUE: If the schedule returns concatenated micro-batch outputs as one
+    # tensor, the comparison uses it whole against a single-micro-batch golden output.
     """Test PP forward pass via schedule.eval() API (all schedules).
 
     Verifies that the PP model produces correct output when driven by the
@@ -567,6 +632,16 @@ def test_pp_forward_schedule(
 
 
 def test_pp_backward_p2p(pp_size: int, out_file: str | None = None) -> bool:
+    # [FUNCTION DOC]
+    # 1F1B manual forward+backward. Randomly materializes parts in train mode, builds an
+    # AdamW optimizer only to zero grads, broadcasts inputs with labels. Forward
+    # iterates stages: owning rank runs its part (non-first stages on a cloned requires-
+    # grad copy of the received buffer), retains grads and stores a detached copy in the
+    # broadcast buffer. The last stage computes cross-entropy of logits vs labels and
+    # backpropagates, capturing its input gradient. Backward iterates stages in reverse:
+    # the gradient buffer is broadcast from stage i and the rank owning stage i-1 calls
+    # backward on its output with it, forwarding its own input gradient if it is not the
+    # first stage. Finally validates and gathers gradients and reports. Returns success.
     """Test PP backward pass via manual gradient passing (1F1B only).
 
     Verifies that gradients flow correctly through all PP stages using
@@ -732,6 +807,13 @@ def test_pp_backward_p2p(pp_size: int, out_file: str | None = None) -> bool:
 def test_pp_backward_schedule(
     pp_size: int, out_file: str | None = None, pp_schedule: str = "1F1B"
 ) -> bool:
+    # [FUNCTION DOC]
+    # Schedule step test for any schedule. Randomly materializes parts in train mode,
+    # zeroes grads, broadcasts inputs with labels, builds the schedule with a cross-
+    # entropy loss_fn and n_microbatches = max(num_stages, 2), and calls schedule.step
+    # with replicated tokens (first stage), replicated labels as target (last stage,
+    # None elsewhere) and batched packing kwargs. Then validates/gathers gradients and
+    # reports. Returns success.
     """Test PP backward pass via schedule.step() API (all schedules).
 
     Verifies that gradients flow correctly through all PP stages when
@@ -778,6 +860,9 @@ def test_pp_backward_schedule(
     n_microbatches = max(ctx.num_stages, 2)
 
     def loss_fn(output, target):
+        # [FUNCTION DOC]
+        # HELPER: Flattens output to [N, vocab] and target to [N] and returns mean
+        # cross-entropy.
         output_flat = output.view(-1, output.size(-1))
         target_flat = target.view(-1)
         return nn.functional.cross_entropy(output_flat, target_flat)
@@ -842,6 +927,11 @@ TEST_REGISTRY = {
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --test_type (required), --pp_size (2), --pp_schedule ("1F1B", passed only
+    # to *_schedule tests) and --output, initializes NCCL, sets the CUDA device to the
+    # rank, runs the test, barriers and prints the summary; on exception rank 0 writes
+    # "Failed" and the exception is re-raised. Destroys the process group in all cases.
     parser = argparse.ArgumentParser(description="Unified PP Tests")
     parser.add_argument(
         "--test_type",
