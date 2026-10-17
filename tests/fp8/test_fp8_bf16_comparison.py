@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# GPU tests comparing a BF16 Qwen3-0.6B MegatronEngine against an FP8 (blockwise e4m3,
+# fp8_param) Qwen3-0.6B-FP8 MegatronEngine on the same fixed SFT batch: sampled decoding
+# output (logged only), logits/logprobs agreement via masked diffs and cosine
+# similarity, per-parameter gradient agreement before the optimizer step, a debug-only
+# GEMM kernel profile, and per-operation activation/gradient comparison on a model
+# truncated to its first layers. Engines are module-scoped and share one process (ports
+# 7777/7778).
+# KNOWN ISSUE: the module docstring lists only the logits/logprobs checks; logger name
+# is not PascalCase.
 """Test comparison between FP8 and BF16 models using Megatron Engine.
 
 This test verifies:
@@ -53,6 +63,17 @@ def fixed_input(
     model_path: str = MODEL_PATH_BF16,
     device=current_platform.device_type,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Module-scoped fixture building a fixed padded SFT batch. Uses default questions
+    # and answers (two pairs) unless given, loads the tokenizer from model_path, encodes
+    # question+answer+eos and question alone without special tokens, builds loss_mask 0
+    # over the question prefix and 1 for the rest, right-pads ids with the pad id (or
+    # 0), the loss mask with 0, and builds a boolean attention mask. Logs a per-sample
+    # summary. Returns dict of input_ids, attention_mask and loss_mask on device. Raises
+    # AssertionError if question/answer counts differ.
+    # KNOWN ISSUE: the extra parameters can never be supplied by pytest (defaults are
+    # always used), and the loss_mask assumes the question tokenization is a prefix of
+    # the full tokenization.
     """Create fixed input data for SFT training with question and answer.
 
     Args:
@@ -147,6 +168,9 @@ def fixed_input(
 
 @pytest.fixture(scope="module")
 def engine_bf16():
+    # [FUNCTION DOC]
+    # Module-scoped fixture creating the BF16 MegatronEngine (no FP8) on port 7777,
+    # yielding it, then destroying it and the default process group.
     engine = create_engine(
         MODEL_PATH_BF16, fp8_enabled=False, fp8_param=False, port=7777
     )
@@ -160,6 +184,10 @@ def engine_bf16():
 
 @pytest.fixture(scope="module")
 def engine_fp8():
+    # [FUNCTION DOC]
+    # Module-scoped fixture creating the FP8 MegatronEngine (fp8 enabled with fp8
+    # params) on port 7778, yielding it, then destroying it and the default process
+    # group.
     engine = create_engine(MODEL_PATH_FP8, fp8_enabled=True, fp8_param=True, port=7778)
     try:
         yield engine
@@ -170,6 +198,10 @@ def engine_fp8():
 
 
 def test_megatron_decode_output(engine_bf16, engine_fp8):
+    # [FUNCTION DOC]
+    # Samples up to 100 tokens at temperature 0.7 for three prompts with each engine via
+    # decode_with_megatron_forward and logs the outputs. Has no assertions
+    # (smoke/inspection test).
     """Test decode using Megatron forward pass and print model output."""
     # Test prompts
     test_prompts = [
@@ -218,6 +250,17 @@ def test_megatron_decode_output(engine_bf16, engine_fp8):
 
 
 def test_fp8_bf16_logits_logprobs_comparison(fixed_input, engine_bf16, engine_fp8):
+    # [FUNCTION DOC]
+    # Runs forward_with_logits_and_logprobs on both engines, asserts matching shapes,
+    # logs max and mean absolute logprob and logit differences over non-padding
+    # positions, then per sample computes sequence-level cosine similarity of flattened
+    # valid logprobs and logits, and computes token-level cosine similarity over the
+    # concatenated valid tokens. Logs all statistics and raises AssertionError if the
+    # mean token-level cosine similarity of logprobs or of logits is below 0.99.
+    # KNOWN ISSUE: logprobs are [batch, seq] (one value per token), not [.., vocab] as
+    # the comments say, so the "token-level" logprob cosine is a single cosine over the
+    # whole concatenated vector rather than a per-token statistic; the max over masked
+    # diffs relies on padded positions contributing zero.
     """Compare both logits and logprobs between FP8 and BF16 models."""
     logits_bf16, logprobs_bf16 = forward_with_logits_and_logprobs(
         engine_bf16, fixed_input
@@ -359,6 +402,13 @@ def test_fp8_bf16_logits_logprobs_comparison(fixed_input, engine_bf16, engine_fp
 
 
 def test_fp8_bf16_gradient_comparison(fixed_input, engine_bf16, engine_fp8):
+    # [FUNCTION DOC]
+    # Puts each engine in train mode and collects gradients with
+    # collect_gradients_after_train_batch, asserts equal counts and per-name equal
+    # shapes, computes per-parameter max/mean absolute difference and cosine similarity,
+    # groups and logs by layer index parsed from "layers.<n>" in the name (others logged
+    # individually), logs overall stats and the 10 lowest-cosine parameters, and asserts
+    # mean cosine > 0.94 and minimum cosine > 0.60.
     """Compare gradients between FP8 and BF16 models after train_batch.
 
     This test verifies that gradients computed from FP8 and BF16 models
@@ -497,6 +547,11 @@ def test_fp8_bf16_gradient_comparison(fixed_input, engine_bf16, engine_fp8):
 
 @pytest.mark.skip(reason="This test is only for debugging")
 def test_profile_gemm_kernels(fixed_input, engine_bf16, engine_fp8):
+    # [FUNCTION DOC]
+    # Debug-only (always skipped): profiles GEMM kernels for forward
+    # (forward_with_logits_and_logprobs) and forward+backward
+    # (collect_gradients_after_train_batch) on both engines, logging the kernel
+    # summaries. No assertions.
     """Profile and print GEMM kernels used in forward and backward pass.
 
     This test profiles the GEMM kernels (matrix multiplication operations) used
@@ -542,6 +597,16 @@ def test_profile_gemm_kernels(fixed_input, engine_bf16, engine_fp8):
 def test_fp8_bf16_partial_layers_comparison(
     fixed_input, engine_bf16, engine_fp8, save_data: bool = False
 ):
+    # [FUNCTION DOC]
+    # Truncates both models to layers 0 and 1 and runs forward_backward_model_with_hooks
+    # on each, logs counts, compares logits and then activations, parameter gradients
+    # (with NaN/Inf and zero-norm checks) and output gradients grouped by op type, and
+    # logs operations with cosine similarity below 0.95. If save_data is True, also
+    # collects q/k layernorm inputs and output gradients and saves them with metadata to
+    # a timestamped .pt file under ./activation_inputs. No assertions.
+    # KNOWN ISSUE: save_data cannot be enabled through pytest (default parameter); the
+    # truncation and train_batch permanently modify the shared module-scoped engines, so
+    # any later test using them would see altered models.
     """Compare FP8 and BF16 on a model reduced to specified layers.
 
     This test reduces the model to specified transformer layers while keeping the full

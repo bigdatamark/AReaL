@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Torchrun script comparing raw logits of ArchonLMEngine against FSDPLMEngine on the
+# same GSM8K-derived batch using Qwen2.5-0.5B-Instruct. Passes if max abs diff < 5.0 and
+# mean abs diff < 0.2 over non-padded tokens; rank 0 writes Passed/Failed to an optional
+# output file (via dist_utils.write_result) for a pytest wrapper.
+# KNOWN ISSUE: docstring path tests/torchrun/run_archon_vs_fsdp.py does not match the
+# actual file location.
 """Test script for Archon vs FSDP Engine logits comparison.
 
 Run with torchrun:
@@ -34,6 +41,10 @@ MODEL_PATHS = {
 
 
 def setup_distributed_environment():
+    # [FUNCTION DOC]
+    # HELPER: Initializes the NCCL default process group from torchrun env vars
+    # (defaults localhost:29500, rank 0, world 1) and sets the current device to the
+    # rank. No-op if already initialized.
     """Set up distributed environment for torchrun."""
     if dist.is_initialized():
         return
@@ -52,6 +63,11 @@ def setup_distributed_environment():
 
 
 def create_batch(model_path: str, dataset_path: str) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Loads the HF tokenizer and the GSM8K "main" train split, and collects the
+    # first 4 samples whose tokenized question+answer+eos length is <= 512. Each sample
+    # has input_ids and a loss_mask that is 0 over the question-token prefix and 1 for
+    # the rest. Returns the padded tensor dict from pad_sequences_to_tensors.
     """Load tokenizer and create batch from GSM8K dataset."""
     tokenizer = load_hf_tokenizer(model_path)
     dataset = load_dataset(path=dataset_path, name="main", split="train")
@@ -72,6 +88,11 @@ def create_batch(model_path: str, dataset_path: str) -> dict:
 
 
 def create_config(engine_type: str, model_path: str) -> TrainEngineConfig:
+    # [FUNCTION DOC]
+    # HELPER: Returns a TrainEngineConfig with backend "fsdp:d1", experiment name
+    # test_<engine_type>_logits, the model path, a single micro-batch, and a constant-LR
+    # Adam optimizer (lr 2e-5, no weight decay/warmup). The same config is used for both
+    # engines.
     """Create engine configuration."""
     return TrainEngineConfig(
         backend="fsdp:d1",
@@ -90,6 +111,20 @@ def create_config(engine_type: str, model_path: str) -> TrainEngineConfig:
 
 
 def test_archon_vs_fsdp_logits(model_type: str, output: str | None = None):
+    # [FUNCTION DOC]
+    # Runs the comparison. Sets up distributed, builds the batch, initializes both
+    # engines with a pure data-parallel strategy over world_size. Moves batch to device,
+    # uses each engine's private _prepare_mb_list and _prepare_mb_inputs to get the
+    # first micro-batch inputs, puts both in eval mode and, without grad, calls the
+    # Archon model with input_ids, position_ids, cu_seqlens and int max_seqlen, and the
+    # FSDP HF model with its inputs; squeezes a leading batch dim of 1. Compares the
+    # first numel(input_ids) rows in float32, printing max/mean diff and failure
+    # reasons. Always destroys both engines; then barriers, rank 0 writes the result
+    # file if output is set, and destroys the process group. Returns bool success.
+    # KNOWN ISSUE: if an exception occurs before success is assigned, the finally block
+    # runs but later code would reference an undefined success; also slicing by numel of
+    # the padded batch tensor includes padding tokens, contrary to the "non-padding
+    # area" comment.
     """Compare Archon and FSDP engine logits.
 
     Verify:
@@ -213,6 +248,9 @@ def test_archon_vs_fsdp_logits(model_type: str, output: str | None = None):
 
 
 def main():
+    # [FUNCTION DOC]
+    # CLI entry: parses --model_type (only "qwen2") and --output, runs the comparison,
+    # and raises AssertionError if it failed.
     parser = argparse.ArgumentParser(
         description="Run Archon vs FSDP Engine Logits Comparison Test"
     )

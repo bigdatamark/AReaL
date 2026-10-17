@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Shared helpers for FP8/BF16 MegatronEngine tests: single-process engine creation with
+# optional blockwise e4m3 FP8, a no-grad forward that returns both full logits and token
+# logprobs (optionally profiling GEMM kernels with torch.profiler), extraction/printing
+# of GEMM kernel statistics from a profiler, and naive autoregressive sampling built on
+# repeated full forward passes. Requires Megatron-Core and a GPU.
+# KNOWN ISSUE: the logger name "FP8 BF16 Comparison Utils" duplicates comparison_utils'
+# name and is not PascalCase.
 """Shared utilities for FP8/BF16 comparison tests.
 
 This module contains common helper functions, fixtures, and constants
@@ -33,6 +41,22 @@ logger = logging.getLogger("FP8 BF16 Comparison Utils")
 
 
 def extract_gemm_kernels(profiler, phase: str = "forward"):
+    # [FUNCTION DOC]
+    # Collects GEMM-like kernel stats from a torch profiler. Iterates raw events
+    # (falling back to key_averages if events() fails), takes each event's key/name/str
+    # as its name, treats it as a CUDA kernel if it has is_cuda, device_type 1, a
+    # CUDA-ish type name or "kernel" in its name, and keeps it if the lowercase name
+    # contains any of gemm, cublas, cutlass, matmul, mm, bmm. For each it records
+    # duration (first available of cuda_time_total, cuda_time, self_cuda_time_total,
+    # self_cuda_time divided by 1000), count and input shapes. Then scans key_averages
+    # again adding GEMM-named entries not already seen (no CUDA check), swallowing any
+    # exception. Aggregates by name into count, total time, average time and up to 5
+    # distinct stringified input shapes. Returns a dict with phase, total_gemm_kernels
+    # (number of collected entries), unique_kernel_names and per-name kernels stats.
+    # KNOWN ISSUE: profiler times are already in microseconds, so dividing by 1000
+    # yields milliseconds while the fields are labeled _us; the "mm" keyword matches
+    # many unrelated names; the dedup of the shape list happens after truncation to 5 so
+    # fewer than 5 unique shapes may be reported.
     """Extract and summarize GEMM-related kernels from profiler output.
 
     Args:
@@ -186,6 +210,11 @@ def extract_gemm_kernels(profiler, phase: str = "forward"):
 
 
 def print_gemm_profile(profile_result: dict):
+    # [FUNCTION DOC]
+    # Logs a profile dict from extract_gemm_kernels: header with phase, totals, then
+    # each kernel sorted by total time descending with count, total and average time and
+    # sample shapes, followed by the summed GEMM time. Logs a notice and returns early
+    # if no kernels. Returns None.
     """Print gemm profiling results in a readable format."""
     logger.info("=" * 80)
     logger.info(f"GEMM Kernel Profile - {profile_result['phase'].upper()}")
@@ -229,6 +258,16 @@ def create_engine(
     fp8_param: bool = False,
     port: int = 7777,
 ) -> MegatronEngine:
+    # [FUNCTION DOC]
+    # Sets single-process distributed env vars in os.environ (world size 1, rank 0,
+    # localhost, MASTER_PORT=port), builds a MegatronEngineConfig with, if fp8_enabled,
+    # an e4m3 blockwise FP8EngineConfig (param=fp8_param) and fp8_param_gather enabled,
+    # wraps it in a TrainEngineConfig with a default optimizer, creates the
+    # MegatronEngine, its process groups from allocation "fsdp:d1p1t1", and initializes
+    # it with a small FinetuneSpec. Returns the engine. Side effects: env mutation,
+    # process group init, GPU model load.
+    # KNOWN ISSUE: backend and allocation strings say "fsdp" although a MegatronEngine
+    # is constructed; it only works because the parallel layout is all ones.
     """Create and initialize a MegatronEngine."""
     os.environ.update(
         {
@@ -269,6 +308,17 @@ def create_engine(
 def forward_with_logits_and_logprobs(
     engine: MegatronEngine, input_: dict[str, Any], profile_gemm: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # No-grad forward of a padded batch through a MegatronEngine. Puts the engine in
+    # eval mode, ensures it is ready, derives per-sequence lengths from the packed
+    # cu_seqlens, splits into micro-batches on the engine device, and runs
+    # forward_backward_batch in forward-only mode with a callback that stores raw logits
+    # and computes next-token logprobs (labels = input_ids rolled left by one, engine
+    # temperature, TP group if TP>1). If profile_gemm, wraps the forward in a CPU+CUDA
+    # torch profiler, synchronizes CUDA and logs the extracted GEMM profile. On the last
+    # pipeline stage reorders and pads outputs back to the original batch order, then
+    # broadcasts logits and logprobs from the last pipeline rank. Returns (logits
+    # [batch, seq, vocab], logprobs [batch, seq]).
     """Forward pass that returns both logits and logprobs.
 
     Args:
@@ -294,6 +344,10 @@ def forward_with_logits_and_logprobs(
     logprobs_list: list[torch.Tensor] = []
 
     def process_output(output: torch.Tensor, inputs: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Forward-only callback: computes logprobs for the rolled labels via
+        # gather_logprobs and appends the output logits and logprobs to the enclosing
+        # lists. Returns None (no loss).
         """Process output to extract logits and logprobs."""
         # output is already unpad_logits'd by forward_backward_batch
         labels = torch.roll(inputs["input_ids"], shifts=-1, dims=-1)
@@ -364,6 +418,16 @@ def decode_with_megatron_forward(
     top_k: int | None = None,
     top_p: float | None = None,
 ) -> str:
+    # [FUNCTION DOC]
+    # Autoregressive sampling using full forward passes (no KV cache). Puts the engine
+    # in eval mode, onloads if offloaded, asserts model and tokenizer exist, tokenizes
+    # the prompt, then for up to max_new_tokens steps: runs
+    # forward_with_logits_and_logprobs on the whole sequence with an all-ones mask,
+    # takes last-position logits, divides by temperature if not 1, applies top-k masking
+    # and top-p nucleus masking (keeping the first token over the threshold), samples
+    # via multinomial and appends; stops early when the first batch element emits the
+    # eos token (logged). Returns the decoded full text (prompt plus generation, special
+    # tokens kept).
     """Decode using Megatron forward pass for autoregressive generation.
 
     Args:

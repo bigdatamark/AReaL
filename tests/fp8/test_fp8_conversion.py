@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Tests Transformer Engine (TE) blockwise FP8 quantization and GEMM correctness on a
+# GPU: quantizes random BF16 matrices to Float8BlockwiseQTensor (1-D block scaling for
+# activations, 2-D for weights), runs TE's general_gemm, and compares against a BF16
+# matmul baseline and against te.Linear under FP8 autocast with a Float8BlockScaling
+# recipe. If TE imports fail, a warning is logged, the whole module is marked skipped
+# and TE names are set to None.
+# KNOWN ISSUE: when TE is missing, the default argument of
+# high_precision_to_te_blockwise_fp8 dereferences tex.DType while tex is None, so module
+# import raises AttributeError before the skip marker can take effect. Logger name is
+# not PascalCase.
 """Test FP8 conversion and matrix multiplication correctness.
 
 This test verifies:
@@ -51,6 +62,13 @@ def high_precision_to_te_blockwise_fp8(
     amax_epsilon: float = 0.0,
     force_pow_2_scales: bool = True,
 ) -> Float8BlockwiseQTensor:
+    # [FUNCTION DOC]
+    # Quantizes a high-precision tensor into a TE Float8BlockwiseQTensor using a
+    # Float8BlockQuantizer with the given FP8 dtype (default e4m3), amax epsilon,
+    # power-of-2 scale forcing and block scaling dimension (1 or 2); both rowwise and
+    # columnwise data are always produced. Raises ValueError if the quantizer reports
+    # the shape is not quantizable for its block length. Returns the quantized tensor.
+    # KNOWN ISSUE: the rowwise and columnwise arguments are accepted but ignored.
     """
     Quantize high precision tensor to TE Blockwise FP8 tensor.
 
@@ -98,6 +116,10 @@ def _log_tensor_comparison(
     max_threshold: float | None = None,
     mean_threshold: float | None = None,
 ) -> tuple[float, float]:
+    # [FUNCTION DOC]
+    # HELPER: Computes max and mean absolute difference of the two tensors (via
+    # .item()), logs them under name, and asserts each is below max_threshold /
+    # mean_threshold when those are given. Returns (max_diff, mean_diff).
     """Compare two tensors and log the differences.
 
     Args:
@@ -128,6 +150,9 @@ def _log_tensor_comparison(
 def _create_test_tensors(
     device: torch.device, M: int = 256, K: int = 512, N: int = 128
 ):
+    # [FUNCTION DOC]
+    # HELPER: Seeds torch with 42 and returns random BF16 matrices A [M, K] and B [K, N]
+    # (defaults 256, 512, 128) on device. Side effect: resets the global RNG.
     """Create test tensors for matrix multiplication.
 
     Args:
@@ -152,6 +177,11 @@ def _perform_fp8_gemm(
     device: torch.device,
     layout: str = "TN",
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Allocates a BF16 output of output_shape and a ~32 MiB uint8 workspace on
+    # device and calls TE general_gemm(weight, input) with the given layout (default
+    # "TN", i.e. input times weight transposed), BF16 output and no split accumulator.
+    # Returns the output tensor [M, N].
     """Perform FP8 GEMM using general_gemm.
 
     Args:
@@ -182,16 +212,24 @@ def _perform_fp8_gemm(
 
 @pytest.fixture
 def device():
+    # [FUNCTION DOC]
+    # Fixture returning the current platform's torch device.
     return torch.device(current_platform.device_type)
 
 
 @pytest.fixture
 def test_tensors(device):
+    # [FUNCTION DOC]
+    # Fixture returning the seeded (A, B) BF16 test matrices on the device.
     """Fixture for test tensors."""
     return _create_test_tensors(device)
 
 
 def test_te_fp8_gemm_vs_bf16(test_tensors, device):
+    # [FUNCTION DOC]
+    # Quantizes A with 1-D blocks and B transposed to [N, K] with 2-D blocks, runs the
+    # FP8 GEMM in TN layout and asserts the result is within max diff 10.0 and mean diff
+    # 1.0 of the BF16 matmul A times B.
     """Test BF16 -> TE Blockwise FP8 -> FP8 GEMM -> BF16 comparison."""
     a_bf16, b_bf16 = test_tensors
     M, _, N = a_bf16.shape[0], a_bf16.shape[1], b_bf16.shape[1]
@@ -230,6 +268,10 @@ def test_te_fp8_gemm_vs_bf16(test_tensors, device):
 
 
 def test_te_linear_autocast_vs_bf16(test_tensors):
+    # [FUNCTION DOC]
+    # Builds a bias-free BF16 te.Linear with weight B transposed, runs it normally and
+    # under FP8 autocast with blockwise E4M3 scaling, and logs the differences (no
+    # thresholds, so it only fails on errors).
     """Test TransformerEngine Linear with autocast FP8 vs BF16."""
     a_bf16, b_bf16 = test_tensors
     K, N = a_bf16.shape[1], b_bf16.shape[1]
@@ -258,6 +300,9 @@ def test_te_linear_autocast_vs_bf16(test_tensors):
 
 
 def test_te_linear_autocast_vs_gemm(test_tensors, device):
+    # [FUNCTION DOC]
+    # Compares te.Linear under FP8 blockwise autocast against the manual quantize + TN
+    # general_gemm path for the same A and B, logging differences without thresholds.
     """Test TransformerEngine Linear autocast FP8 vs manual FP8 GEMM."""
     a_bf16, b_bf16 = test_tensors
     K, N = a_bf16.shape[1], b_bf16.shape[1]

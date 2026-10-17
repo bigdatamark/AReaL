@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Slow GPU integration tests for the OpenAI proxy rollout architecture: launches a real
+# SGLang server (Qwen3-0.6B), builds a RolloutController with RemoteSGLangEngine on a
+# LocalScheduler, starts proxy workers and runs the SimpleAgent workflow end-to-end via
+# rollout_batch. Also includes in-process checks of proxy_rollout_server.SessionData
+# staleness and lifecycle. Marked sglang and slow; skipped without a GPU.
 from __future__ import annotations
 
 import os
@@ -36,17 +42,26 @@ RUN_SERVER_TIMEOUT = 180
 
 
 def get_test_model_path() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the local Qwen3-0.6B path if present, else the HF hub id (resolved
+    # lazily via get_model_path).
     """Get the model path for tests (lazy evaluation)."""
     return get_model_path(LOCAL_MODEL_PATH, HF_MODEL_ID)
 
 
 def has_local_model() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if the local model directory exists. Unused within this
+    # module.
     """Check if the model is available locally (without network)."""
 
     return os.path.exists(LOCAL_MODEL_PATH)
 
 
 def check_server_health(base_url: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: GETs <base_url>/health with a 30s timeout; True iff status 200, False on
+    # any requests exception.
     """Check if the inference server is healthy."""
     try:
         response = requests.get(f"{base_url}/health", timeout=30)
@@ -56,6 +71,8 @@ def check_server_health(base_url: str) -> bool:
 
 
 def has_gpu() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if CUDA is available with at least one device.
     """Check if GPU is available."""
     return torch.cuda.is_available() and torch.cuda.device_count() > 0
 
@@ -67,6 +84,12 @@ def has_gpu() -> bool:
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC]
+    # Module-scoped fixture: skips without GPU, seeds RNGs, picks host IP and two free
+    # ports, launches SGLang (skip tokenizer init, mem fraction 0.3, tp 1, GPU 0) as a
+    # subprocess, polls health each second for up to 180s (killing the process and
+    # failing the test on timeout), yields a dict with host, port, base_url and process,
+    # and finally kills the process tree.
     """Launch an SGLang server for testing."""
     if not has_gpu():
         pytest.skip("GPU required for SGLang server")
@@ -115,6 +138,11 @@ def sglang_server():
 
 @pytest.fixture
 def local_scheduler(tmp_path):
+    # [FUNCTION DOC]
+    # Fixture creating a LocalScheduler on GPU 0 with log dir, fileroot and name-resolve
+    # directories under tmp_path; skips without GPU. Yields it and deletes all its
+    # workers on teardown. Side effects: creates directories, may spawn worker
+    # processes.
     """Create a LocalScheduler for testing."""
     if not has_gpu():
         pytest.skip("GPU required for LocalScheduler")
@@ -143,9 +171,20 @@ def local_scheduler(tmp_path):
 @pytest.mark.slow
 @pytest.mark.skipif(not has_gpu(), reason="GPU required for integration tests")
 class TestProxyIntegration:
+    # [CLASS DOC]
+    # End-to-end proxy workflow test class (slow, GPU only).
     """Integration tests for the proxy architecture."""
 
     def test_proxy_workflow_roundtrip(self, sglang_server, local_scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Builds an InferenceEngineConfig (sglang:d1, 2 concurrent rollouts, consumer
+        # batch 1, tokenizer path set) and a RolloutController over RemoteSGLangEngine
+        # and the scheduler. Initializes it against the already running server
+        # (LocalInfServerInfo without process), starts proxy workers, asserts proxy 0's
+        # address is http, runs rollout_batch on one message sample with workflow
+        # tests.experimental.openai.utils.SimpleAgent, and asserts the result is a
+        # non-empty list of dicts whose input_ids is a 2-D RTensor. Always destroys the
+        # controller.
         """Test a complete roundtrip through the proxy architecture.
 
         This test:
@@ -221,9 +260,18 @@ class TestProxyIntegration:
 @pytest.mark.slow
 @pytest.mark.skipif(not has_gpu(), reason="GPU required for integration tests")
 class TestProxyServerEndpoints:
+    # [CLASS DOC]
+    # Direct tests of proxy server session data structures (slow, GPU-gated though they
+    # need no GPU).
     """Test proxy server HTTP endpoints directly."""
 
     def test_session_timeout_cleanup(self):
+        # [FUNCTION DOC]
+        # Inserts a SessionData into the module-global _session_cache, asserts it is not
+        # stale, backdates its private _last_access_time past SESSION_TIMEOUT_SECONDS
+        # and asserts it is stale, then removes it from the cache.
+        # KNOWN ISSUE: named "cleanup" but never exercises any cleanup routine; it only
+        # checks is_stale. If an assertion fails the cache entry is not removed.
         """Test that stale sessions are cleaned up."""
         from areal.experimental.openai.proxy.proxy_rollout_server import (
             SessionData,
@@ -251,6 +299,10 @@ class TestProxyServerEndpoints:
 
     @pytest.mark.asyncio
     async def test_session_data_lifecycle(self):
+        # [FUNCTION DOC]
+        # Asserts a new SessionData has its id and is not completed, update_last_access
+        # advances _last_access_time, finish sets _completed and _end_time, and
+        # wait_for_finish(timeout 0.1) returns True immediately once finished.
         """Test SessionData class methods."""
         from areal.experimental.openai.proxy.proxy_rollout_server import SessionData
 

@@ -1,7 +1,15 @@
+# [MODULE DOC]
+# Unit test for translate_anthropic_request, which converts an Anthropic Messages API
+# request into an OpenAI chat-completions style request.
 from areal.experimental.openai.anthropic import translate_anthropic_request
 
 
 def test_translate_anthropic_request_preserves_tool_round_trip():
+    # [FUNCTION DOC]
+    # Translates a request containing an assistant tool_use block and a user tool_result
+    # block and asserts the tool call id and function name survive in the assistant
+    # message's tool_calls, and the following tool message carries the matching
+    # tool_call_id.
     translated = translate_anthropic_request(
         {
             "model": "claude-compatible",

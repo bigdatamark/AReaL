@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Integration tests for ArealOpenAI tool calling against a real SGLang server
+# (Qwen3-0.6B, qwen25 tool parser, qwen3 reasoning parser): streaming tool-call chunks,
+# single/multi-round and parallel tool calls, reward discounting across tool turns,
+# think-tag stripping while preserving tool messages, and concat-style export with loss
+# masks. Defines a module-level list of five function tool schemas (get_weather,
+# calculate, get_fact, get_time, translate). Marked sglang; requires a GPU.
+# KNOWN ISSUE: the header comment is copied from test_client.py and does not mention
+# tools.
 # This file tests the functionality of our customized OpenAI client.
 # The client should be able to generate completions and correctly assign rewards with back-propagation.
 import os
@@ -29,6 +38,9 @@ RUN_SERVER_TIMEOUT = 180
 
 
 def check_server_health(base_url):
+    # [FUNCTION DOC]
+    # HELPER: GETs <base_url>/health (30s timeout); returns True iff status 200, False
+    # on any requests exception.
     try:
         response = requests.get(f"{base_url}/health", timeout=30)
         return response.status_code == 200
@@ -38,6 +50,10 @@ def check_server_health(base_url):
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC]
+    # Module-scoped fixture launching an SGLang server subprocess (seeded, mem fraction
+    # 0.3, tp 1, GPU 0) and polling health once per second for up to 180s; raises
+    # RuntimeError on timeout, yields, then kills the process tree.
     seeding.set_random_seed(1, EXPR_NAME)
     cmd = SGLangConfig.build_cmd(
         sglang_config=SGLangConfig(
@@ -71,11 +87,18 @@ def sglang_server():
 
 @pytest.fixture(scope="module")
 def tokenizer():
+    # [FUNCTION DOC]
+    # Module-scoped fixture returning the HF tokenizer for MODEL_PATH.
     return load_hf_tokenizer(MODEL_PATH)
 
 
 @pytest.fixture
 def openai_client(sglang_server, tokenizer):
+    # [FUNCTION DOC]
+    # Fixture building and initializing a RemoteSGLangEngine (sglang:d1) addressed via
+    # the AREAL_LLM_SERVER_ADDRS env var, yielding an ArealOpenAI client with qwen25
+    # tool parser, qwen3 reasoning parser and "hf" template type; destroys the engine
+    # afterwards.
     from areal.api.cli_args import InferenceEngineConfig
     from areal.engine import RemoteSGLangEngine
 
@@ -196,6 +219,11 @@ tools = [
 
 @pytest.mark.asyncio
 async def test_streaming_with_tool_calling(openai_client):
+    # [FUNCTION DOC]
+    # Streams a weather question with tools and asserts chunk structure; if any chunks
+    # carry tool_calls, they must come in pairs where the first carries id, type
+    # function, name and empty arguments and the second has the same index and non-empty
+    # arguments, and the single final chunk's finish_reason must be tool_calls.
     """Test streaming mode with tool calling."""
     chunks = []
     stream = await openai_client.chat.completions.create(
@@ -263,6 +291,10 @@ async def test_streaming_with_tool_calling(openai_client):
 
 @pytest.mark.asyncio
 async def test_single_round_tool_calling(openai_client):
+    # [FUNCTION DOC]
+    # Asserts a weather question yields an assistant message with tool_calls and
+    # finish_reason tool_calls, then that a reward of 1.5 is exported individually for
+    # it.
     """Test single-round conversation with tool calling."""
 
     c = await openai_client.chat.completions.create(
@@ -293,6 +325,10 @@ async def test_single_round_tool_calling(openai_client):
 
 @pytest.mark.asyncio
 async def test_multi_round_tool_calling(openai_client):
+    # [FUNCTION DOC]
+    # Runs three rounds with mocked tool results (tool_call_ids not matching real ones),
+    # sets rewards 1.0 and 2.0 on rounds 2 and 3, applies discount 0.8 and asserts
+    # rewards 2.0, 1.0+0.8*2.0 and 0.8 times round 2's value for round 1.
     """Test multi-round conversation with tool calling across rounds."""
 
     # Round 1 - Initial tool call request
@@ -366,6 +402,10 @@ async def test_multi_round_tool_calling(openai_client):
 
 @pytest.mark.asyncio
 async def test_parallel_tool_calling(openai_client):
+    # [FUNCTION DOC]
+    # Asks for three tool actions in one request, sets reward 3.0, then follows up with
+    # three mocked tool results and sets reward 2.0; after discount 0.9 asserts the
+    # follow-up keeps 2.0 and the first gets 3.0+0.9*2.0.
     """Test parallel tool calling within a single round."""
 
     # Single request that could trigger multiple tool calls
@@ -429,6 +469,9 @@ async def test_parallel_tool_calling(openai_client):
 
 
 def strip_thinking_tags(content: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Removes think-tag blocks (non-greedy, multi-line), collapses whitespace
+    # and strips; returns the cleaned string.
     """Remove thinking tags and their content from a message."""
     import re
 
@@ -442,6 +485,14 @@ def strip_thinking_tags(content: str) -> str:
 
 @pytest.mark.asyncio
 async def test_multi_round_conversation_with_thinking_and_tool_calling(openai_client):
+    # [FUNCTION DOC]
+    # Runs three rounds with tools, stripping think blocks from assistant dicts before
+    # reuse and appending mocked tool results. Asserts stored assistant messages for
+    # rounds 2 and 3 contain no think tags, raises RuntimeError if no tool message is in
+    # round 3's stored history, then checks discounted rewards (0.9) of 1.5, 2.0+0.9*1.5
+    # and 1.0+0.9*(that).
+    # KNOWN ISSUE: an inline comment on the leaf reward assertion says "1.5 + 0.8" which
+    # does not match the asserted value.
     """Test multi-round conversation with both thinking and tool calling, ensuring thinking is stripped but tool calls are preserved."""
 
     # Round 1 - Model thinks before making a tool call
@@ -532,6 +583,15 @@ async def test_multi_round_conversation_with_thinking_and_tool_calling(openai_cl
 
 @pytest.mark.asyncio
 async def test_multi_step_tool_calling_concat_style(openai_client):
+    # [FUNCTION DOC]
+    # Switches to "concat" mode and builds two independent branches (different user
+    # questions) each with a tool-calling turn followed by a mocked tool result turn.
+    # Asserts both first turns produced tool calls, concat export returns the two
+    # leaves, individual returns all four, leaves' parents are their first turns which
+    # have no parent, rewards are not propagated, and each leaf loss mask is 1 over both
+    # outputs and 0 elsewhere.
+    # KNOWN ISSUE: docstring mentions stripping think tags, but message content is
+    # reused as-is without stripping.
     """Test multi-round conversation with tool calling and concat-style export.
 
     This test ensures that when using `export_interactions(style="concat")`,
@@ -617,6 +677,8 @@ async def test_multi_step_tool_calling_concat_style(openai_client):
     }
 
     def wrapped_completion(chat_completion):
+        # [FUNCTION DOC]
+        # HELPER: Looks up the exported interaction for a chat completion by id.
         return all_completions[chat_completion.id]
 
     # Verify tree structure

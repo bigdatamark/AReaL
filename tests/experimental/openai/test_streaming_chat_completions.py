@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests that the proxy rollout server's /chat/completions handler returns an SSE
+# StreamingResponse (data lines terminated by a [DONE] event) when stream is true and a
+# plain JSON ChatCompletion otherwise. The server's module-level OpenAI client is
+# replaced by a fake whose create returns canned objects; the app runs in-process via
+# httpx ASGITransport. Regression test for AReaL issue 1046. Skipped if httpx is
+# missing.
 """Tests for streaming and non-streaming behaviour of the ``/chat/completions`` endpoint.
 
 The proxy rollout server's ``chat_completions`` handler must correctly return a
@@ -33,14 +40,21 @@ _transport = httpx.ASGITransport(app=srv.app)
 
 
 def _client():
+    # [FUNCTION DOC]
+    # HELPER: Returns an httpx.AsyncClient bound to the server app's ASGI transport.
     return httpx.AsyncClient(transport=_transport, base_url="http://testserver")
 
 
 def _admin_headers():
+    # [FUNCTION DOC]
+    # HELPER: Returns an Authorization Bearer header for the test admin key.
     return {"Authorization": f"Bearer {_ADMIN_KEY}"}
 
 
 def _session_headers(api_key: str):
+    # [FUNCTION DOC]
+    # HELPER: Returns Authorization Bearer header for a session key plus JSON content
+    # type.
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -49,6 +63,9 @@ def _session_headers(api_key: str):
 
 @pytest.fixture(autouse=True)
 def _reset_server_globals(monkeypatch):
+    # [FUNCTION DOC]
+    # Autouse fixture resetting the server module's globals (session cache, key maps,
+    # capacity 0, admin key, lock, last cleanup time) via monkeypatch before each test.
     """Reset all module-level globals before each test."""
     monkeypatch.setattr(srv, "_session_cache", {})
     monkeypatch.setattr(srv, "_api_key_to_session", {})
@@ -73,6 +90,14 @@ async def _fake_create(
     areal_cache=None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Async stand-in for the reward-tracking completions create. Accepts
+    # keyword-only messages, stream, temperature, top_p, areal_cache and extra kwargs
+    # (explicit names keep them through the server's signature-based argument
+    # filtering). If stream is truthy returns an async generator yielding one
+    # ChatCompletionChunk with assistant content "hello"; otherwise returns a
+    # ChatCompletion with one "hello" message and finish_reason stop. All inputs are
+    # ignored.
     """Minimal stand-in for ``AsyncCompletionsWithReward.create``.
 
     Returns an ``AsyncGenerator[ChatCompletionChunk]`` when *stream* is truthy,
@@ -85,6 +110,9 @@ async def _fake_create(
     if stream:
 
         async def _gen():
+            # [FUNCTION DOC]
+            # HELPER: Async generator yielding a single chunk with delta role assistant
+            # and content "hello".
             yield ChatCompletionChunk(
                 id="chatcmpl-test",
                 choices=[
@@ -118,6 +146,9 @@ async def _fake_create(
 
 @pytest.fixture()
 def _mock_openai_client(monkeypatch):
+    # [FUNCTION DOC]
+    # Fixture installing a MagicMock as the server's _openai_client with
+    # chat.completions.create replaced by the fake create function (via monkeypatch).
     """Inject a fake OpenAI client so no real inference engine is needed."""
     mock_client = MagicMock()
     mock_client.chat.completions.create = _fake_create
@@ -130,12 +161,19 @@ def _mock_openai_client(monkeypatch):
 
 
 class TestChatCompletionsEndpoint:
+    # [CLASS DOC]
+    # Tests for /chat/completions streaming vs non-streaming responses.
     """Verify streaming and non-streaming responses from ``/chat/completions``."""
 
     @pytest.mark.asyncio
     async def test_streaming_returns_sse_response(
         self, monkeypatch, _mock_openai_client
     ):
+        # [FUNCTION DOC]
+        # Starts a session (capacity 1), posts a streaming chat request with the session
+        # key and asserts 200, an event-stream content type, at least two data events
+        # with the last being the [DONE] sentinel, and that the first event parses as a
+        # chat.completion.chunk whose delta content is "hello".
         """``stream=True`` returns an SSE stream (``text/event-stream``)."""
         monkeypatch.setattr(srv, "_capacity", 1)
 
@@ -177,6 +215,9 @@ class TestChatCompletionsEndpoint:
 
     @pytest.mark.asyncio
     async def test_non_streaming_returns_json(self, monkeypatch, _mock_openai_client):
+        # [FUNCTION DOC]
+        # Starts a session and posts a non-streaming chat request; asserts 200 and a
+        # JSON body of object chat.completion with message content "hello".
         """Without ``stream``, returns a JSON ``ChatCompletion``."""
         monkeypatch.setattr(srv, "_capacity", 1)
 

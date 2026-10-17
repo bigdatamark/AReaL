@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Reusable statistics and logging helpers for FP8 vs BF16 comparison tests: per-tensor
+# diff/norm/cosine-similarity metrics, dictionary-wide comparisons grouped by operation
+# type (via model_hooks.categorize_op_name), logits comparison, and detection/logging of
+# operations whose cosine similarity falls below a threshold. All output goes through an
+# AReaL logger.
+# KNOWN ISSUE: the logger name "FP8 BF16 Comparison Utils" does not follow the project's
+# PascalCase logger naming convention.
 """Comparison utilities for FP8/BF16 comparison tests.
 
 This module contains reusable functions for comparing tensors, activations,
@@ -24,6 +32,17 @@ def compare_tensors(
     check_nan_inf: bool = False,
     check_zero_norm: bool = False,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Compares a BF16 and FP8 tensor. Returns a dict with name and shape_match; if
+    # shapes differ logs a warning and returns only those. Otherwise adds max_diff and
+    # mean_diff of the absolute difference, bf16_norm and fp8_norm (all via .item(),
+    # causing GPU sync); when check_nan_inf adds has_nan/has_inf (warning if any); when
+    # check_zero_norm adds zero_norm (warning if either norm is 0) and then forces
+    # cos_sim 0.0; otherwise computes cosine similarity of the flattened tensors,
+    # replacing NaN with 0.0 (with a warning).
+    # KNOWN ISSUE: the difference and cosine similarity are computed in the inputs'
+    # native dtypes (no float32 upcast), so low-precision rounding affects the metrics,
+    # and mixed dtypes rely on implicit promotion.
     """Compare two tensors and return statistics.
 
     Args:
@@ -118,6 +137,14 @@ def compare_tensors_dict(
     group_by_op_type: bool = True,
     name_width: int = 50,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Compares tensors present under the same key in both dicts (sorted by name),
+    # skipping None values and shape mismatches. Logs one aligned line per tensor (name
+    # padded to name_width, optionally suffixed with its op type). When
+    # group_by_op_type, accumulates max_diffs, mean_diffs, cos_sims and names per
+    # categorized op type and logs a summary per type (max of max_diffs, means of
+    # mean_diffs and cos_sims, op count). Returns a dict with stats_by_type (plain dict;
+    # empty if grouping is off) and individual_stats (name -> compare_tensors result).
     """Compare two dictionaries of tensors and return statistics grouped by operation type.
 
     Args:
@@ -219,6 +246,10 @@ def compare_logits(
     logits_bf16: torch.Tensor,
     logits_fp8: torch.Tensor,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Logs a header and compares logits via compare_tensors (no NaN/zero-norm checks),
+    # logging max/mean diff and cosine similarity or a shape-mismatch warning. Returns
+    # the comparison dict.
     """Compare logits between BF16 and FP8 models.
 
     Args:
@@ -250,6 +281,10 @@ def find_problematic_operations(
     stats_by_type: dict[str, dict[str, list]],
     threshold: float = 0.95,
 ) -> list[tuple[str, str, float, float]]:
+    # [FUNCTION DOC]
+    # Scans stats_by_type and collects (op_type, name, cos_sim, max_diff) for every
+    # entry with cos_sim below threshold (default 0.95). Returns the list sorted by
+    # ascending cos_sim.
     """Find operations with cosine similarity below threshold.
 
     Args:
@@ -272,6 +307,9 @@ def log_problematic_operations(
     threshold: float = 0.95,
     title: str = "Problematic Operations",
 ):
+    # [FUNCTION DOC]
+    # Logs the operations returned by find_problematic_operations for the threshold
+    # under a titled banner, or a message that none were found. Returns None.
     """Log operations with cosine similarity below threshold.
 
     Args:

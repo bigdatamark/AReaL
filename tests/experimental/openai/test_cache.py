@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Unit tests for InteractionCache (an ordered dict of interaction id to
+# InteractionWithTokenLogpReward): reward setting, last-reward setting, reward
+# discounting across turns, and exporting in "individual" vs "concat" styles where
+# concat links interactions into parent/child trees by token-prefix matching and returns
+# only leaves. Uses the Qwen3-0.6B tokenizer and MagicMock model responses.
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,6 +21,9 @@ from areal.utils.hf_utils import load_hf_tokenizer
 
 @pytest.fixture(scope="module")
 def tokenizer():
+    # [FUNCTION DOC]
+    # Module-scoped fixture loading the Qwen3-0.6B tokenizer (local storage path or HF
+    # hub id).
     """Load the tokenizer once for all tests in this module."""
     return load_hf_tokenizer(
         get_model_path("/storage/openpsi/models/Qwen__Qwen3-0.6B", "Qwen/Qwen3-0.6B")
@@ -23,6 +32,9 @@ def tokenizer():
 
 @pytest.fixture
 def mock_interaction(tokenizer):
+    # [FUNCTION DOC]
+    # Fixture returning a factory that builds mock InteractionWithTokenLogpReward
+    # objects.
     """Returns a function to create a mock InteractionWithTokenLogpReward."""
 
     def _create_mock_interaction(
@@ -36,6 +48,19 @@ def mock_interaction(tokenizer):
         messages_delimiter_start: str = "<|im_start|>",
         messages_delimiter_end: str = "<|im_end|>",
     ):
+        # [FUNCTION DOC]
+        # HELPER: Builds an interaction. Renders messages into a ChatML-like prompt
+        # using the given delimiters plus a trailing assistant header, tokenizes it as
+        # input_tokens, tokenizes response_text as output_tokens, and sets both on a
+        # MagicMock model_response. Builds a completed assistant ResponseOutputMessage
+        # with the text, creates the interaction with reward, chat_template_type
+        # (default "concat") and the dumped output message. When is_completion is True
+        # attaches a mock completion (id, created), the messages, and an OpenAI Response
+        # with that output. Returns the interaction. Raises AssertionError for
+        # is_completion False (unsupported).
+        # KNOWN ISSUE: assistant messages whose content is a list (dumped Responses
+        # output) are rendered via Python str() of the list, so prompt tokens for
+        # multi-turn messages are not a realistic template rendering.
         messages = messages or []
         mock_model_response = MagicMock()
 
@@ -98,6 +123,8 @@ def mock_interaction(tokenizer):
 
 
 def test_set_reward(mock_interaction):
+    # [FUNCTION DOC]
+    # Asserts set_reward stores the reward on the cached interaction.
     cache = InteractionCache()
     interaction = mock_interaction(id="1")
     cache["1"] = interaction
@@ -106,6 +133,9 @@ def test_set_reward(mock_interaction):
 
 
 def test_set_reward_updates_cached_reward_tensors():
+    # [FUNCTION DOC]
+    # Asserts set_reward also overwrites cached "rewards" tensor and populates
+    # "original_rewards" in the interaction's _cache.
     cache = InteractionCache()
     cache["1"] = InteractionWithTokenLogpReward(_cache={"rewards": torch.tensor([0.0])})
 
@@ -118,6 +148,9 @@ def test_set_reward_updates_cached_reward_tensors():
 
 
 def test_set_last_reward(mock_interaction):
+    # [FUNCTION DOC]
+    # Asserts set_last_reward assigns reward only to the most recently inserted
+    # interaction.
     cache = InteractionCache()
     cache["1"] = mock_interaction(id="1")
     cache["2"] = mock_interaction(id="2")
@@ -127,6 +160,10 @@ def test_set_last_reward(mock_interaction):
 
 
 def test_export_with_reward_discount(mock_interaction):
+    # [FUNCTION DOC]
+    # Builds three interactions ordered by created time, last with reward 10, exports
+    # individually with reward_discount 0.9 and asserts rewards propagate backwards as
+    # 10, 9, 8.1.
     cache = InteractionCache()
     cache["1"] = mock_interaction(id="1", created=1)
     cache["2"] = mock_interaction(id="2", created=2)
@@ -148,6 +185,8 @@ def test_export_with_reward_discount(mock_interaction):
 
 
 def test_export_triggers_reward_discount_once(mock_interaction):
+    # [FUNCTION DOC]
+    # Asserts apply_reward_discount raises RuntimeError when called a second time.
     cache = InteractionCache()
     cache["1"] = mock_interaction(id="1", reward=10.0)
     # First call triggers it
@@ -160,6 +199,9 @@ def test_export_triggers_reward_discount_once(mock_interaction):
 
 
 def test_export_interactions_individual_style(mock_interaction):
+    # [FUNCTION DOC]
+    # Asserts individual export returns all interactions keyed by id with no parent
+    # links.
     cache = InteractionCache()
     cache["1"] = mock_interaction(id="1")
     cache["2"] = mock_interaction(id="2")
@@ -174,6 +216,10 @@ def test_export_interactions_individual_style(mock_interaction):
 
 
 def test_export_interactions_concat_style(mock_interaction):
+    # [FUNCTION DOC]
+    # Builds a tree (i1 -> i2 -> i4, and i3 sibling of i1 at root) where child prompts
+    # extend parent prompt+output; asserts concat export returns only leaves i3 and i4
+    # and that parent links are i4->i2->i1 with i1 and i3 having no parent.
     cache = InteractionCache()
     # Tree: root -> i1 -> i2 -> i4
     #             \
@@ -232,6 +278,10 @@ def test_export_interactions_concat_style(mock_interaction):
 
 
 def test_export_interactions_concat_style_output_be_refactored(mock_interaction):
+    # [FUNCTION DOC]
+    # Asserts that when a child's prompt contains a rewritten (shortened) version of the
+    # parent's response, token-prefix matching fails and both interactions are exported
+    # as independent leaves with no parent.
     """
     Tests that if a parent's response is refactored (e.g. 'think' tokens removed),
     the child still correctly identifies the parent based on token matching.
@@ -268,6 +318,9 @@ def test_export_interactions_concat_style_output_be_refactored(mock_interaction)
 
 
 def test_multiple_exports_after_build(mock_interaction):
+    # [FUNCTION DOC]
+    # Asserts repeated exports alternate correctly: concat returns only the leaf,
+    # individual returns both, and a second concat again returns only the leaf.
     cache = InteractionCache()
     i1 = mock_interaction(
         id="1",
@@ -305,12 +358,16 @@ def test_multiple_exports_after_build(mock_interaction):
 
 
 def test_export_interactions_empty_cache(mock_interaction):
+    # [FUNCTION DOC]
+    # Asserts concat export of an empty cache returns an empty result.
     cache = InteractionCache()
     exported = cache.export_interactions(style="concat")
     assert len(exported) == 0
 
 
 def test_export_interactions_invalid_style(mock_interaction):
+    # [FUNCTION DOC]
+    # Asserts an unknown export style raises ValueError mentioning the invalid style.
     cache = InteractionCache()
     cache["1"] = mock_interaction(id="1")
     with pytest.raises(ValueError, match="Invalid export interactions style"):
@@ -318,6 +375,9 @@ def test_export_interactions_invalid_style(mock_interaction):
 
 
 def test_export_concat_wrong_template_type(mock_interaction):
+    # [FUNCTION DOC]
+    # Asserts concat export raises ValueError when an interaction uses the "hf" chat
+    # template type.
     cache = InteractionCache()
     cache["1"] = mock_interaction(id="1", chat_template_type="hf")
     with pytest.raises(

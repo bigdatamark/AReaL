@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tests for areal.experimental.openai.tool_call_parser.process_tool_calls, which
+# extracts tool calls and strips reasoning/tool markup from generated text, returning
+# (tool_calls, remaining text, finish_reason). Covers the built-in qwen3_coder XML
+# parser (no SGLang needed), and the qwen25 JSON parser via SGLang or via vLLM (with
+# vLLM tool and reasoning parsers replaced by fakes and the SGLang path forced to fail).
+# Fixtures include a think block followed by two search tool calls, and a variant with a
+# spurious tool call inside the think block which must not be parsed.
 import json
 from types import SimpleNamespace
 
@@ -118,6 +126,10 @@ ls -la
 
 
 def _assert_tool_calls(tool_calls, new_text: str, new_finish_reason: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Asserts finish_reason is tool_calls and exactly two
+    # ChatCompletionMessageToolCall objects of type function named search with the two
+    # expected JSON argument strings. The new_text argument is accepted but not checked.
     assert new_finish_reason == "tool_calls"
     assert tool_calls is not None, "Tool calls should be detected and returned"
     assert len(tool_calls) == 2, "Two tool calls should be parsed from the text"
@@ -137,6 +149,10 @@ def _assert_tool_calls(tool_calls, new_text: str, new_finish_reason: str) -> Non
 
 
 def _run_process_tool_calls(text: str):
+    # [FUNCTION DOC]
+    # HELPER: Runs process_tool_calls on text with the search/access TOOLS, qwen25 tool
+    # parser, qwen3 reasoning parser, finish_reason tool_calls, chat-completions mode
+    # and a dummy tokenizer object; returns its (tool_calls, text, finish_reason) tuple.
     return parser_module.process_tool_calls(
         text=text,
         tools=TOOLS,
@@ -149,6 +165,11 @@ def _run_process_tool_calls(text: str):
 
 
 def test_process_tool_calls_qwen3_coder_xml_parameters_without_sglang():
+    # [FUNCTION DOC]
+    # Parses a qwen3_coder XML tool call (function=Bash with command and timeout params)
+    # and asserts finish_reason becomes tool_calls, one Bash call with arguments command
+    # "ls -la" and timeout coerced to integer 120 per the schema, and that the remaining
+    # text keeps the preamble but no tool_call markup or end-of-turn token.
     tool_calls, new_text, new_finish_reason = parser_module.process_tool_calls(
         text=QWEN3_CODER_TEXT,
         tools=QWEN3_CODER_TOOLS,
@@ -173,6 +194,9 @@ def test_process_tool_calls_qwen3_coder_xml_parameters_without_sglang():
 
 
 def test_qwen3_coder_xml_empty_args_returns_no_parse():
+    # [FUNCTION DOC]
+    # Asserts the private qwen3_coder XML parser returns (None, original text, original
+    # finish_reason) when the function block has no parameters.
     text = "<tool_call>\n<function=Bash>\n</function>\n</tool_call>"
 
     tool_calls, new_text, finish_reason = (
@@ -189,6 +213,10 @@ def test_qwen3_coder_xml_empty_args_returns_no_parse():
 
 
 def test_qwen3_coder_xml_literal_closing_tag_is_not_silently_truncated():
+    # [FUNCTION DOC]
+    # Asserts that a parameter value containing a literal closing parameter tag makes
+    # the XML parser refuse to parse (None, unchanged text, unchanged finish_reason)
+    # rather than truncating the content.
     text = (
         "<tool_call>\n<function=Write>\n"
         "<parameter=file_path>\na.xml\n</parameter>\n"
@@ -211,6 +239,9 @@ def test_qwen3_coder_xml_literal_closing_tag_is_not_silently_truncated():
 
 @pytest.mark.sglang
 def test_process_tool_calls_qwen25_chat_completions_sglang():
+    # [FUNCTION DOC]
+    # SGLang path (skipped without SGLang): asserts both search calls after the think
+    # block are extracted and no tool_call markup remains in the text.
     pytest.importorskip(
         "sglang.srt.function_call.function_call_parser",
         reason="sglang is required for sglang parser tests",
@@ -228,6 +259,10 @@ def test_process_tool_calls_qwen25_chat_completions_sglang():
 
 @pytest.mark.sglang
 def test_process_tool_calls_qwen25_chat_completions_with_tool_call_in_thinking_sglang():
+    # [FUNCTION DOC]
+    # SGLang path: with a tool call embedded inside the think block, asserts only the
+    # two calls after the reasoning are extracted and the embedded markup stays in the
+    # text.
     pytest.importorskip(
         "sglang.srt.function_call.function_call_parser",
         reason="sglang is required for sglang parser tests",
@@ -246,18 +281,31 @@ def test_process_tool_calls_qwen25_chat_completions_with_tool_call_in_thinking_s
 
 
 def _raise_module_not_found(*args, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Always raises ModuleNotFoundError; used to force the SGLang code path to
+    # fail so the vLLM fallback is exercised.
     raise ModuleNotFoundError
 
 
 class FakeReasoningParser:
+    # [CLASS DOC]
+    # HELPER: Fake vLLM reasoning parser exposing think start/end tokens; constructor
+    # ignores its arguments.
     start_token = "<think>"
     end_token = "</think>"
 
     def __init__(self, tokenizer, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Accepts and ignores tokenizer and any other arguments.
         pass
 
 
 def _patch_vllm_parsers(monkeypatch):
+    # [FUNCTION DOC]
+    # HELPER: Skips unless vllm.tool_parsers and vllm.reasoning import. Monkeypatches
+    # the module's _process_tool_calls_sglang to raise ModuleNotFoundError and makes
+    # vLLM's ReasoningParserManager.get_reasoning_parser return FakeReasoningParser.
+    # Returns the vllm.tool_parsers module.
     tool_parsers = pytest.importorskip(
         "vllm.tool_parsers",
         reason="vllm is required for vllm parser tests",
@@ -281,13 +329,26 @@ def _patch_vllm_parsers(monkeypatch):
 def test_process_tool_calls_qwen25_chat_completions_vllm(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    # [FUNCTION DOC]
+    # vLLM path: installs a fake qwen25 tool parser that requires skip_special_tokens
+    # True on the request, removes the two known tool-call strings from content and
+    # returns two search calls. Asserts the parsed calls and that no tool_call markup
+    # remains.
     tool_parsers = _patch_vllm_parsers(monkeypatch)
 
     class FakeParser:
+        # [CLASS DOC]
+        # HELPER: Fake vLLM tool parser returning canned results for the TEXT fixture.
         def __init__(self, tokenizer):
+            # [FUNCTION DOC]
+            # HELPER: Stores the tokenizer.
             self.tokenizer = tokenizer
 
         def extract_tool_calls(self, content_text, request):
+            # [FUNCTION DOC]
+            # HELPER: Asserts request.skip_special_tokens is True and returns a
+            # namespace with tools_called True, content with the two trailing tool-call
+            # strings removed, and two search tool calls with fixed arguments.
             assert request.skip_special_tokens is True
             return SimpleNamespace(
                 tools_called=True,
@@ -330,13 +391,26 @@ def test_process_tool_calls_qwen25_chat_completions_vllm(
 def test_process_tool_calls_qwen25_chat_completions_with_tool_call_in_thinking_vllm(
     monkeypatch: pytest.MonkeyPatch,
 ):
+    # [FUNCTION DOC]
+    # vLLM path with a tool call inside the think block: asserts the two real calls are
+    # returned and the embedded tool-call markup remains in the text (reasoning is split
+    # off before tool parsing).
     tool_parsers = _patch_vllm_parsers(monkeypatch)
 
     class FakeParser:
+        # [CLASS DOC]
+        # HELPER: Fake vLLM tool parser returning canned results for the in-thinking
+        # fixture.
         def __init__(self, tokenizer):
+            # [FUNCTION DOC]
+            # HELPER: Stores the tokenizer.
             self.tokenizer = tokenizer
 
         def extract_tool_calls(self, content_text, request):
+            # [FUNCTION DOC]
+            # HELPER: Asserts request.skip_special_tokens is True and returns
+            # tools_called True, content with the two trailing tool-call strings
+            # removed, and two fixed search calls.
             assert request.skip_special_tokens is True
             return SimpleNamespace(
                 tools_called=True,

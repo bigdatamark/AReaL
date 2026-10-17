@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Unit tests for InteractionCache.drop_retry_orphans, which removes "orphan" completions
+# created when an agent SDK times out and retries the same request: among cached
+# interactions with identical input messages, leaves are dropped when a sibling has
+# children, and if all are leaves only the most recently created survives. Also checks
+# ordering with reward discounting, the export_interactions flag, and total_reward
+# bookkeeping. Uses lightweight mock completions; no tokenizer or server.
 """Unit tests for retry-orphan detection in InteractionCache.
 
 Covers the scenario where the upstream Agent SDK times out, retries the same
@@ -23,6 +30,11 @@ def _make_interaction(
     reward: float | None = None,
     created: int = 0,
 ) -> InteractionWithTokenLogpReward:
+    # [FUNCTION DOC]
+    # HELPER: Builds a concat-style InteractionWithTokenLogpReward with the given
+    # messages, output messages (default a single assistant message "out-<cid>") and
+    # reward, and attaches a MagicMock completion with id cid and created timestamp
+    # (used for interaction ids and recency ranking). Returns the interaction.
     """Build a minimal InteractionWithTokenLogpReward usable by the cache.
 
     Avoids loading a real tokenizer / openai schema by patching the
@@ -45,14 +57,20 @@ def _make_interaction(
 
 
 def _user_msg(text: str) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Returns a user-role message dict with the text.
     return {"role": "user", "content": text}
 
 
 def _assistant_msg(text: str) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Returns an assistant-role message dict with the text.
     return {"role": "assistant", "content": text}
 
 
 def test_no_retry_keeps_all():
+    # [FUNCTION DOC]
+    # Asserts that with no duplicate-input interactions nothing is dropped.
     """No duplicate-input pairs → nothing dropped."""
     cache = InteractionCache()
     cache["a"] = _make_interaction("a", [_user_msg("hi")])
@@ -66,6 +84,10 @@ def test_no_retry_keeps_all():
 
 
 def test_single_retry_with_subsequent_turn_drops_orphan():
+    # [FUNCTION DOC]
+    # Two same-input interactions where only the later one has a child (via prefix
+    # match); asserts the child links to "retry" and that only the childless "orphan" is
+    # dropped.
     """orphan(leaf) + retry(has child) → drop orphan."""
     msgs = [_user_msg("hi")]
     cache = InteractionCache()
@@ -84,6 +106,9 @@ def test_single_retry_with_subsequent_turn_drops_orphan():
 
 
 def test_retry_then_session_ends_keeps_latest():
+    # [FUNCTION DOC]
+    # Two same-input leaves with equal created times; asserts the earlier inserted one
+    # is dropped and the later one kept.
     """Two siblings, both leaves → keep the latest, drop the earlier.
 
     When the session ends immediately after a retry there is no later turn
@@ -102,6 +127,9 @@ def test_retry_then_session_ends_keeps_latest():
 
 
 def test_all_leaves_keeps_latest_by_created_at():
+    # [FUNCTION DOC]
+    # Two same-input leaves where the later-created one is inserted first; asserts the
+    # survivor is chosen by created time (retry, created 100), not insertion order.
     """All-leaf fallback ranks by created_at, not insertion order.
 
     The retry is inserted *before* the orphan but carries a larger
@@ -119,6 +147,8 @@ def test_all_leaves_keeps_latest_by_created_at():
 
 
 def test_three_retries_drops_two_orphans():
+    # [FUNCTION DOC]
+    # Three same-input leaves with created 1, 2, 3; asserts the two earlier are dropped.
     """Three same-input leaves → keep the latest, drop the two earlier."""
     msgs = [_user_msg("hi")]
     cache = InteractionCache()
@@ -131,6 +161,9 @@ def test_three_retries_drops_two_orphans():
 
 
 def test_mid_conversation_retry():
+    # [FUNCTION DOC]
+    # Five-turn chain with a duplicated third turn whose retry is extended by turn 4;
+    # asserts only the third-turn orphan is dropped and all other turns are kept.
     """Retry happens at turn 3 of a 5-turn dialogue.
 
     Only the orphan completion at that position is dropped; earlier and
@@ -160,6 +193,9 @@ def test_mid_conversation_retry():
 
 
 def test_both_siblings_have_children_keeps_both():
+    # [FUNCTION DOC]
+    # Two same-input interactions that each have their own child; asserts nothing is
+    # dropped (conservative behavior).
     """Conservative: if both same-input entries have children, keep both."""
     msgs = [_user_msg("hi")]
     cache = InteractionCache()
@@ -181,6 +217,9 @@ def test_both_siblings_have_children_keeps_both():
 
 
 def test_drop_must_precede_discount():
+    # [FUNCTION DOC]
+    # Asserts calling drop_retry_orphans after apply_reward_discount raises RuntimeError
+    # with the ordering message.
     cache = InteractionCache()
     cache["a"] = _make_interaction("a", [_user_msg("hi")], reward=1.0)
     cache.apply_reward_discount(turn_discount=1.0)
@@ -192,6 +231,10 @@ def test_drop_must_precede_discount():
 
 
 def test_export_with_drop_retry_orphans_flag():
+    # [FUNCTION DOC]
+    # Exports individually with discount 1.0 and drop_retry_orphans True; asserts the
+    # orphan is excluded and that discounting runs after the drop so retry's reward is
+    # 1.0 + 2.0 and next keeps 2.0.
     """End-to-end: export_interactions(drop_retry_orphans=True) removes orphan."""
     msgs = [_user_msg("hi")]
     cache = InteractionCache()
@@ -216,6 +259,9 @@ def test_export_with_drop_retry_orphans_flag():
 
 
 def test_drop_updates_total_reward():
+    # [FUNCTION DOC]
+    # Sets rewards 5.0 (orphan) and 3.0 (retry) via set_reward, asserts total_reward is
+    # 8.0, drops orphans and asserts total_reward decreases to 3.0.
     """Dropping an orphan decrements the running total_reward."""
     msgs = [_user_msg("hi")]
     cache = InteractionCache()

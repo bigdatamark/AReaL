@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Torchrun script that exercises ArchonEngine.forward_batch under tensor parallelism
+# (TP) on a Qwen3-0.6B model. Initializes NCCL, builds an engine with backend
+# "archon:t<tp>", broadcasts a random padded batch from rank 0, runs forward, checks
+# output shape, compares logprobs within each TP group, and checks
+# is_data_parallel_head. Driven by main() CLI.
+# KNOWN ISSUE: the module docstring and trailing comments reference
+# tests/torchrun/run_archon_tp_forward.py, but the file lives at
+# tests/experimental/archon/torchrun/run_tp_forward.py.
 """Test script for Archon Engine forward_batch with Tensor Parallelism.
 
 Run with torchrun for multi-GPU testing (requires at least 2 GPUs for TP=2):
@@ -33,6 +42,12 @@ MODEL_PATHS = {
 
 
 def setup_distributed_environment():
+    # [FUNCTION DOC]
+    # HELPER: Initializes the default torch.distributed NCCL process group from torchrun
+    # env vars (RANK, WORLD_SIZE, MASTER_ADDR default localhost, MASTER_PORT default
+    # 29500) via a tcp init_method, then sets the current device to the global rank.
+    # No-op if already initialized. Side effects: global process group creation, device
+    # selection.
     """Set up distributed environment for torchrun."""
     if dist.is_initialized():
         return
@@ -56,6 +71,12 @@ def mock_input(
     min_seqlen: int = 4,
     max_seqlen: int = 16,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a random right-padded batch on device. Samples batch_size sequence
+    # lengths uniformly in [min_seqlen, max_seqlen) (max exclusive), creates token ids
+    # in [10000, 50000) of shape [batch, max_len], a boolean attention mask that is True
+    # for positions before each length, and fills padded positions with pad id 0.
+    # Returns dict with input_ids (long) and attention_mask (bool).
     """Create mock padded input data for testing."""
     pad_token_id = 0
     seqlens = torch.randint(
@@ -79,6 +100,13 @@ def mock_input(
 
 
 def make_engine_with_tp(model_type: str, mb_spec: MicroBatchSpec, tp_size: int):
+    # [FUNCTION DOC]
+    # HELPER: Builds a forward-only ArchonEngine for model_type with backend
+    # "archon:t<tp_size>", the given micro-batch spec, and no optimizer; prints the
+    # config. Creates a ParallelStrategy with dp = world_size // tp_size and the given
+    # TP size, creates process groups and initializes the engine with a small
+    # FinetuneSpec (1 epoch, 128 samples, batch 8). Returns the engine. Raises KeyError
+    # for unknown model_type.
     """Create and initialize a ArchonEngine with Tensor Parallelism."""
     config = TrainEngineConfig(
         backend=f"archon:t{tp_size}",
@@ -108,6 +136,19 @@ def make_engine_with_tp(model_type: str, mb_spec: MicroBatchSpec, tp_size: int):
 
 
 def test_archon_tp_forward(model_type: str, tp_size: int):
+    # [FUNCTION DOC]
+    # Main test body. Sets up distributed, seeds torch with 42, returns early (skip) if
+    # world_size < tp_size. Builds engine with 2 micro-batches, asserts parallel_dims
+    # reports TP enabled, tp == tp_size and dp_shard == dp size. Rank 0 creates a
+    # 4-sample batch, which is broadcast via broadcast_object_list and moved to the
+    # local device. Runs eval-mode forward_batch concatenating micro-batch outputs on
+    # dim 0 and asserts the leading dim equals batch size. If multi-rank, all-gathers
+    # logprobs and, for every TP group (ranks contiguous blocks of tp_size), prints a
+    # warning (does not fail) if outputs differ beyond atol 1e-5. Asserts
+    # is_data_parallel_head is True exactly for rank % tp_size == 0. Destroys the
+    # engine, barriers and destroys the process group.
+    # KNOWN ISSUE: all_gather assumes equal logprob shapes on all ranks, which holds
+    # only because every rank uses the same broadcast batch.
     """Test ArchonEngine forward_batch with Tensor Parallelism."""
     setup_distributed_environment()
 
@@ -218,6 +259,9 @@ def test_archon_tp_forward(model_type: str, tp_size: int):
 
 
 def main():
+    # [FUNCTION DOC]
+    # CLI entry: parses --model_type (only "qwen3") and --tp_size (default 2) and runs
+    # test_archon_tp_forward.
     parser = argparse.ArgumentParser(description="Run Archon Engine TP Forward Test")
     parser.add_argument(
         "--model_type",

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Shared helpers for Archon engine tests: model/dataset path lookups (re-exported from
+# areal.utils.testing_utils), tensor/logprob comparison metrics, HF and Archon model
+# loaders, synthetic and GSM8K input builders, a torchrun subprocess runner, single-GPU
+# distributed setup, GRPO-style batch/config builders, and a fixture managing paired
+# ArchonLMEngine/FSDPLMEngine instances for numerical comparison tests.
 """Shared utilities for Archon Engine tests."""
 
 import os
@@ -58,6 +64,9 @@ __all__ = [
 
 
 def get_model_path_for_type(model_type: str) -> str | None:
+    # [FUNCTION DOC]
+    # Returns the configured model path for an HF model_type key from MODEL_PATHS, or
+    # None if the type is not configured.
     """Get model path for a given model type.
 
     Args:
@@ -74,6 +83,9 @@ DATASET_PATH = get_dataset_path("/storage/openpsi/data/gsm8k", "openai/gsm8k")
 
 @dataclass
 class ComparisonMetrics:
+    # [CLASS DOC]
+    # Dataclass of diff statistics between two tensors: max/mean/std absolute diff
+    # (floats), allclose result and whether the shapes matched.
     """Metrics for comparing two tensors."""
 
     max_diff: float
@@ -83,6 +95,8 @@ class ComparisonMetrics:
     shape_match: bool
 
     def __str__(self) -> str:
+        # [FUNCTION DOC]
+        # Formats all metrics as a single comma-separated string with 6-decimal floats.
         return (
             f"max_diff={self.max_diff:.6f}, mean_diff={self.mean_diff:.6f}, "
             f"std_diff={self.std_diff:.6f}, allclose={self.allclose}, "
@@ -96,6 +110,11 @@ def compare_tensors(
     atol: float = 1e-5,
     rtol: float = 1e-3,
 ) -> ComparisonMetrics:
+    # [FUNCTION DOC]
+    # Compares t1 and t2. If shapes differ returns metrics with inf diffs, allclose
+    # False and shape_match False. Otherwise casts both to float32, computes absolute
+    # difference max/mean/std (via .item(), forcing GPU sync) and torch.allclose with
+    # atol/rtol.
     """Compare two tensors and return detailed metrics."""
     shape_match = t1.shape == t2.shape
     if not shape_match:
@@ -118,6 +137,10 @@ def compare_tensors(
 
 
 def setup_environment():
+    # [FUNCTION DOC]
+    # If LOCAL_RANK is set, selects that device and initializes an NCCL process group
+    # (env://) when not yet initialized; otherwise selects device 0. Side effects:
+    # device selection and possibly global process group creation.
     """Set up environment for tests."""
     if "LOCAL_RANK" in os.environ:
         rank = int(os.environ["LOCAL_RANK"])
@@ -129,6 +152,12 @@ def setup_environment():
 
 
 def load_hf_model(model_path: str, dtype: torch.dtype = torch.bfloat16):
+    # [FUNCTION DOC]
+    # Loads an AutoModelForCausalLM with the given dtype (default bf16),
+    # trust_remote_code, and flash_attention_2, moves it to the platform device and sets
+    # eval mode. Returns the model.
+    # KNOWN ISSUE: docstring says SDPA attention but the code requests
+    # flash_attention_2.
     """Load HuggingFace model with SDPA attention."""
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -142,6 +171,11 @@ def load_hf_model(model_path: str, dtype: torch.dtype = torch.bfloat16):
 
 
 def load_archon_model(model_path: str, dtype: torch.dtype = torch.bfloat16):
+    # [FUNCTION DOC]
+    # Calls the production testing_utils.load_archon_model with skip_unsupported=False;
+    # if it raises ValueError containing "not supported by Archon" the test is skipped
+    # via pytest.skip, any other ValueError is re-raised. Returns the loaded Archon
+    # model.
     """Load Archon model with same weights.
 
     Wraps the production load_archon_model to handle unsupported models
@@ -162,6 +196,12 @@ def create_test_input(
     device: torch.device = None,
     packed: bool = False,
 ) -> dict:
+    # [FUNCTION DOC]
+    # Seeds torch with 42 and creates random token ids in [100, vocab_size-100) on
+    # device (defaults to the platform device). Unpacked: returns input_ids of shape
+    # [batch, seq_len]. Packed: returns input_ids of shape [1, batch*seq_len], int32
+    # cu_seqlens with equal-length boundaries (0, seq_len, ..., batch*seq_len), and int
+    # max_seqlen = seq_len. Side effect: resets the global torch RNG.
     """Create deterministic test input.
 
     Args:
@@ -200,6 +240,10 @@ def create_test_input(
 
 
 def load_gsm8k_samples(model_path: str, num_samples: int = 5):
+    # [FUNCTION DOC]
+    # Loads the tokenizer and GSM8K main train split and collects up to num_samples
+    # samples whose question+answer+eos token count is <= 512. Each sample dict holds
+    # prompt, answer, prompt_ids and full_ids. Returns (samples, tokenizer).
     """Load real samples from GSM8K dataset."""
     tokenizer = load_hf_tokenizer(model_path)
     gsm8k_path = get_dataset_path("/storage/openpsi/data/gsm8k", "openai/gsm8k")
@@ -228,6 +272,10 @@ def load_gsm8k_samples(model_path: str, num_samples: int = 5):
 def compare_logprobs(
     logits_a: torch.Tensor, logits_b: torch.Tensor, target_ids: torch.Tensor
 ) -> dict:
+    # [FUNCTION DOC]
+    # Computes float32 log_softmax over the last dim of both logits tensors, gathers the
+    # log-probabilities at target_ids, and returns a dict with max_diff and mean_diff of
+    # the absolute difference.
     """Compare logprobs for target tokens."""
     logprobs_a = torch.log_softmax(logits_a.float(), dim=-1)
     logprobs_b = torch.log_softmax(logits_b.float(), dim=-1)
@@ -246,6 +294,9 @@ def compare_logprobs(
 def compare_outputs(
     archon_out: torch.Tensor, hf_out: torch.Tensor, name: str = "output"
 ) -> dict:
+    # [FUNCTION DOC]
+    # Returns a dict with name and max/mean absolute difference of the two tensors after
+    # float32 casting.
     """Compare two tensor outputs with precision metrics."""
     diff = (archon_out.float() - hf_out.float()).abs()
     return {
@@ -256,6 +307,12 @@ def compare_outputs(
 
 
 def run_torchrun_test(script_path: str, n_gpus: int, extra_args: list[str] = None):
+    # [FUNCTION DOC]
+    # Runs script_path under torchrun on a single node with n_gpus processes, localhost
+    # master and a freshly found free port, appending extra_args. Captures output;
+    # prints stdout on success. On non-zero exit prints stdout/stderr and calls
+    # pytest.fail with stderr. Side effect: spawns a subprocess and blocks until it
+    # finishes.
     """Run a test script with torchrun."""
     port = find_free_ports(1)[0]
     cmd = [
@@ -289,6 +346,12 @@ def run_torchrun_test(script_path: str, n_gpus: int, extra_args: list[str] = Non
 
 
 def setup_distributed_environment():
+    # [FUNCTION DOC]
+    # Initializes a single-GPU friendly NCCL process group if none exists: defaults
+    # WORLD_SIZE 1, RANK 0, LOCAL_RANK 0, MASTER_ADDR localhost and a free MASTER_PORT
+    # in os.environ (only if unset), initializes via a tcp init_method, and sets the
+    # device to RANK. Side effects: mutates os.environ, creates the global process
+    # group.
     """Set up distributed environment for single GPU engine tests."""
     if dist.is_initialized():
         return
@@ -317,6 +380,11 @@ def create_engine_config(
     lr: float = 1.7e-5,
     weight_decay: float = 0.017,
 ) -> TrainEngineConfig:
+    # [FUNCTION DOC]
+    # Returns a TrainEngineConfig for GRPO comparison tests: backend "fsdp:d1",
+    # experiment name test_<engine_type>_grpo, one micro-batch, Adam with given lr and
+    # weight_decay, warmup proportion 0.001, constant scheduler, grad clipping 1.0,
+    # temperature 1.0.
     """Create engine configuration for testing.
 
     Args:
@@ -351,6 +419,18 @@ def create_grpo_batch(
     batch_size: int = 4,
     max_seq_len: int = 256,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Builds a GRPO-like batch from the first batch_size GSM8K samples: tokenizes
+    # question + " " + answer + eos, truncates to max_seq_len, loss_mask 0 over the
+    # question prefix (clamped to length) and 1 afterwards, then pads with
+    # pad_sequences_to_tensors. Adds attention_mask (input_ids != pad id), random
+    # logprobs (normal*0.5-2), old_logprobs copy, random binary float rewards per
+    # sample, zero values, and moves all tensors to the platform device. Raises
+    # ValueError if fewer than batch_size samples were found.
+    # KNOWN ISSUE: attention_mask derived from pad_token_id also masks real tokens equal
+    # to the pad id, and is inconsistent with the padding mask returned by
+    # pad_sequences_to_tensors; the raise is effectively unreachable since samples are
+    # truncated rather than skipped.
     """Create a batch that mimics GRPO training inputs.
 
     Args:
@@ -419,9 +499,15 @@ def create_grpo_batch(
 
 
 class DualEngineFixture:
+    # [CLASS DOC]
+    # Manages lifecycle of an ArchonLMEngine and FSDPLMEngine built on the same model
+    # for side-by-side comparisons. Attributes: model_path, archon_engine, fsdp_engine.
     """Fixture to manage Archon and FSDP engine lifecycle for comparison tests."""
 
     def __init__(self, model_path: str = None):
+        # [FUNCTION DOC]
+        # Stores model_path (defaults to MODEL_PATHS["qwen2"]) and sets both engine
+        # slots to None.
         """Initialize fixture.
 
         Args:
@@ -432,6 +518,11 @@ class DualEngineFixture:
         self.fsdp_engine: FSDPLMEngine | None = None
 
     def setup(self):
+        # [FUNCTION DOC]
+        # Sets up distributed, then creates and initializes both engines with a pure
+        # data-parallel strategy of world_size and a tiny FinetuneSpec (1 epoch, 4
+        # samples, batch 4), using create_engine_config for each. Side effects: GPU
+        # model loading, process groups.
         """Initialize both engines."""
         setup_distributed_environment()
 
@@ -452,6 +543,9 @@ class DualEngineFixture:
         self.fsdp_engine.initialize(addr=None, ft_spec=ft_spec)
 
     def teardown(self):
+        # [FUNCTION DOC]
+        # Destroys whichever engines exist and destroys the default process group if
+        # initialized.
         """Cleanup engines."""
         if self.archon_engine is not None:
             self.archon_engine.destroy()
@@ -463,6 +557,9 @@ class DualEngineFixture:
 
 @pytest.fixture(scope="module")
 def dual_engines():
+    # [FUNCTION DOC]
+    # Module-scoped pytest fixture: builds a DualEngineFixture with default model, sets
+    # it up, yields it, and tears it down after the module's tests.
     """Pytest fixture to provide initialized Archon and FSDP engines."""
     fixture = DualEngineFixture()
     fixture.setup()

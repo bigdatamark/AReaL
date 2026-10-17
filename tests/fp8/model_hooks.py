@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Model manipulation helpers for FP8/BF16 comparison tests on Megatron models: unwrap
+# the engine's model, truncate the decoder to selected layers in place, run a training
+# forward/backward and collect gradients before the optimizer step, map parameter or
+# module names to coarse operation categories, and run forward/backward with forward,
+# pre-forward and backward hooks capturing activations, parameter gradients and output
+# gradients per module.
+# KNOWN ISSUE: logger name "FP8 BF16 Model Utils" is not PascalCase per project
+# conventions.
 """Model manipulation utilities for FP8/BF16 comparison tests.
 
 This module contains functions for extracting layers, reducing models,
@@ -23,6 +32,10 @@ logger = logging.getLogger("FP8 BF16 Model Utils")
 
 
 def get_model_from_engine(engine: MegatronEngine):
+    # [FUNCTION DOC]
+    # HELPER: Asserts engine.model is set, takes its first model chunk and unwraps up to
+    # two levels of .module (DDP, then Float16Module). Returns the inner GPTModel-like
+    # module.
     """Get the actual model module from engine, unwrapping DDP and Float16Module."""
     assert engine.model is not None, "Model is not initialized."
     model = engine.model[0]
@@ -35,6 +48,16 @@ def get_model_from_engine(engine: MegatronEngine):
 
 
 def reduce_model_to_layers(engine: MegatronEngine, layer_indices: list[int] | int):
+    # [FUNCTION DOC]
+    # Truncates the model in place to the given layer indices (int or list): locates
+    # decoder (directly or under .module, raising ValueError if no decoder.layers),
+    # raises ValueError for any index >= layer count, dedups and sorts indices, and
+    # replaces decoder.layers with a new ModuleList of the selected layer modules,
+    # keeping embedding, final norm and output layer intact. Logs the reduction. Returns
+    # the original layer count.
+    # KNOWN ISSUE: negative indices are not rejected and would select from the end;
+    # layer numbering attributes inside the kept layers are not updated, and the
+    # transformer config's num_layers is unchanged.
     """Reduce the model to specified transformer layers while keeping full structure.
 
     This function modifies the model in-place by replacing decoder.layers (ModuleList)
@@ -101,6 +124,19 @@ def reduce_model_to_layers(engine: MegatronEngine, layer_indices: list[int] | in
 def collect_gradients_after_train_batch(
     engine: MegatronEngine, input_: dict[str, Any], profile_gemm: bool = False
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Reimplements the engine's train step up to (but excluding) optimizer.step to
+    # capture gradients. Ensures readiness, asserts an optimizer, zeroes optimizer grads
+    # and each chunk's grad buffer, builds micro-batches, defines an SFT loss and a
+    # valid-token loss weight, computes the global total loss weight over the DP group,
+    # sets the loss multiplier to DP world size times the current loss scale, and runs
+    # forward_backward_batch (non forward-only) with the engine's logprob/loss callback,
+    # optionally under a CPU+CUDA profiler whose GEMM stats are logged with phase
+    # "backward". Then for every trainable named parameter clones main_grad (preferred)
+    # or grad. Returns name -> gradient. Raises ValueError if a trainable parameter has
+    # no gradient and NotImplementedError when TP size > 1.
+    # KNOWN ISSUE: the "if grad is not None" check is always true (missing grads raise
+    # earlier), and the TP check runs inside the loop only after a gradient is found.
     """Execute train_batch but collect gradients before optimizer.step().
 
     This function replicates the train_batch logic but stops before optimizer.step()
@@ -125,6 +161,11 @@ def collect_gradients_after_train_batch(
 
     # Step 2: Define loss functions
     def sft_loss_fn(logprobs, entropy, input_):
+        # [FUNCTION DOC]
+        # HELPER: SFT loss: shifts loss_mask left by one to align with next-token
+        # logprobs, zeros masked logprobs and returns the negative sum divided by the
+        # number of valid tokens, or a zero tensor requiring grad when none are valid.
+        # Entropy is ignored.
         """SFT loss function based on compute_packed_sft_loss."""
         del entropy  # SFT does not use entropy
 
@@ -147,6 +188,8 @@ def collect_gradients_after_train_batch(
         return loss
 
     def loss_weight_fn(mb):
+        # [FUNCTION DOC]
+        # HELPER: Returns the count of nonzero loss_mask entries in the micro-batch.
         """Loss weight function based on number of valid tokens."""
         return mb["loss_mask"].count_nonzero()
 
@@ -161,6 +204,10 @@ def collect_gradients_after_train_batch(
     )
 
     def process_output(output: torch.Tensor, inputs: dict[str, Any]) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Delegates to the engine's private _compute_logprobs_and_loss with the
+        # SFT loss, weight function, total loss weight and loss multiplier; returns the
+        # scaled loss.
         return engine._compute_logprobs_and_loss(
             output,
             inputs,
@@ -212,6 +259,18 @@ def collect_gradients_after_train_batch(
 
 
 def categorize_op_name(name: str) -> str:
+    # [FUNCTION DOC]
+    # Maps a lowercase name to an op category by substring tests in priority order:
+    # attention names become attention_proj (qkv/q/k/v_proj), attention_out
+    # (linear_proj/o_proj/ out_proj), attention_core (core_attention) or attention;
+    # mlp/feedforward/ffn names become mlp_activation, mlp_gate_up (fc1/gate/up),
+    # mlp_down (fc2/down) or mlp; rotary/rope -> rope; layernorm/norm -> qk_layernorm
+    # (q_ or k_layernorm) or layernorm; embedding/embed -> embedding; otherwise other.
+    # Returns the category string.
+    # KNOWN ISSUE: docstring lists only five categories but many more are returned; q/k
+    # layernorms under self_attention match the attention branch first so qk_layernorm
+    # is only reachable for names without "attn"; the "up" substring check is very
+    # broad.
     """Categorize operation name into op type.
 
     Args:
@@ -271,6 +330,26 @@ def forward_backward_model_with_hooks(
     dict[str, torch.Tensor],
     dict[str, torch.Tensor],
 ]:
+    # [FUNCTION DOC]
+    # Truncates the model to layer_indices (default layer 0) and instruments it.
+    # Registers a forward hook on embedding, word embeddings, rotary embedding, decoder,
+    # every kept layer and its input layernorm, self-attention (linear_qkv, linear_proj,
+    # core_attention, q/k layernorms), post-attention or pre-MLP layernorm, MLP (fc1,
+    # fc2), final layernorm and output layer, capturing a detached clone of the (first)
+    # output keyed by "layer_<i>.<sub>" style names, plus a full backward hook per
+    # module capturing the output gradient under "<name>.output_grad". Also registers
+    # input pre-hooks for q/k layernorms and an input pre-hook on fc2 capturing the MLP
+    # activation output. Puts the engine in train mode, zeroes grads, runs
+    # engine.train_batch with an SFT loss and valid-token weight, collects main_grad or
+    # grad of every trainable parameter in the kept layers as "layer_<i>.<param>", then
+    # runs engine.forward in eval mode for logits and removes all hooks. Returns
+    # (logits, activations, gradients, output_gradients). Raises ValueError if a
+    # trainable layer parameter has no gradient.
+    # KNOWN ISSUE: engine.train_batch performs the optimizer step (and may clear grads),
+    # so gradients are read after the update rather than "before optimizer step" as the
+    # comment says, and logits come from the updated weights; hooks are still active
+    # during the final eval forward, so captured activations are overwritten by that
+    # pass. The model stays permanently truncated.
     """Perform forward and backward pass on model with specified layers and activation hooks.
 
     This function reduces the model to specified layers, then performs forward and backward
@@ -303,7 +382,13 @@ def forward_backward_model_with_hooks(
     hooks = []
 
     def make_activation_hook(name):
+        # [FUNCTION DOC]
+        # HELPER: Returns a forward hook that stores a detached clone of the module
+        # output (first element if a tuple, None for an empty tuple) under name and logs
+        # its dtype; failures are logged as warnings.
         def hook(module, input, output):
+            # [FUNCTION DOC]
+            # HELPER: Forward hook body capturing the module output into activations.
             try:
                 if isinstance(output, tuple):
                     activations[name] = (
@@ -320,9 +405,15 @@ def forward_backward_model_with_hooks(
         return hook
 
     def make_input_pre_hook(activation_key: str, log_name: str):
+        # [FUNCTION DOC]
+        # HELPER: Returns a forward pre-hook storing a detached clone of the module's
+        # first input under activation_key and logging its shape; failures are logged as
+        # warnings.
         """Create a pre-hook to capture module input."""
 
         def input_hook(module, input):
+            # [FUNCTION DOC]
+            # HELPER: Pre-hook body capturing the module input into activations.
             try:
                 if isinstance(input, tuple):
                     activations[activation_key] = (
@@ -339,9 +430,15 @@ def forward_backward_model_with_hooks(
         return input_hook
 
     def make_output_grad_hook(grad_key: str, log_name: str):
+        # [FUNCTION DOC]
+        # HELPER: Returns a full backward hook storing a detached clone of
+        # grad_output[0] (if present) under grad_key in output_gradients, logging its
+        # shape; failures are logged.
         """Create a backward hook to capture module output gradient."""
 
         def backward_hook(module, grad_input, grad_output):
+            # [FUNCTION DOC]
+            # HELPER: Backward hook body capturing the output gradient.
             try:
                 if grad_output is not None and len(grad_output) > 0:
                     if grad_output[0] is not None:
@@ -357,6 +454,10 @@ def forward_backward_model_with_hooks(
     def register_layernorm_hooks(
         module, layer_prefix: str, layernorm_name: str
     ) -> list:
+        # [FUNCTION DOC]
+        # HELPER: Registers on a q/k layernorm module an input pre-hook (key
+        # "<layer>.self_attention.<ln>.input") and a full backward hook (key
+        # "<layer>.self_attention.<ln>.output_grad"). Returns the two hook handles.
         """Register input pre-hook and backward hook for a layernorm module."""
         registered_hooks = []
         activation_key = f"{layer_prefix}.self_attention.{layernorm_name}.input"
@@ -507,7 +608,13 @@ def forward_backward_model_with_hooks(
 
             # Register backward hook to capture output gradients
             def make_backward_hook(hook_name):
+                # [FUNCTION DOC]
+                # HELPER: Returns a full backward hook that stores a detached clone of
+                # grad_output[0] under "<hook_name>.output_grad" and logs at debug
+                # level; errors become warnings.
                 def backward_hook(module, grad_input, grad_output):
+                    # [FUNCTION DOC]
+                    # HELPER: Backward hook body capturing the module's output gradient.
                     try:
                         if grad_output is not None and len(grad_output) > 0:
                             if grad_output[0] is not None:
@@ -534,6 +641,9 @@ def forward_backward_model_with_hooks(
 
     # Prepare loss function
     def sft_loss_fn(logprobs, entropy, input_):
+        # [FUNCTION DOC]
+        # HELPER: SFT loss: left-shifted loss mask, masked logprobs, negative mean over
+        # valid tokens (zero tensor requiring grad if none).
         del entropy
         loss_mask = input_["loss_mask"].bool()
         loss_mask = torch.roll(loss_mask, shifts=-1, dims=-1)
@@ -546,6 +656,8 @@ def forward_backward_model_with_hooks(
         return loss
 
     def loss_weight_fn(mb):
+        # [FUNCTION DOC]
+        # HELPER: Returns the number of valid loss-mask tokens in the micro-batch.
         return mb["loss_mask"].count_nonzero()
 
     # Use engine's train_batch but collect gradients before optimizer step

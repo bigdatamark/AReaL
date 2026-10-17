@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Unit tests for the proxy rollout server FastAPI app (proxy_rollout_server.app),
+# focused on session API-key handling: honoring caller-provided keys, rejecting the
+# admin key or keys bound to active sessions, cleaning up finished-session key bindings,
+# reporting interaction_count on end_session, and admin-only export_trajectories
+# addressed by explicit session_id. The app runs in-process via httpx ASGITransport;
+# module-level server globals are reset per test. Skipped if httpx is missing.
 """Unit tests for the proxy rollout server's session key handling."""
 
 from __future__ import annotations
@@ -18,6 +25,11 @@ _ADMIN_KEY = "test-admin-key"
 
 @pytest.fixture(autouse=True)
 def _reset_server_globals(monkeypatch):
+    # [FUNCTION DOC]
+    # Autouse fixture that monkeypatches the server module's globals to a clean state
+    # before each test: empty session cache and key<->session maps, capacity 0, admin
+    # key set to the test key, a fresh lock and last cleanup time 0. Restored after each
+    # test.
     """Reset all module-level globals before each test."""
     monkeypatch.setattr(srv, "_session_cache", {})
     monkeypatch.setattr(srv, "_api_key_to_session", {})
@@ -34,10 +46,15 @@ _transport = httpx.ASGITransport(app=srv.app)
 
 
 def _client():
+    # [FUNCTION DOC]
+    # HELPER: Returns a new httpx.AsyncClient bound to the shared ASGI transport for the
+    # server app with base URL http://testserver.
     return httpx.AsyncClient(transport=_transport, base_url="http://testserver")
 
 
 def _admin_headers():
+    # [FUNCTION DOC]
+    # HELPER: Returns an Authorization Bearer header for the test admin key.
     return {"Authorization": f"Bearer {_ADMIN_KEY}"}
 
 
@@ -47,8 +64,14 @@ def _admin_headers():
 
 
 class TestStartSessionApiKey:
+    # [CLASS DOC]
+    # Tests start_session behavior when an api_key is (or is not) supplied. Each test
+    # sets capacity 1 so one session can be started.
     @pytest.mark.asyncio
     async def test_uses_provided_api_key(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Asserts a provided api_key is echoed back and mapped to the new session id in
+        # _api_key_to_session.
         """Worker returns the caller-provided key instead of generating one."""
         monkeypatch.setattr(srv, "_capacity", 1)
         async with _client() as client:
@@ -64,6 +87,9 @@ class TestStartSessionApiKey:
 
     @pytest.mark.asyncio
     async def test_generates_key_when_none(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Asserts that without api_key a random key (longer than 10 chars, not the admin
+        # key) is generated.
         """No api_key → worker generates a random key (current behaviour)."""
         monkeypatch.setattr(srv, "_capacity", 1)
         async with _client() as client:
@@ -79,6 +105,8 @@ class TestStartSessionApiKey:
 
     @pytest.mark.asyncio
     async def test_rejects_admin_key_as_session_key(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Asserts using the admin key as the session key is rejected with 400.
         """Cannot use the admin key as a session key."""
         monkeypatch.setattr(srv, "_capacity", 1)
         async with _client() as client:
@@ -91,6 +119,10 @@ class TestStartSessionApiKey:
 
     @pytest.mark.asyncio
     async def test_cleans_up_finished_session_conflict(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Pre-seeds a finished session bound to key reuse-me, then asserts start_session
+        # with that key succeeds, returns the key and rebinds it to a new, different
+        # session id.
         """Key reuse after a finished session cleans up old mappings."""
         # Pre-seed a finished session with the same key.
         sid_old = "old-session"
@@ -116,6 +148,9 @@ class TestStartSessionApiKey:
 
     @pytest.mark.asyncio
     async def test_rejects_active_session_conflict(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Pre-seeds an active (unfinished) session bound to busy-key and asserts
+        # start_session with that key returns 409.
         """Key bound to an active (unfinished) session → 409."""
         sid_active = "active-session"
         active_session = SessionData(session_id=sid_active)
@@ -139,8 +174,13 @@ class TestStartSessionApiKey:
 
 
 class TestEndSessionInteractionCount:
+    # [CLASS DOC]
+    # Tests the end_session response payload.
     @pytest.mark.asyncio
     async def test_end_session_returns_interaction_count(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Starts a session, ends it immediately with its session key, and asserts 200
+        # with interaction_count 0.
         """end_session response includes interaction_count field."""
         monkeypatch.setattr(srv, "_capacity", 1)
         async with _client() as client:
@@ -170,6 +210,8 @@ class TestEndSessionInteractionCount:
 
 
 class TestExportTrajectories:
+    # [CLASS DOC]
+    # Tests for /export_trajectories: requires admin auth and an explicit session_id.
     """Tests for the export_trajectories endpoint.
 
     The endpoint requires an explicit ``session_id`` in the request body
@@ -179,6 +221,9 @@ class TestExportTrajectories:
 
     @pytest.mark.asyncio
     async def test_export_with_session_id_and_admin_auth(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Starts and ends a session, then asserts admin export by session_id returns 200
+        # with an interactions field.
         """Export succeeds with required session_id + admin key."""
         monkeypatch.setattr(srv, "_capacity", 1)
         async with _client() as client:
@@ -208,6 +253,8 @@ class TestExportTrajectories:
 
     @pytest.mark.asyncio
     async def test_export_rejects_non_admin_key(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Asserts export authenticated with the session key (not admin) returns 403.
         """Export requires admin auth; a session key must be rejected."""
         monkeypatch.setattr(srv, "_capacity", 1)
         async with _client() as client:
@@ -235,6 +282,8 @@ class TestExportTrajectories:
 
     @pytest.mark.asyncio
     async def test_export_rejects_missing_session_id(self, monkeypatch):
+        # [FUNCTION DOC]
+        # Asserts export without session_id in the body fails validation with 422.
         """Omitting session_id from body triggers a validation error (422)."""
         monkeypatch.setattr(srv, "_capacity", 1)
         async with _client() as client:
@@ -247,6 +296,11 @@ class TestExportTrajectories:
 
     @pytest.mark.asyncio
     async def test_export_survives_key_remap(self, monkeypatch):
+        # [FUNCTION DOC]
+        # With capacity 2, starts and ends a session with key shared-key, starts a
+        # second one reusing it, asserts the key now maps to the new session, and
+        # asserts exporting the old session by explicit id still returns 200 with
+        # interactions.
         """Explicit session_id resolves correctly even after key remapping.
 
         After a session refresh the API key maps to the NEW session.

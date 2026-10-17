@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Integration tests for ArealOpenAI, the OpenAI-compatible client that routes chat
+# completions to a RemoteSGLangEngine and records each interaction for RL training. A
+# module-scoped fixture launches a real SGLang server (Qwen3-0.6B) on a free port; tests
+# cover single/multi-turn rollouts, streaming, reward setting and turn discounting,
+# "concat" tree export with parent links and loss masks, input type validation, and
+# prompt length overflow. Marked sglang; requires a GPU.
 # This file tests the functionality of our customized OpenAI client.
 # The client should be able to generate completions and correctly assign rewards with back-propagation.
 import os
@@ -29,6 +36,9 @@ RUN_SERVER_TIMEOUT = 180
 
 
 def check_server_health(base_url):
+    # [FUNCTION DOC]
+    # HELPER: GETs <base_url>/health with a 30s timeout and returns True iff status is
+    # 200; any requests exception returns False.
     try:
         response = requests.get(f"{base_url}/health", timeout=30)
         return response.status_code == 200
@@ -38,6 +48,12 @@ def check_server_health(base_url):
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC]
+    # Module-scoped fixture: seeds RNGs, builds the SGLang launch command (skip
+    # tokenizer init, mem fraction 0.3, tp 1, GPU 0, dist addr on a free port) and
+    # spawns it as a subprocess with output to stdout. Polls health every second up to
+    # RUN_SERVER_TIMEOUT (180s), raising RuntimeError if not healthy, yields, then kills
+    # the process tree gracefully.
     seeding.set_random_seed(1, EXPR_NAME)
     cmd = SGLangConfig.build_cmd(
         sglang_config=SGLangConfig(
@@ -71,11 +87,19 @@ def sglang_server():
 
 @pytest.fixture(scope="module")
 def tokenizer():
+    # [FUNCTION DOC]
+    # Module-scoped fixture returning the HF tokenizer for MODEL_PATH.
     return load_hf_tokenizer(MODEL_PATH)
 
 
 @pytest.fixture
 def openai_client(sglang_server, tokenizer):
+    # [FUNCTION DOC]
+    # Fixture creating a RemoteSGLangEngine (backend sglang:d1, 2 concurrent rollouts)
+    # pointed at the launched server by setting AREAL_LLM_SERVER_ADDRS in os.environ,
+    # initializing it, and yielding an ArealOpenAI client with qwen25 tool parser, qwen3
+    # reasoning parser, "hf" chat template type and engine_max_tokens 16384. Destroys
+    # the engine afterwards.
     from areal.api.cli_args import InferenceEngineConfig
     from areal.engine import RemoteSGLangEngine
 
@@ -102,6 +126,9 @@ def openai_client(sglang_server, tokenizer):
 
 @pytest.mark.asyncio
 async def test_single_turn_rollout(openai_client):
+    # [FUNCTION DOC]
+    # Creates one completion, sets reward 0.5, and asserts individual export contains
+    # just that interaction with the reward.
     c = await openai_client.chat.completions.create(
         messages=[
             {"role": "system", "content": "You are a helpful assistant."},
@@ -117,6 +144,11 @@ async def test_single_turn_rollout(openai_client):
 
 @pytest.mark.asyncio
 async def test_streaming_conversation(openai_client):
+    # [FUNCTION DOC]
+    # Streams a completion and asserts: at least one chunk, a single shared chunk id,
+    # each chunk is a chat.completion.chunk with one choice, some chunks have content,
+    # exactly one chunk has finish_reason in stop/length, and that final chunk carries
+    # usage with positive prompt/completion tokens summing to total.
     """Test streaming mode for a conversation."""
     chunks = []
     stream = await openai_client.chat.completions.create(
@@ -171,6 +203,10 @@ async def test_streaming_conversation(openai_client):
 
 @pytest.mark.asyncio
 async def test_multi_round_conversation(openai_client):
+    # [FUNCTION DOC]
+    # Runs three chained turns (feeding back assistant message objects), sets reward 2.0
+    # on the last, applies turn discount 0.9, and asserts individually exported rewards
+    # are 2.0, 1.8, 1.62 for turns 3, 2, 1.
     """Test multi-round conversation with reward backpropagation."""
     # Round 1
     messages = [
@@ -219,6 +255,10 @@ async def test_multi_round_conversation(openai_client):
 
 
 def strip_thinking_tags(content: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Removes all think-tag blocks (non-greedy, across newlines) from content,
+    # collapses runs of whitespace to single spaces and strips. Returns the cleaned
+    # string.
     """Remove thinking tags and their content from a message."""
     import re
 
@@ -232,6 +272,12 @@ def strip_thinking_tags(content: str) -> str:
 
 @pytest.mark.asyncio
 async def test_multi_round_conversation_with_thinking(openai_client):
+    # [FUNCTION DOC]
+    # Runs three turns, stripping think blocks from each assistant message (as a dict)
+    # before feeding it back. Asserts stored messages for turns 2 and 3 contain no think
+    # tags, then sets rewards 1.5 (turn 2) and 2.5 (turn 3), applies discount 0.85 and
+    # asserts turn 3 is 2.5, turn 2 is 1.5 + 0.85*2.5 and turn 1 is 0.85 times turn 2's
+    # value.
     """Test multi-round conversation where thinking content is excluded from subsequent rounds."""
 
     # Round 1 - Model generates response with thinking
@@ -304,6 +350,13 @@ async def test_multi_round_conversation_with_thinking(openai_client):
 
 @pytest.mark.asyncio
 async def test_multi_round_conversation_concat_style_export(openai_client):
+    # [FUNCTION DOC]
+    # Switches the client to "concat" template type, builds a tree root -> a -> {a1, a2}
+    # and root -> b -> b1, sets rewards on leaves, and asserts concat export returns
+    # only the three leaves, individual export returns all six, parent links match the
+    # tree, rewards are not propagated, and each leaf's loss_mask is 1 exactly over
+    # every ancestor's (and its own) output tokens and 0 over the interleaved prompt
+    # tokens.
     """Create a conversation tree using create() and verify parents and rewards.
 
     Rewards are explicitly set (no propagation). Export should return only leaves.
@@ -383,6 +436,8 @@ async def test_multi_round_conversation_concat_style_export(openai_client):
     }
 
     def wrapped_completion(chat_completion):
+        # [FUNCTION DOC]
+        # HELPER: Looks up the exported interaction for a chat completion by id.
         return all_completions[chat_completion.id]
 
     # Check tree structure
@@ -452,6 +507,10 @@ async def test_multi_round_conversation_concat_style_export(openai_client):
 
 @pytest.mark.asyncio
 async def test_type_checking(openai_client):
+    # [FUNCTION DOC]
+    # In concat mode, asserts message history may contain ChatCompletionMessage objects
+    # or dicts, but raises TypeError when it contains a bare string or when messages is
+    # a tuple instead of a list.
     openai_client: ArealOpenAI
     openai_client.chat_template_type = "concat"
     openai_client.chat.completions.chat_template_type = "concat"
@@ -503,6 +562,10 @@ async def test_type_checking(openai_client):
 
 @pytest.mark.asyncio
 async def test_prompt_len_exceed(openai_client):
+    # [FUNCTION DOC]
+    # In concat mode, asserts a follow-up whose prompt (~16k repeats) exceeds the
+    # engine's max tokens raises ValueError and that the failed request is not cached:
+    # both export styles contain only the root.
     openai_client: ArealOpenAI
     openai_client.chat_template_type = "concat"
     openai_client.chat.completions.chat_template_type = "concat"
@@ -534,6 +597,13 @@ async def test_prompt_len_exceed(openai_client):
 
 @pytest.mark.asyncio
 async def test_multi_round_conversation_end_with_length(openai_client):
+    # [FUNCTION DOC]
+    # Same as the concat tree test but a single chain root -> a -> a1 with
+    # max_completion_tokens 8 (generations end by length). Asserts leaf/all export sets,
+    # parent links, unpropagated reward, and that a1's loss mask covers all three
+    # outputs.
+    # KNOWN ISSUE: docstring is copied from the tree test and mentions rewards/leaves
+    # generally rather than the length-truncation scenario actually tested.
     """Create a conversation tree using create() and verify parents and rewards.
 
     Rewards are explicitly set (no propagation). Export should return only leaves.
@@ -582,6 +652,8 @@ async def test_multi_round_conversation_end_with_length(openai_client):
     }
 
     def wrapped_completion(chat_completion):
+        # [FUNCTION DOC]
+        # HELPER: Looks up the exported interaction for a chat completion by id.
         return all_completions[chat_completion.id]
 
     # Check tree structure
