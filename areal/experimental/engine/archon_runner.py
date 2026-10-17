@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Forward/backward execution strategies ("runners") for the Archon engine. A runner takes
+# a list of microbatches, runs the model over them and hands each microbatch's logits to a
+# caller-supplied process_output_fn (which computes loss or extracts outputs). Two
+# strategies exist: SequentialRunner (no pipeline parallelism; plain loop with per-mb
+# backward) and PipelinedRunner (torch.distributed.pipelining schedules). create_runner
+# picks one. Uses the "ArchonRunner" logger (currently unused).
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -23,11 +30,18 @@ logger = logging.getLogger("ArchonRunner")
 
 
 class _NullOutputChunks(list):
+    # [CLASS DOC]
+    # HELPER: A list subclass whose append is a no-op. Installed as a pipeline stage's
+    # output_chunks during training so per-microbatch logits are not retained.
     def append(self, item: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Discards the item; returns None. Other list methods behave normally.
         pass
 
 
 class ForwardBackwardRunner(ABC):
+    # [CLASS DOC]
+    # Abstract interface for runners. Subclasses implement run().
     """Abstract base for forward/backward execution strategies."""
 
     @abstractmethod
@@ -39,6 +53,11 @@ class ForwardBackwardRunner(ABC):
         ],
         forward_only: bool,
     ) -> list[torch.Tensor | dict[int, torch.Tensor]] | None:
+        # [FUNCTION DOC]
+        # Abstract. Inputs: mb_list (microbatches), process_output_fn(logits, ctx_dict) returning a
+        # loss/result tensor (or dict for tree training) or None, forward_only flag. Output: list
+        # of detached results in forward-only mode, an empty list in training, or None where the
+        # rank produces no outputs (non-last pipeline stage).
         """Run forward (and optionally backward) pass over microbatches.
 
         Args:
@@ -54,6 +73,8 @@ class ForwardBackwardRunner(ABC):
 
 
 class SequentialRunner(ForwardBackwardRunner):
+    # [CLASS DOC]
+    # Runs microbatches one at a time through a single (non-pipelined) model part.
     """Sequential microbatch execution when no pipeline parallelism is used."""
 
     def __init__(
@@ -61,6 +82,9 @@ class SequentialRunner(ForwardBackwardRunner):
         model_parts: list[nn.Module],
         prepare_inputs_fn: Callable[[MicroBatchItem], tuple[dict, Any]],
     ):
+        # [FUNCTION DOC]
+        # Inputs: model_parts (must have exactly one module; AssertionError otherwise) and
+        # prepare_inputs_fn(mb_item) -> (inputs dict, ctx). Stores the model and the function.
         assert len(model_parts) == 1, "SequentialRunner expects exactly 1 model part"
         self.model = model_parts[0]
         self.prepare_inputs_fn = prepare_inputs_fn
@@ -73,6 +97,16 @@ class SequentialRunner(ForwardBackwardRunner):
         ],
         forward_only: bool,
     ) -> list[torch.Tensor | dict[int, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # For each microbatch: call prepare_inputs_fn to get inputs (input_ids, position_ids,
+        # cu_seqlens, max_seqlen) and a ctx. If ctx.trie_node is set (tree training), build a
+        # TreeAttentionMeta from the trie, padded length (must be non-None) and device, and pass
+        # dummy cu_seqlens [0, seq_len] with max_seqlen = seq_len; otherwise use the provided
+        # cu_seqlens and int(max_seqlen). Call the model, squeeze the batch dim of the logits, and
+        # call process_output_fn(logits, ctx.to_dict()). Non-None results are detached and
+        # collected (dict results detached per value) when forward_only; otherwise result.backward()
+        # is called immediately (accumulating gradients) and nothing is collected. Returns the
+        # collected list (empty in training). Side effects: GPU compute, autograd backward.
         results: list[torch.Tensor | dict[int, torch.Tensor]] = []
 
         for mb_item in mb_list:
@@ -122,6 +156,9 @@ class SequentialRunner(ForwardBackwardRunner):
 
 
 class PipelinedRunner(ForwardBackwardRunner):
+    # [CLASS DOC]
+    # Pipeline-parallel runner that builds a fresh torch pipelining schedule per call
+    # (any schedule type supported by build_pipeline_schedule) over this rank's stages.
     """Unified pipeline-parallel runner supporting all schedule types."""
 
     def __init__(
@@ -133,6 +170,10 @@ class PipelinedRunner(ForwardBackwardRunner):
         has_first_stage: bool,
         has_last_stage: bool,
     ):
+        # [FUNCTION DOC]
+        # Stores pp_stages (local PipelineStage objects), prepare_inputs_fn(mb_list) returning
+        # (batched_args, batched_kwargs, batched_target, contexts), schedule name, pp group size,
+        # and whether this rank holds the first and/or last stage.
         self.pp_stages = pp_stages
         self.prepare_inputs_fn = prepare_inputs_fn
         self.pp_schedule = pp_schedule
@@ -145,6 +186,9 @@ class PipelinedRunner(ForwardBackwardRunner):
         n_microbatches: int,
         loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None,
     ) -> _PipelineSchedule:
+        # [FUNCTION DOC]
+        # HELPER: Builds a pipeline schedule via build_pipeline_schedule for the stored stages,
+        # schedule name and pp degree, with n_microbatches and the given loss_fn (None for eval).
         return build_pipeline_schedule(
             stages=self.pp_stages,
             pp_schedule=self.pp_schedule,
@@ -154,12 +198,18 @@ class PipelinedRunner(ForwardBackwardRunner):
         )
 
     def _get_output_stage(self) -> PipelineStage:
+        # [FUNCTION DOC]
+        # HELPER: Returns the first local stage whose is_last is true. Raises RuntimeError if none.
         for stage in self.pp_stages:
             if stage.is_last:
                 return stage
         raise RuntimeError("No last stage found in pp_stages")
 
     def _patch_skip_output_merge(self, schedule: _PipelineSchedule) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Monkey-patches the schedule's _merge_outputs to a function returning None so
+        # the schedule does not concatenate all microbatch outputs (saves memory); outputs are
+        # read from the stage's output_chunks instead. Mutates the schedule object.
         """Patch schedule to skip output merging, halving memory usage.
 
         TODO(pytorch-upgrade): PyTorch 2.10+ adds step(return_outputs=False) parameter.
@@ -182,6 +232,11 @@ class PipelinedRunner(ForwardBackwardRunner):
         ],
         forward_only: bool,
     ) -> list[torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # Empty mb_list: returns [] in training; in forward_only returns [] on the last-stage rank,
+        # None otherwise. Else calls prepare_inputs_fn on the whole list; positional args are only
+        # fed on the first-stage rank (empty tuple elsewhere). Dispatches to _run_eval when
+        # forward_only, else _run_train, and returns their result.
         if not mb_list:
             if forward_only:
                 return None if not self.has_last_stage else []
@@ -216,6 +271,10 @@ class PipelinedRunner(ForwardBackwardRunner):
         contexts: list,
         process_output_fn: Callable,
     ) -> list[torch.Tensor] | None:
+        # [FUNCTION DOC]
+        # HELPER: Creates a loss-free schedule, patches out output merging, runs schedule.eval.
+        # Non-last-stage ranks return None. Last-stage rank converts output_chunks to results via
+        # _process_outputs, clears output_chunks, and returns the results.
         schedule = self._create_schedule(n_microbatches, loss_fn=None)
         self._patch_skip_output_merge(schedule)
         schedule.eval(*args, **batched_kwargs)
@@ -237,6 +296,12 @@ class PipelinedRunner(ForwardBackwardRunner):
         contexts: list,
         process_output_fn: Callable,
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Builds a loss fn wrapping process_output_fn, creates the schedule with it and
+        # patches output merging. On the last stage temporarily replaces output_chunks with a
+        # _NullOutputChunks so logits are freed after each microbatch's backward. Runs
+        # schedule.step with the args, target and kwargs (forward+backward, gradients accumulate),
+        # then restores output_chunks to an empty list. Always returns [].
         pp_loss_fn = self._create_loss_fn(contexts, process_output_fn)
         schedule = self._create_schedule(n_microbatches, loss_fn=pp_loss_fn)
         self._patch_skip_output_merge(schedule)
@@ -265,10 +330,21 @@ class PipelinedRunner(ForwardBackwardRunner):
         contexts: list,
         process_output_fn: Callable,
     ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Returns the per-microbatch loss callable given to the schedule. On the last stage
+        # it consumes contexts in order (one per call via an iterator), squeezes a 3-D prediction
+        # to 2-D and returns process_output_fn(pred, ctx dict); a None result is replaced by a zero
+        # loss (pred mean times 0) that keeps the graph connected. On other stages it always
+        # returns that zero loss.
+        # KNOWN ISSUE: Context matching relies on the schedule calling the loss in microbatch order;
+        # the target argument is ignored.
         if self.has_last_stage:
             ctx_iter = iter(contexts)
 
             def pp_loss_fn(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC]
+                # HELPER: Last-stage loss: pulls the next ctx, squeezes pred, applies process_output_fn,
+                # returns zero loss if it yields None.
                 ctx = next(ctx_iter)
                 # Squeeze batch dim: outputs (1, seq_len, vocab) -> (seq_len, vocab)
                 if pred.ndim == 3:
@@ -281,6 +357,8 @@ class PipelinedRunner(ForwardBackwardRunner):
             # Non-last stage: dummy loss that keeps all elements in computation graph
             # so autograd can compute complete pred.grad for upstream stage
             def pp_loss_fn(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+                # [FUNCTION DOC]
+                # HELPER: Non-last-stage dummy loss: returns pred mean times 0.
                 return pred.mean() * 0.0
 
         return pp_loss_fn
@@ -291,6 +369,11 @@ class PipelinedRunner(ForwardBackwardRunner):
         contexts: list,
         process_output_fn: Callable,
     ) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Zips output chunks with contexts (strict, lengths must match), squeezes 3-D
+        # outputs, calls process_output_fn and collects detached non-None results.
+        # KNOWN ISSUE: Calls detach() on the result directly, so dict results (tree training, which
+        # SequentialRunner supports) would fail here.
         results: list[torch.Tensor] = []
         for output, ctx in zip(output_chunks, contexts, strict=True):
             # Squeeze batch dim: outputs (1, seq_len, vocab) -> (seq_len, vocab)
@@ -313,6 +396,10 @@ def create_runner(
     has_first_stage: bool = True,
     has_last_stage: bool = True,
 ) -> ForwardBackwardRunner:
+    # [FUNCTION DOC]
+    # Factory. Keyword-only inputs. If pp_enabled, asserts pp_stages and pp_schedule are given
+    # and returns a PipelinedRunner with the pipeline settings; otherwise returns a
+    # SequentialRunner over model_parts. prepare_inputs_fn signature differs per runner kind.
     """Factory function to create the appropriate runner."""
     if pp_enabled:
         assert pp_stages is not None, "pp_stages required when pp_enabled=True"

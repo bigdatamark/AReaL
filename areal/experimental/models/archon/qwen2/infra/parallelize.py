@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Parallelization recipe for the Archon Qwen2 model, applied in order: TP with sequence
+# parallelism, CP (Ulysses), activation checkpointing, per-block torch.compile, FSDP2,
+# then weight tying. Also defines the op save list for per-op selective AC. Logging via a
+# cached rank-aware logger.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -37,12 +42,18 @@ if TYPE_CHECKING:
 
 @functools.cache
 def _get_logger() -> logging.Logger:
+    # [FUNCTION DOC]
+    # HELPER: Cached logger "[Archon Qwen2Parallelize Rank N]".
     """Get rank-aware logger for this module."""
     rank = dist.get_rank() if dist.is_initialized() else 0
     return logging.getLogger(f"[Archon Qwen2Parallelize Rank {rank}]")
 
 
 def _get_op_sac_save_list() -> set[torch._ops.OpOverload]:
+    # [FUNCTION DOC]
+    # HELPER: Imports the varlen module (registering the areal custom op) and returns the set
+    # of ops whose outputs per-op selective AC should keep: aten mm, all SDPA kernel variants,
+    # functional reduce_scatter, aten max, flex_attention HOP, and areal _varlen_attn.
     # Import varlen to register torch.ops.areal._varlen_attn custom op
     from areal.experimental.models.archon.attention import varlen as _  # noqa: F401
 
@@ -79,6 +90,17 @@ def parallelize_qwen2(
     ac_config: ActivationCheckpointConfig | None = None,
     enable_compile: bool = True,
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # Main entry (matches ParallelizeFn). If TP enabled: apply_tp with the "tp" mesh. If CP
+    # enabled: apply_cp with the "cp" group and tp size. If ac_config given and mode not
+    # "none": apply_ac with the save list (compile flag passed for memory_budget). If
+    # enable_compile: apply_compile. If a "dp_shard_cp" mesh exists (always after mesh build):
+    # apply_fsdp with dtypes, pp flag, offload and reshard policy. Finally, if weight tying is
+    # enabled and both heads exist on this part, sets output.weight to the embedding weight.
+    # Returns the (in-place modified) model. Collective operations during sharding.
+    # KNOWN ISSUE: Weight tying is applied after fully_shard; reassigning a parameter on an
+    # FSDP2-managed module afterwards bypasses FSDP's parameter registration (torchtitan ties
+    # before sharding), so tied weights may not be handled correctly under FSDP.
     """Apply parallelization to Qwen2 model.
 
     This is the main entry point for parallelizing a Qwen2 model.
@@ -160,6 +182,15 @@ def apply_tp(
     tp_mesh: DeviceMesh,
     loss_parallel: bool = True,
 ) -> None:
+    # [FUNCTION DOC]
+    # Validates head/dim divisibility via validate_tp_constraints. Root plan (only for owned
+    # modules): embeddings RowwiseParallel (replicated input, sequence-sharded output), norm
+    # SequenceParallel, output ColwiseParallel from sequence-sharded input to vocab-sharded
+    # (loss_parallel) or replicated local output, score gets its input gathered to replicated.
+    # Per block: norms SequenceParallel; attention inputs (x, rope, positions, plus 2 non-
+    # tensors) redistributed so x is replicated; wq/wk/wv ColwiseParallel with local outputs;
+    # wo RowwiseParallel to sequence-sharded; MLP input gathered, w1/w3 Colwise, w2 Rowwise to
+    # sequence-sharded. Mutates the model; logs.
     """Apply tensor parallelism to Qwen2 model.
 
     This applies TP with Sequence Parallelism to the model:
@@ -253,6 +284,11 @@ def apply_fsdp(
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
 ) -> None:
+    # [FUNCTION DOC]
+    # Builds MixedPrecisionPolicy(param_dtype, reduce_dtype) and optional CPUOffloadPolicy.
+    # reshard_after_forward: "always" True, "never" False, "default" = not pp_enabled; other
+    # values raise ValueError. fully_shard on embeddings, each block, then norm+output/score as
+    # one group (resharded only for "always"), then the root model. Logs.
     """Apply FSDP2 to Qwen2 model.
 
     This wraps each component with FSDP for memory-efficient training:
@@ -334,6 +370,9 @@ def apply_cp(
     cp_group: ProcessGroup,
     tp_size: int = 1,
 ) -> None:
+    # [FUNCTION DOC]
+    # Gets the CP world size, validates head counts with validate_cp_constraints (ValueError),
+    # and calls set_cp_group on every block's attention. Logs.
     """Apply context parallelism (Ulysses SP) to Qwen2 model.
 
     This configures each Attention layer to use Ulysses sequence parallelism

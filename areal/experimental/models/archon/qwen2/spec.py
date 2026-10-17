@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Defines QWEN2_SPEC (Qwen2Model, Qwen2ModelArgs, Qwen2StateDictAdapter,
+# parallelize_qwen2, pipeline_llm) for HF model_type "qwen2" and registers it in the
+# global Archon model registry at import time (ValueError if imported into a registry that
+# already has "qwen2").
 # SPDX-License-Identifier: Apache-2.0
 
 from areal.experimental.models.archon.model_spec import ModelSpec, register_model_spec

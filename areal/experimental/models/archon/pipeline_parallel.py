@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Pipeline parallelism for Archon LLMs (adapted from torchtitan): assigning module FQNs
+# (tok_embeddings, layers.N, norm, output/score) to virtual stages, splitting a meta-device
+# model into per-rank PipelineStage parts (loop-style or V-style stage placement),
+# parallelizing each part, and building torch pipelining schedules. Logging via a cached
+# rank-aware logger.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/distributed/pipeline_parallel.py
@@ -32,6 +38,8 @@ if TYPE_CHECKING:
 
 @functools.cache
 def _get_logger() -> logging.Logger:
+    # [FUNCTION DOC]
+    # HELPER: Cached logger "[Archon PipelineParallel Rank N]".
     """Get rank-aware logger for this module."""
     rank = dist.get_rank() if dist.is_initialized() else 0
     return logging.getLogger(f"[Archon PipelineParallel Rank {rank}]")
@@ -52,6 +60,11 @@ def build_pipeline_schedule(
     pp_degree: int = 1,
     loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
 ) -> "_PipelineSchedule":
+    # [FUNCTION DOC]
+    # Resolves the schedule class by name; multi-stage (looped) schedules receive the whole
+    # stage list, single-stage ones only stages[0]. Warns if n_microbatches is less than
+    # len(stages) * pp_degree (bubbles). Instantiates with n_microbatches, loss_fn (None for
+    # eval) and scale_grads False (loss scaling is the caller's job). Returns the schedule.
     """Build pipeline schedule, passing single stage or list based on schedule type.
 
     Args:
@@ -89,6 +102,16 @@ def generate_llm_fqn_per_model_part(
     last_stage_less_layers: int = 1,
     is_critic: bool = False,
 ) -> list[list[str]]:
+    # [FUNCTION DOC]
+    # Distributes num_layers transformer layers over num_stages, treating embedding and
+    # output as costing first/last_stage_less_layers layer-equivalents. One stage: everything.
+    # Otherwise effective = layers + both weights; raises ValueError if num_stages < 1, more
+    # stages than effective layers, zero layers per stage, or either weight exceeds the base
+    # per-stage count. Each stage gets effective // num_stages units, the first (effective mod
+    # num_stages) stages one extra. Stage 0 gets "tok_embeddings" plus (units - first weight)
+    # layers; the last stage gets (units - last weight) layers plus "norm" and "output" (or
+    # "score" when is_critic); middle stages get units layers; layers are assigned
+    # consecutively. Returns one FQN list per stage.
     """Generate module FQN lists for each pipeline stage.
 
     This function distributes transformer layers across pipeline stages,
@@ -204,6 +227,10 @@ def pipeline_module_split(
     device: torch.device,
     module_names_per_stage: list[list[str]],
 ) -> tuple[list[PipelineStage], list[nn.Module]]:
+    # [FUNCTION DOC]
+    # Determines this rank's stage indices and, for each, builds a pruned deep copy of the
+    # meta-device model wrapped in a PipelineStage over the pp group. Returns (stages, parts)
+    # in stage-index order. Logs each built stage.
     """Split model into pipeline stages based on module names.
 
     Key points:
@@ -230,6 +257,12 @@ def pipeline_module_split(
         module_names: list[str],
         num_stages: int,
     ) -> tuple[PipelineStage, nn.Module]:
+        # [FUNCTION DOC]
+        # HELPER: Asserts the model is on meta, deep-copies it, and prunes top-level children:
+        # ModuleDict children keep only keys named "<child>.<key>" in the stage list (empty
+        # ModuleDict if none); ModuleList children keep listed numeric indices (re-indexed); other
+        # children not listed are set to None. Wraps the copy in PipelineStage(stage_idx,
+        # num_stages, device, pp group). Returns (stage, model part).
         """Build a single pipeline stage from module names."""
         assert next(whole_model.parameters()).device.type == "meta", (
             "Model must be on meta device for pipeline splitting"
@@ -296,6 +329,10 @@ def pipeline_module_split(
         return stage, model
 
     def _get_stage_indices() -> tuple[int, ...]:
+        # [FUNCTION DOC]
+        # HELPER: Requires num_stages divisible by pp_degree (ValueError). For V-style schedules
+        # (ZBVZeroBubble, DualPipeV) requires exactly 2 stages per rank and returns (rank,
+        # num_stages-1-rank); otherwise loop-style (rank, rank+pp, rank+2pp, ...).
         """Get stage indices for this rank based on schedule style.
 
         Examples (pp_degree=4, num_stages=8):
@@ -354,6 +391,16 @@ def pipeline_llm(
     parallelize_fn: Callable,
     **parallelize_kwargs,
 ) -> tuple[list[PipelineStage], list[nn.Module], bool, bool]:
+    # [FUNCTION DOC]
+    # Entry point. Gets the "pp" mesh (RuntimeError if missing), reads schedule and layer
+    # settings from archon_config, determines num_layers from model.model_args or model.config
+    # (num_hidden_layers or n_layers; RuntimeError if absent) and is_critic from model_args.
+    # If pp_layers_per_stage is set: virtual stages = ceil((layers + first + last) /
+    # layers_per_stage), which must divide by pp degree; single-stage schedules need exactly 1
+    # stage per rank, multi-stage at least 2, V-style exactly 2 (ValueError otherwise). Else
+    # defaults to 1 or 2 stages per rank. Generates FQNs, splits the model, applies
+    # parallelize_fn(part, parallel_dims, **kwargs) to each part and updates stage.submod.
+    # Returns (stages, parts, has_first_stage, has_last_stage).
     """Main entry point for pipeline parallelism.
 
     Workflow:

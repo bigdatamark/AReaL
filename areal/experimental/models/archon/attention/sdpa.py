@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# SDPA-based attention for packed sequences: builds a dense block-diagonal causal float
+# mask from cu_seqlens and calls torch scaled_dot_product_attention under a prioritized
+# backend list. Simple and portable but materializes an O(seq_len^2) mask per call.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -21,6 +25,12 @@ def create_block_causal_mask_2d(
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Builds a [seq_len, seq_len] additive mask (0.0 = attend, -inf = masked) in the given
+    # dtype/device. Each position gets a sequence id via right-sided searchsorted over
+    # cu_seqlens minus one; a query may attend a key only if both share a sequence id and key
+    # index <= query index. Positions at or past cu_seqlens[-1] (padding) share one extra id,
+    # so padding forms its own causal block. No side effects.
     """Create a 2D block-diagonal causal attention mask for SDPA.
 
     For packed sequences, creates a mask where:
@@ -62,6 +72,9 @@ def create_block_causal_mask_2d(
 
 
 class SDPAWrapper(nn.Module):
+    # [CLASS DOC]
+    # nn.Module (no parameters) computing attention over [batch, heads, seq, head_dim] inputs
+    # with packed-sequence masking. DEFAULT_BACKENDS priority: cuDNN, Flash, Efficient, Math.
     """SDPA wrapper for packed sequences with block-diagonal causal mask.
 
     This wrapper supports packed sequences by creating a block-diagonal
@@ -78,6 +91,8 @@ class SDPAWrapper(nn.Module):
     ]
 
     def __init__(self, sdpa_backends: list[SDPBackend] | None = None):
+        # [FUNCTION DOC]
+        # Stores the given SDPA backend list, or DEFAULT_BACKENDS if None.
         super().__init__()
         self.sdpa_backends = (
             sdpa_backends if sdpa_backends is not None else self.DEFAULT_BACKENDS
@@ -94,6 +109,12 @@ class SDPAWrapper(nn.Module):
         max_seqlen: int,
         tree_attn_meta: TreeAttentionMeta | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Builds the block causal mask for q's sequence length (dim 2) with q's dtype/device and
+        # calls scaled_dot_product_attention with that mask, the optional scale, is_causal False
+        # and GQA enabled when q and k head counts differ, inside an sdpa_kernel context with the
+        # stored backend priority. max_seqlen and tree_attn_meta are ignored. Returns the output in
+        # the same [batch, heads, seq, head_dim] layout.
         """Compute attention with block-diagonal causal mask.
 
         Args:

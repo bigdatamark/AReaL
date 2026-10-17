@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# HF <-> Archon state-dict key mapping for Qwen2 (1:1 tensors, no reshaping). Handles
+# weight tying and strips activation-checkpoint/compile wrapper prefixes for weight sync.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/qwen3/model/state_dict_adapter.py
@@ -16,11 +19,19 @@ if TYPE_CHECKING:
 
 
 class Qwen2StateDictAdapter(BaseStateDictAdapter):
+    # [CLASS DOC]
+    # Holds the static HF->Archon template map (with "{}" for layer index; rotary inv_freq
+    # mapped to None = dropped), the reverse map, and enable_weight_tying from the config.
+    # KNOWN ISSUE: No mapping for the critic "score.weight", so critic heads are silently
+    # dropped by to_hf/from_hf/convert_single_to_hf.
     """State dict adapter for Qwen2 models."""
 
     def __init__(
         self, model_config: PretrainedConfig, hf_assets_path: str | None = None
     ):
+        # [FUNCTION DOC]
+        # Calls the base init (loads safetensors index), fills from_hf_map and builds to_hf_map
+        # from non-None entries; reads tie_word_embeddings.
         super().__init__(model_config, hf_assets_path)
 
         # HuggingFace -> Archon key mapping
@@ -52,6 +63,9 @@ class Qwen2StateDictAdapter(BaseStateDictAdapter):
         self.enable_weight_tying = getattr(model_config, "tie_word_embeddings", False)
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Converts each Archon key to HF, skipping output.weight when tied and dropping unknown
+        # keys. Values (incl. DTensors) are passed through. Returns a new dict.
         hf_state_dict = {}
 
         for key, value in state_dict.items():
@@ -67,6 +81,10 @@ class Qwen2StateDictAdapter(BaseStateDictAdapter):
         return hf_state_dict
 
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # If tied and lm_head.weight is missing, copies the dict and aliases lm_head.weight to the
+        # embedding weight. Converts keys to Archon names, dropping unknown/ignored keys. Returns a
+        # new dict.
         # Handle weight tying
         if (
             self.enable_weight_tying
@@ -87,6 +105,9 @@ class Qwen2StateDictAdapter(BaseStateDictAdapter):
     def convert_single_to_hf(
         self, name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Removes "._checkpoint_wrapped_module" and "._orig_mod" from the name, maps it to HF and
+        # returns a one-element list, or [] if unmapped. Does not skip output.weight under tying.
         # Strip activation checkpoint wrapper prefix if present
         # e.g., "layers.0._checkpoint_wrapped_module.attention.wq.weight"
         #    -> "layers.0.attention.wq.weight"
@@ -102,6 +123,9 @@ class Qwen2StateDictAdapter(BaseStateDictAdapter):
         return []
 
     def _convert_key_to_hf(self, archon_key: str) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Exact lookup in to_hf_map; otherwise replaces the first "layers.N." with the
+        # template, looks it up and substitutes N into the HF template. None if unknown.
         if archon_key in self.to_hf_map:
             return self.to_hf_map[archon_key]
 
@@ -116,6 +140,9 @@ class Qwen2StateDictAdapter(BaseStateDictAdapter):
         return None
 
     def _convert_key_from_hf(self, hf_key: str) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Same as above in the HF->Archon direction; returns None for keys mapped to None
+        # or unknown keys.
         if hf_key in self.from_hf_map:
             result = self.from_hf_map[hf_key]
             return result if result is not None else None

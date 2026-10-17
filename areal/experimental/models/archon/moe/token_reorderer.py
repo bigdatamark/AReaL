@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# TokenReorderer: sorts the flattened (token, top-k slot) routing assignments by expert.
+# Kept as its own module so ReordererSequenceParallel can shard its inputs across TP ranks.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/moe/moe.py
@@ -9,6 +12,8 @@ from torch import nn
 
 
 class TokenReorderer(nn.Module):
+    # [CLASS DOC]
+    # Parameter-free module storing num_experts and top_k.
     """Token reordering module for MoE routing.
 
     Separates the token reordering logic from the router to enable
@@ -24,6 +29,8 @@ class TokenReorderer(nn.Module):
     """
 
     def __init__(self, num_experts: int, top_k: int):
+        # [FUNCTION DOC]
+        # Stores num_experts and top_k.
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
@@ -33,6 +40,12 @@ class TokenReorderer(nn.Module):
         top_scores: torch.Tensor,
         selected_experts_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Counts slots per expert via a histogram of the flattened expert indices, computes a
+        # stable argsort of the flattened indices (slot indices grouped by expert, original order
+        # kept within an expert), and gathers flattened scores in that order. Returns (sorted
+        # scores [T*k], sorted slot indices [T*k] - slot // top_k is the token, counts
+        # [num_experts]).
         """Reorder tokens by expert assignment.
 
         Args:

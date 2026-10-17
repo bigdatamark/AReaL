@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Activation checkpointing (AC) for Archon models, adapted from torchtitan. Supports
+# "full" (wrap each transformer block), "selective" either per-op (save outputs of a
+# model-specific op list, recompute the rest, recompute every second matmul) or per-layer
+# (wrap every Nth block), "memory_budget" (delegates to the torch.compile functorch
+# min-cut partitioner via a global budget), and "none". Keeps a module-global counter for
+# layer-level selective AC. Logging goes through a cached rank-aware logger.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/distributed/activation_checkpoint.py
@@ -24,6 +31,9 @@ from areal.utils import logging
 
 @functools.cache
 def _get_logger() -> logging.Logger:
+    # [FUNCTION DOC]
+    # HELPER: Cached; returns an areal logger named "[Archon ActivationCheckpoint Rank N]"
+    # using the dist rank (0 if not initialized). Cached forever after first call.
     """Get rank-aware logger for this module."""
     rank = dist.get_rank() if dist.is_initialized() else 0
     return logging.getLogger(f"[Archon ActivationCheckpoint Rank {rank}]")
@@ -35,6 +45,11 @@ _layer_sac_count = 0
 
 @dataclass
 class ActivationCheckpointConfig:
+    # [CLASS DOC]
+    # Dataclass of AC settings: mode, selective_ac_option ("op" or digits = every Nth layer),
+    # FQN substrings of Linear layers whose matmuls must always be recomputed (default the MoE
+    # router gate), early_stop, memory_budget (0..1), pareto visualization flag,
+    # preserve_rng_state, determinism_check ("default"/"none"/"throw"), debug.
     """Activation checkpointing configuration."""
 
     mode: str = "selective"
@@ -67,6 +82,11 @@ class ActivationCheckpointConfig:
     """Capture AC debug information. Will be slower."""
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Validates mode is one of none/full/selective/memory_budget and, for selective, that the
+        # option is "op" or a digit string; raises ValueError otherwise.
+        # KNOWN ISSUE: "0" passes validation (error message says positive integer); with ac_freq 0
+        # the layer path wraps every block, same as "1".
         valid_modes = ("none", "full", "selective", "memory_budget")
         if self.mode not in valid_modes:
             raise ValueError(
@@ -88,6 +108,11 @@ def _apply_layer_sac(
     module: nn.Module,
     ac_config: ActivationCheckpointConfig,
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # HELPER: Increments the global layer counter and wraps the module with the PyTorch
+    # checkpoint_wrapper (config's rng/determinism/early_stop/debug options) when the
+    # frequency is 0 or the counter is a multiple of it; otherwise returns the module unchanged.
+    # Side effect: mutates module-global _layer_sac_count.
     """Apply layer selective activation checkpointing to the module.
 
     Args:
@@ -119,6 +144,12 @@ def _apply_op_sac(
     base_fqn: str | None = None,
     op_sac_save_list: set[torch._ops.OpOverload],
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # HELPER: Per-op selective AC. First collects (in_features, out_features) weight shapes of
+    # submodules whose FQN (prefixed by base_fqn) contains any configured force-recompute
+    # substring; raises ValueError if such a submodule is not nn.Linear. Returns a
+    # checkpoint_wrapper whose context_fn creates fresh selective-checkpoint contexts with a
+    # per-invocation counter dict and the custom policy below.
     """Apply selective activation checkpointing to the module.
 
     Args:
@@ -154,7 +185,15 @@ def _apply_op_sac(
             )
 
     def _get_custom_policy(meta):
+        # [FUNCTION DOC]
+        # HELPER: Closure factory binding the counter dict meta; returns the policy function.
         def _custom_policy(ctx, func, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Policy deciding save vs recompute per op. Device-to-CPU copies from CUDA are
+            # always saved. For aten.mm: if the rhs shape is in the force-recompute set, prefer
+            # recompute; else increment the forward/recompute-specific mm counter. Any op in
+            # op_sac_save_list is saved, except mm calls with an even counter (every second mm is
+            # recomputed). Everything else prefers recompute.
             if (
                 func == torch.ops.aten._to_copy.default
                 and "cuda" in str(args[0].device)
@@ -183,6 +222,9 @@ def _apply_op_sac(
         return _custom_policy
 
     def selective_checkpointing_context_fn():
+        # [FUNCTION DOC]
+        # HELPER: Creates a new zero-default counter dict and returns the forward/recompute
+        # context pair from create_selective_checkpoint_contexts with the custom policy.
         meta = defaultdict(int)
         return create_selective_checkpoint_contexts(_get_custom_policy(meta))
 
@@ -200,6 +242,9 @@ def _apply_full_ac(
     module: nn.Module,
     ac_config: ActivationCheckpointConfig,
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # HELPER: Wraps the module with checkpoint_wrapper using the config's options (recompute
+    # the entire block in backward).
     """Apply full activation checkpointing to the module.
 
     Args:
@@ -226,6 +271,10 @@ def _apply_ac_to_transformer_block(
     model_compile_enabled: bool = False,
     op_sac_save_list: set[torch._ops.OpOverload] | None = None,
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # HELPER: Raises ValueError unless mode is full or selective. full -> _apply_full_ac;
+    # selective with option "op" -> _apply_op_sac (empty save list if None); otherwise
+    # layer-level _apply_layer_sac. model_compile_enabled is accepted but unused.
     """Apply AC to a single transformer block."""
     valid_ac_modes = ("full", "selective")
     if ac_config.mode not in valid_ac_modes:
@@ -254,6 +303,14 @@ def apply_ac(
     op_sac_save_list: set[torch._ops.OpOverload] | None = None,
     base_folder: str = "",
 ) -> None:
+    # [FUNCTION DOC]
+    # Applies AC to model in place. memory_budget: asserts compile is enabled, optionally
+    # creates base_folder/memory_budget_pareto and enables functorch pareto visualization,
+    # sets functorch activation_memory_budget globally, and returns. none: returns. Otherwise
+    # requires a "layers" attribute (ValueError), resets the global layer counter, wraps each
+    # child of model.layers via _apply_ac_to_transformer_block (FQN "layers.<id>") and
+    # re-registers it under the same name. Logs at INFO. Side effects: global torch config,
+    # filesystem directory creation.
     """Apply activation checkpointing to the model.
 
     Args:

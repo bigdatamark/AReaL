@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# MoEArgs dataclass: configuration of an MoE layer (expert counts, routing, shared experts,
+# computation mode, load balancing), with a constructor from HF configs.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/moe/moe.py
@@ -15,6 +18,14 @@ if TYPE_CHECKING:
 
 @dataclass
 class MoEArgs:
+    # [CLASS DOC]
+    # Dataclass fields: num_experts (8), num_shared_experts (0), top_k (1),
+    # shared_expert_intermediate_size (0) and use_shared_expert_gate (False) for shared
+    # experts, score_func ("sigmoid" default; "softmax" for Qwen3-MoE), route_norm,
+    # route_scale, score_before_experts (multiply scores into inputs instead of outputs),
+    # router_dtype (None = model dtype), num_expert_groups / num_limited_groups (node-limited
+    # routing), use_grouped_mm, load_balance_coeff (None disables aux-loss-free balancing),
+    # _debug_force_load_balance (testing: uniform routing).
     """Arguments for Mixture of Experts (MoE) configuration.
 
     Attributes:
@@ -78,6 +89,12 @@ class MoEArgs:
 
     @classmethod
     def from_hf_config(cls, hf_config: PretrainedConfig) -> MoEArgs:
+        # [FUNCTION DOC]
+        # Builds MoEArgs from an HF config: num_experts from num_experts, else num_local_experts,
+        # else 8; top_k from num_experts_per_tok (default 1); route_norm from norm_topk_prob
+        # (default False); score_func fixed to "softmax". All other fields keep defaults.
+        # KNOWN ISSUE: Shared-expert fields (e.g. Qwen2-MoE shared_expert_intermediate_size) are
+        # not read here; callers must fill them separately.
         """Create MoEArgs from a HuggingFace config.
 
         Expected HuggingFace config fields:

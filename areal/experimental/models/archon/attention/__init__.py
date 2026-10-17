@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Attention backends for Archon models. Re-exports SDPAWrapper (padded/causal torch SDPA
+# with per-sequence masking), VarlenAttentionWrapper (flash varlen on packed sequences),
+# and the tree-attention wrapper and metadata from areal.models.tree_attn.
 # SPDX-License-Identifier: Apache-2.0
 
 from areal.experimental.models.archon.attention.sdpa import SDPAWrapper

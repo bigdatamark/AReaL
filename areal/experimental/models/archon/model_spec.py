@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Model registry for Archon. A ModelSpec bundles everything needed to build and
+# parallelize one model family (model class, args class, state-dict adapter, parallelize
+# function, optional pipelining function) and the HF model_type strings it serves.
+# Specs are registered into the module-global _MODEL_SPECS dict at import time by each
+# family's spec module.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -24,6 +30,9 @@ if TYPE_CHECKING:
 
 # Type alias for parallelize function signature
 class ParallelizeFn(Protocol):
+    # [CLASS DOC]
+    # Protocol for a family's parallelize function: applies TP, CP (Ulysses), EP, AC,
+    # compile and FSDP to a model according to parallel_dims flags and returns the module.
     """Protocol for model parallelization functions.
 
     This protocol defines the signature for functions that apply various
@@ -50,9 +59,17 @@ class ParallelizeFn(Protocol):
         ac_config: ActivationCheckpointConfig | None = None,
         enable_compile: bool = True,
     ) -> nn.Module: ...
+        # [FUNCTION DOC]
+        # Signature only: model, parallel_dims, param/reduce dtypes for FSDP mixed precision,
+        # loss_parallel, cpu_offload, reshard_after_forward_policy, optional AC config,
+        # enable_compile. Returns the parallelized model.
 
 
 class PipeliningFn(Protocol):
+    # [CLASS DOC]
+    # Protocol for a pipeline-parallel function: splits a model into stages for this rank,
+    # parallelizes each part via parallelize_fn, and returns (stages, model_parts,
+    # has_first_stage, has_last_stage).
     """Protocol for pipeline parallelism functions.
 
     This protocol defines the signature for functions that apply pipeline
@@ -80,10 +97,17 @@ class PipeliningFn(Protocol):
         parallelize_fn: ParallelizeFn,
         **parallelize_kwargs,
     ) -> tuple[list[PipelineStage], list[nn.Module], bool, bool]: ...
+        # [FUNCTION DOC]
+        # Signature only: model, device, parallel_dims, archon_config, parallelize_fn and extra
+        # kwargs forwarded to parallelize_fn.
 
 
 @dataclass
 class ModelSpec:
+    # [CLASS DOC]
+    # Dataclass: name, model_class, model_args_class, state_dict_adapter_class,
+    # parallelize_fn, supported_model_types (frozenset of HF model_type), optional
+    # pipelining_fn.
     """Specification for a Archon-compatible model."""
 
     name: str
@@ -99,6 +123,10 @@ _MODEL_SPECS: dict[str, ModelSpec] = {}
 
 
 def register_model_spec(spec: ModelSpec) -> ModelSpec:
+    # [FUNCTION DOC]
+    # Registers spec under each of its model types; raises ValueError if a type already has a
+    # spec. Returns the spec. Mutates the global registry.
+    # KNOWN ISSUE: Not atomic - types iterated before a duplicate is hit stay registered.
     """Register a ModelSpec."""
     for model_type in spec.supported_model_types:
         if model_type in _MODEL_SPECS:
@@ -111,6 +139,8 @@ def register_model_spec(spec: ModelSpec) -> ModelSpec:
 
 
 def get_model_spec(model_type: str) -> ModelSpec:
+    # [FUNCTION DOC]
+    # Returns the spec registered for model_type; raises KeyError listing available types.
     """Get ModelSpec by HF model_type."""
     if model_type not in _MODEL_SPECS:
         available = sorted(_MODEL_SPECS.keys())
@@ -119,11 +149,15 @@ def get_model_spec(model_type: str) -> ModelSpec:
 
 
 def is_supported_model(model_type: str) -> bool:
+    # [FUNCTION DOC]
+    # True if model_type is registered.
     """Check if a model_type is supported."""
     return model_type in _MODEL_SPECS
 
 
 def get_supported_model_types() -> frozenset[str]:
+    # [FUNCTION DOC]
+    # Returns a frozenset snapshot of registered model types.
     """Get all supported model types."""
     return frozenset(_MODEL_SPECS.keys())
 

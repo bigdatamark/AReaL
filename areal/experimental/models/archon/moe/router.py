@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# MoE router: a bias-free gate Linear (optionally computing its GEMM in a higher-precision
+# router_dtype via a custom autograd function, as in Megatron-Core) and the token-choice
+# top-k router with sigmoid/softmax scoring, aux-loss-free expert bias, optional
+# node-limited (group) routing, normalization/scaling and a debug balanced mode.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/moe/moe.py
@@ -12,6 +17,9 @@ from torch import nn
 
 
 class RouterGatingLinearFunction(torch.autograd.Function):
+    # [CLASS DOC]
+    # Custom autograd Function computing input times weight-transposed in router_dtype while
+    # saving input/weight in their original (low) precision.
     """Custom autograd function for MoE router gate GEMM in higher precision.
 
     Performs the gate linear layer (input @ weight.T) in the specified dtype
@@ -28,6 +36,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         weight: torch.Tensor,
         router_dtype: torch.dtype,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Saves input and weight, stores router_dtype on ctx, returns the matmul of both cast to
+        # router_dtype (result stays in router_dtype). Decorated with CUDA amp custom_fwd.
         """Forward pass: compute input @ weight.T in router_dtype.
 
         Saves input and weight in their original dtype (BF16) for memory efficiency.
@@ -42,6 +53,10 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         ctx: torch.autograd.function.FunctionCtx,
         *grad_outputs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, None]:
+        # [FUNCTION DOC]
+        # Casts grad_output to router_dtype; grad_input = grad times weight (cast back to input
+        # dtype); grad_weight = grad transposed times input (cast to weight dtype); None for the
+        # dtype argument.
         """Backward pass: compute gradients in router_dtype, return in original dtype."""
         grad_output = grad_outputs[0]
         input, weight = cast(Any, ctx).saved_tensors
@@ -55,6 +70,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 def router_gating_linear(
     input: torch.Tensor, weight: torch.Tensor, router_dtype: torch.dtype | None
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Uses RouterGatingLinearFunction when router_dtype is given, otherwise F.linear. Input
+    # [tokens, dim], weight [experts, dim]; returns [tokens, experts].
     """Apply router gate linear with optional dtype casting for numerical stability.
 
     Args:
@@ -74,6 +92,9 @@ def router_gating_linear(
 
 
 class RouterGateLinear(nn.Linear):
+    # [CLASS DOC]
+    # nn.Linear subclass (no bias) whose forward goes through router_gating_linear, so
+    # module-level DTensor parallel hooks still apply.
     """Router gate linear that performs GEMM in higher precision.
 
     Wraps :func:`router_gating_linear` inside an :class:`~torch.nn.Linear`
@@ -99,14 +120,20 @@ class RouterGateLinear(nn.Linear):
         out_features: int,
         router_dtype: torch.dtype | None = None,
     ):
+        # [FUNCTION DOC]
+        # Creates a bias-free Linear and stores router_dtype.
         super().__init__(in_features, out_features, bias=False)
         self.router_dtype = router_dtype
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Returns router_gating_linear(input, weight, router_dtype).
         return router_gating_linear(input, self.weight, self.router_dtype)
 
 
 class TokenChoiceTopKRouter(nn.Module):
+    # [CLASS DOC]
+    # Router module holding the gate and routing hyperparameters (see MoEArgs).
     """Token-choice routing with top-k expert selection.
 
     Each token is routed to the top-k experts based on learned gate scores.
@@ -144,6 +171,8 @@ class TokenChoiceTopKRouter(nn.Module):
         num_limited_groups: int | None = None,
         _debug_force_load_balance: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Builds the RouterGateLinear(dim -> num_experts) and stores all settings.
         super().__init__()
         self.gate = RouterGateLinear(dim, num_experts, router_dtype=router_dtype)
         self.num_experts = num_experts
@@ -159,6 +188,9 @@ class TokenChoiceTopKRouter(nn.Module):
     def _debug_force_load_balance_routing(
         self, scores: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Debug: assigns slot j of token i to expert (i*top_k + j) mod num_experts and
+        # gathers the corresponding scores. Returns (indices [T, top_k] int64, scores).
         """Force balanced round-robin expert assignment for debugging.
 
         Args:
@@ -182,6 +214,11 @@ class TokenChoiceTopKRouter(nn.Module):
         self,
         scores_for_choice: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Validates num_limited_groups is set (ValueError), num_experts divisible by
+        # num_expert_groups and at least 2 experts per group (ValueError). Scores each group by the
+        # sum of its top-2 expert scores, keeps the top num_limited_groups groups per token and
+        # sets all experts in other groups to -inf. Returns [T, num_experts].
         """Apply node-limited routing by masking non-selected expert groups.
 
         Args:
@@ -234,6 +271,14 @@ class TokenChoiceTopKRouter(nn.Module):
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Computes gate logits, applies sigmoid or softmax in float32 (NotImplementedError for
+        # others). Selection scores add expert_bias if given and apply node-limited masking if
+        # num_expert_groups is set; top_k experts are chosen (unsorted) from those, but returned
+        # scores are gathered from the unbiased scores. Debug mode overrides with balanced routing.
+        # Optionally normalizes the k scores to sum 1 (eps 1e-20), multiplies by route_scale, and
+        # counts tokens per expert with a histogram over [0, num_experts). Returns (top_scores
+        # [T, k] float32, indices [T, k], counts [num_experts]).
         """Route tokens to experts.
 
         Args:
@@ -297,6 +342,8 @@ class TokenChoiceTopKRouter(nn.Module):
         return top_scores, selected_experts_indices, num_tokens_per_expert
 
     def init_weights(self, init_std: float = 0.02):
+        # [FUNCTION DOC]
+        # Truncated-normal init of the gate weight with init_std.
         """Initialize gate weights.
 
         Args:

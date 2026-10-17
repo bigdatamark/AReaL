@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Variable-length (packed) flash attention exposed as torch custom ops so it is traceable
+# by torch.compile: a forward op "areal::_varlen_attn" and backward op
+# "areal::_varlen_attn_backward" wrap aten's private flash attention kernels (dropout 0),
+# each with a fake (meta) implementation, glued via register_autograd. varlen_attn is the
+# functional API on [total_tokens, heads, head_dim] tensors; VarlenAttentionWrapper adapts
+# Archon's [1, heads, seq, head_dim] layout. Import has side effects: op registration.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -28,6 +35,10 @@ def _varlen_attn(
     is_causal: bool = False,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Custom op (no mutation). Calls aten _flash_attention_forward with the given
+    # q/k/v, cumulative lengths, max lengths, dropout 0, causal flag and scale. Returns
+    # (output [T_q, H, D], softmax logsumexp, placeholder rng state of two uint64 zeros).
     """Internal custom op calling Flash Attention kernel.
 
     Args:
@@ -76,6 +87,9 @@ def _varlen_attn_fake(
     is_causal: bool = False,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Fake/meta impl: returns empty tensors shaped like the real outputs - output like
+    # query, logsumexp float [num_heads, total_q], rng state uint64 [2].
     """Fake implementation for meta tensor computation and tracing."""
     output = torch.empty_like(query)
 
@@ -110,6 +124,10 @@ def _varlen_attn_backward(
     rng_state: torch.Tensor,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Custom op. Calls aten _flash_attention_backward with grad_out, q/k/v, forward
+    # output and lse, cu_seqlens, max lengths, dropout 0, causal flag, rng state, an empty
+    # unused tensor, and scale. Returns (dq, dk, dv).
     """Backward pass calling Flash Attention backward kernel."""
     unused = torch.empty(0, device=query.device)
 
@@ -149,6 +167,8 @@ def _varlen_attn_backward_fake(
     rng_state: torch.Tensor,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Fake impl returning empty tensors shaped like query, key and value.
     """Fake implementation for backward tracing."""
     grad_query = torch.empty_like(query)
     grad_key = torch.empty_like(key)
@@ -160,6 +180,9 @@ def _varlen_attn_backward_fake(
 
 
 def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Autograd setup: saves q, k, v, cu_seq_q, cu_seq_k, out, lse, rng_state on ctx
+    # and stores max_q, max_k, is_causal, scale as ctx attributes.
     """Save tensors for backward pass."""
     query, key, value, cu_seq_q, cu_seq_k, max_q, max_k, is_causal, scale = inputs
     out, lse, rng_state = output
@@ -175,6 +198,10 @@ def _setup_context(ctx: Any, inputs: tuple[Any, ...], output: Any) -> None:
 def _backward(
     ctx: Any, grad_out: torch.Tensor, grad_lse: torch.Tensor, grad_rng: torch.Tensor
 ) -> tuple[torch.Tensor | None, ...]:
+    # [FUNCTION DOC]
+    # HELPER: Autograd backward: unpacks saved tensors and attributes, calls the backward
+    # custom op and returns (dq, dk, dv) followed by six Nones for non-differentiable inputs.
+    # Gradients flowing into lse and rng outputs are ignored.
     """Compute gradients for backward pass."""
     query, key, value, cu_seq_q, cu_seq_k, out, lse, rng_state = ctx.saved_tensors
 
@@ -219,6 +246,11 @@ def varlen_attn(
     is_causal: bool = False,
     scale: float | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Public functional API: calls the forward custom op and returns only the attention
+    # output [T_q, H, D]. Inputs: q [T_q,H,D], k/v [T_k,H,D], int32 cumulative lengths
+    # [N+1] for q and k, max lengths, is_causal (default False), scale (default kernel's
+    # 1/sqrt(D)). Requires a CUDA flash-attention capable device.
     """Compute variable-length attention using Flash Attention.
 
     This function is similar to scaled_dot_product_attention but optimized for
@@ -257,6 +289,8 @@ def varlen_attn(
 
 
 class VarlenAttentionWrapper(nn.Module):
+    # [CLASS DOC]
+    # Parameter-free nn.Module adapting varlen_attn to Archon's 4-D attention interface.
     """Wrapper adapting varlen_attn for Archon Engine's 4D tensor format.
 
     Archon Engine uses 4D tensors [batch, heads, seq_len, head_dim],
@@ -277,6 +311,11 @@ class VarlenAttentionWrapper(nn.Module):
         max_seqlen: int,
         tree_attn_meta: TreeAttentionMeta | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Asserts batch == 1, converts q/k/v from [1, H, T, D] to contiguous [T, H, D], casts
+        # cu_seqlens to int32, runs causal varlen_attn with identical cu_seqlens and max_seqlen for
+        # queries and keys, and returns output transposed back to [1, H, T, D]. tree_attn_meta is
+        # ignored.
         """Compute attention with varlen_attn.
 
         Args:

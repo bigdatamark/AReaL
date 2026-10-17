@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# ArchonParallelDims: validates parallelism degrees (pp, dp_shard, cp, tp, ep, etp) and
+# lazily builds the torch DeviceMesh plus named flattened submeshes used by the Archon
+# engine (data loading, FSDP sharding, loss reduction, EP), adapted from torchtitan.
+# Logging via a cached rank-aware logger.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/distributed/parallel_dims.py
@@ -13,6 +18,8 @@ from areal.utils import logging
 
 @functools.cache
 def _get_logger() -> logging.Logger:
+    # [FUNCTION DOC]
+    # HELPER: Cached logger "[Archon ParallelDims Rank N]" (rank 0 when dist not initialized).
     """Get rank-aware logger for this module."""
     rank = dist.get_rank() if dist.is_initialized() else 0
     return logging.getLogger(f"[Archon ParallelDims Rank {rank}]")
@@ -25,6 +32,11 @@ __all__ = [
 
 @dataclass
 class ArchonParallelDims:
+    # [CLASS DOC]
+    # Dataclass of degrees plus world_size and device_type; internal _world_mesh (built
+    # lazily) and _meshes (name -> submesh). World = pp * dp_shard * cp * tp; EP is carved out
+    # of dp_shard * cp (etp == tp) or dp_shard * cp * tp (etp == 1). See docstring table for
+    # which expert-parallel style applies. dp_replicate (HSDP) is always 1.
     """Parallel dimensions for Archon engine.
 
     Archon Engine uses PyTorch-native distributed APIs inspired by torchtitan.
@@ -123,6 +135,11 @@ class ArchonParallelDims:
     _meshes: dict[str, DeviceMesh] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Auto-computes dp_shard = world_size / (tp * cp * pp) (floor) when negative. Raises
+        # ValueError if pp*dp_shard*cp*tp != world_size, if etp is not 1 or tp, or if EP does not
+        # fit: for etp == tp, ep must be divisible by cp and divide dp_shard*cp; for etp == 1, ep
+        # must be divisible by cp*tp and divide dp_shard*cp*tp.
         if self.dp_shard < 0:
             self.dp_shard = self.world_size // (self.tp * self.cp * self.pp)
 
@@ -172,6 +189,9 @@ class ArchonParallelDims:
     # =========================================================================
 
     def build_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC]
+        # Builds the mesh with or without the EP layout depending on ep > 1 and returns it.
+        # Collective: all ranks must call it.
         """Build device mesh for all parallelism dimensions."""
         if self.ep > 1:
             return self._build_mesh_with_ep()
@@ -179,6 +199,10 @@ class ArchonParallelDims:
             return self._build_mesh_without_ep()
 
     def _build_mesh_without_ep(self) -> DeviceMesh:
+        # [FUNCTION DOC]
+        # HELPER: Creates a 4-D mesh (pp, dp_shard, cp, tp), always including size-1 dims, stores
+        # base submeshes and flattened ones: dp (dp_shard), dp_shard_cp and dp_cp (dp_shard x cp),
+        # pp_cp_tp. Sets _world_mesh and returns it. Logs the shape.
         """Build mesh when EP is disabled."""
         # Always include all dimensions, even if size=1
         # This ensures submeshes like mp (cp × tp) can always be created
@@ -215,6 +239,14 @@ class ArchonParallelDims:
         return mesh
 
     def _build_mesh_with_ep(self) -> DeviceMesh:
+        # [FUNCTION DOC]
+        # HELPER: Splits data parallel into dp_shard_mod_ep (outer) and dp_shard_in_ep (inner):
+        # for etp == tp, in_ep = ep / cp and mod_ep = dp_shard*cp / ep; for etp == 1, in_ep =
+        # ep / (cp*tp) and mod_ep = dp_shard*cp*tp / ep. Creates the 5-D mesh (pp, mod_ep, in_ep,
+        # cp, tp), stores base submeshes and flattened dp (mod_ep x in_ep), dp_shard_cp and dp_cp
+        # (mod_ep x in_ep x cp), pp_cp_tp. EP mesh: for etp == tp, flatten in_ep (with cp if cp > 1)
+        # into "ep" and also store the 2-D "ep_tp" mesh; for etp == 1, flatten in_ep x cp x tp into
+        # "ep". Sets _world_mesh and returns it.
         """Build mesh when EP is enabled.
 
         Handles both etp=1 and etp=tp cases:
@@ -296,6 +328,8 @@ class ArchonParallelDims:
 
     @property
     def world_mesh(self) -> DeviceMesh:
+        # [FUNCTION DOC]
+        # Property: builds the mesh on first access and returns it.
         """Lazily build and return the device mesh."""
         if self._world_mesh is None:
             self._world_mesh = self.build_mesh()
@@ -307,51 +341,71 @@ class ArchonParallelDims:
 
     @property
     def dp_replicate_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: dp_replicate > 1 (always False in practice).
         """Whether HSDP replication is enabled (dp_replicate > 1)."""
         return self.dp_replicate > 1
 
     @property
     def dp_shard_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: dp_shard > 1.
         """Whether FSDP sharding is enabled (dp_shard > 1)."""
         return self.dp_shard > 1
 
     @property
     def dp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: dp_replicate or dp_shard enabled.
         """Whether any data parallelism is enabled (dp_replicate > 1 or dp_shard > 1)."""
         return self.dp_replicate_enabled or self.dp_shard_enabled
 
     @property
     def dp_cp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: dp or cp enabled (loss all-reduce needed).
         """Whether data or context parallelism is enabled (for loss all-reduce)."""
         return self.dp_enabled or self.cp_enabled
 
     @property
     def fsdp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: dp_shard > 1 or cp > 1 (CP ranks also shard weights).
         """Whether FSDP is enabled (dp_shard > 1 or cp > 1)."""
         return self.dp_shard_enabled or self.cp_enabled
 
     @property
     def cp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: cp > 1.
         """Whether context parallelism is enabled."""
         return self.cp > 1
 
     @property
     def tp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: tp > 1.
         """Whether tensor parallelism is enabled."""
         return self.tp > 1
 
     @property
     def pp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: pp > 1.
         """Whether pipeline parallelism is enabled."""
         return self.pp > 1
 
     @property
     def ep_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: ep > 1.
         """Whether expert parallelism is enabled."""
         return self.ep > 1
 
     @property
     def etp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: etp > 1.
         """Whether expert tensor parallelism is enabled (etp > 1)."""
         return self.etp > 1
 
@@ -361,6 +415,9 @@ class ArchonParallelDims:
 
     @property
     def fsdp_gradient_divide_factor(self) -> int:
+        # [FUNCTION DOC]
+        # Property: dp_shard * cp, used so EP-sharded experts (FSDP on a smaller mesh) divide
+        # gradients consistently with dense params.
         """Gradient divide factor for FSDP (consistent with data parallelism degree).
 
         This is needed for FSDP-sharded experts when Expert Parallel is enabled.
@@ -371,15 +428,25 @@ class ArchonParallelDims:
 
     @property
     def seq_len_divisor(self) -> int:
+        # [FUNCTION DOC]
+        # Property: tp * cp * 2, the multiple sequence lengths must be padded to.
         """Minimum divisor for sequence length (for TP and CP compatibility)."""
         return self.tp * self.cp * 2
 
     @property
     def context_and_model_parallel_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: cp * tp * pp.
         """Context and model parallel size (cp * tp * pp)."""
         return self.cp * self.tp * self.pp
 
     def get_mesh(self, name: str) -> DeviceMesh | None:
+        # [FUNCTION DOC]
+        # Ensures the mesh is built (may trigger collective mesh creation) and returns the named
+        # submesh or None if that name was not stored (e.g. "ep" without EP, "dp_shard" with EP).
+        # "ep_tp" is also available when etp == tp.
+        # KNOWN ISSUE: Docstring says cp=1 yields no "cp" mesh; in fact all base dims are always
+        # stored, including size-1 ones.
         """Get submesh by name, return None if not available.
 
         This method safely retrieves a submesh without throwing an exception
@@ -399,6 +466,8 @@ class ArchonParallelDims:
         return self._meshes.get(name)
 
     def get_group(self, name: str) -> dist.ProcessGroup | None:
+        # [FUNCTION DOC]
+        # Returns the process group of the named submesh, or None if it does not exist.
         """Get process group by name, return None if not available.
 
         This method always returns a group if the mesh exists, even if size=1.

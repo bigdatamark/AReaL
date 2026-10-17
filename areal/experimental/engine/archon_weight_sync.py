@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Weight synchronization from an ArchonEngine (training) to a rollout InferenceEngine.
+# Two transports: (1) "xccl" - a dedicated NCCL/XCCL process group between a training
+# rank (rank 0 of the group) and the inference workers, over which full (unsharded)
+# parameters, converted to HF names, are broadcast in memory-bounded buckets; and
+# (2) disk - save an HF checkpoint and tell inference to reload it. For SGLang with
+# inference PP > 1, one group per PP stage is created (Megatron-style), each owned by the
+# matching training PP-stage head. Mutable per-engine state lives in WeightSyncState.
+# KNOWN ISSUE: Uses stdlib logging.getLogger(__name__) instead of areal.utils.logging with
+# a PascalCase name as required by the project style rules.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -32,6 +42,10 @@ logger = logging.getLogger(__name__)
 
 
 class WeightSyncState:
+    # [CLASS DOC]
+    # Plain mutable container for weight-update group state. Single-group fields: group_name
+    # (default "update_weight_group_{pp_rank}"), master_addr/port, group, group_initialized.
+    # Multi-group fields (SGLang PP > 1): group_names, groups, master_addrs, master_ports.
     """State container for weight synchronization.
 
     Attributes:
@@ -47,6 +61,8 @@ class WeightSyncState:
     """
 
     def __init__(self, pp_rank: int):
+        # [FUNCTION DOC]
+        # Initializes all fields to empty/default values; pp_rank only shapes the default name.
         self.group_initialized: bool = False
         self.group_name: str = f"update_weight_group_{pp_rank}"
         self.master_addr: str = ""
@@ -64,6 +80,12 @@ def init_weight_update_group(
     meta: WeightUpdateMeta,
     engine: ArchonEngine,
 ) -> None:
+    # [FUNCTION DOC]
+    # Asserts meta.type is "xccl", sets env TORCHELASTIC_USE_AGENT_STORE="False" so a new TCP
+    # store can be created, derives gen_pp_size and backend from meta.gen_allocation (1/None
+    # if absent), then calls the per-PP initializer for sglang with gen_pp_size > 1 and the
+    # single-group initializer otherwise. Marks state.group_initialized True. Side effects:
+    # env mutation, network/process-group creation, RPC to inference engine.
     """Initialize the weight update process group for XCCL synchronization.
 
     When the SGLang inference engine uses pipeline parallelism (gen_pp_size > 1),
@@ -110,6 +132,14 @@ def _init_single_weight_update_group(
     meta: WeightUpdateMeta,
     engine: ArchonEngine,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: On every rank picks this host's IP and a free port, stores them in state and in
+    # meta (also group name). Only the PP head rank (asserts gen_allocation set), under the
+    # engine lock, asks the rollout engine to join the group asynchronously, then creates a
+    # custom process group (platform comm backend, world size = gen world size + 1, rank 0,
+    # TCP init method, default timeout) and waits for the rollout future.
+    # KNOWN ISSUE: Non-head ranks also call find_free_ports/gethostip and overwrite meta with
+    # their own unused address; harmless only if meta is per-rank.
     """Original single-group initialization path (gen_pp_size == 1)."""
     state.master_addr = gethostip()
     state.master_port = find_free_ports(1)[0]
@@ -153,6 +183,16 @@ def _init_per_pp_weight_update_groups(
     engine: ArchonEngine,
     gen_pp_size: int,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Requires train pp size == gen_pp_size (ValueError otherwise). Non-PP-head ranks
+    # just record all group names, set group_name for their pp rank, clear addr/port and
+    # return. The head of training PP rank k creates group "update_weight_group_k" with world
+    # size gen_world_size / gen_pp_size + 1 at a fresh host/port: it copies meta with these
+    # fields, asks the rollout engine to join (async), creates the process group as rank 0 under
+    # the engine lock, waits, and stores the group in both the list fields (one entry each) and
+    # the single-group alias fields.
+    # KNOWN ISSUE: Non-head ranks get group_names listing every stage, while heads get only
+    # their own; code iterating group_names sees inconsistent contents across ranks.
     """Create one NCCL weight-update group per inference PP stage.
 
     Mirrors the Megatron pattern: each training PP-stage head
@@ -248,6 +288,13 @@ def _init_per_pp_weight_update_groups(
 
 
 def _get_full_tensor(param: nn.Parameter) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns the full, unsharded tensor for a parameter on the accelerator. DTensors
+    # on device are gathered with full_tensor(); CPU-offloaded DTensors are rebuilt from their
+    # local shard with the same mesh/placements and gathered (collective). Plain CPU tensors
+    # are moved to the platform device; other tensors returned as-is.
+    # KNOWN ISSUE: For a CPU DTensor the rebuilt DTensor still holds a CPU local shard, so the
+    # gather runs on CPU tensors and the result is not moved to the accelerator.
     """Get full tensor from a parameter, handling DTensor and CPU offload."""
     tensor = param.data
     if isinstance(tensor, DTensor):
@@ -271,6 +318,14 @@ def update_weights_from_distributed(
     meta: WeightUpdateMeta,
     engine: ArchonEngine,
 ) -> None:
+    # [FUNCTION DOC]
+    # Perf-traced. Rank 0 pauses rollout generation; cpu_group barrier; if gen_pp_size > 1
+    # uses the per-stage path, otherwise writes state's addr/port/group name into meta and
+    # uses the single-group path; barrier; rank 0 resumes generation; device synchronize and a
+    # final barrier. Must be called collectively by all training ranks.
+    # KNOWN ISSUE: Branches on gen_pp_size alone, but init used the single-group path for vLLM
+    # with gen_pp_size > 1. In that case state.groups is empty, so the per-stage path sends no
+    # weights at all.
     """Update weights by broadcasting from training engine to inference engine.
 
     When the inference side uses pipeline parallelism (gen_pp_size > 1), each
@@ -314,6 +369,12 @@ def _update_weights_single_group(
     meta: WeightUpdateMeta,
     engine: ArchonEngine,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Iterates all model parameters; every rank materializes the full tensor (needed
+    # for the collective gather) but only the PP head continues. Each param is converted to HF
+    # (name, tensor) pairs via the engine's state_dict_adapter if present. Pairs are batched
+    # into buckets bounded by meta.weight_chunked_mem_mb (MiB); a full bucket is flushed with
+    # _update_bucket_weights before adding. The trailing bucket is flushed at the end.
     """Original single-group weight update path."""
     weight_chunked_mem_size = meta.weight_chunked_mem_mb * 1024 * 1024
 
@@ -359,6 +420,11 @@ def _update_weights_per_stage(
     meta: WeightUpdateMeta,
     engine: ArchonEngine,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Same bucketing as the single-group path but only for ranks that are PP heads and
+    # own a group; they broadcast this stage's parameters through their per-stage group using
+    # a copy of meta carrying that group's addr/port/name. Non-owners still gather full
+    # tensors (collectives) but send nothing. Logs the tensor count at DEBUG.
     """Per-PP-stage weight update path for sglang PP > 1.
 
     Each training PP-stage head broadcasts ONLY the parameters that live on
@@ -439,6 +505,11 @@ def _update_bucket_weights(
     engine_lock: DistributedLock,
     named_tensors: list[tuple[str, torch.Tensor]],
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: No-op for an empty bucket. Under the engine lock, builds ParamSpecs (name,
+    # shape, dtype string without the "torch." prefix), asks the rollout engine to receive
+    # them (async future), issues async broadcasts from src 0 over state.group for each tensor,
+    # waits for all, waits for the future, and clears the passed list in place.
     """Broadcast a bucket of weights to the inference engine (single-group mode)."""
     if not named_tensors:
         return
@@ -476,6 +547,8 @@ def _update_bucket_weights_multi_group(
     engine_lock: DistributedLock,
     named_tensors: list[tuple[str, torch.Tensor]],
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Same as _update_bucket_weights but broadcasts over the explicitly given group.
     """Broadcast a bucket of weights to one per-PP-rank group (multi-group mode)."""
     if not named_tensors:
         return
@@ -508,6 +581,12 @@ def update_weights_from_disk(
     meta: WeightUpdateMeta,
     engine: ArchonEngine,
 ) -> None:
+    # [FUNCTION DOC]
+    # Perf-traced. Rank 0 pauses generation and asks the rollout engine to load from
+    # meta.path (async). All ranks save the model as an HF checkpoint to meta.path (asserted
+    # non-None). Rank 0 then publishes a timestamp under the name_resolve key for this
+    # experiment/trial/version (keepalive 120s), waits for the reload, and resumes
+    # generation. Ends with device synchronize and cpu_group barrier.
     """Update weights by saving to disk and loading in inference engine."""
     fut: Future | None = None
 

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# FP8 blockwise training support (via torchao's prototype fp8_blockwise_mm). Patches the
+# forward of eligible nn.Linear and GroupedExperts modules on a meta-device model with
+# per-instance bound methods that quantize on the fly (no weight conversion), and
+# validates after parallelism that local weight dims stay multiples of the 128 block
+# size. Logs via "ArchonFP8".
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -21,6 +27,11 @@ def enable_fp8_linear(
     exclude_fqns: set[str] | None = None,
     use_triton: bool = True,
 ) -> None:
+    # [FUNCTION DOC]
+    # Imports torchao lazily (ImportError if absent). Walks named_modules; for each nn.Linear
+    # that _is_eligible (FQN not containing any exclude substring - default output, router,
+    # score - no bias, both dims 128-aligned) patches forward with the FP8 path. Logs the
+    # patched/total count. Mutates modules in place.
     """Enable FP8 blockwise matmul for eligible nn.Linear modules.
 
     Patches the forward of each eligible nn.Linear to use torchao's
@@ -55,6 +66,9 @@ def enable_fp8_linear(
 
 
 def enable_fp8_experts(model: nn.Module, *, use_triton: bool = True) -> None:
+    # [FUNCTION DOC]
+    # For every GroupedExperts module with dim and hidden_dim multiples of 128, patches its
+    # forward with the FP8 expert loop; others are skipped with a warning. Logs counts.
     """Enable FP8 blockwise matmul for MoE expert modules.
 
     Patches the forward of each eligible :class:`GroupedExperts` to use
@@ -89,6 +103,11 @@ def enable_fp8_experts(model: nn.Module, *, use_triton: bool = True) -> None:
 
 
 def _patch_fp8_experts_forward(mod: nn.Module, use_triton: bool) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Sets _fp8_use_triton and _fp8_block attributes on the module and binds a new
+    # forward that fetches local weights via the module's _get_local_weights and runs
+    # _run_experts_fp8_for_loop(w1, w2, w3, x, counts, use_triton). Bound with MethodType so
+    # deepcopy keeps working and FSDP-swapped weights are read at call time.
     """Replace mod.forward with FP8 expert computation.
 
     Uses ``types.MethodType`` so that ``self`` refers to the module
@@ -108,6 +127,9 @@ def _patch_fp8_experts_forward(mod: nn.Module, use_triton: bool) -> None:
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Patched GroupedExperts forward: x [tokens, dim] grouped by expert plus counts;
+        # returns expert outputs computed in FP8.
         w1, w2, w3 = self._get_local_weights()
         return _run_experts_fp8_for_loop(
             w1, w2, w3, x, num_tokens_per_expert, use_triton=self._fp8_use_triton
@@ -117,6 +139,9 @@ def _patch_fp8_experts_forward(mod: nn.Module, use_triton: bool) -> None:
 
 
 def _is_eligible(mod: nn.Linear, fqn: str, exclude_fqns: set[str]) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if the Linear's FQN matches no exclude substring, it has no bias, and
+    # in/out features are multiples of 128 (warns when skipping for alignment).
     for exclude in exclude_fqns:
         if exclude in fqn:
             return False
@@ -132,6 +157,9 @@ def _is_eligible(mod: nn.Linear, fqn: str, exclude_fqns: set[str]) -> bool:
 
 
 def _patch_fp8_forward(mod: nn.Linear, fp8_blockwise_mm, use_triton: bool) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Stores the fp8 mm autograd function, triton flag and block size on the module and
+    # binds a replacement forward (see nested fn).
     """Replace mod.forward with FP8 blockwise matmul (padding + fp8_blockwise_mm).
 
     Uses ``types.MethodType`` so that ``self`` refers to the module
@@ -144,6 +172,10 @@ def _patch_fp8_forward(mod: nn.Linear, fp8_blockwise_mm, use_triton: bool) -> No
     mod._fp8_block = _FP8_BLOCK  # type: ignore[attr-defined]
 
     def _fp8_linear_fwd(self: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Flattens x to 2-D, zero-pads rows up to a multiple of the block size, unwraps a
+        # DTensor weight to its local shard, applies fp8_blockwise_mm (output dtype = input
+        # dtype), drops pad rows and reshapes to the original leading dims with the new last dim.
         leading = x.shape[:-1]
         x = x.reshape(-1, x.shape[-1])
         m = x.shape[0]
@@ -167,6 +199,10 @@ def validate_fp8_shard_alignment(
     model_parts: list[nn.Module],
     block_size: int = _FP8_BLOCK,
 ) -> None:
+    # [FUNCTION DOC]
+    # After TP/PP, checks every module carrying _fp8_block: Linear local weight [out, in] and
+    # each GroupedExperts w1/w2/w3 local per-expert dims (dims 1 and 2) must be multiples of
+    # block_size; raises ValueError with a remediation hint otherwise. Returns None.
     """Check that FP8-patched modules have block-aligned local weight dims.
 
     Must be called **after** parallelism (TP/PP) is applied.  TP can shard
@@ -187,6 +223,8 @@ def validate_fp8_shard_alignment(
         DTensor = None  # type: ignore[assignment, misc]
 
     def _local_shape(t: torch.Tensor) -> torch.Size:
+        # [FUNCTION DOC]
+        # HELPER: Local shard shape of a DTensor, or the plain tensor shape.
         if DTensor is not None and isinstance(t, DTensor):
             return t.to_local().shape
         return t.shape

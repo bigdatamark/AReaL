@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# DTensor ParallelStyles for MoE layers, adapted from torchtitan. Each style shards a
+# GroupedExperts module's weights (w1/w3 [num_experts, dim, hidden], w2 [num_experts,
+# hidden, dim]) and installs input/output hooks through distribute_module:
+# ExpertParallel (EP, all-to-all token dispatch/combine), TensorParallel (TP-only experts),
+# ExpertTensorParallel (2-D EP x TP), and ReordererSequenceParallel (splits router output
+# across TP ranks when TP ranks are borrowed by EP). All hooks issue collectives.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/distributed/expert_parallel.py
@@ -27,6 +34,9 @@ from areal.experimental.models.archon.moe.utils import _permute, _unpermute
 
 
 class BaseExpertParallel(ParallelStyle, ABC):
+    # [CLASS DOC]
+    # Abstract ParallelStyle declaring the EP hooks: _partition_fn, _token_dispatch,
+    # _token_combine (subclasses also implement _apply).
     """Abstract base class for Expert Parallelism styles.
 
     Subclasses implement specific communication patterns for
@@ -46,6 +56,8 @@ class BaseExpertParallel(ParallelStyle, ABC):
         module: nn.Module,
         device_mesh: DeviceMesh,
     ) -> None:
+        # [FUNCTION DOC]
+        # Abstract: shard the module's parameters across device_mesh in place.
         """Partition expert weights across devices."""
 
     @abstractmethod
@@ -55,6 +67,9 @@ class BaseExpertParallel(ParallelStyle, ABC):
         inputs: tuple[torch.Tensor, torch.Tensor],
         device_mesh: DeviceMesh,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Abstract: forward pre-hook; given (routed_input, num_tokens_per_expert) return the
+        # tokens/counts as seen by the local experts.
         """Dispatch tokens to devices holding their assigned experts."""
 
     @abstractmethod
@@ -64,10 +79,18 @@ class BaseExpertParallel(ParallelStyle, ABC):
         output: torch.Tensor,
         device_mesh: DeviceMesh,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Abstract: forward hook; return expert outputs restored to the original token order/rank.
         """Combine expert outputs back to original token locations."""
 
 
 class ExpertParallel(BaseExpertParallel):
+    # [CLASS DOC]
+    # EP with ETP=1: experts sharded on dim 0 across a 1-D EP mesh, each rank holding
+    # num_experts / ep_size experts. Dispatch state (splits, pre-permutation shape, permutation
+    # indices) is stored on the instance between the pre-hook and the hook.
+    # KNOWN ISSUE: Because the dispatch state lives on the style instance, overlapping forwards
+    # of the same module (e.g. multiple in-flight microbatches) would overwrite it.
     """Expert Parallelism with ETP=1 (no tensor parallelism within experts).
 
     This class implements EP by:
@@ -79,6 +102,8 @@ class ExpertParallel(BaseExpertParallel):
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC]
+        # Initializes the dispatch state fields to None.
         super().__init__()
         # State saved during dispatch for use in combine
         self.input_splits: list[int] | None = None
@@ -92,6 +117,9 @@ class ExpertParallel(BaseExpertParallel):
         module: nn.Module,
         device_mesh: DeviceMesh,
     ) -> None:
+        # [FUNCTION DOC]
+        # Replaces every direct parameter of module with an nn.Parameter wrapping a DTensor
+        # sharded on dim 0 over device_mesh. name is unused.
         """Shard expert weights on expert dimension (dim 0).
 
         Args:
@@ -109,6 +137,15 @@ class ExpertParallel(BaseExpertParallel):
         inputs: tuple[torch.Tensor, torch.Tensor],
         device_mesh: DeviceMesh,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Inputs: routed_input [tokens sorted by global expert, dim] and per-expert counts
+        # [num_experts]. Without grad: all-to-all the counts so each rank learns how many tokens
+        # it will receive for each of its local experts from each source rank (waited explicitly
+        # for compile), then computes per-rank send splits (sum of counts for each destination's
+        # experts) and receive splits, copying both to CPU lists (device sync). Then an autograd
+        # all-to-all moves the tokens. Finally _permute regroups received tokens by local expert
+        # (with padding/alignment for grouped GEMM) and saves shape and permutation indices.
+        # Returns (permuted tokens, aligned per-local-expert token counts).
         """Dispatch tokens to EP ranks via all-to-all.
 
         Args:
@@ -188,6 +225,10 @@ class ExpertParallel(BaseExpertParallel):
         output: torch.Tensor,
         device_mesh: DeviceMesh,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Undoes the permutation with _unpermute using the saved shape and indices, then runs the
+        # reverse autograd all-to-all (send/receive splits swapped). Returns tokens in the
+        # original pre-dispatch order on this rank.
         """Combine expert outputs via all-to-all back to original locations.
 
         Args:
@@ -214,6 +255,9 @@ class ExpertParallel(BaseExpertParallel):
         return output
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC]
+        # Calls distribute_module with the partition fn and the dispatch/combine hooks; returns
+        # the module.
         """Apply expert parallelism to the module.
 
         Uses distribute_module to:
@@ -243,6 +287,9 @@ def apply_expert_parallel(
     experts_module: nn.Module,
     ep_mesh: DeviceMesh,
 ) -> None:
+    # [FUNCTION DOC]
+    # Convenience: creates a new ExpertParallel and applies it to experts_module over the 1-D
+    # ep_mesh. Returns None (module modified in place).
     """Apply Expert Parallelism to a GroupedExperts module.
 
     This is a convenience function that applies EP with ETP=1 to the
@@ -262,6 +309,15 @@ def apply_expert_parallel(
 
 
 class TensorParallel(ParallelStyle):
+    # [CLASS DOC]
+    # TP-only experts (EP disabled): w1/w3 (actual layout [num_experts, hidden, dim]) are
+    # sharded on dim 1 (hidden, column-parallel) and w2 ([num_experts, dim, hidden]) on dim 2
+    # (hidden, row-parallel); inputs are replicated with Partial gradient placement so input
+    # gradients are summed across TP ranks.
+    # KNOWN ISSUE: The docstring and inline comments state w1/w3 shape (num_experts, dim,
+    # hidden_dim) and w2 (num_experts, hidden_dim, dim); GroupedExperts actually stores them
+    # transposed, so the comments are wrong (the sharded dims are still the hidden dim). Same
+    # for ExpertTensorParallel's comments.
     """Tensor Parallelism for experts when EP is disabled.
 
     This class implements TP-only parallelism for MoE experts by:
@@ -283,6 +339,9 @@ class TensorParallel(ParallelStyle):
         inputs: tuple[torch.Tensor, torch.Tensor],
         device_mesh: DeviceMesh,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Wraps routed_input as a Replicate DTensor and converts back to local with
+        # Partial grad placement (backward all-reduces grads); counts pass through unchanged.
         """Prepare input for TP by marking it for Partial gradient accumulation.
 
         The input is replicated across TP ranks, but we need Partial placement
@@ -302,6 +361,8 @@ class TensorParallel(ParallelStyle):
         module: nn.Module,
         device_mesh: DeviceMesh,
     ) -> None:
+        # [FUNCTION DOC]
+        # Re-registers w1 and w3 sharded on dim 1 and w2 sharded on dim 2 as DTensor parameters.
         """Shard expert weights for tensor parallelism.
 
         w1/w3: Column-wise (Shard on dim 1)
@@ -321,6 +382,9 @@ class TensorParallel(ParallelStyle):
         )
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC]
+        # distribute_module with the TP partition fn and input fn (no output hook; the model's
+        # outer TP output handling reduces partial outputs).
         """Apply tensor parallelism to the experts module."""
         return distribute_module(
             module,
@@ -331,6 +395,10 @@ class TensorParallel(ParallelStyle):
 
 
 class ExpertTensorParallel(ExpertParallel):
+    # [CLASS DOC]
+    # EP x TP on a 2-D mesh named ["ep", "tp"]: weights sharded [Shard(0), Shard(1)] for
+    # w1/w3 and [Shard(0), Shard(2)] for w2; token dispatch/combine reuse ExpertParallel on the
+    # "ep" submesh.
     """Expert Parallelism with Tensor Parallelism (EP + ETP).
 
     This class implements combined EP + TP for experts by:
@@ -356,6 +424,9 @@ class ExpertTensorParallel(ExpertParallel):
         inputs: tuple[torch.Tensor, torch.Tensor],
         device_mesh: DeviceMesh,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Marks routed_input as replicated with Partial gradient over the "tp" submesh, then runs
+        # the parent EP dispatch over the "ep" submesh.
         """Dispatch tokens with TP input preparation.
 
         First prepares input for TP (Replicate with Partial gradient),
@@ -379,6 +450,8 @@ class ExpertTensorParallel(ExpertParallel):
         module: nn.Module,
         device_mesh: DeviceMesh,
     ) -> None:
+        # [FUNCTION DOC]
+        # Re-registers w1/w2/w3 as 2-D sharded DTensor parameters (see class doc).
         """Shard expert weights on both EP and TP dimensions.
 
         Uses 2D sharding:
@@ -413,10 +486,14 @@ class ExpertTensorParallel(ExpertParallel):
         output: torch.Tensor,
         device_mesh: DeviceMesh,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Delegates to the parent combine on the "ep" submesh.
         """Combine expert outputs via all-to-all back to original locations."""
         return super()._token_combine(module, output, device_mesh["ep"])
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC]
+        # distribute_module over the 2-D mesh with this class's partition/dispatch/combine.
         """Apply expert + tensor parallelism to the module.
 
         Args:
@@ -436,6 +513,9 @@ class ExpertTensorParallel(ExpertParallel):
 
 
 class ReordererSequenceParallel(ParallelStyle):
+    # [CLASS DOC]
+    # For EP > 1 with etp = 1: wraps the TokenReorderer so each TP rank reorders only its
+    # contiguous 1/tp slice of tokens, avoiding duplicate tokens in the EP all-to-all.
     """Sequence Parallel for TokenReorderer when etp=1.
 
     When EP>1 and etp=1 (TP borrowed by EP), this parallelism:
@@ -452,6 +532,10 @@ class ReordererSequenceParallel(ParallelStyle):
         inputs: tuple[torch.Tensor, torch.Tensor],
         device_mesh: DeviceMesh,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Given (top_scores, selected_indices) with tokens on dim 0, raises ValueError
+        # unless the token count divides by TP size, and returns this rank's contiguous slice of
+        # both.
         """Split tokens across TP ranks."""
         top_scores, selected_indices = inputs
         num_tokens = top_scores.shape[0]
@@ -478,6 +562,10 @@ class ReordererSequenceParallel(ParallelStyle):
         outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         device_mesh: DeviceMesh,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Shifts sorted token indices by (local token-slot count, i.e. local tokens times
+        # top_k) times tp rank, so they index the global flattened token-slot space; scores and
+        # per-expert counts pass through.
         """Adjust token indices from local to global.
 
         As we shard routed tokens along bs*slen dim across the TP ranks,
@@ -496,6 +584,8 @@ class ReordererSequenceParallel(ParallelStyle):
         return top_scores_sorted, token_indices_global, num_tokens_per_expert
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC]
+        # distribute_module with only the input/output hooks (no parameter partitioning).
         """Apply sequence parallel to TokenReorderer."""
         return distribute_module(
             module,

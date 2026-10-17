@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# GroupedExperts: all routed experts of an MoE layer stored as 3-D SwiGLU weights
+# w1/w3 [num_experts, hidden, dim] and w2 [num_experts, dim, hidden]. Provides three
+# compute paths over tokens already sorted by expert: grouped GEMM (torch._grouped_mm,
+# bf16, CUDA), a reference per-expert loop, and a per-expert FP8 loop used when FP8 is
+# enabled by patching forward (see fp8.py). Each computes w2(silu(w1 x) * w3 x) per expert.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/moe/moe.py
@@ -19,6 +25,10 @@ def _run_experts_for_loop(
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Reference path. Copies counts to CPU (GPU sync), splits the first total-count rows
+    # of x by expert, computes SwiGLU per non-empty expert (empty ones yield [0, dim]),
+    # concatenates, and appends zero rows if x had trailing padding rows. Returns [x rows, dim].
     """Execute expert computation using for-loop (reference implementation).
 
     This implementation is slower but works without grouped_mm support.
@@ -74,6 +84,12 @@ def _run_experts_grouped_mm(
     x: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Computes int32 cumulative offsets from (aligned) counts, casts x and transposed
+    # weights to bfloat16, runs three torch._grouped_mm calls for the SwiGLU, and casts the
+    # result back to x's dtype. Rows beyond the last offset are not computed by any group.
+    # KNOWN ISSUE: Always computes in bf16 regardless of parameter dtype, so fp32 weights lose
+    # precision in this path.
     """Execute expert computation using torch._grouped_mm.
 
     This is the efficient implementation that uses grouped matrix multiplication
@@ -120,6 +136,11 @@ def _run_experts_fp8_for_loop(
     block_size: int = 128,
     use_triton: bool = True,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: FP8 per-expert loop (imports torchao lazily). Counts to CPU (sync), split x by
+    # expert; for each non-empty expert, zero-pad rows to a multiple of block_size, compute the
+    # three projections with fp8_blockwise_mm (output in input dtype), SwiGLU, then strip the
+    # padding. Concatenates and zero-pads trailing rows like the reference path.
     """Per-expert FP8 for-loop fallback (no grouped_mm FP8 support yet).
 
     .. note:: Performance
@@ -182,6 +203,8 @@ def _run_experts_fp8_for_loop(
 
 
 def _check_grouped_mm_available() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if torch has _grouped_mm and CUDA is available.
     """Check if torch._grouped_mm is available and functional.
 
     Note: grouped_mm requires CUDA. It exists in PyTorch 2.4+ but only works on CUDA.
@@ -193,6 +216,9 @@ def _check_grouped_mm_available() -> bool:
 
 
 class GroupedExperts(nn.Module):
+    # [CLASS DOC]
+    # nn.Module holding dim, hidden_dim, num_experts, use_grouped_mm (requested AND
+    # available), and the three uninitialized (torch.empty) 3-D weight parameters.
     """Grouped experts module with 3D weight tensors.
 
     This module stores expert weights in 3D tensors (num_experts, hidden_dim, dim)
@@ -223,6 +249,8 @@ class GroupedExperts(nn.Module):
         num_experts: int,
         use_grouped_mm: bool = True,
     ):
+        # [FUNCTION DOC]
+        # Stores sizes, resolves use_grouped_mm against availability, allocates w1, w2, w3.
         super().__init__()
         self.dim = dim
         self.hidden_dim = hidden_dim
@@ -237,6 +265,9 @@ class GroupedExperts(nn.Module):
     def _get_local_weights(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Returns local shards of w1/w2/w3 if they are DTensors (checks w1 only), else
+        # the parameters themselves.
         """Return (w1, w2, w3), converting from DTensor to local if needed."""
         if isinstance(self.w1, DTensor):
             return self.w1.to_local(), self.w2.to_local(), self.w3.to_local()
@@ -247,6 +278,14 @@ class GroupedExperts(nn.Module):
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Inputs: x tokens sorted by expert [N, dim] and per-expert counts [num_experts local].
+        # Uses local weights. Grouped-mm mode: if weights are not EP-sharded (not a DTensor, or no
+        # "ep" mesh dim), wraps the grouped-mm fn with indices_padding_wrapper (which permutes and
+        # pads to alignment itself); with EP, the EP hooks already did that. Otherwise uses the
+        # for-loop path. Returns [N, dim].
+        # KNOWN ISSUE: If w1 is a DTensor whose mesh has no dim names, the membership test on
+        # mesh_dim_names (None) raises TypeError.
         """Forward pass through grouped experts.
 
         Args:
@@ -275,6 +314,8 @@ class GroupedExperts(nn.Module):
             return _run_experts_for_loop(w1, w2, w3, x, num_tokens_per_expert)
 
     def init_weights(self, init_std: float = 0.02):
+        # [FUNCTION DOC]
+        # In place truncated-normal init: w1 with std 0.02 always, w2 and w3 with init_std.
         """Initialize weights using truncated normal distribution.
 
         Args:

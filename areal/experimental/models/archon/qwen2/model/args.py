@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Qwen2ModelArgs: hyperparameters for the Archon Qwen2 model, built from an HF config.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/qwen3/model/args.py
@@ -15,6 +17,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class Qwen2ModelArgs(BaseModelArgs):
+    # [CLASS DOC]
+    # Dataclass (defaults = Qwen2-0.5B): dim, n_layers, n_heads, n_kv_heads, vocab_size,
+    # head_dim, hidden_dim (MLP), norm_eps, rope_theta, max_seq_len (rope cache length),
+    # depth_init (scale init std by layer depth), attention_bias (QKV bias), eos_id,
+    # enable_weight_tying, is_critic (value head instead of LM head), num_labels (critic
+    # output width), plus inherited attn_type.
     """Model arguments for Qwen2. Default values are for Qwen2-0.5B."""
 
     dim: int = 896
@@ -42,6 +50,12 @@ class Qwen2ModelArgs(BaseModelArgs):
         is_critic: bool = False,
         **kwargs,
     ) -> Qwen2ModelArgs:
+        # [FUNCTION DOC]
+        # Maps HF fields: hidden_size, num_hidden_layers, num_attention_heads, num_key_value_heads
+        # (default = heads), vocab_size, head_dim (default hidden/heads), intermediate_size,
+        # rms_norm_eps, rope theta (v4/v5 compatible), max_position_embeddings (32768),
+        # attention_bias (True), eos_token_id, tie_word_embeddings; is_critic as given and
+        # attn_type from kwargs (default "varlen"). Other kwargs ignored; num_labels stays 1.
         return cls(
             dim=hf_config.hidden_size,
             n_layers=hf_config.num_hidden_layers,

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Triton (and CPU reference) kernels computing the permutation that regroups tokens
+# received from all EP ranks into per-local-expert contiguous, alignment-padded chunks
+# for grouped GEMM. Adapted from torchtitan. Importing requires triton.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/moe/kernels.py
@@ -19,6 +23,11 @@ def _fill_indices_kernel(
     num_ranks: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Triton kernel. Programs stride over local experts; for each expert it walks the
+    # source ranks in order, and for each (rank, expert) pair writes the source indices
+    # start_index .. start_index+length-1 into output at the expert's running write offset,
+    # in BLOCK_SIZE chunks, advancing the offset by length. Unwritten slots keep -1 (padding).
     pid = tl.program_id(axis=0)
     num_programs = tl.num_programs(axis=0)
 
@@ -67,6 +76,12 @@ def fill_indices_wrapper(
     block_size: int = 128,
     max_blocks: int = 1024,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Allocates a [max_len] int32 tensor of -1 on the counts' device, launches the
+    # kernel with min(experts_per_rank, max_blocks) programs and the given block size, and
+    # returns the filled indices.
+    # KNOWN ISSUE: Unlike fill_indices_cpu, writes are not clamped to max_len, so a too-small
+    # max_len would write out of bounds.
     """Wrapper for Triton kernel to fill permutation indices.
 
     Args:
@@ -113,6 +128,9 @@ def fill_indices_cpu(
     num_ranks: int,
     max_len: int,
 ):
+    # [FUNCTION DOC]
+    # HELPER: CPU reference of the kernel using Python loops and .item() calls (syncs);
+    # clamps writes to max_len. Returns an int32 CPU tensor (-1 for padding).
     """CPU reference implementation for fill_indices.
 
     Args:
@@ -160,6 +178,15 @@ def generate_permute_indices(
     alignment: int,
     use_cpu: bool = False,
 ):
+    # [FUNCTION DOC]
+    # Inputs: counts laid out [num_ranks * experts_per_rank] (source rank major), sizes,
+    # max_len and alignment. Computes the exclusive prefix sum as the start index of each
+    # (rank, expert) block in the received buffer, per-local-expert totals summed over ranks,
+    # clamps totals to at least alignment (so empty experts still get one aligned chunk),
+    # rounds up to multiples of alignment (m_sizes, int32), inclusive cumsum m_offsets and
+    # exclusive write offsets, then fills the index vector via the CPU or Triton
+    # implementation. Returns (permuted_indices [max_len] with -1 for padding slots, m_sizes,
+    # m_offsets int32).
     """Prepare permutation indices and the number of tokens for each expert.
 
     Args:

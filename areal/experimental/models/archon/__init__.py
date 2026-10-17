@@ -1,3 +1,9 @@
+# [PACKAGE DOC]
+# Public entry point of the Archon model package (a lightweight torchtitan-style model
+# stack used by ArchonEngine). Re-exports the state-dict adapter base, expert/tensor
+# parallel styles, model spec registry functions, MoE weight converter, parallel dims and
+# pipeline-parallel helpers. Importing it also imports the qwen2, qwen3 and qwen3_5 spec
+# modules purely for their side effect of registering ModelSpecs in the global registry.
 # SPDX-License-Identifier: Apache-2.0
 
 # Import model spec modules to trigger registration

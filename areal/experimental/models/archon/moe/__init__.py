@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Mixture-of-Experts building blocks for Archon models (adapted from torchtitan):
+# configuration (MoEArgs), the MoE layer and dense FeedForward, GroupedExperts (3-D expert
+# weights), the top-k router, the token reorderer, and token permutation utilities used
+# by grouped GEMM and expert parallelism. This file only re-exports them.
 # SPDX-License-Identifier: Apache-2.0
 
 from areal.experimental.models.archon.moe.args import MoEArgs

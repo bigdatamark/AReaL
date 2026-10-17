@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# MoE layer (token-choice top-k routing over GroupedExperts, optional shared experts with
+# optional sigmoid gate, aux-loss-free load-balancing buffers) and the dense SwiGLU
+# FeedForward used for shared experts. Adapted from torchtitan.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/moe/moe.py
@@ -15,6 +19,9 @@ from areal.experimental.models.archon.moe.token_reorderer import TokenReorderer
 
 
 class FeedForward(nn.Module):
+    # [CLASS DOC]
+    # Dense SwiGLU MLP with bias-free Linear w1 (dim->hidden), w3 (dim->hidden), w2
+    # (hidden->dim).
     """Standard SwiGLU feedforward module (for shared experts).
 
     Args:
@@ -23,21 +30,34 @@ class FeedForward(nn.Module):
     """
 
     def __init__(self, dim: int, hidden_dim: int):
+        # [FUNCTION DOC]
+        # Creates the three Linear layers.
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Returns w2(silu(w1 x) * w3 x); shape preserved except last dim stays dim.
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
     def init_weights(self, init_std: float = 0.02):
+        # [FUNCTION DOC]
+        # Truncated-normal init in place: w1 std 0.02, w2 and w3 std init_std.
         nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.w2.weight, mean=0.0, std=init_std)
         nn.init.trunc_normal_(self.w3.weight, mean=0.0, std=init_std)
 
 
 class MoE(nn.Module):
+    # [CLASS DOC]
+    # MoE layer. Submodules: router (TokenChoiceTopKRouter), experts (GroupedExperts),
+    # reorderer (TokenReorderer; separate so a sequence-parallel style can wrap it), optional
+    # shared_experts and shared_expert_gate. Buffers created by init_buffers:
+    # tokens_per_expert (non-persistent float32 usage counter, accumulated every forward and
+    # consumed by an external load-balance update) and expert_bias (persistent, only when
+    # load_balance_coeff is set; otherwise None).
     """Mixture of Experts layer.
 
     This module routes tokens to a subset of experts and combines their outputs.
@@ -61,6 +81,14 @@ class MoE(nn.Module):
     """
 
     def __init__(self, moe_args: MoEArgs, dim: int, hidden_dim: int):
+        # [FUNCTION DOC]
+        # Stores config scalars and builds submodules from moe_args. Shared experts:
+        # shared_expert_intermediate_size > 0 takes priority (hidden = that size), else
+        # num_shared_experts > 0 gives hidden = hidden_dim * num_shared_experts, else None. Gate is
+        # a Linear(dim, 1) only if use_shared_expert_gate and shared experts exist. Buffers are
+        # only annotated here.
+        # KNOWN ISSUE: tokens_per_expert / expert_bias do not exist until init_buffers runs; a
+        # forward before that raises AttributeError.
         super().__init__()
         self.moe_args = moe_args
         self.dim = dim
@@ -122,6 +150,17 @@ class MoE(nn.Module):
         self.tokens_per_expert: torch.Tensor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # x [bs, slen, dim] is flattened. Router returns top_scores and selected expert indices
+        # [T, top_k] plus per-expert counts, which are added (no grad) into tokens_per_expert.
+        # Reorderer sorts the T*top_k slots by expert, returning sorted scores, sorted slot
+        # indices (global when sequence-parallel is applied) and counts. Tokens are gathered with
+        # slot index // top_k; optionally pre-multiplied by scores (float, cast back). Experts
+        # run (EP hooks may dispatch/combine). Shared experts (optionally gated by sigmoid of the
+        # gate) run on all tokens. Expert outputs are scattered into a zero [T*top_k, dim] buffer
+        # at their slot indices, reshaped to [T, top_k, dim], then summed (scores pre-applied) or
+        # combined by a float batched matmul with top_scores, cast to x dtype; shared output is
+        # added. Returns [bs, slen, dim]. Side effect: tokens_per_expert mutated.
         """Forward pass through MoE layer.
 
         Args:
@@ -219,6 +258,9 @@ class MoE(nn.Module):
         return out.view(bs, slen, dim)
 
     def init_weights(self, init_std: float):
+        # [FUNCTION DOC]
+        # Calls init_weights(init_std) on experts, router, shared experts (if any) and
+        # truncated-normal inits the shared gate weight with init_std.
         """Initialize MoE parameters.
 
         Args:
@@ -236,6 +278,10 @@ class MoE(nn.Module):
             )
 
     def init_buffers(self, buffer_device: torch.device | str):
+        # [FUNCTION DOC]
+        # Under the given device context registers tokens_per_expert (zeros [num_experts] fp32,
+        # non-persistent) and, if load_balance_coeff is set (asserted > 0), a persistent zero
+        # expert_bias; else sets expert_bias None.
         """Initialize MoE buffers (tokens_per_expert, expert_bias).
 
         Args:

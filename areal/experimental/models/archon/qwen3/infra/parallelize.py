@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Parallelization recipe for Archon Qwen3 (dense and MoE): dense TP with sequence
+# parallelism (including q/k norms), MoE-specific TP/EP/ETP, Ulysses CP, activation
+# checkpointing, MoE-aware torch.compile (also globally patches the grouped-mm expert
+# kernel), FSDP2 with a separate expert mesh under EP plus explicit prefetch chains, and
+# weight tying. Logging via a cached rank-aware logger.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -51,12 +57,18 @@ if TYPE_CHECKING:
 
 @functools.cache
 def _get_logger() -> logging.Logger:
+    # [FUNCTION DOC]
+    # HELPER: Cached logger "[Archon Qwen3Parallelize Rank N]".
     """Get rank-aware logger for this module."""
     rank = dist.get_rank() if dist.is_initialized() else 0
     return logging.getLogger(f"[Archon Qwen3Parallelize Rank {rank}]")
 
 
 def _get_op_sac_save_list() -> set[torch._ops.OpOverload]:
+    # [FUNCTION DOC]
+    # HELPER: Same as the Qwen2 list (mm, SDPA variants, reduce_scatter, max, flex_attention,
+    # areal _varlen_attn; importing varlen to register the op) plus functional
+    # all_to_all_single so EP/Ulysses communication is not recomputed.
     # Import varlen to register torch.ops.areal._varlen_attn custom op
     from areal.experimental.models.archon.attention import varlen as _  # noqa: F401
 
@@ -94,6 +106,15 @@ def parallelize_qwen3(
     ac_config: ActivationCheckpointConfig | None = None,
     enable_compile: bool = True,
 ) -> nn.Module:
+    # [FUNCTION DOC]
+    # Main entry (ParallelizeFn). Order: apply_non_moe_tp if TP; apply_moe_ep_tp if TP or EP
+    # (with "ep" mesh when EP enabled and "ep_tp" mesh when etp > 1); apply_cp if CP; apply_ac
+    # if configured; _apply_compile if enabled (EP flag selects dynamic shapes); apply_fsdp on
+    # "dp_shard_cp" with "dp_shard_mod_ep" (None without EP) for experts and
+    # fsdp_gradient_divide_factor; finally ties output.weight to the embedding weight if
+    # enabled and both exist. Returns the model (modified in place).
+    # KNOWN ISSUE: As in Qwen2, weight tying happens after fully_shard, which may not be
+    # respected by FSDP2's parameter management.
     """Apply parallelization to Qwen3 model.
 
     This is the main entry point for parallelizing a Qwen3 model.
@@ -200,6 +221,14 @@ def apply_non_moe_tp(
     tp_mesh: DeviceMesh,
     loss_parallel: bool = True,
 ) -> None:
+    # [FUNCTION DOC]
+    # Validates TP constraints. Root plan like Qwen2 (embedding Rowwise -> sequence-sharded,
+    # norm SequenceParallel, output Colwise to vocab-sharded or replicated, score input
+    # gathered). Per block: norms SequenceParallel; attention input x gathered to replicated;
+    # wq/wk Colwise keeping DTensor outputs so q_norm/k_norm (SequenceParallel on dim 2, the
+    # head dim after view) see sharded heads; wv Colwise with local output; wo Rowwise to
+    # sequence-sharded. Dense (non-MoE) blocks with a feed_forward also get the SwiGLU plan;
+    # MoE blocks are left to apply_moe_ep_tp. Logs.
     """Apply tensor parallelism to non-MoE components of Qwen3 model.
 
     This handles TP for all non-MoE components:
@@ -311,6 +340,13 @@ def apply_fsdp(
     dp_mod_ep_mesh: DeviceMesh | None = None,
     gradient_divide_factor: int | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Like Qwen2's apply_fsdp (mixed precision, optional CPU offload, reshard policy with
+    # ValueError on unknown values, embeddings/blocks/final-layers/root wrapping), plus: for
+    # MoE blocks with ep_degree > 1 and an expert mesh, first wraps moe.experts with FSDP on
+    # dp_mod_ep_mesh (sharding on dim 1 instead of dim 0 when dp_mod_ep size * ep exceeds
+    # num_experts) and sets its gradient divide factor to gradient_divide_factor. With EP,
+    # also installs explicit prefetching via _setup_fsdp_prefetch. Logs.
     """Apply FSDP2 to Qwen3 model.
 
     This wraps each component with FSDP for memory-efficient training:
@@ -434,6 +470,12 @@ def apply_fsdp(
 
 
 def _setup_fsdp_prefetch(model: nn.Module) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Configures explicit FSDP prefetch (EP's device-to-host syncs defeat implicit
+    # prefetch). Forward: embeddings -> first block; each block -> next block (plus its
+    # experts if MoE); last block -> norm/output/score. Backward: output (or score) -> last
+    # block; each block -> previous block (plus experts if MoE); first block -> embeddings.
+    # No-op if there are no blocks. Logs.
     """Set up explicit FSDP prefetching for EP.
 
     When EP is enabled, D2H syncs in token dispatch can interfere with
@@ -504,6 +546,9 @@ def apply_cp(
     cp_group: ProcessGroup,
     tp_size: int = 1,
 ) -> None:
+    # [FUNCTION DOC]
+    # Validates CP head constraints (ValueError) and sets the CP group on every block's
+    # attention. Input padding/slicing for CP is done by the engine. Logs.
     """Apply context parallelism (Ulysses SP) to Qwen3 model.
 
     This configures each Attention layer to use Ulysses sequence parallelism
@@ -531,6 +576,18 @@ def apply_cp(
 
 
 def _apply_compile(model: Compilable, ep_enabled: bool = False) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Sets global dynamo capture_scalar_outputs True and disables the dynamo eval-frame
+    # LRU cache if available (global side effects). Non-MoE blocks are compiled whole
+    # (Inductor, fullgraph) and replaced in model.layers. For MoE blocks (unwrapping a
+    # CheckpointWrapper), each child is compiled separately: inside MoE every child except
+    # experts is compiled; attention_norm/ffn_norm are skipped (SequenceParallel issues); other
+    # children are compiled in place. Then, unless already patched, replaces the module-global
+    # grouped_experts._run_experts_grouped_mm with a compiled version, and with EP wraps it in
+    # _run_experts_grouped_mm_dynamic that marks x's dim 0 as dynamic. Logs.
+    # KNOWN ISSUE: The "already patched" check looks for the dynamic wrapper's name, so without
+    # EP a second call (e.g. another pipeline model part) compiles the already compiled
+    # function again.
     """Apply torch.compile to Qwen3 model (MoE-aware).
 
     For MoE layers, compile submodules separately to avoid graph breaks
@@ -621,6 +678,9 @@ def _apply_compile(model: Compilable, ep_enabled: bool = False) -> None:
                 x: torch.Tensor,
                 num_tokens_per_expert: torch.Tensor,
             ) -> torch.Tensor:
+                # [FUNCTION DOC]
+                # HELPER: Marks x dim 0 dynamic (token count varies per step under EP) and calls the
+                # compiled grouped-mm expert function.
                 torch._dynamo.mark_dynamic(x, 0)
                 return compiled_fn(w1, w2, w3, x, num_tokens_per_expert)
 
@@ -638,6 +698,14 @@ def apply_moe_ep_tp(
     etp: int = 1,
     ep_tp_mesh: DeviceMesh | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # No-op if neither mesh is given. With EP, validates num_experts divisible by ep size.
+    # For each MoE block: with TP, wraps "moe" with PrepareModuleInputOutput (sequence-sharded
+    # input gathered to replicated local tensor; Partial output reduce-scattered back to
+    # sequence-sharded), replicates the router gate (ReplicateParallel), and with EP and
+    # etp == 1 shards the reorderer's tokens across TP ranks (ReordererSequenceParallel).
+    # Experts: no EP -> TensorParallel on tp mesh; EP with no TP or etp == 1 ->
+    # ExpertParallel on ep mesh; else ExpertTensorParallel on the 2-D ep_tp mesh. Logs.
     """Apply MoE-specific parallelism (Expert Parallelism and MoE TP) to Qwen3 model.
 
     This handles all MoE-related parallelism:

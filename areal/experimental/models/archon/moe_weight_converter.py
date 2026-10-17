@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Conversion between Archon's fused 3-D expert weights [num_experts, out, in] and HF's
+# per-expert 2-D weights, adapted from torchtitan. DTensor-aware methods split/rebuild
+# sharded expert weights using only local shards (no gathers), supporting EP, FSDP+EP and
+# EP+ETP placements; offline methods do the same for plain tensors. Metadata needed to
+# rebuild DTensors is kept in an explicit MoEConversionState.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/utils.py
@@ -17,6 +23,11 @@ if TYPE_CHECKING:
 
 @dataclass
 class MoEConversionState:
+    # [CLASS DOC]
+    # Dataclass keyed by concrete Archon param key: original 3-D placements, original global
+    # shape, and the [start, end) global expert range held locally. Filled by
+    # split_expert_weights_dtensor (to_hf) and consumed by concatenate_expert_weights_dtensor
+    # (from_hf), so the same instance must be used for both.
     """Explicit state container for DTensor conversion metadata.
 
     This dataclass holds the metadata needed for DTensor-aware MoE expert weight
@@ -37,6 +48,8 @@ class MoEConversionState:
     local_experts_indices: dict[str, tuple[int, int]] = field(default_factory=dict)
 
     def clear(self) -> None:
+        # [FUNCTION DOC]
+        # Empties all three dictionaries.
         """Clear all stored conversion metadata."""
         self.grouped_expert_weight_placements.clear()
         self.grouped_expert_weight_shape.clear()
@@ -44,6 +57,9 @@ class MoEConversionState:
 
 
 class MoEWeightConverter:
+    # [CLASS DOC]
+    # Stateless helper (composed into state-dict adapters) offering the DTensor-aware and
+    # offline split/concatenate operations.
     """DTensor-aware MoE expert weight converter.
 
     HF MoE models store experts as a module list each with 2D weights. In Archon, we
@@ -68,6 +84,10 @@ class MoEWeightConverter:
         shard_dim_rank: int,
         dim_size_to_split: int,
     ) -> tuple[int, int]:
+        # [FUNCTION DOC]
+        # Static. For a dim split by [StridedShard, Shard] mesh dims: block = size /
+        # (strided_degree * shard_degree), raising ValueError if not exact; the local block index
+        # is strided_degree * shard_rank + strided_rank. Returns (start, end) = block range.
         """Calculate start/end indices for [StridedShard(dim=i), Shard(dim=i)] placement.
 
         GPU Layout (strided_shard_rank, shard_rank):
@@ -128,6 +148,13 @@ class MoEWeightConverter:
         dtensor_placements: tuple,
         device_mesh: DeviceMesh,
     ) -> tuple[int | None, int | None]:
+        # [FUNCTION DOC]
+        # Static. Collects mesh dims whose placement shards tensor dim "dim" (Shard or
+        # _StridedShard; Replicate ignored; any other placement type raises ValueError). Two
+        # placements: first must be _StridedShard, delegate to calculate_strided_shard_indices with
+        # the submesh sizes and local ranks. One placement: must be a plain Shard; even split
+        # (ValueError otherwise) at the local rank. None: returns (None, None). More:
+        # NotImplementedError. Returns the local [start, end) range on that dim.
         """Calculate local indices for a given dimension from DTensor placements.
 
         Handles various sharding strategies:
@@ -224,6 +251,14 @@ class MoEWeightConverter:
         grouped_expert_weight: DTensor,
         state: MoEConversionState,
     ) -> dict[str, DTensor]:
+        # [FUNCTION DOC]
+        # Records the weight's placements, global shape and local expert range (from dim-0
+        # placements; asserted non-None) in state under archon_abstract_key formatted with
+        # layer_id. Builds 2-D placements: any placement sharding dim 0 becomes Replicate, other
+        # Shard/_StridedShard placements are kept. Checks the local shard has exactly end-start
+        # experts (ValueError). For each local expert id, wraps that expert's local slice as a
+        # DTensor (via a temporary leading dim, run_check off, then squeezed) and maps it under
+        # hf_abstract_key formatted with (layer_id, expert_id). Returns {hf_key: DTensor}.
         """Split GroupedExperts weight into individual expert weights for distributed save.
 
         This method handles various sharding strategies for expert weights:
@@ -322,6 +357,12 @@ class MoEWeightConverter:
         device_mesh: DeviceMesh,
         state: MoEConversionState,
     ) -> DTensor | None:
+        # [FUNCTION DOC]
+        # Looks up collected expert tensors for layer_id/abstract key; returns None if missing or
+        # fewer than the locally expected count (from state). Otherwise stacks them sorted by
+        # expert id, takes the local tensor, asserts placements/shape metadata exist, and rebuilds
+        # a DTensor with the original 3-D placements on device_mesh (run_check off). Deletes the
+        # consumed entries from expert_weights_by_layer (and the layer if empty). Returns it.
         """Concatenate individual expert weights back into GroupedExperts DTensor.
 
         Args:
@@ -389,6 +430,10 @@ class MoEWeightConverter:
     def split_expert_weights_offline(
         weight: torch.Tensor, n_experts: int
     ) -> tuple[torch.Tensor, ...]:
+        # [FUNCTION DOC]
+        # Static. torch.split of weight along dim 0 into chunks of shape[0] / n_experts.
+        # KNOWN ISSUE: Docstring says it returns 2-D tensors, but split keeps the leading dim, so
+        # each chunk is [1, out, in] (or larger) unless the caller squeezes it.
         """Split 3D expert weight into tuple of 2D weights. Used for offline conversion.
 
         NOTE: If used for online conversion with DTensors, torch.split() might incur
@@ -411,6 +456,10 @@ class MoEWeightConverter:
         layer_num: str,
         n_experts: int,
     ) -> torch.Tensor | None:
+        # [FUNCTION DOC]
+        # Static. Returns None unless all n_experts tensors are present for the layer/key; then
+        # stacks them sorted by expert id into [n_experts, ...], deletes the consumed entries
+        # (and the empty layer dict), and returns the stacked tensor.
         """Concatenate 2D expert weights into 3D using torch.stack(). Used for offline conversion.
 
         Args:

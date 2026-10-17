@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Loading blockwise-FP8 HF checkpoints (DeepSeek-V3 / Qwen3-FP8 style: float8_e4m3fn
+# weights plus float32 "<weight>_scale_inv" tensors, one scale per 128x128 block) into
+# BF16 Archon models through torch DCP: detect FP8 checkpoints, reshape the placeholder
+# state dict so DCP loads FP8 weights and scales, then dequantize (Triton kernel on GPU,
+# pure PyTorch on CPU, local-shard aware for FSDP DTensors). Logs via
+# "ArchonFP8Checkpoint". Only 2-D weights are supported.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -13,6 +20,10 @@ logger = getLogger("ArchonFP8Checkpoint")
 
 
 def _get_scale_inv_keys(path: str) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns all keys ending in "_scale_inv" from <path>/model.safetensors.index.json
+    # weight_map if present, else from the key list of a single <path>/model.safetensors
+    # (opened with safetensors), else an empty list. File I/O only.
     index_path = os.path.join(path, "model.safetensors.index.json")
     if os.path.exists(index_path):
         with open(index_path) as f:
@@ -32,6 +43,10 @@ def _get_scale_inv_keys(path: str) -> list[str]:
 
 
 def _detect_fp8_checkpoint(path: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if _get_scale_inv_keys finds any scale key.
+    # KNOWN ISSUE: Docstring says only the index file is checked and that a missing index
+    # yields False; the code also inspects a single-file model.safetensors.
     """Return True if the HF checkpoint at *path* contains FP8 weights.
 
     Detection heuristic: look for ``*_scale_inv`` keys in
@@ -51,6 +66,14 @@ def _prepare_fp8_state_dict(
     *,
     _cached_keys: list[str] | None = None,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: For each scale key (given via _cached_keys or read from path), finds the weight
+    # key by removing "_scale_inv"; missing weights are warned and skipped. Requires the
+    # placeholder to be 2-D (ValueError otherwise), replaces it with an empty float8_e4m3fn
+    # tensor of the same shape/device (DTensor placeholders keep their sharding via
+    # empty_like), and adds an empty float32 scale placeholder of shape ceil(M/bs) x
+    # ceil(N/bs) on the placeholder's device. Mutates and returns hf_state_dict; returns it
+    # untouched if no scale keys.
     """Prepare *hf_state_dict* for loading an FP8 checkpoint via DCP.
 
     DCP only loads keys that already exist in the state dict.  This function
@@ -122,6 +145,10 @@ def weight_dequant_cpu(
     block_size: int = 128,
     dst_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Pure PyTorch blockwise dequant: expands the scale grid by repeating each entry
+    # block_size times along both dims (cropped to M, N), multiplies with x in float32 and
+    # casts to dst_dtype. Returns an [M, N] tensor. Works on any device.
     """Blockwise FP8 dequantization in pure PyTorch (CPU-compatible).
 
     Equivalent to the Megatron ``weight_dequant`` Triton kernel::
@@ -155,6 +182,13 @@ def _dequant_dtensor(
     block_size: int,
     target_dtype: torch.dtype,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Dequantizes an FP8 DTensor shard locally. Raises ValueError for any Shard
+    # placement on a dim other than 0. Computes this shard's global row offset, slices the
+    # scale rows covering it, pads the local shard on top by offset modulo block_size so block
+    # indexing aligns, dequantizes with the Megatron Triton kernel (CUDA) or
+    # weight_dequant_cpu, strips the padding, and returns a DTensor with the original mesh,
+    # placements, global shape and stride. scale_inv must be a full (non-sharded) tensor.
     """Dequantize a single FSDP-sharded FP8 DTensor on its local shard.
 
     Only ``Shard(0)`` placements are supported.  TP/ETP column-sharded
@@ -231,6 +265,13 @@ def dequant_fp8_state_dict(
     target_dtype: torch.dtype = torch.bfloat16,
     block_size: int = 128,
 ) -> dict[str, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Finds all float8_e4m3fn tensors; returns the dict unchanged if none. For each: requires
+    # "<key>_scale_inv" (KeyError otherwise), gathers a DTensor scale to full, requires a 2-D
+    # weight (ValueError), and replaces the weight with target_dtype values via
+    # _dequant_dtensor (DTensor), the Triton kernel (CUDA), or weight_dequant_cpu. Then deletes
+    # all used scale keys. Mutates and returns the dict; logs counts. GPU work / collectives
+    # (full_tensor) may occur.
     """Dequantize all FP8 weights in *hf_state_dict* to *target_dtype*.
 
     Detects FP8 weights by their ``float8_e4m3fn`` dtype.  For each FP8

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Token permutation utilities for MoE. Simple reference helpers (permute_tokens,
+# unpermute_tokens, merge_expert_outputs) plus the grouped-GEMM path: _permute/_unpermute
+# which regroup tokens by local expert with per-expert alignment padding (using
+# generate_permute_indices, no host sync), and indices_padding_wrapper for the non-EP case.
+# Holds a module-global alignment TOKEN_GROUP_ALIGN_SIZE_M (default 8, settable to 16/32
+# for fp8/mxfp8).
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/moe/utils.py and moe.py
@@ -13,6 +20,8 @@ from areal.experimental.models.archon.moe.kernels import generate_permute_indice
 
 
 def _round_up(x: int, multiple: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Rounds x up to the nearest multiple of multiple.
     """Round up x to the nearest multiple."""
     return ((x + multiple - 1) // multiple) * multiple
 
@@ -22,6 +31,10 @@ def permute_tokens(
     selected_experts_indices: torch.Tensor,
     num_experts: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Reference helper: flattens [T, k] expert indices, stable-argsorts them, repeats each
+    # token k times ([T*k, dim]) and reorders by the sort. Returns (permuted tokens, sort
+    # indices, per-expert histogram counts).
     """Reorder tokens by expert assignment for efficient grouped computation.
 
     Given tokens and their assigned expert indices, this function:
@@ -80,6 +93,9 @@ def unpermute_tokens(
     num_tokens: int,
     top_k: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Inverse of permute_tokens: scatters permuted rows back to their pre-sort slots in a new
+    # tensor of the same shape [T*k, dim]. num_tokens and top_k are unused.
     """Restore tokens to their original order after expert computation.
 
     This is the inverse of permute_tokens. It takes the expert-sorted tokens
@@ -110,6 +126,10 @@ def merge_expert_outputs(
     top_k: int,
     score_before_experts: bool = True,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Reshapes [T*k, dim] to [T, k, dim]; sums over k if scores were applied before experts,
+    # otherwise a float batched matmul with scores [T, k] gives the weighted sum, cast back
+    # to the input dtype. Returns [T, dim].
     """Merge outputs from multiple experts for each token using routing scores.
 
     Args:
@@ -154,6 +174,9 @@ ValidTokenGroupAlignmentSize = Literal[8, 16, 32]
 def set_token_group_alignment_size(
     alignment_size: ValidTokenGroupAlignmentSize,
 ) -> None:
+    # [FUNCTION DOC]
+    # Sets the module-global TOKEN_GROUP_ALIGN_SIZE_M (8, 16 or 32; not validated). Affects
+    # all later _permute calls.
     """Set the token group alignment size for grouped_mm.
 
     Valid values are: 8, 16, or 32.
@@ -181,6 +204,13 @@ def _permute(
     ep_degree: int,
     num_local_experts: int,
 ) -> tuple[tuple[int, ...], torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Inputs: x [N, dim] tokens ordered by (source rank, expert); counts laid out
+    # [ep_degree * num_local_experts]. Computes max output length N + num_local_experts *
+    # alignment rounded up to alignment, and (no grad) gets permutation indices and aligned
+    # per-local-expert counts from generate_permute_indices. Appends one zero row to x so that
+    # padding indices (-1) select that zero row, records the padded input shape, and gathers
+    # rows. Returns (padded input shape, permuted x [max_len, dim], indices, aligned counts).
     """Permute and pad tokens for grouped_mm alignment.
 
     Used by both EP (via ExpertParallel) and non-EP (via indices_padding_wrapper).
@@ -229,6 +259,10 @@ def _unpermute(
     input_shape: tuple[int, ...],
     permuted_indices: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Allocates an uninitialized tensor of the padded input shape, scatters out rows
+    # back by permuted_indices (all padding rows land on the last row), and drops that last
+    # row. Returns [N, dim] in pre-permutation order.
     """Unpermute tokens after expert computation.
 
     Restores tokens to their original order after grouped_mm computation,
@@ -249,6 +283,10 @@ def _unpermute(
 
 
 def indices_padding_wrapper(func: Callable) -> Callable:
+    # [FUNCTION DOC]
+    # Decorator for an expert function (w1, w2, w3, x, counts) in the non-EP case: returns a
+    # wrapper that permutes/pads x via _permute, calls func with aligned counts, and
+    # unpermutes the result.
     """Wrapper for non-EP scenario to add padding for grouped_mm.
 
     In order to use torch._grouped_mm, we need to make sure the number of
@@ -271,6 +309,9 @@ def indices_padding_wrapper(func: Callable) -> Callable:
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: num_local_experts = w1.shape[0]; ep_degree = len(counts) / num_local_experts
+        # (1 without EP); permute, compute, unpermute; returns [N, dim].
         num_local_experts = w1.shape[0]
         ep_degree = num_tokens_per_expert.shape[0] // num_local_experts
 

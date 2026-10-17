@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Archon Qwen2 decoder (adapted from torchtitan's Qwen3): RMSNorm, GQA attention with
+# QKV bias, RoPE, pluggable packed attention backend (varlen / sdpa / tree) and optional
+# Ulysses sequence parallelism, SwiGLU MLP, pre-norm blocks, and the top-level model
+# with an LM head or a critic score head. Inputs are packed sequences with batch 1.
+# Modules not owned by a pipeline stage may be None (forward tolerates this).
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/models/qwen3/model/model.py
@@ -30,14 +36,21 @@ from areal.experimental.models.archon.ulysses import (
 
 
 class RMSNorm(nn.Module):
+    # [CLASS DOC]
+    # RMS normalization with a learnable scale (init ones) computed in float32.
     """RMSNorm with float32 intermediate computation."""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
+        # [FUNCTION DOC]
+        # Creates the weight [hidden_size] of ones and stores eps.
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Upcasts to float32, divides by sqrt(mean of squares over last dim + eps), casts back to
+        # the input dtype, multiplies by weight. Returns same shape.
         input_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).mean(-1, keepdim=True)
@@ -45,10 +58,17 @@ class RMSNorm(nn.Module):
         return self.weight * x.to(input_dtype)
 
     def reset_parameters(self):
+        # [FUNCTION DOC]
+        # Resets weight to ones in place.
         nn.init.ones_(self.weight)
 
 
 class Attention(nn.Module):
+    # [CLASS DOC]
+    # GQA self-attention: wq/wk/wv Linear (bias = attention_bias) to n_heads / n_kv_heads
+    # times head_dim, wo without bias; scale head_dim^-0.5. Backend: TreeAttentionWrapper for
+    # attn_type "tree", VarlenAttentionWrapper for "varlen", SDPAWrapper otherwise. Holds
+    # Ulysses state (cp group, size, rank), set by set_cp_group.
     """Multi-head attention module with GQA and Ulysses SP support.
 
     Ulysses SP (Sequence Parallelism) uses All-to-All communication to split
@@ -57,6 +77,9 @@ class Attention(nn.Module):
     """
 
     def __init__(self, model_args: Qwen2ModelArgs):
+        # [FUNCTION DOC]
+        # Builds projections and the attention backend; Ulysses disabled initially. n_kv_heads
+        # None falls back to n_heads.
         super().__init__()
         self.n_heads = model_args.n_heads
         self.n_kv_heads = (
@@ -97,6 +120,8 @@ class Attention(nn.Module):
         self._cp_rank: int = 0
 
     def set_cp_group(self, cp_group: ProcessGroup | None):
+        # [FUNCTION DOC]
+        # Stores the CP group and caches its world size and this rank's index (1/0 when None).
         """Configure Ulysses sequence parallelism.
 
         Args:
@@ -113,10 +138,14 @@ class Attention(nn.Module):
 
     @property
     def _sp_enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: a CP group is set and its size > 1.
         """Check if Ulysses SP is enabled."""
         return self._cp_group is not None and self._cp_size > 1
 
     def init_weights(self, init_std: float):
+        # [FUNCTION DOC]
+        # Truncated-normal (std 0.02) for wq/wk/wv with zeroed biases; wo with init_std.
         for linear in (self.wq, self.wk, self.wv):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
             if linear.bias is not None:
@@ -132,6 +161,15 @@ class Attention(nn.Module):
         max_seqlen: int,
         tree_attn_meta: TreeAttentionMeta | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # x [bs, seq, dim] -> projections viewed as [bs, seq, heads, head_dim], RoPE applied at
+        # positions. With Ulysses: if kv heads < cp size, repeat KV heads by cp_size // kv_heads;
+        # then all-to-all each of q/k/v from sequence-sharded to head-sharded (full sequence of
+        # length seq * cp). Transposes to [bs, heads, seq, d], calls the backend with scale,
+        # cu_seqlens, max_seqlen and tree meta, transposes back; with Ulysses, all-to-all back to
+        # sequence-sharded. Flattens heads and applies wo. Returns [bs, seq, dim].
+        # KNOWN ISSUE: If cp_size is not a multiple of kv_heads, the KV repeat factor is floored
+        # and the head scatter would not divide evenly.
         bs, seqlen, _ = x.shape
 
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -201,27 +239,41 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
+    # [CLASS DOC]
+    # SwiGLU MLP: bias-free w1 (gate), w3 (up), w2 (down).
     """SwiGLU feedforward module."""
 
     def __init__(self, dim: int, hidden_dim: int):
+        # [FUNCTION DOC]
+        # Creates the three Linear layers.
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=False)
         self.w2 = nn.Linear(hidden_dim, dim, bias=False)
         self.w3 = nn.Linear(dim, hidden_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Returns w2(silu(w1 x) * w3 x).
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
     def init_weights(self, init_std: float):
+        # [FUNCTION DOC]
+        # w1 truncated-normal std 0.02; w2 and w3 with init_std.
         nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
         for linear in (self.w2, self.w3):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
 
 
 class TransformerBlock(nn.Module):
+    # [CLASS DOC]
+    # Pre-norm block: x + attention(attention_norm(x)), then + feed_forward(ffn_norm(x)).
+    # Per-layer init std is 0.02 / sqrt(2*(layer_id+1)) with depth_init, else
+    # 0.02 / sqrt(2*n_layers).
     """Pre-norm transformer block with attention and feedforward."""
 
     def __init__(self, layer_id: int, model_args: Qwen2ModelArgs):
+        # [FUNCTION DOC]
+        # Builds attention, MLP and both RMSNorms and computes weight_init_std.
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
@@ -247,6 +299,9 @@ class TransformerBlock(nn.Module):
         max_seqlen: int,
         tree_attn_meta: TreeAttentionMeta | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Applies the two residual sub-layers, passing rope cache, positions, cu_seqlens,
+        # max_seqlen and tree meta to attention. Returns [bs, seq, dim].
         x = x + self.attention(
             self.attention_norm(x),
             rope_cache,
@@ -259,6 +314,8 @@ class TransformerBlock(nn.Module):
         return x
 
     def init_weights(self):
+        # [FUNCTION DOC]
+        # Resets norms and initializes attention and MLP with weight_init_std.
         for norm in (self.attention_norm, self.ffn_norm):
             norm.reset_parameters()
         self.attention.init_weights(self.weight_init_std)
@@ -266,9 +323,16 @@ class TransformerBlock(nn.Module):
 
 
 class Qwen2Model(BaseArchonModel):
+    # [CLASS DOC]
+    # Full model: tok_embeddings, non-persistent rope_cache buffer, layers ModuleDict keyed
+    # "0".."n-1", final norm, and either output (LM head, vocab) or score (critic,
+    # num_labels); the unused head is None.
     """Qwen2 transformer model."""
 
     def __init__(self, model_args: Qwen2ModelArgs):
+        # [FUNCTION DOC]
+        # Stores args and convenience fields, builds all submodules and registers the rope cache
+        # computed on the current default device.
         super().__init__()
         self.model_args = model_args
         self.vocab_size = model_args.vocab_size
@@ -297,6 +361,8 @@ class Qwen2Model(BaseArchonModel):
             self.score = None
 
     def _precompute_rope_cache(self) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: precompute_rope_cache(head_dim, max_seq_len, rope_theta).
         return precompute_rope_cache(
             self.model_args.head_dim,
             self.model_args.max_seq_len,
@@ -304,6 +370,9 @@ class Qwen2Model(BaseArchonModel):
         )
 
     def init_weights(self):
+        # [FUNCTION DOC]
+        # Embedding normal(0, 1); each present layer's init_weights; norm reset; output/score
+        # weights truncated normal with std dim^-0.5 cut at +-3 std. Skips None modules.
         if self.tok_embeddings is not None:
             nn.init.normal_(self.tok_embeddings.weight)
 
@@ -336,6 +405,8 @@ class Qwen2Model(BaseArchonModel):
             )
 
     def init_buffers(self, buffer_device: torch.device | str):
+        # [FUNCTION DOC]
+        # Recomputes rope_cache under the given device context (e.g. after meta init).
         with torch.device(buffer_device):
             self.rope_cache = self._precompute_rope_cache()
 
@@ -347,6 +418,12 @@ class Qwen2Model(BaseArchonModel):
         max_seqlen: int | torch.Tensor,
         tree_attn_meta: TreeAttentionMeta | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Squeezes a 2-D cu_seqlens and converts a tensor max_seqlen to int (.item(), host sync)
+        # for pipeline-parallel calls. Embeds tokens if this part owns tok_embeddings (otherwise
+        # input is hidden states), runs all owned layers, applies norm if present, then score
+        # (critic) or output if present. Returns logits [1, seq, vocab], values [1, seq, labels],
+        # or hidden states for non-last pipeline stages.
         # When pipeline parallelism enabled, cu_seqlens is [1, B+1]
         if cu_seqlens.ndim == 2:
             cu_seqlens = cu_seqlens.squeeze(0)

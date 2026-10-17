@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Stateless helpers used by ArchonEngine during setup: optimizer and LR-scheduler
+# construction from OptimizerConfig, activation-checkpoint config building, fixing
+# zero-bubble pipeline schedule incompatibilities, deterministic-mode setup, forcing
+# pad_to_maximum, and prepare_training_config which chains them. Callers pass their own
+# logger. Several functions mutate the passed config objects and process env vars.
 # SPDX-License-Identifier: Apache-2.0
 
 """Utility functions extracted from ArchonEngine for reuse and testability."""
@@ -45,6 +51,10 @@ def create_optimizer(
     params: list[torch.nn.Parameter],
     optimizer_config: OptimizerConfig,
 ) -> torch.optim.Optimizer:
+    # [FUNCTION DOC]
+    # Builds an optimizer over params from optimizer_config (lr, weight_decay, beta1, beta2,
+    # eps). type "adam" -> fused torch AdamW with betas and eps; "sgd" -> SGD with lr and
+    # weight decay only. Raises ValueError for any other type.
     """Create optimizer from config."""
     lr = optimizer_config.lr
     weight_decay = optimizer_config.weight_decay
@@ -76,6 +86,10 @@ def create_lr_scheduler(
     optimizer_config: OptimizerConfig,
     total_train_steps: int,
 ) -> torch.optim.lr_scheduler.LRScheduler:
+    # [FUNCTION DOC]
+    # Computes warmup steps via get_num_warmup_steps(config, total_train_steps) and returns a
+    # cosine (with min_lr_ratio), linear, or constant warmup schedule depending on
+    # lr_scheduler_type. Raises ValueError for unknown types.
     """Create LR scheduler from config."""
     num_warmup_steps = get_num_warmup_steps(optimizer_config, total_train_steps)
 
@@ -112,6 +126,11 @@ def build_ac_config(
     config: TrainEngineConfig,
     logger: logging.Logger,
 ) -> ActivationCheckpointConfig | None:
+    # [FUNCTION DOC]
+    # Returns None if config.gradient_checkpointing is false or config.archon.ac_mode is
+    # "none". Otherwise builds an ActivationCheckpointConfig from the archon settings (mode,
+    # selective_ac_option, ac_memory_budget, ac_preserve_rng_state, ac_debug), logs it at INFO
+    # and returns it.
     """Build ActivationCheckpointConfig from engine config.
 
     Returns None if gradient checkpointing is disabled.
@@ -162,6 +181,13 @@ def validate_zero_bubble_compatibility(
     ac_config: ActivationCheckpointConfig | None,
     logger: logging.Logger,
 ) -> bool:
+    # [FUNCTION DOC]
+    # If pp_schedule resolves (via get_schedule_class) to a zero-bubble schedule
+    # (InterleavedZeroBubble, ZBVZeroBubble, DualPipeV), applies fixes: disables compile
+    # (warning), for MoE models globally sets torch functorch config donated_buffer to False,
+    # and downgrades op-level selective or memory_budget AC to "full" (mutating ac_config).
+    # Returns the possibly-updated enable_compile; non-zero-bubble schedules return it as-is.
+    # Side effects: global functorch config mutation, logging.
     """Fix zero-bubble schedule incompatibilities.
 
     Zero-bubble schedules (split backward with retain_graph=True) conflict with
@@ -216,6 +242,12 @@ def setup_deterministic_mode(
     enable_compile: bool,
     logger: logging.Logger,
 ) -> None:
+    # [FUNCTION DOC]
+    # Enables deterministic training: forces ac_config.preserve_rng_state True (if given),
+    # calls torch.use_deterministic_algorithms(True, warn_only=True), sets
+    # CUBLAS_WORKSPACE_CONFIG to ":4096:8" unless already a valid value, sets NCCL_ALGO to
+    # "Ring" unless already one of the allowed algorithms, and sets TORCH_COMPILE_DETERMINISTIC
+    # to "1" when compile is enabled. Mutates os.environ and global torch state; logs each step.
     """Set env vars and PyTorch flags for deterministic training."""
     logger.info("Deterministic mode enabled. May reduce performance.")
 
@@ -262,6 +294,10 @@ def force_pad_to_maximum(
     enable_tree_training: bool,
     logger: logging.Logger,
 ) -> None:
+    # [FUNCTION DOC]
+    # Sets config.pad_to_maximum True when compile is enabled, PP is enabled, or tree training
+    # is enabled (logging each change). For tree training also raises NotImplementedError for
+    # critic models and ValueError if PP or CP is enabled. Returns None; mutates config.
     """Force ``config.pad_to_maximum = True`` when compile, PP, or tree training
     requires it. Also validates tree training constraints.
     """
@@ -313,6 +349,12 @@ def prepare_training_config(
     enable_tree_training: bool,
     logger: logging.Logger,
 ) -> tuple[ActivationCheckpointConfig | None, bool]:
+    # [FUNCTION DOC]
+    # Orchestrates setup: build_ac_config, then validate_zero_bubble_compatibility starting
+    # from config.archon.enable_compile, then disables compile if FP8 is enabled (warning),
+    # runs setup_deterministic_mode if use_deterministic_algorithms, runs force_pad_to_maximum,
+    # and raises ValueError if PP is enabled with tie_word_embeddings. Returns
+    # (ac_config, effective enable_compile); config.archon.enable_compile is not updated.
     """Build and validate all training configs before parallelism setup.
 
     Returns (ac_config, enable_compile). May mutate ``config.pad_to_maximum``
