@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# torchrun entry script for multi-GPU NCCL weight-transfer tests of
+# areal.v2.weight_update.nccl_group. Each test function: rank 0 picks a free port and
+# broadcasts it over the default group, all ranks build a separate NCCL group via
+# init_weights_update_group, exercise it, destroy it, barrier on the default group, and
+# rank 0 writes a Passed/Failed result file (via dist_utils.write_result) for the parent
+# pytest to read. Tests are selected by name through TEST_REGISTRY and the --test_type
+# CLI flag.
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
@@ -20,6 +28,14 @@ from areal.v2.weight_update.nccl_group import (
 
 
 def run_nccl_group_init(output=None):
+    # [FUNCTION DOC]
+    # Creates a custom NCCL group 'awex_test_nccl_init' (role 'test') over all ranks
+    # using MASTER_ADDR (default localhost) and a broadcast free port, runs a barrier on
+    # it and destroys it. Input: output (optional result file path, written by rank 0).
+    # Returns True on success, False if any step raised (exception printed on rank 0
+    # only).
+    # KNOWN ISSUE: leftover debug prints of 1 and 2 on every rank. Port tensor uses
+    # device cuda:<global rank>, which is wrong on multi-node runs.
     """Test: All ranks create and destroy a custom NCCL process group."""
     print(1, flush=True)
     rank = dist.get_rank()
@@ -73,6 +89,11 @@ def run_nccl_group_init(output=None):
 
 
 def run_batch_isend_irecv(output=None):
+    # [FUNCTION DOC]
+    # Creates custom NCCL group 'awex_test_p2p' like run_nccl_group_init, then calls
+    # setup_batch_isend_irecv(group, rank, world_size), which performs and verifies P2P
+    # exchanges; destroys the group. Prints traceback on failure. Writes result on rank
+    # 0 if output given; returns success bool (local to the rank).
     """Test: P2P communication via batch_isend_irecv on custom group."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -121,6 +142,20 @@ def run_batch_isend_irecv(output=None):
 
 
 def run_weight_transfer_lifecycle(output=None):
+    # [FUNCTION DOC]
+    # Simulates a weight update: ranks [0, world_size//2) are inference, the rest
+    # training. Creates group 'awex_test_transfer' with role per side. Training ranks
+    # fill three params (shapes 512x256, 256, 1024x512) with randn seeded by 42+rank;
+    # inference ranks allocate zeros. Inference rank r receives from training rank
+    # r+half and training rank t sends to t-half, each via batch_isend_irecv of P2POps
+    # in sorted param-name order, waiting on all requests. After device sync and group
+    # barrier, inference ranks regenerate expected tensors with the partner's seed and
+    # compare with allclose (1e-6 tolerances), logging mismatches. A MIN all-reduce of
+    # the success flag over the group makes the result global. Destroys the group,
+    # barriers, writes result on rank 0, returns success.
+    # KNOWN ISSUE: print_rank0 for mismatches/verification only prints on rank 0, so
+    # failures on other inference ranks are silent except via the reduced flag; with odd
+    # world_size the last training rank has no partner and is idle.
     """Test: Full weight transfer lifecycle - training ranks send, inference ranks receive."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -251,6 +286,15 @@ TEST_REGISTRY = {
 
 
 def main():
+    # [FUNCTION DOC]
+    # CLI entry: parses --test_type (required, a TEST_REGISTRY key) and --output
+    # (optional result path), initializes the default NCCL process group (env:// from
+    # torchrun), sets the CUDA device to the global rank, runs the selected test,
+    # barriers, and prints PASSED/FAILED on rank 0 (rank 0 also writes a Failed result
+    # on failure). On exception: prints it with traceback, writes Failed on rank 0, and
+    # re-raises. Always destroys the default process group.
+    # KNOWN ISSUE: uses global rank instead of LOCAL_RANK for torch.cuda.set_device,
+    # which breaks on multi-node launches.
     parser = argparse.ArgumentParser(description="NCCL Weight Transfer Tests")
     parser.add_argument(
         "--test_type",

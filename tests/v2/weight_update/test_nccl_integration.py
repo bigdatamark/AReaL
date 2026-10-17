@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# GPU integration tests for the v2 weight-update (awex) path. Part 1 launches torchrun
+# subprocesses running torchrun/run_nccl_weight_transfer.py to test raw NCCL group
+# creation and P2P transfer. Part 2 runs end-to-end round trips: a single LocalScheduler
+# owns all GPUs; RolloutControllerV2 starts SGLang inference workers (whose weights are
+# randomized via /awex/debug/randomize_parameters so the update is not a no-op),
+# GatewayTrainController starts FSDP or Megatron training workers, and
+# WeightUpdateController launches the weight-update gateway and drives connect ->
+# update_weights -> disconnect. Afterwards inference /generate is smoke-tested and
+# selected parameters are fetched from both sides via /awex/debug/get_parameters (saved
+# to .pt files) and compared bitwise. Covers FSDP DP, Megatron DP/TP/PP/CP/EP
+# combinations, and colocated (shared GPU, CUDA IPC) mode. All tests skip without CUDA
+# or with too few GPUs; most are marked multi_gpu/slow/sglang.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -24,6 +37,15 @@ _PROJECT_ROOT = os.path.abspath(
 
 
 def _run_weight_update_test(n_gpus: int, test_type: str, output: str):
+    # [FUNCTION DOC]
+    # HELPER: Runs run_nccl_weight_transfer.py under torchrun on one node with n_gpus
+    # processes, a free master port, the given test_type and output result path, with
+    # the project root prepended to PYTHONPATH and output streamed to the test's stdout.
+    # Waits for completion (killing the process tree on any interruption and re-
+    # raising), fails the test on non-zero exit, then asserts the result file content
+    # equals 'Passed'.
+    # KNOWN ISSUE: the script path is relative, so it only works when pytest runs from
+    # the repo root.
     port = find_free_ports(1)[0]
     env = os.environ.copy()
     env["PYTHONPATH"] = _PROJECT_ROOT + os.pathsep + env.get("PYTHONPATH", "")
@@ -59,6 +81,9 @@ def _run_weight_update_test(n_gpus: int, test_type: str, output: str):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_nccl_group_init_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # 2-GPU test (skipped if fewer GPUs): runs the 'nccl_group_init' torchrun test and
+    # checks its result file.
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
     output = tmp_path_factory.mktemp("test_output") / "nccl_group_init.out"
@@ -68,6 +93,8 @@ def test_nccl_group_init_2gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_batch_isend_irecv_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # 2-GPU test: runs the 'batch_isend_irecv' torchrun test and checks its result file.
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
     output = tmp_path_factory.mktemp("test_output") / "batch_isend_irecv.out"
@@ -77,6 +104,11 @@ def test_batch_isend_irecv_2gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_weight_transfer_lifecycle_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # 2-GPU test: runs the 'weight_transfer_lifecycle' torchrun test (1 inference + 1
+    # training rank) and checks its result file.
+    # KNOWN ISSUE: output file is named weight_transfer_4gpu.out although only 2 GPUs
+    # are used (cosmetic).
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")
     output = tmp_path_factory.mktemp("test_output") / "weight_transfer_4gpu.out"
@@ -89,6 +121,9 @@ def test_weight_transfer_lifecycle_2gpu(tmp_path_factory):
 
 
 def _get_test_model_path() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the local Qwen3-0.6B path under /storage/openpsi/models if
+    # present, else the HF id 'Qwen/Qwen3-0.6B'.
     local = "/storage/openpsi/models/Qwen__Qwen3-0.6B/"
     if os.path.isdir(local):
         return local
@@ -96,6 +131,9 @@ def _get_test_model_path() -> str:
 
 
 def _get_test_moe_model_path() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the local Qwen3-30B-A3B MoE path if present, else the HF id
+    # 'Qwen/Qwen3-30B-A3B'.
     local = "/storage/openpsi/models/Qwen__Qwen3-30B-A3B/"
     if os.path.isdir(local):
         return local
@@ -103,6 +141,16 @@ def _get_test_moe_model_path() -> str:
 
 
 def _make_truncated_moe_model(tmp_path, num_layers: int = 4) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Builds a truncated MoE model directory at tmp_path/truncated_moe: copies
+    # config.json with num_hidden_layers overridden to num_layers (default 4), copies
+    # existing tokenizer/generation config files, symlinks every *.safetensors / *.bin
+    # weight file and copies their index JSONs from the source. Returns the new
+    # directory path. Filesystem side effects only. Intended for use with
+    # init_from_scratch so full weights need not be loaded.
+    # KNOWN ISSUE: if the local model is absent the source is an HF hub id, which is not
+    # a directory, so opening config.json raises FileNotFoundError. Re-calling with the
+    # same tmp_path would fail on os.symlink because the links already exist.
     import glob
     import json
     import shutil
@@ -143,6 +191,10 @@ def _make_truncated_moe_model(tmp_path, num_layers: int = 4) -> str:
 
 
 def _make_local_scheduler(tmp_path, name: str, gpu_devices: list[int]):
+    # [FUNCTION DOC]
+    # HELPER: Creates <name>_fileroot and <name>_name_resolve dirs under tmp_path and
+    # returns a LocalScheduler over gpu_devices with logs at <name>_logs, experiment
+    # 'test-awex-<name>', trial 't0'.
     from areal.infra.scheduler.local import LocalScheduler
 
     fileroot = tmp_path / f"{name}_fileroot"
@@ -192,6 +244,17 @@ def _validate_weight_update_correctness(
     inf_worker_url: str,
     param_dir,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER (FSDP validation): For each training worker URL, POSTs
+    # /awex/debug/get_parameters asking it to save _VALIDATE_PARAM_NAMES to
+    # train_params_rank<i>.pt in param_dir; does the same for the single inference
+    # worker (infer_params.pt). Asserts every request returns 200. Loads all files on
+    # CPU, asserts every name exists on every side, reconstructs each full training
+    # param by concatenating rank shards along dim 0 (FSDP Shard(0)) when there are
+    # several ranks, and asserts exact equality (rtol=atol=0) with the inference tensor.
+    # Prints progress. Returns None; raises AssertionError on mismatch.
+    # KNOWN ISSUE: assumes inference TP=1 and that shard order equals URL order; params
+    # not sharded on dim 0 would be reconstructed incorrectly.
     """Fetch params from both sides via HTTP and compare bitwise.
 
     Training workers return FSDP local shards (Shard(0)), so we concatenate
@@ -269,6 +332,14 @@ def _validate_weight_update_correctness_megatron(
     tag: str = "megatron",
     param_names: list[str] | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER (Megatron validation): Like the FSDP variant but fetches training params
+    # concurrently (thread pool, one thread per worker) into
+    # <tag>_train_params_rank<i>.pt, uses param_names (default _VALIDATE_PARAM_NAMES),
+    # and instead of concatenating shards it unions the per-rank dicts (later ranks
+    # overwrite earlier) since with PP/EP each rank owns a disjoint subset and with
+    # DP/TP/CP ranks return full gathered params. Asserts every name is present on both
+    # sides and exactly equal. Returns None.
     import concurrent.futures
 
     names = param_names or _VALIDATE_PARAM_NAMES
@@ -283,6 +354,9 @@ def _validate_weight_update_correctness_megatron(
     ]
 
     def _fetch_train(args):
+        # [FUNCTION DOC]
+        # HELPER: Takes a tuple (rank index, worker url, save path), POSTs
+        # get_parameters for the enclosing names list, and asserts HTTP 200.
         i, url, p = args
         resp = httpx.post(
             f"{url}/awex/debug/get_parameters",
@@ -353,6 +427,15 @@ def _validate_weight_update_correctness_megatron(
 @pytest.mark.sglang
 @pytest.mark.parametrize("n_gpus", [2, 4, 8], ids=["2gpu", "4gpu", "8gpu"])
 def test_awex_fsdp_e2e_weight_update(n_gpus, tmp_path_factory):
+    # [FUNCTION DOC]
+    # E2E for FSDPEngine pure DP, parametrized over 2/4/8 GPUs: first half for SGLang
+    # (sglang:d<half>, mem fraction 0.7), second half for FSDP (fsdp:d<half>,
+    # NCCL_CUMEM/NVLS disabled). Initializes inference, randomizes its weights,
+    # initializes training (FinetuneSpec 1 epoch, 100 samples, batch 2), launches the
+    # weight-update gateway on 127.0.0.1, checks health, connects with training worker
+    # URLs, updates to version 1 asserting status ok, disconnects, checks /generate
+    # returns 200, then runs _validate_weight_update_correctness. Always destroys
+    # gateway, training, inference controllers and scheduler workers in finally.
     """Full round trip: FSDPEngine (pure DP) → weight-update gateway → SGLang.
 
     A single :class:`LocalScheduler` owns all *n_gpus* devices.  Inference
@@ -511,6 +594,9 @@ def test_awex_fsdp_e2e_weight_update(n_gpus, tmp_path_factory):
 @pytest.mark.sglang
 @pytest.mark.parametrize("n_gpus", [2, 4, 8], ids=["2gpu", "4gpu", "8gpu"])
 def test_awex_megatron_dp_e2e_weight_update(n_gpus, tmp_path_factory):
+    # [FUNCTION DOC]
+    # E2E for Megatron pure DP over 2/4/8 GPUs via _run_megatron_awex_e2e with backend
+    # megatron:d<half>.
     """Full round trip: MegatronEngine (pure DP) → weight-update gateway → SGLang.
 
     Each training rank holds a full copy of every parameter. Validation unions
@@ -537,6 +623,10 @@ def test_awex_megatron_dp_e2e_weight_update(n_gpus, tmp_path_factory):
     ids=["4gpu-dp1tp2", "8gpu-dp2tp2", "8gpu-dp1tp4"],
 )
 def test_awex_megatron_dp_tp_e2e_weight_update(n_gpus, tp_size, tmp_path_factory):
+    # [FUNCTION DOC]
+    # E2E for Megatron DP+TP with (n_gpus, tp_size) in (4,2),(8,2),(8,4): dp_size =
+    # training GPUs // tp_size, skips if < 1, runs _run_megatron_awex_e2e with backend
+    # megatron:d<dp>t<tp>.
     """Full round trip: MegatronEngine (DP+TP) → weight-update gateway → SGLang.
 
     TP ranks within a DP group each hold the same full parameter after
@@ -570,6 +660,16 @@ def _run_megatron_awex_e2e(
     validate_param_names: list[str] | None = None,
     init_from_scratch: bool = False,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Shared Megatron E2E driver (keyword-only args). n_gpus split half
+    # inference (sglang:d<n/2>) and remainder training with the given Megatron backend
+    # string; pair_name for the gateway pair; tag names the tmp dir, scheduler,
+    # experiment and saved param files; model_path defaults to Qwen3-0.6B;
+    # validate_param_names defaults to the dense list; init_from_scratch is forwarded to
+    # TrainEngineConfig. Flow identical to the FSDP E2E test (init + randomize
+    # inference, init MegatronLMEngine training, gateway connect/update v1/disconnect,
+    # /generate smoke test) ending with _validate_weight_update_correctness_megatron.
+    # Cleans up all controllers and scheduler workers in finally.
     from areal.api import FinetuneSpec
     from areal.api.cli_args import (
         InferenceEngineConfig,
@@ -706,6 +806,8 @@ def _run_megatron_awex_e2e(
     ids=["4gpu-dp1pp2", "8gpu-dp1pp4"],
 )
 def test_awex_megatron_pp_e2e_weight_update(n_gpus, pp_size, tmp_path_factory):
+    # [FUNCTION DOC]
+    # E2E for Megatron pure PP ((4,2),(8,4)) with backend megatron:d1p<pp>.
     """Full round trip: MegatronEngine (pure PP) → weight-update gateway → SGLang.
 
     Each PP stage owns a disjoint subset of layers. Validation unions params
@@ -733,6 +835,8 @@ def test_awex_megatron_pp_e2e_weight_update(n_gpus, pp_size, tmp_path_factory):
 def test_awex_megatron_dp_pp_e2e_weight_update(
     n_gpus, dp_size, pp_size, tmp_path_factory
 ):
+    # [FUNCTION DOC]
+    # E2E for Megatron DP+PP (8 GPUs, dp2 pp2) with backend megatron:d<dp>p<pp>.
     """Full round trip: MegatronEngine (DP+PP) → weight-update gateway → SGLang.
 
     Combines data parallelism (multiple replicas) with pipeline parallelism
@@ -761,6 +865,8 @@ def test_awex_megatron_dp_pp_e2e_weight_update(
 def test_awex_megatron_pp_tp_e2e_weight_update(
     n_gpus, pp_size, tp_size, tmp_path_factory
 ):
+    # [FUNCTION DOC]
+    # E2E for Megatron PP+TP (8 GPUs, pp2 tp2) with backend megatron:d1p<pp>t<tp>.
     """Full round trip: MegatronEngine (PP+TP) → weight-update gateway → SGLang.
 
     PP splits layers across stages; TP shards each stage's weights across ranks.
@@ -786,6 +892,8 @@ def test_awex_megatron_pp_tp_e2e_weight_update(
     ids=["4gpu-dp1cp2", "8gpu-dp1cp4"],
 )
 def test_awex_megatron_cp_e2e_weight_update(n_gpus, cp_size, tmp_path_factory):
+    # [FUNCTION DOC]
+    # E2E for Megatron pure CP ((4,2),(8,4)) with backend megatron:d1c<cp>.
     """Full round trip: MegatronEngine (pure CP) → weight-update gateway → SGLang.
 
     CP splits the sequence across ranks for attention but all CP ranks hold
@@ -814,6 +922,8 @@ def test_awex_megatron_cp_e2e_weight_update(n_gpus, cp_size, tmp_path_factory):
 def test_awex_megatron_dp_cp_e2e_weight_update(
     n_gpus, dp_size, cp_size, tmp_path_factory
 ):
+    # [FUNCTION DOC]
+    # E2E for Megatron DP+CP (8 GPUs, dp2 cp2) with backend megatron:d<dp>c<cp>.
     """Full round trip: MegatronEngine (DP+CP hybrid) → weight-update gateway → SGLang.
 
     Combines data parallelism with context parallelism. Each DP replica has
@@ -840,6 +950,12 @@ def test_awex_megatron_dp_cp_e2e_weight_update(
     ids=["4gpu-dp2ep2", "8gpu-dp4ep4"],
 )
 def test_awex_megatron_ep_e2e_weight_update(n_gpus, ep_size, tmp_path_factory):
+    # [FUNCTION DOC]
+    # E2E for Megatron EP ((4,2),(8,4)) using a 4-layer truncated Qwen3-30B-A3B model
+    # initialized from scratch, backend megatron:d<n_train>e<ep>, validated with
+    # _VALIDATE_PARAM_NAMES_MOE.
+    # KNOWN ISSUE: requires the local MoE model directory (see
+    # _make_truncated_moe_model).
     """Full round trip: MegatronEngine (EP) → weight-update gateway → SGLang.
 
     Each EP rank owns a different subset of expert parameters while attention
@@ -873,6 +989,9 @@ def test_awex_megatron_ep_e2e_weight_update(n_gpus, ep_size, tmp_path_factory):
 def test_awex_megatron_dp_ep_e2e_weight_update(
     n_gpus, dp_size, ep_size, tmp_path_factory
 ):
+    # [FUNCTION DOC]
+    # E2E for Megatron DP+EP (8 GPUs, dp4 ep2) with the truncated MoE model,
+    # init_from_scratch, backend megatron:d<dp>e<ep> and MoE validation names.
     """Full round trip: MegatronEngine (DP+EP hybrid) → weight-update gateway → SGLang.
 
     Combines data parallelism with expert parallelism. Each DP replica has
@@ -907,6 +1026,13 @@ def _run_megatron_colocate_e2e(
     tmp_path_factory,
     model_path: str | None = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Colocated Megatron E2E driver (keyword-only). Both SGLang
+    # (sglang:d<n_gpus>) and Megatron (megatron:d<n_gpus>, pure DP) span all n_gpus
+    # GPUs; the scheduler's round-robin wraps so each GPU hosts one inference and one
+    # training worker. Same flow as _run_megatron_awex_e2e except controllers are
+    # initialized without wait=True and connect passes colocate=True (transfer via CUDA
+    # IPC). Validates with the default dense param list and cleans up in finally.
     """Colocated weight transfer: MegatronEngine + SGLang share the same GPUs.
 
     Unlike the separated tests where inference and training each own a
@@ -1054,6 +1180,8 @@ def _run_megatron_colocate_e2e(
 @pytest.mark.sglang
 @pytest.mark.parametrize("n_gpus", [2, 4, 8], ids=["2gpu", "4gpu", "8gpu"])
 def test_awex_megatron_colocate_dp_e2e_weight_update(n_gpus, tmp_path_factory):
+    # [FUNCTION DOC]
+    # Colocated pure-DP E2E over 2/4/8 GPUs via _run_megatron_colocate_e2e.
     """Full round trip: colocated MegatronEngine (pure DP) + SGLang on same GPUs.
 
     Unlike separated tests that split GPUs between training and inference,
@@ -1076,6 +1204,11 @@ def test_awex_megatron_colocate_dp_e2e_weight_update(n_gpus, tmp_path_factory):
 @pytest.mark.slow
 @pytest.mark.sglang
 def test_awex_megatron_colocate_dp_multi_version_e2e(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Colocated 2-GPU Megatron+SGLang test performing two sequential updates (version 1
+    # then 2) on the same connection, asserting both succeed, then the /generate smoke
+    # test and Megatron param validation. Setup and cleanup duplicate
+    # _run_megatron_colocate_e2e inline.
     """Colocated weight update with multiple sequential versions.
 
     Verifies that the colocated IPC path correctly handles version
