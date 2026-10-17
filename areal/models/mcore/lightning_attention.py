@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Megatron-Core implementation of Lightning Attention (linear attention with fixed
+# per-head exponential decay) for BailingMoeV2.5 hybrid models, built on the fla
+# (flash-linear-attention) chunk_simple_gla kernel. Provides parallel-state helpers that
+# degrade gracefully when Megatron parallel state is not initialised, ALiBi-style decay
+# slopes, context-parallel (CP) all-to-all and zigzag reorder helpers, a core attention
+# module, a grouped RMSNorm for output gating with TP-sharded checkpointing, and a
+# TransformerLayer-compatible self-attention module. Tensors use Megatron [S, B, H, D]
+# layout unless noted.
 # SPDX-License-Identifier: Apache-2.0
 
 """Lightning Attention module for megatron-core, using fla (flash-linear-attention) Triton kernels.
@@ -48,6 +57,9 @@ logger = logging.getLogger("LightningAttention")
 
 
 def _get_tp_world_size() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the Megatron tensor-parallel world size, or 1 if model parallel
+    # state is not initialised or querying fails.
     """Get tensor model parallel world size, with fallback for uninitialized mpu."""
     try:
         if mpu.model_parallel_is_initialized():
@@ -58,6 +70,8 @@ def _get_tp_world_size() -> int:
 
 
 def _get_tp_rank() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the Megatron tensor-parallel rank, or 0 when unavailable.
     """Get tensor model parallel rank, with fallback for uninitialized mpu."""
     try:
         if mpu.model_parallel_is_initialized():
@@ -68,6 +82,8 @@ def _get_tp_rank() -> int:
 
 
 def _get_cp_world_size() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the Megatron context-parallel world size, or 1 when unavailable.
     """Get context parallel world size, with fallback for uninitialized mpu."""
     try:
         if mpu.model_parallel_is_initialized():
@@ -78,6 +94,8 @@ def _get_cp_world_size() -> int:
 
 
 def _get_cp_rank() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the Megatron context-parallel rank, or 0 when unavailable.
     """Get context parallel rank, with fallback for uninitialized mpu."""
     try:
         if mpu.model_parallel_is_initialized():
@@ -88,6 +106,9 @@ def _get_cp_rank() -> int:
 
 
 def _get_cp_group():
+    # [FUNCTION DOC]
+    # HELPER: Returns the Megatron context-parallel process group, or None when
+    # unavailable.
     """Get context parallel process group, with fallback for uninitialized mpu."""
     try:
         if mpu.model_parallel_is_initialized():
@@ -98,6 +119,11 @@ def _get_cp_group():
 
 
 def _build_alibi_slopes(n_attention_heads: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns a float32 tensor [n_attention_heads] of ALiBi slopes. For a power
+    # of two n: geometric sequence with start and ratio 2^(-2^(-(log2 n - 3))).
+    # Otherwise: the slopes for the largest power of two below n, followed by every
+    # other slope of the 2x-size sequence, truncated to fill the remaining heads.
     """Build ALiBi-style geometric slopes for Lightning Attention decay.
 
     For power-of-2 head counts: slopes are geometric sequence starting from
@@ -109,7 +135,12 @@ def _build_alibi_slopes(n_attention_heads: int) -> torch.Tensor:
     """
 
     def _get_slopes(n):
+        # [FUNCTION DOC]
+        # HELPER: Recursive slope list builder implementing the power-of-two /
+        # interleaved scheme described above.
         def _get_slopes_power_of_2(n):
+            # [FUNCTION DOC]
+            # HELPER: Returns the n-element geometric slope list for a power-of-two n.
             start = 2 ** (-(2 ** -(math.log2(n) - 3)))
             ratio = start
             return [start * ratio**i for i in range(n)]
@@ -132,6 +163,12 @@ def _build_alibi_slopes(n_attention_heads: int) -> torch.Tensor:
 
 
 def _all_to_all_cp2hp(input_: torch.Tensor, cp_group) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Autograd-aware all-to-all over cp_group converting context-parallel layout
+    # [S/CP, B, H_local, D] to head-parallel [S, B, H_local/CP, D]: splits heads into CP
+    # chunks, sends chunk r to rank r, and stacks received sequence chunks in rank order
+    # (so the full sequence is in the CP zigzag order). Requires H_local divisible by
+    # CP.
     """All-to-all: context-parallel to head-parallel with autograd support.
 
     [S/CP, B, H_local, D] -> [S, B, H_local/CP, D]
@@ -152,6 +189,10 @@ def _all_to_all_cp2hp(input_: torch.Tensor, cp_group) -> torch.Tensor:
 
 
 def _all_to_all_hp2cp(input_: torch.Tensor, cp_group) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Inverse of _all_to_all_cp2hp: [S, B, H_local/CP, D] to [S/CP, B, H_local,
+    # D]; splits the sequence into CP chunks, exchanges them, and concatenates received
+    # head chunks in rank order. Autograd-aware collective.
     """All-to-all: head-parallel to context-parallel with autograd support.
 
     [S, B, H_local/CP, D] -> [S/CP, B, H_local, D]
@@ -185,6 +226,14 @@ def _build_zigzag_undo_indices(
     cu_seqlens: torch.Tensor | None,
     device: torch.device,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Builds a long index tensor (length total_len, on device) such that
+    # indexing the zigzag-ordered gathered sequence with it yields sequential order.
+    # Megatron CP zigzag splits each sequence into 2*CP chunks and gives rank j chunks j
+    # and 2*CP-1-j; after cp2hp, rank j's tokens occupy block j (size total_len/CP). For
+    # each sequence (bounds from cu_seqlens, or one global sequence when None; .item()
+    # calls), maps the front chunk j and back chunk to their positions inside block j at
+    # offset cu_start/CP. Assumes each sequence length is divisible by 2*CP.
     """Build index tensor to undo zigzag reordering after all-to-all cp2hp.
 
     After cp2hp, the full sequence has tokens in zigzag-interleaved order
@@ -224,6 +273,9 @@ def _build_zigzag_undo_indices(
 
 
 def _build_zigzag_redo_indices(undo_indices: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns the inverse permutation of undo_indices (sequential -> zigzag
+    # order).
     """Build inverse permutation of undo indices (sequential -> zigzag)."""
     redo = torch.empty_like(undo_indices)
     redo[undo_indices] = torch.arange(len(undo_indices), device=undo_indices.device)
@@ -232,6 +284,10 @@ def _build_zigzag_redo_indices(undo_indices: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class LightningAttentionSubmodules:
+    # [CLASS DOC]
+    # Dataclass of ModuleSpecs/classes for the Lightning attention projections:
+    # linear_qkv (fused QKV, column parallel), linear_gate (gate projection, column
+    # parallel) and linear_proj (output projection, row parallel). All default to None.
     """Submodule specs for Lightning Self-Attention layer."""
 
     linear_qkv: ModuleSpec | type = None
@@ -240,6 +296,11 @@ class LightningAttentionSubmodules:
 
 
 class LightningCoreAttention(MegatronModule):
+    # [CLASS DOC]
+    # Module computing linear attention with per-head decay via fla chunk_simple_gla.
+    # Holds a non-persistent buffer g_gamma [H_local] of log decays: minus ALiBi slopes
+    # for the global head count, times (1 - layer_idx/(num_layers-1) + 1e-5), sliced to
+    # this TP rank's heads. Attention scale is 1/sqrt(attn_head_dim).
     """Core Lightning Attention computation using fla's chunk_simple_gla kernel.
 
     Handles tensor layout conversion between megatron-core format and fla format:
@@ -260,6 +321,10 @@ class LightningCoreAttention(MegatronModule):
         layer_number: int,
         attn_head_dim: int,
     ):
+        # [FUNCTION DOC]
+        # Stores layer_idx (layer_number - 1, since Megatron is 1-indexed), num_layers,
+        # attn_head_dim and scale; computes local head count (global heads // TP size)
+        # and registers the TP-sliced g_gamma buffer. No communication.
         super().__init__(config=config)
         # megatron layer_number is 1-indexed; convert to 0-indexed
         self.layer_idx = layer_number - 1
@@ -289,6 +354,12 @@ class LightningCoreAttention(MegatronModule):
         self.register_buffer("g_gamma", g_gamma, persistent=False)
 
     def forward(self, query, key, value, cu_seqlens=None, cp_rank=None):
+        # [FUNCTION DOC]
+        # Imports fla's chunk_simple_gla lazily (raises ImportError with install hint if
+        # missing). Permutes Q/K/V from [S, B, H, D] to [B, S, H, D]; if cp_rank is
+        # given, slices g_gamma to that CP rank's head chunk (H_local / CP heads). Calls
+        # the kernel with g_gamma, scale and optional cu_seqlens (packed varlen) and
+        # returns the output permuted back to [S, B, H, D].
         """Forward pass for Lightning Attention core computation.
 
         Args:
@@ -343,6 +414,12 @@ class LightningCoreAttention(MegatronModule):
 
 
 class GroupRMSNorm(nn.Module):
+    # [CLASS DOC]
+    # RMSNorm applied independently to groups of heads: input [..., num_heads, head_dim]
+    # is split into num_groups groups of num_heads/num_groups heads, each normalised by
+    # the RMS over all its elements (computed in float32), then multiplied by a
+    # learnable weight of size num_heads*head_dim (initialised to ones). Under TP
+    # num_heads is the local count.
     """Group RMSNorm applied per group of heads.
 
     Used for gate normalization in Lightning Attention.
@@ -354,6 +431,10 @@ class GroupRMSNorm(nn.Module):
     def __init__(
         self, num_heads: int, head_dim: int, num_groups: int, eps: float = 1e-6
     ):
+        # [FUNCTION DOC]
+        # Stores sizes and eps (default 1e-6), group_size = num_heads // num_groups, and
+        # creates the weight parameter of ones. Assumes num_heads divisible by
+        # num_groups.
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -363,6 +444,10 @@ class GroupRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(num_heads * head_dim))
 
     def forward(self, x):
+        # [FUNCTION DOC]
+        # Normalises x [..., num_heads, head_dim] per head group as described, casts
+        # back to the input dtype and multiplies by weight reshaped to [num_heads,
+        # head_dim]. Returns a tensor of the same shape.
         """Apply group RMSNorm.
 
         Args:
@@ -385,6 +470,13 @@ class GroupRMSNorm(nn.Module):
         return x * weight
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        # [FUNCTION DOC]
+        # Megatron distributed-checkpoint hook: returns sharded tensors for this
+        # module's state with the weight declared TP-sharded along axis 0 (so the global
+        # tensor is num_heads_global*head_dim), using
+        # make_sharded_tensors_for_checkpoint with the given prefix and sharded_offsets.
+        # metadata is ignored. Prevents the default path from treating the weight as
+        # replicated and losing other ranks' shards.
         """TP-shard the gate-norm weight for distributed checkpointing.
 
         ``weight`` holds the LOCAL slice (``num_heads_local * head_dim``) and is
@@ -409,6 +501,17 @@ class GroupRMSNorm(nn.Module):
 
 
 class LightningSelfAttention(MegatronModule):
+    # [CLASS DOC]
+    # Megatron self-attention module for Lightning layers. Pipeline per layer: fused QKV
+    # projection (per-head interleaved [q, k, v], no GQA), per-head Q/K RMSNorm, gate
+    # projection, optional CP all-to-all with zigzag undo, partial RoPE on the first
+    # rotary_dim = attn_head_dim * partial_rotary_factor dims, core linear attention, CP
+    # redo/all-to-all back, grouped RMSNorm of the attention output, multiplication by
+    # sigmoid(gate), and row-parallel output projection. Uses a copied config with
+    # multi_latent_attention and rope fusion disabled for RoPE application.
+    # KNOWN ISSUE: the class docstring describes the gate as sigmoid(g_norm(g_proj(x)))
+    # * attention_output, but the code applies g_norm to the attention output and
+    # multiplies by sigmoid(g_proj(x)).
     """Lightning Self-Attention layer compatible with megatron-core TransformerLayer.
 
     Architecture:
@@ -451,6 +554,17 @@ class LightningSelfAttention(MegatronModule):
         linear_attn_norm_group_size: int = 1,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Builds submodules: linear_qkv (hidden -> 3*H*attn_head_dim, no output gather),
+        # linear_gate (hidden -> H*attn_head_dim), LightningCoreAttention, linear_proj
+        # (H*attn_head_dim -> hidden, input parallel, bias returned separately), q/k
+        # nn.RMSNorm(attn_head_dim, eps=config.layernorm_epsilon), and gate_norm
+        # GroupRMSNorm over local heads with max(linear_attn_norm_group_size // TP, 1)
+        # groups (weight marked tensor_model_parallel along dim 0). Bias for projections
+        # follows config.add_bias_linear. Creates a Megatron RotaryEmbedding over
+        # rotary_dim with base config.rotary_base (default 600000); on failure logs a
+        # warning and falls back to externally passed embeddings. attn_mask_type and
+        # extra kwargs are ignored.
         super().__init__(config=config)
         self.config = config
         # HACK: Lightning Attention needs multi_latent_attention=False for correct RoPE.
@@ -572,6 +686,12 @@ class LightningSelfAttention(MegatronModule):
             self.lightning_rotary_emb = None
 
     def _apply_rope(self, query, key, seq_len, rotary_pos_emb=None):
+        # [FUNCTION DOC]
+        # HELPER: Applies RoPE to query and key. Prefers the module's own rotary
+        # embedding for seq_len positions (packed_seq=True to suppress CP auto-slicing,
+        # since CP is handled explicitly); otherwise uses the passed rotary_pos_emb
+        # (single or (q, k) tuple); if neither exists returns inputs unchanged. Uses the
+        # non-MLA rope config. Returns (query, key).
         """Apply RoPE to query and key tensors."""
         if self.lightning_rotary_emb is not None:
             # packed_seq=True prevents RotaryEmbedding from auto-slicing by CP rank.
@@ -599,6 +719,21 @@ class LightningSelfAttention(MegatronModule):
         packed_seq_params=None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Input hidden_states [S_local, B, hidden] (sequence-parallel shard when TP>1;
+        # the column parallel linear gathers it). Takes cu_seqlens from
+        # packed_seq_params.cu_seqlens_q if provided. Projects QKV and splits into
+        # per-head Q/K/V [S, B, H_local, D], applies Q/K norms, projects the gate. If CP
+        # > 1: all-to-alls Q/K/V to head-parallel full sequence, undoes zigzag order,
+        # applies RoPE, runs core attention with cu_seqlens and this CP rank's g_gamma
+        # slice, redoes zigzag and all-to-alls back. Otherwise applies RoPE and core
+        # attention directly. Then gate_norm, multiply by sigmoid(gate), flatten heads
+        # and apply linear_proj. Returns (output [S_local, B, hidden], output_bias).
+        # attention_mask, key_value_states and inference_params are ignored.
+        # KNOWN ISSUE: the docstring says the bias is always None, but the output
+        # projection's bias is returned (non-None when add_bias_linear is set). RoPE
+        # positions run over the whole packed buffer rather than restarting at each
+        # sequence in cu_seqlens.
         """Forward pass for Lightning Self-Attention.
 
         Args:

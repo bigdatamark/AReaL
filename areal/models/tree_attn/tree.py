@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Tree-based sequence packing for tree training. Sequences of a batch (unpadded via
+# attention_mask) are greedily inserted into token tries bounded by max_tokens_per_mb;
+# each trie is compressed (linear chains merged) into TrieNode objects whose tokens
+# occupy contiguous positions of a flat packed buffer, so shared prefixes are computed
+# once. Provides packing into a MicroBatchList (input_ids, tree position_ids, trie,
+# packed extra data), DP synchronization of the number of trees via dummy tries, and
+# builders for the attention structures (dense bool mask where token i attends to j iff
+# j is an ancestor-or-self on the same sequence path, flex BlockMask, Triton
+# parent-array data, and a backend-selecting kwargs builder).
 # SPDX-License-Identifier: Apache-2.0
 
 """Tree-based sequence packing for efficient training with shared prefixes.
@@ -39,6 +49,13 @@ logger = logging.getLogger("TreeAttentionCore")
 
 @dataclass
 class TrieNode:
+    # [CLASS DOC]
+    # Dataclass for a compressed trie node. A node holds a contiguous run of tokens at
+    # inclusive flat positions [start_idx, end_idx] shared by the same set of
+    # sequence_ids; children are keyed by their first token; ancestors lists nodes from
+    # the top-level node down to the parent. Root nodes have start/end -1, no tokens,
+    # and keep in nodes every descendant in pre-order (which is also flat-position
+    # order).
     """A node in a compressed trie (prefix tree) for token sequences.
 
     Each node represents a contiguous run of tokens that share the same set of
@@ -78,11 +95,16 @@ class TrieNode:
 
     @property
     def is_root(self) -> bool:
+        # [FUNCTION DOC]
+        # True when start_idx and end_idx are both -1.
         """Check if this is a root node."""
         return self.start_idx == -1 and self.end_idx == -1
 
     @property
     def num_tokens(self) -> int:
+        # [FUNCTION DOC]
+        # Number of tokens in this node; for a root, the total over all descendant
+        # nodes.
         """Number of tokens stored in this node (or total for root)."""
         if self.is_root:
             return sum(node.num_tokens for node in self.nodes)
@@ -90,11 +112,16 @@ class TrieNode:
 
     @property
     def tree_indices(self) -> tuple[int, int]:
+        # [FUNCTION DOC]
+        # Returns the (start_idx, end_idx) pair.
         """Return (start_idx, end_idx) tuple for this node's position in tree."""
         return (self.start_idx, self.end_idx)
 
     @property
     def all_sequence_ids(self) -> list[int]:
+        # [FUNCTION DOC]
+        # Sorted unique sequence ids: for a root, the union over all descendant nodes;
+        # otherwise those of this node. Recomputed on each access (O(nodes)).
         """Get sorted list of all sequence IDs in this tree (for root nodes)."""
         if self.is_root:
             seq_ids: set[int] = set()
@@ -104,6 +131,9 @@ class TrieNode:
         return sorted(set(self.sequence_ids))
 
     def get_all_tree_indices(self) -> list[tuple[int, int]]:
+        # [FUNCTION DOC]
+        # Returns the tree index ranges of all ancestors (top-down) followed by this
+        # node's own range (omitted for a root).
         """Get tree indices for this node and all ancestors."""
         indices = [ancestor.tree_indices for ancestor in self.ancestors]
         if not self.is_root:
@@ -111,6 +141,10 @@ class TrieNode:
         return indices
 
     def get_sequence_tree_indices(self, seq_id: int) -> list[tuple[int, int]]:
+        # [FUNCTION DOC]
+        # Root-only helper returning, in pre-order (flat position order), the (start,
+        # end) ranges of all nodes whose sequence_ids include seq_id; this is the
+        # sequence's path. Linear in the number of nodes and their id lists.
         """Get all tree index ranges for a given sequence ID (for root nodes)."""
         indices = []
         for node in self.nodes:
@@ -125,11 +159,17 @@ class TrieNode:
 
 
 class _BuildNode:
+    # [CLASS DOC]
+    # HELPER: Uncompressed per-token trie node used during construction (slots class).
+    # Holds tree_id, token_id, node_id (insertion-order index = flat position), children
+    # by token, is_end flag and the list of sequence ids passing through it.
     """Temporary node structure used during trie construction."""
 
     __slots__ = ("tree_id", "token_id", "node_id", "children", "is_end", "sequence_ids")
 
     def __init__(self, tree_id: int, token_id: int, node_id: int):
+        # [FUNCTION DOC]
+        # Initializes fields with no children, is_end False and empty sequence id list.
         self.tree_id = tree_id
         self.token_id = token_id
         self.node_id = node_id
@@ -139,6 +179,10 @@ class _BuildNode:
 
 
 def _count_additional_nodes(root: _BuildNode, sequence: list[int]) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Walks sequence down from root along existing children and returns the
+    # number of tokens that would need new nodes (length of the unmatched suffix; 0 if
+    # fully present).
     """Count how many new nodes are needed to insert sequence into root."""
     current = root
     for idx, token in enumerate(sequence):
@@ -156,6 +200,11 @@ def _insert_sequence(
     tree_id: int,
     sequence_id: int,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Inserts sequence under root, creating missing child nodes with node_id
+    # equal to the current length of all_nodes (appending them), appending sequence_id
+    # to every node on the path and marking the last node is_end. Mutates the trie in
+    # place.
     """Insert a sequence into the trie, mutating it in-place."""
     current = root
     for token in sequence:
@@ -170,6 +219,11 @@ def _insert_sequence(
 
 @trace_perf("tree_attn._compress_trie")
 def _compress_trie(root: _BuildNode) -> TrieNode:
+    # [FUNCTION DOC]
+    # HELPER: Converts an uncompressed build trie into a compressed TrieNode tree.
+    # Returns a root TrieNode (tree_id from the build root) whose children are
+    # compressed chains for each first token (in sorted token order) and whose nodes
+    # list collects all created nodes in pre-order.
     """Compress a trie by merging linear chains into single TrieNodes."""
     trie_root = TrieNode(tree_id=root.tree_id)
 
@@ -177,6 +231,14 @@ def _compress_trie(root: _BuildNode) -> TrieNode:
         node: _BuildNode,
         ancestors: list[TrieNode],
     ) -> TrieNode:
+        # [FUNCTION DOC]
+        # HELPER: Starting at node, follows single-child chains that are not sequence
+        # ends, collecting tokens; raises ValueError if sequence ids differ along the
+        # chain or node ids are not consecutive (which would break contiguous flat
+        # positions). Creates a TrieNode spanning [first node_id, last node_id] with the
+        # last node's sequence ids and a copy of ancestors, appends it to the root's
+        # nodes list, recursively compresses children (sorted by token) with this node
+        # added to ancestors, and returns it.
         """Compress a chain of nodes with single children into one TrieNode."""
         tokens: list[int] = []
         current = node
@@ -229,6 +291,11 @@ def _compress_trie(root: _BuildNode) -> TrieNode:
 
 
 def trie_to_parent_array(trie: TrieNode, max_tokens: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Builds a parent array of shape [1, max_tokens] (int32, CPU, default -1). For each
+    # node, its first token's parent is the end position of its parent node (-1 for
+    # top-level nodes) and each subsequent token's parent is the previous position.
+    # Positions >= max_tokens are skipped. Returns the array (all -1 for an empty trie).
     """Build a parent array from TrieNode structure.
 
     The parent array `fa` is a 1D tensor where `fa[i]` is the index of the
@@ -277,6 +344,23 @@ def build_packed_tree_batch(
     dp_group: dist.ProcessGroup | None = None,
     parallel_size: int = 1,
 ) -> MicroBatchList:
+    # [FUNCTION DOC]
+    # Packs a padded batch (data with input_ids and attention_mask [B, S], plus optional
+    # extra tensors) into tree microbatches. Warns if mb_spec.n_mbs, granularity or
+    # n_mbs_divisor are non-default (ignored). Raises ValueError if max_tokens_per_mb is
+    # missing/non-positive, if pad_to_maximum is False, or if max_tokens_per_mb is not a
+    # multiple of lcm(BLOCK_SIZE, parallel_size). Builds tries greedily (ValueError if a
+    # sequence exceeds the limit). If torch.distributed is initialized, all-gathers the
+    # tree count over dp_group (default world) and appends empty dummy tries so all
+    # ranks have the same number. Records tree_token_ratio (tree tokens / original
+    # tokens) in stats_tracker. For each trie: packs input_ids to [1, padded_size],
+    # computes position ids from a temporary dense mask (then frees it), and packs extra
+    # data. Returns a MicroBatchList with mbs == padded_mbs (dicts with input_ids,
+    # position_ids, trie_node and extra keys), group_lens = tree token counts, padding
+    # lengths and padded_to_lengths of max_tokens_per_mb. Attention masks are built
+    # lazily later.
+    # KNOWN ISSUE: pad_to_maximum is required to be True, so the non-padded branch
+    # (padded_size = num_tokens) is dead code.
     """Build a MicroBatchList from input data using greedy trie packing.
 
     This function constructs tries from input sequences using a greedy packing
@@ -478,6 +562,12 @@ def _greedy_build_tries(
     data: dict[str, Any],
     max_tokens_per_tree: int,
 ) -> tuple[list[TrieNode], list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: First-fit greedy packing. For each sequence (in batch order, seq_id = row
+    # index), inserts it into the first existing tree where current nodes + new nodes
+    # needed <= max_tokens_per_tree; otherwise starts a new tree (ValueError if the
+    # sequence alone exceeds the limit). Returns (compressed tries, per-tree token
+    # counts).
     """Build tries using greedy packing strategy."""
     sequences = _extract_sequences(data)
     forests: list[dict[str, Any]] = []
@@ -524,6 +614,9 @@ def _greedy_build_tries(
 
 
 def _extract_sequences(data: dict[str, Any]) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: Asserts input_ids and attention_mask exist and returns, per row, the list
+    # of token ids where the mask is nonzero (Python lists; host sync).
     """Extract token sequences from padded input data."""
     assert "input_ids" in data, "Input data must contain 'input_ids'"
     assert "attention_mask" in data, "Input data must contain 'attention_mask'"
@@ -543,6 +636,11 @@ def _pack_input_ids(
     input_template: torch.Tensor,
     max_tokens: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Creates a zero tensor of length max_tokens (dtype/device of
+    # input_template) and for each trie node copies the node's tokens from the first
+    # owning sequence's row at offset = total tokens of ancestors into the node's flat
+    # range. Returns shape [1, max_tokens].
     """Pack input_ids from trie structure into a flat tensor."""
     input_ids = torch.zeros(
         (max_tokens,),
@@ -574,6 +672,11 @@ def _build_attention_mask(
     max_tokens: int,
     device: torch.device,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Builds a dense [max_tokens, max_tokens] bool mask on device. For each
+    # sequence, concatenates the flat positions of its path and sets causal
+    # (lower-triangular) entries among those positions blockwise. Padding rows remain
+    # all False.
     """Build 2D attention mask from trie structure.
 
     Uses blockwise processing for large sequences to limit memory usage.
@@ -614,6 +717,11 @@ def _apply_causal_mask_blockwise(
     seq_len: int,
     device: torch.device,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Sets mask[positions[r], positions[c]] = True for all 0 <= c <= r <
+    # seq_len, processing the lower triangle in tiles of _ATTN_MASK_BLOCK_SIZE (2048):
+    # diagonal tiles via tril indices, below-diagonal tiles via broadcast index grids,
+    # to bound temporary memory. Mutates mask in place; returns None.
     """Apply causal mask entries blockwise to limit memory usage.
 
     Instead of creating one huge tril_indices(seq_len, seq_len), we process
@@ -679,6 +787,12 @@ def _pack_extra_data(
     packable_keys: set[str],
     non_packable_keys: set[str],
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: For each packable key (tensors shaped like input_ids), concatenates each
+    # sequence's first sequence_lens[sid] entries in trie.all_sequence_ids order into a
+    # 1D (plus trailing dims) tensor; note this is sequence-concatenated layout, not
+    # tree layout. Non-packable keys are copied by reference. Returns the dict. Uses
+    # .item().
     """Pack additional tensor data according to trie structure."""
     extra_data: dict[str, Any] = {}
     seq_ids = trie.all_sequence_ids
@@ -709,6 +823,11 @@ def get_packed_tree_position_ids(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Computes position ids for a packed tree: squeezes input_ids to 1D and validates
+    # that attention_mask is square and matches its length (ValueError otherwise).
+    # Position of each token = (number of attended positions in its mask row) - 1,
+    # clamped at 0 (so padding gets 0). Returns shape [1, T] long tensor.
     """Generate position IDs for packed tree inputs.
     Position IDs are computed from the attention mask by counting the number
     of ancestors each token can attend to (minus 1 for 0-indexing).
@@ -736,6 +855,10 @@ def build_block_mask_from_trie(
     padded_size: int,
     device: torch.device,
 ) -> BlockMask:
+    # [FUNCTION DOC]
+    # Builds the dense tree mask for padded_size on device and converts it to a flex
+    # attention BlockMask (dense mask then freed). For a dummy trie (no sequences)
+    # returns a BlockMask from an all-False mask.
     """Lazily build a block mask from a trie node.
 
     This function builds the dense attention mask from the trie structure and
@@ -782,6 +905,10 @@ def build_attention_mask_from_trie(
     padded_size: int,
     device: torch.device,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Returns the dense [padded_size, padded_size] bool tree mask on device (all False
+    # for a dummy trie). Used by Megatron, which needs tensor arguments for activation
+    # checkpointing.
     """Build a dense attention mask tensor from a trie node.
 
     This function builds the dense attention mask from the trie structure.
@@ -822,6 +949,14 @@ def build_triton_attn_data_from_trie(
     trie: TrieNode,
     padded_size: int,
 ) -> TreeAttentionData:
+    # [FUNCTION DOC]
+    # Returns TreeAttentionData for the Triton kernel: builds the parent array and calls
+    # precompute_tree_attention_data. For a dummy trie returns zero-filled data: packed
+    # mask [1, padded_size, ceil(padded_size/64)] int64, empty kv/q index arrays and
+    # zero offset arrays sized by 128-row query blocks and 64-column kv blocks.
+    # KNOWN ISSUE: the dummy tensors are created on CPU (no device argument) and the 128
+    # query block size is hardcoded, unlike the real path; callers must move them to the
+    # GPU.
     """Lazily build Triton tree attention data from a trie node.
 
     This function builds the parent array from the trie structure and
@@ -870,6 +1005,11 @@ def build_tree_attn_kwargs(
     *,
     dense_mask: bool = False,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Returns a kwargs dict for model forward: {"tree_triton_data": ...} when Triton
+    # tree attention is enabled and available and dense_mask is False;
+    # {"attention_mask": dense mask} when dense_mask is True (Megatron); otherwise
+    # {"tree_block_mask": BlockMask} (FSDP).
     """Build tree attention kwargs dict for HF model forwarding.
 
     Selects Triton or flex attention backend automatically.

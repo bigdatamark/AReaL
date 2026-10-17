@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Vision SP Shard: splits vision-encoder (ViT) work across Ulysses sequence-parallel
+# ranks for Qwen2-VL / Qwen2.5-VL / Qwen3-VL. Whole images are assigned contiguously to
+# SP ranks, each rank encodes only its images, and the embeddings are all-gathered so
+# every rank has the full vision embedding sequence. A custom autograd Function
+# all-reduces (sum) gradients in backward and slices out each rank's portion. Naming
+# uses "dp" for the ranks sharing vision work, which are in fact the SP group ranks.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -31,6 +38,10 @@ logger = logging.getLogger("VisionSPShard")
 
 
 def _get_image_patch_counts(grid_thw: torch.Tensor) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Given grid_thw [num_images, 3] (t, h, w patch grid per image), returns a
+    # Python list of t*h*w per image (empty list for an empty tensor). Calls tolist
+    # (host sync if on GPU).
     """Return [t*h*w for each image] from a [num_images, 3] grid_thw tensor."""
     if grid_thw.numel() == 0:
         return []
@@ -40,6 +51,10 @@ def _get_image_patch_counts(grid_thw: torch.Tensor) -> list[int]:
 def _get_image_embedding_counts(
     grid_thw: torch.Tensor, spatial_merge_size: int = 1
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Like _get_image_patch_counts but returns per-image output-embedding counts
+    # after spatial merging: t * (h // merge) * (w // merge); identical to patch counts
+    # when spatial_merge_size is 1 (default).
     """Return per-image embedding counts after spatial merging: t * (h/merge) * (w/merge)."""
     if grid_thw.numel() == 0:
         return []
@@ -57,6 +72,13 @@ def _assign_images_to_dp_ranks(
     patch_counts: list[int],
     dp_size: int,
 ) -> tuple[list[list[int]], list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: Greedy contiguous bin packing of images (in order) onto dp_size ranks. For
+    # each rank, target = remaining patches / remaining ranks; it takes images in order
+    # (at least one when allowed) until its load reaches the target, capped so that
+    # enough images remain to give each later rank one. When there are fewer images than
+    # ranks, earlier ranks get none. Returns (per-rank lists of image indices, per-rank
+    # patch loads). With zero images returns empty lists and zero loads.
     """Assign whole images to DP ranks via greedy contiguous bin-packing."""
     num_images = len(patch_counts)
     if num_images == 0:
@@ -103,6 +125,13 @@ def _prepare_local_vision_inputs(
     image_assignments: list[list[int]],
     dp_rank: int,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: Selects this rank's slice of the flattened patch tensor pixel_values (rows
+    # are patches of all images concatenated) and grid_thw rows for the rank's
+    # contiguous image indices, using cumulative patch-count offsets. Returns
+    # (local_pixel_values, local_grid_thw, local_indices); for a rank with no images
+    # returns empty tensors of matching trailing dim/dtype/device and an empty list.
+    # Relies on assignments being contiguous; uses .item().
     """Extract pixel values and grid_thw for this DP rank's assigned images."""
     local_indices = image_assignments[dp_rank]
 
@@ -143,6 +172,12 @@ def _prepare_local_vision_inputs(
 
 
 class GatherVisionEmbeddings(Function):
+    # [CLASS DOC]
+    # Autograd Function performing a variable-length all-gather of vision embeddings
+    # over a process group. Forward pads each rank's [n_r, hidden] embeddings to the max
+    # count, all-gathers, strips padding and concatenates in rank order. Backward sums
+    # the incoming gradient across ranks (each rank only has gradient for vision tokens
+    # in its own sequence shard) and returns this rank's contiguous slice.
     """All-gather vision embeddings across DP ranks with gradient support.
 
     Forward: all_gather + remove padding + concat.
@@ -156,6 +191,15 @@ class GatherVisionEmbeddings(Function):
         dp_group,
         all_counts: list[int],
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Saves group size/rank, group and all_counts (list of embedding counts per
+        # rank, in rank order) on ctx. Returns the input unchanged when the group has
+        # one rank or all counts are zero. Otherwise zero-pads local_embeddings to
+        # max(all_counts) rows (hidden size from dim 1, or 1 for 1D input), all-gathers
+        # padded tensors over dp_group, trims each to its count and concatenates.
+        # Returns [sum(all_counts), hidden]. Collective call.
+        # KNOWN ISSUE: 1D inputs are padded with a 2D zero tensor, which would fail the
+        # concat; in practice inputs are 2D.
         dp_size = dist.get_world_size(dp_group)
         dp_rank = dist.get_rank(dp_group)
         ctx.dp_size = dp_size
@@ -197,6 +241,14 @@ class GatherVisionEmbeddings(Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC]
+        # Returns grad unchanged for a single-rank group. Otherwise all-reduces (SUM, in
+        # place on a contiguous copy/view) grad_output over the group and returns the
+        # slice [sum(counts before rank), +count of rank) as the gradient for
+        # local_embeddings, plus None for the group and counts arguments. Collective
+        # call.
+        # KNOWN ISSUE: forward returns early when all counts are zero but backward still
+        # performs the all_reduce and slicing; consistent across ranks, so harmless.
         dp_size = ctx.dp_size
 
         if dp_size == 1:
@@ -225,6 +277,9 @@ def _gather_vision_embeddings(
     dp_group,
     all_counts: list[int],
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns local_embeddings unchanged if dp_group is None or has world size
+    # 1; otherwise applies GatherVisionEmbeddings (autograd-aware gather).
     """All-gather vision embeddings from all DP ranks with gradient support."""
     if dp_group is None or dist.get_world_size(dp_group) == 1:
         return local_embeddings
@@ -237,6 +292,13 @@ def _unpack_deepstack(
     local_embeddings: torch.Tensor | tuple,
     hidden_states: torch.Tensor,
 ) -> tuple[torch.Tensor, list[torch.Tensor]] | None:
+    # [FUNCTION DOC]
+    # HELPER: For Qwen3-VL style models (having deepstack_merger_list) splits the vision
+    # forward output into (main embeddings, list of deepstack embeddings). If the output
+    # is a tuple, returns its first two elements; if it is a plain tensor (rank with no
+    # images), returns it together with one empty [0, hidden] requires-grad tensor per
+    # deepstack merger (dtype/device from hidden_states). Returns None for models
+    # without deepstack.
     """Unpack Qwen3-VL deepstack from forward output, or return None."""
     if not hasattr(model, "deepstack_merger_list"):
         return None
@@ -257,6 +319,9 @@ def _unpack_deepstack(
 
 
 def create_dp_vision_forward(original_forward):
+    # [FUNCTION DOC]
+    # Factory wrapping a vision transformer's original forward(self, hidden_states,
+    # grid_thw, **kwargs) into an SP-sharded forward. Returns the wrapper function.
     """Wrap VisionTransformer.forward for Vision SP Shard (shard across SP ranks).
 
     Strategy:
@@ -277,6 +342,19 @@ def create_dp_vision_forward(original_forward):
         grid_thw: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Sharded vision forward. Falls back to original forward when Ulysses SP size <=
+        # 1. Otherwise copies grid_thw to CPU, computes per-image patch counts
+        # (asserting they sum to hidden_states rows) and post-merge embedding counts
+        # (self.spatial_merge_size, default 1), assigns images to SP ranks, extracts
+        # this rank's patches and grid (grid moved back to the original device) and runs
+        # original forward on them. A rank with no images creates an empty [0, hidden]
+        # requires-grad tensor, hidden from config out_hidden_size or hidden_size
+        # (RuntimeError if neither exists). Unpacks deepstack outputs if present,
+        # computes every rank's embedding count locally, all-gathers main embeddings
+        # (asserting the total equals expected) and each deepstack tensor. Returns the
+        # full embeddings, or (embeddings, list of deepstack embeddings) for deepstack
+        # models. All SP ranks must call it together (collectives).
         sp_group = get_ulysses_sequence_parallel_group()
         sp_size = get_ulysses_sequence_parallel_world_size(sp_group)
         sp_rank = get_ulysses_sequence_parallel_rank(sp_group)
@@ -374,6 +452,10 @@ def create_dp_vision_forward(original_forward):
 
 
 def _patch_vision_class(cls, class_name: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Replaces cls.forward with the SP-sharded wrapper unless the class is
+    # already marked _vision_sp_shard_patched; sets the marker and logs INFO.
+    # Class-level mutation.
     """Patch a single VisionTransformer class for Vision SP Shard, with idempotency guard."""
     if getattr(cls, "_vision_sp_shard_patched", False):
         return
@@ -402,6 +484,11 @@ _VISION_CLASSES = [
 
 
 def apply_vision_sp_shard_patch():
+    # [FUNCTION DOC]
+    # Imports each registered HF vision transformer class (Qwen2-VL, Qwen2.5-VL,
+    # Qwen3-VL) and patches its forward idempotently, silently skipping classes that
+    # fail to import or are missing. Logs a warning if none were patched. Returns None;
+    # process-global side effect.
     """Apply Vision SP Shard monkey patch to supported VisionTransformer classes.
 
     Patches the class-level forward method. Works whether called before or

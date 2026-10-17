@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Pre-commit hook script that ensures every given Python file contains the SPDX
+# Apache-2.0 license header, inserting it (after a shebang line if present, followed by
+# a blank line) when missing. Exits 1 if any file was changed, else 0.
 # SPDX-License-Identifier: Apache-2.0
 
 """Pre-commit hook that ensures every Python file under areal/ contains the
@@ -19,6 +23,9 @@ SHEBANG_PREFIX = "#!"
 
 
 def needs_header(path: Path) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if the file's UTF-8 text does not contain the SPDX header
+    # string anywhere. Returns False if the file cannot be read.
     """Return True if *path* does not contain the SPDX header."""
     try:
         text = path.read_text(encoding="utf-8")
@@ -28,6 +35,10 @@ def needs_header(path: Path) -> bool:
 
 
 def fix_file(path: Path) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Rewrites the file in place inserting the header as line 1, or as line 2
+    # when line 1 is a shebang, and ensures an empty line follows the header. Reads and
+    # writes UTF-8; may raise on I/O errors.
     """Insert the SPDX header into *path*, respecting shebangs."""
     text = path.read_text(encoding="utf-8")
     lines = text.split("\n")
@@ -45,6 +56,12 @@ def fix_file(path: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # [FUNCTION DOC]
+    # Iterates file paths (argv, or sys.argv[1:] when argv is None/empty), skipping
+    # non-.py files, fixing those that need the header. Prints a summary of fixed files
+    # to stdout and returns 1 if any were fixed, else 0.
+    # KNOWN ISSUE: an explicitly passed empty list falls back to sys.argv[1:] because
+    # the check is on truthiness rather than None.
     files = argv if argv else sys.argv[1:]
     fixed: list[str] = []
 

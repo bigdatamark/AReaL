@@ -1,3 +1,10 @@
+# [PACKAGE DOC]
+# Reward package. Provides MathVerifyWorker (a thread-safe, timeout-guarded wrapper over
+# the math_verify library for comparing a model answer to ground truth), a lazily-
+# created process-wide singleton accessor, and lazy (PEP 562 module __getattr__) exports
+# of the dataset reward functions gsm8k_reward_fn, geometry3k_reward_fn and
+# clevr_count_70k_reward_fn so importing the package does not import every reward
+# module.
 # SPDX-License-Identifier: Apache-2.0
 
 import concurrent.futures
@@ -11,6 +18,11 @@ logger = logging.getLogger("RewardUtils")
 
 
 class MathVerifyWorker:
+    # [CLASS DOC]
+    # Holds gold and prediction extraction configs (both: ExprExtractionConfig with the
+    # configured anchor setting plus LatexExtractionConfig), the float rounding
+    # precision and the per-call timeout. verify() returns 1.0 for a match and 0.0
+    # otherwise, never raising.
     """Thin wrapper over math_verify with configurable extraction/precision.
 
     Uses ``parse()`` + ``verify()`` directly instead of ``math_metric()``
@@ -37,6 +49,10 @@ class MathVerifyWorker:
         precision: int = 6,
         timeout: float | None = 5.0,
     ):
+        # [FUNCTION DOC]
+        # Stores extraction targets built from try_extract_without_anchor (default
+        # True), precision (significant digits used as float_rounding, default 6) and
+        # timeout (seconds, default 5.0; None disables the timeout). No side effects.
         self.gold_extraction_target = (
             ExprExtractionConfig(try_extract_without_anchor=try_extract_without_anchor),
             LatexExtractionConfig(),
@@ -49,6 +65,11 @@ class MathVerifyWorker:
         self.timeout = timeout
 
     def _verify_impl(self, response: str, ground_truth: str) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Parses ground_truth and response with math_verify.parse (no signal
+        # timeouts), returns 0.0 if either parse is empty, else 1.0 if
+        # math_verify.verify judges them equivalent with float rounding = precision,
+        # otherwise 0.0. May raise on library errors.
         """Core verification logic without timeout wrapper."""
         gold_parsed = parse(
             ground_truth,
@@ -71,6 +92,14 @@ class MathVerifyWorker:
         return 1.0 if result else 0.0
 
     def verify(self, response: str, ground_truth: str) -> float:
+        # [FUNCTION DOC]
+        # Public verification entry point. If timeout is None runs _verify_impl
+        # directly; otherwise runs it in a single-worker ThreadPoolExecutor and waits up
+        # to timeout seconds. On timeout or any exception logs a warning and returns
+        # 0.0.
+        # KNOWN ISSUE: on timeout the executor context manager's exit waits for the
+        # worker thread to finish (shutdown(wait=True)), so a hung verification still
+        # blocks the caller beyond the timeout.
         try:
             if self.timeout is None:
                 return self._verify_impl(response, ground_truth)
@@ -95,6 +124,10 @@ _MATH_VERIFY_WORKER: MathVerifyWorker | None = None
 
 
 def get_math_verify_worker() -> MathVerifyWorker:
+    # [FUNCTION DOC]
+    # Returns the module-global MathVerifyWorker singleton, creating it with default
+    # settings on first call (not lock-protected; concurrent first calls may create
+    # duplicates, which is harmless).
     global _MATH_VERIFY_WORKER
     if _MATH_VERIFY_WORKER is None:
         _MATH_VERIFY_WORKER = MathVerifyWorker()
@@ -118,6 +151,10 @@ _LAZY_IMPORTS = {
 
 
 def __getattr__(name: str):
+    # [FUNCTION DOC]
+    # Module-level lazy attribute hook. For names in the lazy-import table, imports the
+    # backing module, fetches the attribute, caches it in module globals and returns it.
+    # Raises AttributeError for any other name.
     if name in _LAZY_IMPORTS:
         import importlib
 
@@ -129,4 +166,6 @@ def __getattr__(name: str):
 
 
 def __dir__():
+    # [FUNCTION DOC]
+    # Returns the list of public names (__all__) for dir() on the package.
     return list(__all__)

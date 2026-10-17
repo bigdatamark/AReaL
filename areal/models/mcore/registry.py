@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Megatron-Core model registry/factory used by the Megatron engine. Builds the (HF
+# config, mcore TransformerConfig) pair and the mcore model chunks for a HF checkpoint,
+# either through a bridge (mbridge or NVIDIA Megatron-Bridge) or via AReaL's own
+# converters for Qwen3 dense and BailingMoe architectures. Also post-processes the
+# output layer: a scalar ValueHead for critics, or for actors either AReaL's chunked
+# vocab-parallel LM head or an in-place fp32 LM-head forward patch.
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
@@ -33,6 +40,11 @@ logger = logging.getLogger("MCoreRegistry")
 
 
 class ValueHead(torch.nn.Linear):
+    # [CLASS DOC]
+    # Linear layer (hidden -> output_size, default 1) used as critic value head in place
+    # of the LM output layer. Weight initialised N(0, 0.02), optional bias zeroed. With
+    # sequence parallelism the weight is marked sequence_parallel (so grads are
+    # all-reduced across TP) and outputs are gathered along the sequence dim.
     def __init__(
         self,
         input_size: int,
@@ -41,6 +53,10 @@ class ValueHead(torch.nn.Linear):
         config: TransformerConfig,
         bias: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Creates the linear layer with the given sizes and bias flag, records
+        # config.sequence_parallel, marks the weight sequence_parallel when enabled, and
+        # initialises parameters in place.
         super().__init__(in_features=input_size, out_features=output_size, bias=bias)
         self.sequence_parallel = config.sequence_parallel
         if self.sequence_parallel:
@@ -56,6 +72,12 @@ class ValueHead(torch.nn.Linear):
         weight: torch.Tensor | None = None,
         runtime_gather_output: bool | None = None,
     ) -> tuple[torch.Tensor, None]:
+        # [FUNCTION DOC]
+        # Applies the linear layer, casts to float32, all-gathers from the
+        # sequence-parallel region if SP is enabled (no gradient reduce-scatter on
+        # output grad), and returns (values, None) to mimic ColumnParallelLinear. weight
+        # and runtime_gather_output are accepted for interface compatibility and
+        # ignored.
         logits = super().forward(input_)
         logits = logits.float()
         if self.sequence_parallel:
@@ -69,6 +91,11 @@ def _replace_output_layer_with_value_head(
     model: GPTModel,
     tf_config: TransformerConfig,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Replaces model.output_layer with a ValueHead(hidden_size -> 1) cast to
+    # tf_config.params_dtype and sets model.vocab_size to 1. Raises ValueError if the
+    # model has no output_layer (e.g. non-post-process pipeline stage). Mutates the
+    # model.
     """Replace model's output_layer with ValueHead.
 
     This function can be used on any GPTModel instance, whether created
@@ -98,12 +125,20 @@ def _replace_output_layer_with_value_head(
 
 
 def _is_lm_head_module_name(name: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if a module name is "output_layer"/"lm_head" or ends with
+    # ".output_layer"/".lm_head".
     return name in ("output_layer", "lm_head") or name.endswith(
         (".output_layer", ".lm_head")
     )
 
 
 def _call_with_optional_group(fn, tensor: torch.Tensor, group: Any | None):
+    # [FUNCTION DOC]
+    # HELPER: Calls fn(tensor, group=group), falling back to fn(tensor) if a TypeError
+    # is raised (older megatron-core signatures without group).
+    # KNOWN ISSUE: any TypeError raised inside fn itself is also swallowed and triggers
+    # a second call without the group.
     try:
         return fn(tensor, group=group)
     except TypeError:
@@ -119,6 +154,12 @@ def _fp32_lm_head_forward_impl(
     tp_group: Any | None = None,
     **_: Any,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Replacement for ColumnParallelLinear._forward_impl (keyword-only). If
+    # sequence_parallel, all-gathers input along the sequence dim from the TP region
+    # (with reduce-scatter in backward), passing tp_group when supported. Computes input
+    # @ weight^T in float32 and adds float32 bias if given. Returns fp32 logits (local
+    # vocab shard). Extra kwargs are ignored.
     """Run the lm-head projection in fp32.
 
     A bf16 head keeps the ``[tokens, vocab]`` logits and their gradient in bf16,
@@ -167,6 +208,16 @@ def _fp32_lm_head_forward(
     runtime_gather_output: bool | None = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Replacement forward bound to an LM-head module lacking _forward_impl,
+    # mirroring ColumnParallelLinear.forward. Uses the supplied weight or self.weight
+    # (RuntimeError if neither). Determines bias (added in the matmul unless
+    # skip_bias_add) and tp_group. If none of async allreduce / sequence_parallel /
+    # explicit_expert_comm is set, wraps input with copy_to_tensor_model_parallel_region
+    # (identity forward, all-reduce in backward). Runs the fp32 impl, then gathers
+    # output across TP if runtime_gather_output (kwarg overrides positional) or else
+    # self.gather_output is true. Returns (output, output_bias) where output_bias is
+    # self.bias only when skip_bias_add.
     if weight is None:
         weight = self.weight
     if weight is None:
@@ -221,6 +272,16 @@ def _enable_fp32_lm_head_forward(
     *,
     enabled: bool,
 ) -> int:
+    # [FUNCTION DOC]
+    # HELPER: When enabled, walks each model chunk (unwrapping DDP via .module) for
+    # modules named output_layer/lm_head. Skips modules already fp32 (native
+    # ColumnParallelLinearFP32 or previously patched). Patches modules with
+    # _forward_impl by replacing that attribute with the fp32 impl (saving the
+    # original); otherwise, for modules with weight and forward, binds
+    # _fp32_lm_head_forward as forward (saving the original). Marks patched modules.
+    # Logs a warning listing patched modules, an info if all were already fp32, or a
+    # warning if none were found. Returns the number of patched modules (0 when
+    # disabled).
     if not enabled:
         return 0
 
@@ -281,6 +342,10 @@ def _enable_fp32_lm_head_forward(
 
 
 def unwrap_to_gpt_model(model: torch.nn.Module) -> GPTModel:
+    # [FUNCTION DOC]
+    # Unwraps nested .module wrappers (DDP, Float16Module etc.) until a GPTModel is
+    # found; for VLM wrappers returns .language_model if it is a GPTModel. Raises
+    # TypeError otherwise.
     """Unwraps a model to the underlying GPTModel instance.
 
     Handles both plain GPTModel (possibly wrapped in DDP) and VLM models
@@ -305,6 +370,10 @@ def _replace_actor_output_layers(
     enabled: bool,
     fp32_operands: bool = False,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: When enabled, replaces each chunk's GPT output layer with AReaL's
+    # vocab-parallel LM head producing fp32 output, with fp32 operands if fp32_operands.
+    # No-op otherwise.
     if not enabled:
         return
     for model in models:
@@ -320,6 +389,10 @@ def _configure_actor_output_layers(
     models: list[GPTModel | DDP],
     mcore_config: MegatronEngineConfig | None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: No-op if mcore_config is None. If enable_chunked_logits, installs the
+    # AReaL LM head (fp32 operands per enable_fp32_lm_head); otherwise applies the fp32
+    # LM-head forward patch when enable_fp32_lm_head is set.
     if mcore_config is None:
         return
     if mcore_config.enable_chunked_logits:
@@ -342,6 +415,14 @@ def make_hf_and_mcore_config(
     bridge=None,
     bridge_type: str = "mbridge",
 ) -> tuple[PretrainedConfig, TransformerConfig]:
+    # [FUNCTION DOC]
+    # Returns (hf_config, TransformerConfig). With an mbridge bridge: the bridge's
+    # hf_config (its _name_or_path set to hf_path) and bridge.config. With a
+    # megatron-bridge bridge: the HF config from bridge.hf_pretrained (or the object
+    # itself) and bridge.transformer_config. Otherwise loads the HF config with
+    # AutoConfig (trust_remote_code=True; asserts exactly one architecture) and converts
+    # it with the Qwen3-dense or BailingMoe converter using dtype; raises ValueError for
+    # other architectures. Mutates the bridge's hf_config name.
     if bridge is not None and bridge_type == "mbridge":
         hf_config = bridge.hf_config
         hf_config._name_or_path = hf_path
@@ -373,6 +454,10 @@ def make_hf_and_mcore_config(
 
 
 def make_mcore_layer_specs(hf_config: PretrainedConfig, tf_config: TransformerConfig):
+    # [FUNCTION DOC]
+    # Returns the mcore transformer layer spec (TransformerEngine-based) for the single
+    # HF architecture: Qwen3 dense or BailingMoe variants. Raises ValueError for
+    # unregistered architectures; asserts exactly one architecture.
     assert len(hf_config.architectures) == 1
     architecture = hf_config.architectures[0]
     if architecture == "Qwen3ForCausalLM":
@@ -398,6 +483,27 @@ def make_mcore_model(
     is_critic: bool = False,
     use_lora: bool = False,
 ) -> list[GPTModel | DDP]:
+    # [FUNCTION DOC]
+    # Builds the model chunks (list of GPTModel or DDP-wrapped models). mbridge path:
+    # bridge.get_model with DDP/FSDP/precision options from mcore_config, then critic
+    # value head replacement or actor output-layer configuration. megatron-bridge path:
+    # creates a provider (no weight loading), sets TP/PP/VPP (VPP only if > 1)/CP/EP/ETP
+    # sizes from Megatron parallel state, sequence parallel when TP > 1, pipeline dtype,
+    # recompute settings, disables embedding/loss pipeline-split accounting, enforces
+    # enable_mtp (ValueError if requested but missing; otherwise drops MTP layers with a
+    # warning), disables gradient accumulation fusion for LoRA, forces
+    # variable_seq_lengths, alltoall MoE dispatcher (warning that the configured value
+    # is ignored), no batched p2p and overlap p2p only with VPP and PP > 1, mirrors
+    # these into tf_config, applies deterministic settings if configured, finalises and
+    # provides the distributed model (LoRA disables distributed optimizer and overlap
+    # options), then applies critic/actor output-layer handling. Fallback (no bridge):
+    # raises NotImplementedError for VPP > 1 or non-linear rope scaling; builds a single
+    # GPTModel (pre/post process, untied embeddings, RoPE with hf rope_theta and linear
+    # interpolation factor), applies output-layer handling and optionally wraps in DDP.
+    # Returns a list of model chunks.
+    # KNOWN ISSUE: mcore_config defaults to None but is dereferenced unconditionally in
+    # the mbridge and megatron-bridge paths and for wrap_with_ddp in the fallback path,
+    # so calling without it raises AttributeError.
     if bridge is not None and bridge_type == "mbridge":
         models = bridge.get_model(
             # TODO: Add DDP options when supporting training

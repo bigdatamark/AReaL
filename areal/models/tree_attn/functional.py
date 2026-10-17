@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Per-sequence log-probability, entropy and vocab min/max extraction for packed prefix
+# trees. In a packed tree, sequences sharing prefixes share token positions, so labels
+# cannot be obtained by rolling input_ids; instead each sequence's path through the trie
+# (a list of inclusive [start, end] position ranges, one per node) is used. Within a
+# node, position p predicts p+1; at the last position of a node, the prediction label is
+# the first position of the next node on the path. Results for shared nodes/transitions
+# are cached and reused. Supports vocab-parallel (TP-sharded) logits via
+# areal.utils.functional.vocab_parallel. Public functions are wrapped with trace_perf
+# for performance tracing.
 # SPDX-License-Identifier: Apache-2.0
 
 """Logprob and entropy computation utilities for packed tree structures.
@@ -32,6 +42,11 @@ def _compute_internal_node_logprobs(
     chunk_size: int = 1024,
     tp_group: dist.ProcessGroup | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: For a node spanning inclusive [start_idx, end_idx], returns logprobs of
+    # tokens start_idx+1..end_idx given logits at start_idx..end_idx-1 (length
+    # end_idx-start_idx) via gather_logprobs with temperature, chunk_size and optional
+    # tp_group. Returns an empty tensor (logits dtype) for a single-token node.
     """Compute logprobs for internal predictions within a single trie node.
 
     For a node spanning [start_idx, end_idx], computes logprobs for predicting
@@ -86,6 +101,10 @@ def _compute_internal_node_logprobs_entropy(
     chunk_size: int = 1024,
     tp_group: dist.ProcessGroup | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Same as _compute_internal_node_logprobs but uses gather_logprobs_entropy
+    # and returns (logprobs, entropy), each of length end_idx-start_idx (two references
+    # to the same empty tensor for single-token nodes).
     """Compute logprobs and entropy for internal predictions within a node.
 
     Parameters
@@ -135,6 +154,9 @@ def _compute_transition_logprob(
     temperature: float = 1.0,
     tp_group: dist.ProcessGroup | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns the scalar logprob of input_ids[label_pos] under logits[pred_pos]
+    # (temperature scaled, optionally vocab-parallel over tp_group).
     """Compute logprob for a single transition between nodes.
 
     Parameters
@@ -172,6 +194,9 @@ def _compute_transition_logprob_entropy(
     temperature: float = 1.0,
     tp_group: dist.ProcessGroup | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Returns scalar (logprob, entropy) for predicting input_ids[label_pos] from
+    # logits[pred_pos].
     """Compute logprob and entropy for a single transition between nodes.
 
     Parameters
@@ -211,6 +236,17 @@ def _gather_packed_tree_logprobs(
     chunk_size: int = 1024,
     tp_group: dist.ProcessGroup | None = None,
 ) -> dict[int, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: For each sequence id in trie.all_sequence_ids, gets its node ranges from
+    # trie.get_sequence_tree_indices and concatenates, per node, the internal-node
+    # logprobs followed by the transition logprob from the node's last position to the
+    # next node's first position. For the final node the transition target is position 0
+    # (a dummy wrap-around entry mirroring the rolled-label convention). Caches node
+    # results by (start, end) and transitions by (pred, label). input_ids is squeezed of
+    # a leading batch dim. Returns a dict seq_id -> 1D logprobs tensor (empty float
+    # tensor for sequences with no indices). logits is [T, vocab] or [T, vocab/tp].
+    # KNOWN ISSUE: the docstring says each tensor has seq_len - 1 entries, but the code
+    # emits seq_len entries (the last one is the dummy transition to position 0).
     """Compute log probabilities for all sequences in a packed tree.
 
     In a packed tree, multiple sequences share prefix tokens. The labels for
@@ -325,6 +361,11 @@ def _gather_packed_tree_logprobs_entropy(
     chunk_size: int = 1024,
     tp_group: dist.ProcessGroup | None = None,
 ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    # [FUNCTION DOC]
+    # HELPER: Same traversal and caching as _gather_packed_tree_logprobs, additionally
+    # collecting entropy. Returns (logprobs dict, entropy dict) keyed by sequence id.
+    # KNOWN ISSUE: like the logprob variant, tensors have seq_len entries (including the
+    # dummy final transition), not seq_len - 1 as documented.
     """Compute log probabilities and entropy for all sequences in a packed tree.
 
     Similar to gather_packed_tree_logprobs but also computes entropy.
@@ -420,6 +461,10 @@ def gather_packed_tree_logprobs(
     chunk_size: int = 1024,
     tp_group: dist.ProcessGroup | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Public API. Returns an empty float tensor for a trie without sequences; otherwise
+    # computes per-sequence logprobs and concatenates them in trie.all_sequence_ids
+    # order into one 1D tensor (each sequence contributes one entry per token).
     # Handle empty/dummy trie
     if not trie.all_sequence_ids:
         # logprobs/entropy should always be float
@@ -447,6 +492,10 @@ def gather_packed_tree_logprobs_entropy(
     chunk_size: int = 1024,
     tp_group: dist.ProcessGroup | None = None,
 ):
+    # [FUNCTION DOC]
+    # Public API. Like gather_packed_tree_logprobs but returns (logprobs, entropy)
+    # concatenated in trie.all_sequence_ids order; empty float tensors for an empty
+    # trie.
     # Handle empty/dummy trie
     if not trie.all_sequence_ids:
         # logprobs/entropy should always be float
@@ -472,6 +521,14 @@ def _gather_packed_tree_vocab_stats(
     logits: torch.Tensor,
     trie: TrieNode,
 ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    # [FUNCTION DOC]
+    # HELPER: Computes detached per-position min and max over the vocab dim of logits
+    # (as float), then for each sequence concatenates the values at its node ranges
+    # (inclusive) in path order. Returns (min dict, max dict) keyed by sequence id;
+    # empty tensors for sequences without indices. With TP-sharded logits these are
+    # per-shard statistics.
+    # KNOWN ISSUE: the docstring states length seq_len - 1, but each sequence gets
+    # seq_len entries (all node positions).
     """Compute vocab min and max logits for all sequences in a packed tree.
 
     For tree training, vocab_min_logits and vocab_max_logits need to be unpacked
@@ -527,6 +584,11 @@ def gather_packed_tree_vocab_stats(
     logits: torch.Tensor,
     trie: TrieNode,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Public API. Returns (vocab_min, vocab_max) 1D tensors concatenated in
+    # trie.all_sequence_ids order; empty float tensors for an empty trie.
+    # KNOWN ISSUE: the docstring's documented length (total_tokens - num_sequences) does
+    # not match the code, which yields total_tokens entries.
     """Compute vocab min and max logits for all sequences in a packed tree.
 
     This is the public API that returns concatenated tensors instead of
@@ -570,6 +632,13 @@ def merge_packed_tree_results(
     max_seq_len: int | None = None,
     padding_value: float = 0.0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Merges per-sequence result dicts from several microbatches into a [batch_size,
+    # max_seq_len] tensor filled with padding_value, placing each sequence at row seq_id
+    # and truncating to max_seq_len (inferred as the longest sequence when None).
+    # dtype/device come from the first tensor. Raises ValueError on a seq_id appearing
+    # in more than one dict or seq_id >= batch_size. With no results returns a CPU
+    # tensor of padding values with width max_seq_len or 0.
     """Merge per-sequence results from multiple packed trees back to batch format.
 
     After computing logprobs (or other per-sequence values) for each microbatch,

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Tree attention integration for FSDP/HuggingFace models. At import time builds a
+# torch.compile'd flex_attention (dynamic shapes unless
+# AREAL_DISABLE_FLEX_ATTENTION_DYNAMIC=1; max_autotune only when not dynamic) and logs
+# the settings. Provides dense-mask to BlockMask conversion and a patch that replaces
+# transformers' internal _flash_attention_forward with a tree-attention implementation
+# reading a pre-built BlockMask or Triton data from kwargs. The original function is
+# kept in the module global ORIGINAL_FLASH_ATTENTION_FORWARD for restoration.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -43,6 +51,11 @@ def create_block_mask_from_dense(
     seq_len: int,
     device: torch.device,
 ) -> BlockMask:
+    # [FUNCTION DOC]
+    # Converts a dense boolean attention mask [seq_len, seq_len] into a flex attention
+    # BlockMask (B=1, H=1, block size BLOCK_SIZE, mask function indexing the dense mask,
+    # built without compilation) on device. Returns the BlockMask. Intended to be called
+    # at data preparation so the dense mask can be freed.
     """Create a flex attention block mask from a dense attention mask.
 
     This function should be called early (during data preparation) to allow
@@ -69,6 +82,9 @@ def create_block_mask_from_dense(
         q_idx: torch.Tensor,
         k_idx: torch.Tensor,
     ):
+        # [FUNCTION DOC]
+        # HELPER: flex attention mask_mod returning attention_mask[q_idx, k_idx]
+        # (closure); batch and head are ignored.
         return attention_mask[q_idx, k_idx]
 
     block_mask = create_block_mask(
@@ -93,6 +109,15 @@ def _tree_attn_fwd_func(
     *args,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Replacement for transformers' _flash_attention_forward. Inputs in [B, S,
+    # H, D] layout; attention_mask and extra positional args are ignored; softmax_scale
+    # is the attention scale. If Triton tree attention is enabled, available and
+    # kwargs["tree_triton_data"] is given, permutes to [B, H, S, D] and calls the Triton
+    # tree_attention kernel. Otherwise requires kwargs["tree_block_mask"] to be a
+    # BlockMask (ValueError if missing) and runs the compiled flex attention with GQA
+    # enabled when Q and K head counts differ. Returns output permuted back to [B, S, H,
+    # D] (contiguous).
     # Check for Triton path (dict key prefixed with "tree_" to avoid
     # collisions with HuggingFace's own kwargs during **kwargs forwarding)
     tree_triton_data = kwargs.get("tree_triton_data", None)
@@ -152,6 +177,11 @@ ORIGINAL_FLASH_ATTENTION_FORWARD = None
 
 
 def patch_fsdp_for_tree_training(enable: bool = True):
+    # [FUNCTION DOC]
+    # No-op when enable is False. Otherwise, unless already patched (logs a warning and
+    # returns), saves transformers.integrations.flash_attention._flash_attention_forward
+    # into the module global and replaces it with the tree implementation. Logs INFO.
+    # Process-wide side effect.
     if not enable:
         return
 
@@ -171,6 +201,9 @@ def patch_fsdp_for_tree_training(enable: bool = True):
 
 
 def restore_patch_fsdp_for_tree_training():
+    # [FUNCTION DOC]
+    # Restores the saved original _flash_attention_forward and clears the saved global;
+    # logs a warning and returns if nothing was saved. Used in tests.
     """Restore original flash attention forward function. Only used in testing."""
     global ORIGINAL_FLASH_ATTENTION_FORWARD
     if ORIGINAL_FLASH_ATTENTION_FORWARD is None:

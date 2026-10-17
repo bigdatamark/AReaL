@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Shared constants for tree attention, read from environment variables at import time:
+# BLOCK_SIZE (AREAL_FLEX_ATTENTION_BLOCK_SIZE, default 128) is the flex-attention/tree
+# block size, and USE_TRITON_TREE_ATTN (AREAL_USE_TRITON_TREE_ATTN == 1) selects the
+# experimental Triton tree attention kernel. Logs a warning at import when Triton tree
+# attention is enabled.
 # SPDX-License-Identifier: Apache-2.0
 
 """Shared constants for tree attention functionality."""

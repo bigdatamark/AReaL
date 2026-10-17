@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Experimental Triton tree attention kernel (FlashAttention-style forward and backward)
+# with block-sparse iteration. The tree mask is represented as a bit-packed ancestor
+# matrix: for each batch b and query token i, word w holds 64 bits for key tokens
+# 64w..64w+63, bit set iff the key is an ancestor-or-self of i. KV blocks are 64 tokens
+# (one mask word); query blocks are 128 tokens. CPU-side precomputation derives the
+# packed mask from a parent array and the per-Q-block list of KV blocks with any set bit
+# (and the reverse mapping). TRITON_AVAILABLE reports whether triton imported; when it
+# is missing, kernels are not defined and tree_attention raises ImportError. Tensors are
+# in [B, H, N, D] layout; GQA is supported when query heads are a multiple of KV heads.
+# Softmax uses base-2 exponentials (scores scaled by log2(e)) and masked scores use a
+# large finite negative value (-16384) to avoid NaNs.
 # SPDX-License-Identifier: Apache-2.0
 
 """Triton-based tree attention kernel with sparse block iteration."""
@@ -17,6 +29,11 @@ except ImportError:
 
 @dataclass
 class TreeAttentionData:
+    # [CLASS DOC]
+    # Dataclass of precomputed tree-attention metadata: packed_mask [B, N, ceil(N/64)]
+    # int64, kv_indices (1D, all batches concatenated) with kv_offsets [B,
+    # num_q_blocks+1] (absolute CSR offsets), and q_indices (1D) with q_offsets [B,
+    # num_kv_blocks+1].
     packed_mask: torch.Tensor  # (B, N, ceil(N/64))
     kv_indices: torch.Tensor  # 1D sparse indices
     kv_offsets: torch.Tensor  # (B, num_q_blocks + 1)
@@ -25,6 +42,14 @@ class TreeAttentionData:
 
 
 def compute_packed_mask(fa: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Builds the packed ancestor bitmask from a parent array fa [B, N] (-1 = no parent)
+    # by dynamic programming in index order: each token ORs in its parent's words (up to
+    # the parent's word) and sets its own bit. Assumes parent index < child index.
+    # Returns a CPU int64 tensor [B, N, ceil(N/64)].
+    # KNOWN ISSUE: implemented with Python loops and per-element .item() calls, so it is
+    # O(B*N*words) Python work and very slow for long packed sequences; setting bit 63
+    # relies on signed int64 overflow semantics.
     """
     Compute packed ancestor mask directly from parent array.
 
@@ -59,6 +84,11 @@ def compute_kv_indices_packed(
     packed_mask: torch.Tensor,
     BLOCK_M: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # For each batch and each BLOCK_M-row query block, lists the mask word indices
+    # (64-token KV blocks) where any row in the block has a set bit. Returns (kv_indices
+    # int32 1D concatenated over batches, kv_offsets int32 [B, num_q_blocks+1] absolute
+    # offsets). Python loops; CPU tensors.
     """
     Compute packed KV block indices for each Q block from bit-packed mask.
 
@@ -98,6 +128,11 @@ def compute_q_indices_packed(
     BLOCK_M: int,
     BLOCK_N: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Reverse mapping of compute_kv_indices_packed: for each batch and KV word block,
+    # lists query block indices (BLOCK_M rows) with any set bit. Returns (q_indices
+    # int32 1D, q_offsets int32 [B, num_kv_blocks+1]). BLOCK_N is accepted but unused
+    # (KV block size is implicitly 64 = one word).
     """
     Compute Q block indices for each KV block (reverse mapping for backward dK/dV).
 
@@ -141,6 +176,10 @@ def precompute_tree_attention_data(
     BLOCK_M: int = 128,
     BLOCK_N: int = 64,
 ) -> TreeAttentionData:
+    # [FUNCTION DOC]
+    # Runs compute_packed_mask, compute_kv_indices_packed (BLOCK_M) and
+    # compute_q_indices_packed and returns them bundled as TreeAttentionData (CPU
+    # tensors).
     """
     Precompute packed mask, KV indices, and Q indices from parent array.
 
@@ -219,6 +258,15 @@ if TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         GQA_GROUP_SIZE: tl.constexpr,
     ):
+        # [FUNCTION DOC]
+        # Triton forward kernel; grid (ceil(N/BLOCK_M), B*H). Each program loads one
+        # query block for one (batch, head), maps the head to its KV head (head //
+        # GQA_GROUP_SIZE), and iterates only the KV blocks listed in kv_indices for that
+        # query block. For each it computes scaled QK^T, unpacks the 64 mask bits per
+        # row, applies mask and bounds, and performs an online-softmax update of running
+        # max, normaliser and output accumulator. Writes the normalised output and the
+        # base-2 log-sum-exp (m + log2 l) per row to LSE. Autotuned over warps/stages
+        # with BLOCK_M=128, BLOCK_N=64 (BLOCK_N must equal 64).
         """
         Tree attention forward kernel with dense bit-packed mask.
 
@@ -346,6 +394,12 @@ if TRITON_AVAILABLE:
         kv_offsets: torch.Tensor,
         sm_scale: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Host launcher for the forward kernel. Validates shapes (K/V share
+        # batch, length and head dim with Q; V shape equals K; H divisible by KV heads),
+        # defaults sm_scale to 1/sqrt(D), moves mask/index tensors to the query device
+        # and makes inputs contiguous, allocates output (like query) and LSE [B, H, N]
+        # float32, and launches over (ceil(N/128), B*H). Returns (output, lse).
         """
         Tree attention forward using precomputed dense bit-packed mask with block skipping.
 
@@ -433,6 +487,11 @@ if TRITON_AVAILABLE:
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
     ):
+        # [FUNCTION DOC]
+        # Triton kernel computing Delta[bh, n] = sum over D of O * dO (in float32) per
+        # row, grid (ceil(N/BLOCK_M), B*H). Indexes O and dO by pid_bh times the head
+        # stride, so it assumes contiguous [B, H, N, D] tensors with identical strides
+        # for O and dO.
         pid_m = tl.program_id(0)
         pid_bh = tl.program_id(1)
 
@@ -518,6 +577,11 @@ if TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         GQA_GROUP_SIZE: tl.constexpr,
     ):
+        # [FUNCTION DOC]
+        # Triton kernel computing dQ; grid (ceil(N/BLOCK_M), B*H). For each listed KV
+        # block of its query block, recomputes masked probabilities P = exp2(scaled QK -
+        # LSE), dP = dO V^T, dS = P * (dP - Delta) (masked) and accumulates dS K. Stores
+        # dQ * sm_scale.
         pid_m = tl.program_id(0)
         pid_bh = tl.program_id(1)
         off_b = pid_bh // H
@@ -675,6 +739,15 @@ if TRITON_AVAILABLE:
         NUM_Q_BLOCKS: tl.constexpr,
         GQA_GROUP_SIZE: tl.constexpr,
     ):
+        # [FUNCTION DOC]
+        # Triton kernel computing dK and dV for one 64-token KV block of one (batch, KV
+        # head); grid (ceil(N/64), B*H_KV). Loops over the GQA group's query heads and
+        # over all query blocks, skipping blocks whose mask words are all zero;
+        # accumulates dV += P^T dO and dK += dS^T Q with the same recomputation as the
+        # dQ kernel, then stores dK * sm_scale and dV.
+        # KNOWN ISSUE: it scans every query block (NUM_Q_BLOCKS) instead of using the
+        # precomputed q_indices/q_offsets, which are therefore unused; correct but
+        # slower than intended.
         pid_n = tl.program_id(0)
         pid_bh_kv = tl.program_id(1)
         off_b = pid_bh_kv // H_KV
@@ -801,6 +874,11 @@ if TRITON_AVAILABLE:
         q_offsets: torch.Tensor,
         sm_scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Host launcher for the backward pass. Allocates dQ/dK/dV (zeros like
+        # inputs) and Delta [B*H, N], runs the preprocess, dQ and dK/dV kernels with
+        # BLOCK_M=128 and BLOCK_N=64, and returns (dq, dk, dv). q_indices/q_offsets are
+        # accepted but not used.
         B, H, N, D = query.shape
         H_kv = key.shape[1]
         gqa_group_size = H // H_kv
@@ -932,6 +1010,8 @@ if TRITON_AVAILABLE:
         return dq, dk, dv
 
     class TreeAttentionFunction(torch.autograd.Function):
+        # [CLASS DOC]
+        # Autograd Function wrapping the Triton forward/backward kernels.
         @staticmethod
         def forward(
             ctx,
@@ -945,6 +1025,9 @@ if TRITON_AVAILABLE:
             q_offsets,
             sm_scale,
         ):
+            # [FUNCTION DOC]
+            # Runs tree_attention_triton, saves Q, K, V, output, LSE and all metadata
+            # tensors plus sm_scale on ctx, and returns the output [B, H, N, D].
             output, lse = tree_attention_triton(
                 query, key, value, packed_mask, kv_indices, kv_offsets, sm_scale
             )
@@ -965,6 +1048,9 @@ if TRITON_AVAILABLE:
 
         @staticmethod
         def backward(ctx, dout):
+            # [FUNCTION DOC]
+            # Runs tree_attention_backward with the saved tensors and returns (dq, dk,
+            # dv) followed by None for the six non-differentiable inputs.
             (
                 query,
                 key,
@@ -1004,6 +1090,12 @@ if TRITON_AVAILABLE:
         q_offsets: torch.Tensor,
         sm_scale: float | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Public entry point (Triton available). Inputs Q [B, H, N, D], K/V [B, H_kv, N,
+        # D] and the TreeAttentionData fields; sm_scale defaults to 1/sqrt(D). Moves
+        # metadata tensors to the query device (contiguous) and applies
+        # TreeAttentionFunction on contiguous Q/K/V. Returns attention output [B, H, N,
+        # D] with autograd support.
         """
         Tree attention with backward support.
 
@@ -1034,6 +1126,9 @@ if TRITON_AVAILABLE:
 else:
 
     def tree_attention(*args, **kwargs):
+        # [FUNCTION DOC]
+        # Fallback defined when Triton is not installed: accepts any arguments and
+        # always raises ImportError.
         raise ImportError(
             "Triton is not available. Please install triton to use tree_attention."
         )

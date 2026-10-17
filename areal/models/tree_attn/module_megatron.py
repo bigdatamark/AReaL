@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tree attention integration for Megatron-Core models built through mbridge: a
+# core-attention module (PytorchFlexAttention) accepting arbitrary attention masks via
+# flex attention or the Triton tree kernel, and a context manager that patches mbridge's
+# LLMBridge layer-spec construction to use it.
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import contextmanager
@@ -33,6 +38,10 @@ logger = logging.getLogger("TreeAttentionMegatron")
 
 
 class PytorchFlexAttention(torch.nn.Module):
+    # [CLASS DOC]
+    # Megatron core_attention replacement computing self-attention under an arbitrary
+    # (tree) mask. Stores the constructor config; has no parameters. Attention dropout
+    # is stored but not applied.
     """Pytorch flex attention implementation that supports arbitrary attention mask type."""
 
     def __init__(
@@ -45,6 +54,11 @@ class PytorchFlexAttention(torch.nn.Module):
         softmax_scale: float | None = None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Stores config, layer_number, attn_mask_type, attention_type, attention_dropout
+        # and softmax_scale (None means default 1/sqrt(head_dim)); extra kwargs ignored.
+        # Logs INFO. Raises ValueError if config.context_parallel_size != 1 or
+        # attention_type is not "self".
         super().__init__()
         self.config = config
         self.layer_number = layer_number
@@ -73,6 +87,18 @@ class PytorchFlexAttention(torch.nn.Module):
         attention_bias: torch.Tensor = None,
         packed_seq_params: PackedSeqParams = None,
     ):
+        # [FUNCTION DOC]
+        # Inputs query/key/value in Megatron layout [S, B, H, D] (B expected 1).
+        # attention_mask may be TreeAttentionData, a BlockMask, or a dense [S, S]
+        # boolean tensor; attn_mask_type is ignored. Triton path (Triton tree attention
+        # enabled and available and mask is TreeAttentionData): raises
+        # NotImplementedError if attention_bias or packed_seq_params is given, permutes
+        # to [B, H, S, D], calls tree_attention with the packed mask and index/offset
+        # arrays and softmax_scale. Otherwise (flex path): same NotImplementedError
+        # checks; converts a dense tensor to a BlockMask (via
+        # create_block_mask_from_dense), uses a BlockMask as is, else raises ValueError;
+        # permutes to [B, H, S, D] and calls the compiled flex attention with GQA when
+        # head counts differ. Both paths return [S, B, H*D].
         # query: [S, B, H, D] in which B should be 1 in current tree training implementation
         # key: [S, B, H, D]
         # value: [S, B, H, D]
@@ -169,6 +195,11 @@ class PytorchFlexAttention(torch.nn.Module):
 
 @contextmanager
 def patch_bridge_for_tree_training(enable: bool = True):
+    # [FUNCTION DOC]
+    # Generator-based context manager. If enable is False, just yields. Otherwise
+    # replaces LLMBridge._get_transformer_layer_spec (class-level) with a patched getter
+    # for the duration of the context and restores the original in a finally block.
+    # Yields None.
     """Context manager to patch LLMBridge for tree training with arbitrary attention mask.
 
     Parameters
@@ -195,6 +226,12 @@ def patch_bridge_for_tree_training(enable: bool = True):
     original_layer_spec_getter = LLMBridge._get_transformer_layer_spec
 
     def _patched_getter(self, vp_stage: int | None = None):
+        # [FUNCTION DOC]
+        # HELPER: Calls the original layer-spec getter for vp_stage, then for every
+        # layer spec whose module is exactly TransformerLayer with a SelfAttention
+        # self_attention submodule, sets the attention mask type param to arbitrary and
+        # the core_attention submodule to PytorchFlexAttention (mutating the spec in
+        # place); other layers are skipped with an INFO log. Returns the spec.
         spec: TransformerBlockSubmodules = original_layer_spec_getter(self, vp_stage)
         for layer_spec in spec.layer_specs:
             if layer_spec.module is not TransformerLayer:

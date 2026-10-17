@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Debug helper for rendering a (tree) attention mask as an ASCII/Unicode density grid in
+# the logs.
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
@@ -10,6 +13,17 @@ logger = logging.getLogger("TreeAttentionViz")
 # Helper function for visualizing attention masks
 # Used for debugging and performance optimization
 def visualize_attention_mask(mask_tensor: torch.Tensor, granularity: int = 128) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Converts mask_tensor (2D, square, bool or numeric; nonzero = attend) to a
+    # CPU float mask. Logs a short message and returns for an empty mask. If size n
+    # exceeds granularity (default 128), downsamples by zero-padding to
+    # block_size*granularity where block_size = ceil(n / granularity) and averaging each
+    # block; otherwise shows full resolution. Renders four header lines with column
+    # index digits (thousands and hundreds only every 10 columns, tens and ones every
+    # column), a separator, then one row per display row prefixed by its 4-digit
+    # starting index, mapping density in [0,1] to the characters space, middle dot, and
+    # three shade blocks to full block (nonzero density shows at least the lightest
+    # char). Logs the whole visualization at INFO. Returns None.
     """Visualize an attention mask as a text grid with configurable granularity.
 
     Parameters

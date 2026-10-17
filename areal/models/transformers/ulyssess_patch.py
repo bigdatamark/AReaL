@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Ulysses sequence-parallelism monkey patches for HuggingFace transformers models
+# (adapted from verl). For text-only models it replaces transformers' internal
+# _flash_attention_forward with an all-to-all wrapped version; for supported VLMs
+# (Qwen2-VL, Qwen2.5-VL, Qwen3-VL) it replaces the attention class forward, wraps the
+# text model forward to slice inputs_embeds (and Qwen3-VL deepstack visual data) along
+# the sequence dimension per SP rank, and optionally enables vision-tower SP sharding.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from verl
@@ -19,6 +26,12 @@ logger = logging.getLogger("UlyssesPatch")
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Repeats KV heads n_rep times along the head dim. Input [batch, seq,
+    # kv_heads, head_dim]; output [batch, seq, kv_heads*n_rep, head_dim] (each head
+    # repeated contiguously, like repeat_interleave on dim 2). Returns the input
+    # unchanged when n_rep is 1. Note: head dim is axis 2 here, unlike HF's repeat_kv
+    # (axis 1).
     """
     This is the equivalent of torch.repeat_interleave(x, dim=2, repeats=n_rep).
     The hidden states go from (batch, seqlen, num_key_value_heads, head_dim)
@@ -40,6 +53,14 @@ def _ulysses_flash_attention_forward(
     *args,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Drop-in replacement for transformers' _flash_attention_forward with
+    # tensors in [1, S/sp, heads, head_dim] layout. When SP size > 1: if there are fewer
+    # KV heads than the SP size, repeats K/V by sp // kv_heads (at least 1) so they can
+    # be scattered, then all-to-all gathers sequence/scatters heads for Q, K and V;
+    # calls the original flash attention with remaining args; finally all-to-alls back
+    # to [1, S/sp, heads, head_dim]. Returns the attention output. Collective
+    # communication when sp > 1.
     ulysses_sp_size = get_ulysses_sequence_parallel_world_size()
 
     if ulysses_sp_size > 1:
@@ -72,8 +93,32 @@ def _ulysses_flash_attention_forward(
 
 # NOTE: For vision models, inputs_embeds will be sliced instead of input_ids.
 def patch_vlm_for_ulysses_input_slicing(model_class: type):
+    # [FUNCTION DOC]
+    # Patches model_class.forward (class-level, affects all instances) with a wrapper
+    # that slices inputs_embeds along the sequence dim for this Ulysses rank before
+    # calling the original forward. Logs an INFO message. Vision models are sliced on
+    # inputs_embeds rather than input_ids.
     def _create_ulysses_wrapped_decoder_forward(original_forward):
+        # [FUNCTION DOC]
+        # HELPER: Closure factory returning the wrapped forward for original_forward.
         def ulysses_wrapped_decoder_forward(self, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Wrapped text-model forward. Slices only when inputs_embeds is
+            # given, SP size > 1 and the instance flag _needs_initial_slice (default
+            # True) is set. Then: slices inputs_embeds on dim 1 (no padding); if
+            # visual_pos_masks is given slices it likewise; if deepstack_visual_embeds
+            # is also given, computes this rank's [start, end) sequence window (seq_len
+            # // sp per rank), counts visual tokens before start and before end across
+            # the whole batch, and slices each deepstack embedding tensor to that token
+            # range (or to an empty slice when the shard has no visual tokens, keeping
+            # grad flow). Sets _needs_initial_slice False during the call (to avoid
+            # re-slicing on nested calls) and restores it in a finally block. Calls the
+            # original forward with modified kwargs and returns its result. Uses .item()
+            # (GPU-CPU sync).
+            # KNOWN ISSUE: the window computation assumes the sequence length is
+            # divisible by the SP size and that visual tokens are counted across the
+            # flattened batch in order, which is only correct for batch size 1 / packed
+            # inputs.
             inputs_embeds = kwargs.get("inputs_embeds")
             visual_pos_masks = kwargs.get("visual_pos_masks")
             deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds")
@@ -151,6 +196,17 @@ def apply_monkey_patch(
     ulysses_sp_size: int = 1,
     shard_vision_across_sp: bool = False,
 ):
+    # [FUNCTION DOC]
+    # Entry point that applies Ulysses SP patches for a model. Reads attention and KV
+    # head counts from model.config (or model.config.text_config). Raises ValueError if
+    # heads are not divisible by ulysses_sp_size, or if KV heads and sp size are not
+    # divisible one way or the other. Returns immediately if ulysses_sp_size <= 1 (after
+    # validation). For model_type in qwen2_5_vl/qwen2_vl/qwen3_vl: imports the HF
+    # modeling module, replaces the attention class's forward with the matching areal
+    # ulysses_flash_attn_forward, patches the text model class for input slicing, and if
+    # shard_vision_across_sp applies the vision SP shard patch. Otherwise replaces
+    # transformers.integrations.flash_attention._flash_attention_forward globally. All
+    # patches are process-global class/module mutations; logs INFO messages.
     try:
         num_attention_heads, num_key_value_heads = (
             model.config.num_attention_heads,

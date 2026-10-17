@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Custom DTensor ParallelStyle (adapted from torchtitan) providing ReplicateParallel,
+# used when applying tensor parallelism to modules that must compute replicated (e.g.
+# MoE router gates, Q/K norms, critic score heads) while exchanging DTensors with
+# neighbours.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from torchtitan: torchtitan/distributed/__init__.py
@@ -14,6 +19,12 @@ __all__ = ["ReplicateParallel"]
 
 
 class ReplicateParallel(ParallelStyle):
+    # [CLASS DOC]
+    # ParallelStyle that converts a module's parameters to replicated DTensors on a
+    # device mesh and installs input/output hooks: plain tensor inputs are wrapped as
+    # DTensors with input_layout and redistributed to desired_input_layout; outputs are
+    # redistributed to output_layout and optionally converted back to local tensors. All
+    # layouts default to Replicate().
     """ParallelStyle that keeps computation replicated across devices.
 
     This style is used for modules that should have replicated computation
@@ -41,6 +52,9 @@ class ReplicateParallel(ParallelStyle):
         output_layout: Placement | None = None,
         use_local_output: bool = True,
     ):
+        # [FUNCTION DOC]
+        # Stores the keyword-only layouts (None -> Replicate()) and use_local_output
+        # flag (default True) on the instance. No other side effects.
         super().__init__()
         self.input_layout = input_layout or Replicate()
         self.output_layout = output_layout or Replicate()
@@ -49,6 +63,12 @@ class ReplicateParallel(ParallelStyle):
 
     @staticmethod
     def _prepare_input_fn(input_layout, desired_input_layout, mod, inputs, device_mesh):
+        # [FUNCTION DOC]
+        # HELPER: Forward-pre hook. Takes the first positional input; if it is not a
+        # DTensor, wraps it with DTensor.from_local on device_mesh with input_layout (no
+        # consistency check). If input_layout differs from desired_input_layout,
+        # redistributes asynchronously. Returns a tuple of the converted first input
+        # followed by the remaining inputs unchanged. Only the first input is converted.
         """Convert input to DTensor and redistribute if needed."""
         input_tensor = inputs[0]
         if not isinstance(input_tensor, DTensor):
@@ -64,12 +84,22 @@ class ReplicateParallel(ParallelStyle):
 
     @staticmethod
     def _prepare_output_fn(output_layout, use_local_output, mod, outputs, device_mesh):
+        # [FUNCTION DOC]
+        # HELPER: Forward hook. Redistributes the output DTensor (async) to
+        # output_layout if its placements differ, then returns its local tensor if
+        # use_local_output else the DTensor. Assumes the output is a single DTensor
+        # (fails on tuples/plain tensors).
         """Redistribute output and optionally convert back to local tensor."""
         if outputs.placements != (output_layout,):
             outputs = outputs.redistribute(placements=(output_layout,), async_op=True)
         return outputs.to_local() if use_local_output else outputs
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        # [FUNCTION DOC]
+        # Applies the style to a module via distribute_module with the default
+        # (replicate) partition function and the two hooks bound (via partial) to this
+        # instance's layouts. Mutates the module's parameters into DTensors and
+        # registers hooks; returns the module.
         return distribute_module(
             module,
             device_mesh,

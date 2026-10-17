@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# CLI/pre-commit check that pyproject.toml (SGLang variant) and pyproject.vllm.toml
+# (vLLM variant) are consistent. Only "escapable" backend-specific packages (torch
+# family, sglang, vllm, cudnn, openai, soundfile, peft, transformers) may differ or be
+# present in one file only, and the backend extras "sglang"/"vllm" may exist exclusively
+# in one variant. Prints a summary to stdout on success or errors to stderr; exit code
+# 0/1.
 # SPDX-License-Identifier: Apache-2.0
 
 """Check consistency between pyproject.toml and pyproject.vllm.toml.
@@ -53,11 +60,18 @@ BACKEND_EXTRAS: frozenset[str] = frozenset({"sglang", "vllm"})
 
 
 def _normalize_name(name: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: PEP 503 normalisation: strips, collapses runs of "-", "_" or "." to "-"
+    # and lowercases.
     """PEP 503-normalize a package name (lowercase, ``[-_.]+`` → ``-``)."""
     return re.sub(r"[-_.]+", "-", name.strip()).lower()
 
 
 def _parse_dep_name(dep: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Extracts the leading distribution name from a requirement string (before
+    # extras, version specifiers or markers) and normalises it; returns the stripped
+    # string unchanged if it does not start with a valid name character.
     """Extract the normalized package name from a dependency string.
 
     Examples::
@@ -73,6 +87,9 @@ def _parse_dep_name(dep: str) -> str:
 
 
 def _dep_list_to_dict(deps: list[str]) -> dict[str, list[str]]:
+    # [FUNCTION DOC]
+    # HELPER: Groups requirement strings (stripped) by normalised package name,
+    # preserving multiple entries per package (e.g. platform markers).
     """Map normalized package name → list of full dependency strings.
 
     A package may have multiple entries (e.g. platform-specific markers).
@@ -85,10 +102,15 @@ def _dep_list_to_dict(deps: list[str]) -> dict[str, list[str]]:
 
 
 def _is_escapable(name: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if the normalised name is in ESCAPABLE_PACKAGES.
     return _normalize_name(name) in {_normalize_name(n) for n in ESCAPABLE_PACKAGES}
 
 
 def _is_backend_selfref(dep: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True if the requirement is a self-reference "areal[<extra>]" whose extra
+    # string exactly equals a backend extra (so "areal[sglang,foo]" is not matched).
     """True if *dep* is a self-reference to a backend-specific extra.
 
     E.g. ``areal[sglang]`` or ``areal[vllm]``.
@@ -101,19 +123,29 @@ def _is_backend_selfref(dep: str) -> bool:
 
 
 class _Checker:
+    # [CLASS DOC]
+    # Accumulates human-readable inconsistency messages while comparing two parsed TOML
+    # documents; file_a/file_b are the display names used in messages.
     """Accumulates errors while comparing two parsed TOML dicts."""
 
     def __init__(self, file_a: str, file_b: str) -> None:
+        # [FUNCTION DOC]
+        # Stores the two file names and an empty error list.
         self.file_a = file_a
         self.file_b = file_b
         self.errors: list[str] = []
 
     def _err(self, msg: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Appends one error message.
         self.errors.append(msg)
 
     # ── generic deep comparison ─────────────────────────────────────────
 
     def _cmp_values(self, path: str, a: Any, b: Any) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Recursive deep comparison at a dotted path: reports type mismatch;
+        # recurses into dicts; reports differing lists (order-sensitive) or scalars.
         if type(a) is not type(b):
             self._err(
                 f"{path}: type mismatch — {self.file_a} has "
@@ -131,6 +163,9 @@ class _Checker:
             self._err(f"{path}: {self.file_a}={a!r} ≠ {self.file_b}={b!r}")
 
     def _cmp_dicts(self, path: str, a: dict, b: dict) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For every key in either dict (sorted), reports keys missing on one
+        # side and recursively compares shared keys.
         for key in sorted(set(a) | set(b)):
             sub = f"{path}.{key}" if path else key
             if key not in a:
@@ -143,6 +178,10 @@ class _Checker:
     # ── [project].dependencies ──────────────────────────────────────────
 
     def check_dependencies(self, deps_a: list[str], deps_b: list[str]) -> None:
+        # [FUNCTION DOC]
+        # Compares [project].dependencies: for each non-escapable package, reports
+        # presence in only one file or differing (order-insensitive) requirement
+        # strings.
         dict_a = _dep_list_to_dict(deps_a)
         dict_b = _dep_list_to_dict(deps_b)
         for name in sorted(set(dict_a) | set(dict_b)):
@@ -173,6 +212,11 @@ class _Checker:
         extras_a: dict[str, list[str]],
         extras_b: dict[str, list[str]],
     ) -> None:
+        # [FUNCTION DOC]
+        # Compares optional-dependency extras except backend extras: reports extras
+        # missing on one side and, for shared extras, differing requirement lists after
+        # removing backend self-references (sorted comparison; escapable packages are
+        # not exempt here).
         all_extras = sorted(set(extras_a) | set(extras_b))
         for extra in all_extras:
             # Backend-specific extras are expected to be exclusive.
@@ -210,6 +254,8 @@ class _Checker:
     def check_override_deps(
         self, overrides_a: list[str], overrides_b: list[str]
     ) -> None:
+        # [FUNCTION DOC]
+        # Same rules as check_dependencies applied to [tool.uv].override-dependencies.
         dict_a = _dep_list_to_dict(overrides_a)
         dict_b = _dep_list_to_dict(overrides_b)
         for name in sorted(set(dict_a) | set(dict_b)):
@@ -239,6 +285,13 @@ class _Checker:
     def check_uv_sources(
         self, sources_a: dict[str, Any], sources_b: dict[str, Any]
     ) -> None:
+        # [FUNCTION DOC]
+        # Compares [tool.uv.sources]: every package must exist in both; for escapable
+        # packages only the sets of "index" names among dict entries must match; other
+        # packages must be equal.
+        # KNOWN ISSUE: for escapable packages the entries are iterated as a list; if a
+        # source is a single table (dict) rather than a list, iteration yields its keys,
+        # no index names are collected, and differences go undetected.
         for pkg in sorted(set(sources_a) | set(sources_b)):
             if pkg not in sources_a:
                 self._err(f"tool.uv.sources: {pkg!r} missing in {self.file_a}")
@@ -267,6 +320,10 @@ class _Checker:
     # ── [tool.uv] (top-level) ──────────────────────────────────────────
 
     def check_tool_uv(self, uv_a: dict, uv_b: dict) -> None:
+        # [FUNCTION DOC]
+        # Checks override-dependencies and sources with the special rules, skips
+        # "conflicts" and "dependency-metadata" entirely, and deep-compares every other
+        # [tool.uv] key, reporting keys missing on one side.
         special_keys = {
             "override-dependencies",
             "sources",
@@ -299,6 +356,12 @@ class _Checker:
     # ── entry point ─────────────────────────────────────────────────────
 
     def run(self, toml_a: dict, toml_b: dict) -> int:
+        # [FUNCTION DOC]
+        # Runs all checks: build-system deep compare, project metadata excluding
+        # dependency lists, dependencies, optional dependencies, dependency-groups,
+        # tool.uv, and every other [tool.*] section. If errors were collected prints a
+        # count and each message to stderr and returns 1; otherwise prints a success
+        # line (listing escapable packages) to stdout and returns 0.
         # 1. build-system
         self._cmp_values(
             "build-system",
@@ -376,6 +439,10 @@ class _Checker:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # [FUNCTION DOC]
+    # CLI entry: parses positional files (default pyproject.toml and
+    # pyproject.vllm.toml); returns 1 with a stderr message unless exactly two files are
+    # given and both exist. Loads both with tomllib and returns the checker's result.
     import argparse
 
     parser = argparse.ArgumentParser(

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Public facade for tree attention support. Re-exports the shared constant, FSDP
+# patching and block-mask helpers, trie-based mask/kwargs builders, optional Triton
+# kernel symbols (set to None/False when Triton import fails), optional Megatron symbols
+# (None when Megatron is unavailable) and the Archon
+# TreeAttentionMeta/TreeAttentionWrapper. Import of this module triggers imports of
+# those submodules; no other side effects.
 # SPDX-License-Identifier: Apache-2.0
 
 from areal.models.tree_attn.constants import USE_TRITON_TREE_ATTN

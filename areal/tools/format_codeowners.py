@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Pre-commit hook script that validates and canonically formats .github/CODEOWNERS (path
+# relative to the current working directory): aligns owner columns, preserves comments,
+# validates owner tokens, rejects duplicate patterns and warns on single-owner rules.
+# Process exit code is the return value of format_codeowners.
 # SPDX-License-Identifier: Apache-2.0
 
 """Pre-commit hook that formats and lints .github/CODEOWNERS.
@@ -35,6 +40,19 @@ MIN_COLUMN = 32
 
 
 def format_codeowners(path: Path) -> int:
+    # [FUNCTION DOC]
+    # Reads the CODEOWNERS file at path. Returns 2 (printing an error to stderr) if the
+    # file is missing. Parses each line: blank or comment lines are kept verbatim
+    # (right-stripped); rule lines have a trailing inline comment (whitespace then '#')
+    # split off, and are split into a path pattern plus owners. Collects errors for
+    # rules without owners and owner tokens not matching the GitHub user/team regex; if
+    # any, prints them and returns 2. Owner column = max(32, (longest path + 5) rounded
+    # down to a multiple of 4). Renders rules with the path left-justified to that
+    # column, owners space-joined and the inline comment appended after two spaces.
+    # Duplicate path patterns produce errors (return 2); rules with fewer than two
+    # owners print WARN lines. Joins output with a single trailing newline; if it
+    # differs from the original, rewrites the file, prints a notice to stderr and
+    # returns 1, else returns 0.
     """Return 0 if no changes needed, 1 if the file was rewritten, 2 on error."""
     if not path.is_file():
         print(f"ERROR: {path} not found", file=sys.stderr)

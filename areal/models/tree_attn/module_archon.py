@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tree attention for the Archon engine: per-microbatch metadata (flex-attention
+# BlockMask or Triton tree data) built from a prefix trie, and an nn.Module attention
+# wrapper with the VarlenAttentionWrapper interface that dispatches to the Triton tree
+# kernel or flex_attention.
 # SPDX-License-Identifier: Apache-2.0
 
 """Tree attention module for Archon engine.
@@ -40,6 +45,10 @@ __all__ = [
 
 @dataclass
 class TreeAttentionMeta:
+    # [CLASS DOC]
+    # Dataclass holding tree attention metadata for one packed microbatch: block_mask
+    # (flex attention BlockMask) or triton_data (TreeAttentionData); exactly one must be
+    # set.
     """Tree attention metadata for one microbatch.
 
     Exactly one of block_mask or triton_data must be set,
@@ -50,6 +59,9 @@ class TreeAttentionMeta:
     triton_data: TreeAttentionData | None = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Validates that exactly one of block_mask / triton_data is non-None; raises
+        # ValueError otherwise.
         if (self.block_mask is None) == (self.triton_data is None):
             raise ValueError("Exactly one of block_mask or triton_data must be set.")
 
@@ -57,6 +69,11 @@ class TreeAttentionMeta:
     def from_trie(
         cls, trie_node: TrieNode, padded_size: int, device: torch.device
     ) -> TreeAttentionMeta:
+        # [FUNCTION DOC]
+        # Builds metadata from a TrieNode for a sequence padded to padded_size. Uses the
+        # Triton backend (build_triton_attn_data_from_trie) when USE_TRITON_TREE_ATTN is
+        # set and Triton is available, else builds a flex attention BlockMask on device.
+        # Returns a new instance.
         """Build tree attention metadata from a trie node.
 
         Automatically selects the Triton kernel or flex attention backend.
@@ -71,6 +88,9 @@ class TreeAttentionMeta:
 
 
 class TreeAttentionWrapper(nn.Module):
+    # [CLASS DOC]
+    # Stateless nn.Module computing tree attention for packed sequences (batch 1).
+    # Requires a TreeAttentionMeta via the tree_attn_meta keyword in forward.
     """Attention wrapper for tree training in Archon Engine.
 
     This wrapper has the same interface as VarlenAttentionWrapper but uses
@@ -94,6 +114,14 @@ class TreeAttentionWrapper(nn.Module):
         max_seqlen: int,
         tree_attn_meta: TreeAttentionMeta | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Inputs q/k/v of shape [1, heads, seq, head_dim] (k/v may have fewer heads for
+        # GQA), optional scale; cu_seqlens and max_seqlen are ignored (API
+        # compatibility). Asserts batch == 1 and that tree_attn_meta is given. If
+        # triton_data is set, calls the Triton tree_attention kernel with its packed
+        # mask and kv/q index/offset arrays; otherwise calls (uncompiled) flex_attention
+        # with the block mask, enabling GQA when head counts differ. Returns [1, heads,
+        # seq, head_dim].
         """Compute tree attention.
 
         Args:

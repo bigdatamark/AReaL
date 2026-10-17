@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Qwen3-VL specific patches: a Ulysses sequence-parallel replacement forward for
+# Qwen3VLTextAttention, and a patch making the language model's deepstack visual-feature
+# injection work when hidden states are tensor-parallel DTensors.
 # SPDX-License-Identifier: Apache-2.0
 
 # Qwen3VL-specific Ulysses sequence parallelism patch
@@ -31,6 +35,21 @@ def ulysses_flash_attn_forward(
     cache_position: torch.LongTensor | None = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # [FUNCTION DOC]
+    # Replacement forward for Qwen3VLTextAttention (self). Projects hidden_states [B,
+    # S/sp, hidden] to Q/K/V reshaped to [B, heads, S/sp, head_dim], applying
+    # q_norm/k_norm per head to Q and K. If Ulysses SP size > 1: requires
+    # config.num_attention_heads divisible by sp (else ValueError), expands K/V to all
+    # heads (repeat_kv by num_key_value_groups) and all-to-alls to [B, heads/sp, S,
+    # head_dim]. Applies standard RoPE with the provided (cos, sin), updates
+    # past_key_values cache (with sin/cos/cache_position) for this layer_idx if given,
+    # runs transformers' flash_attention_forward (dropout only when training, module
+    # scaling and is_causal, extra kwargs forwarded), all-to-alls back with SP, reshapes
+    # to [B, S/sp, hidden], applies o_proj. Returns (attn_output, attn_weights).
+    # Collective communication when sp > 1.
+    # KNOWN ISSUE: with SP the KV cache is updated with the full gathered sequence for a
+    # head subset; combined with caching this differs from the vanilla layout (only safe
+    # for training without cache).
     """Ulysses sequence parallelism forward for Qwen3VLTextAttention.
 
     This follows the Qwen3VLTextAttention.forward signature and implementation,
@@ -97,6 +116,10 @@ def ulysses_flash_attn_forward(
 
 
 def patch_qwen3_vl_deepstack_process_for_tp(language_model: nn.Module):
+    # [FUNCTION DOC]
+    # Monkey-patches language_model._deepstack_process (bound method) when present;
+    # no-op otherwise. The patched version handles DTensor hidden states for tensor
+    # parallelism. Mutates the given module instance.
     """Patch _deepstack_process to convert visual_pos_masks and visual_embeds
     to DTensor when TP is enabled.
     """
@@ -106,6 +129,14 @@ def patch_qwen3_vl_deepstack_process_for_tp(language_model: nn.Module):
     original_deepstack_process = language_model._deepstack_process
 
     def patched_deepstack_process(self, hidden_states, visual_pos_masks, visual_embeds):
+        # [FUNCTION DOC]
+        # HELPER: If hidden_states is a DTensor, redistributes it to fully replicated,
+        # converts to a local tensor and clones it (boolean-mask indexing cannot be
+        # sharding-propagated), calls the original _deepstack_process with
+        # visual_pos_masks and visual_embeds, wraps the result back as a replicated
+        # DTensor on the same mesh and redistributes to the original placements.
+        # Otherwise delegates directly to the original. Returns the updated hidden
+        # states. Involves collective communication under TP.
         # Check if hidden_states is a DTensor (TP is enabled)
         if isinstance(hidden_states, DTensor):
             device_mesh = hidden_states.device_mesh
