@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Torchrun tests for areal.models.fsdp.ulysses.all_to_all_tensor: forward equality with
+# a dist.all_to_all reference in both directions, autograd backward sanity, and
+# torch.compile (inductor) equivalence with eager. Raises AssertionError on failure.
 """Test suite for ulysses all_to_all_tensor using all_to_all_single_autograd.
 
 This test verifies:
@@ -21,6 +25,9 @@ from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
 
 
 def setup_distributed_environment():
+    # [FUNCTION DOC]
+    # HELPER: If not initialized, inits NCCL over TCP from RANK/WORLD_SIZE/MASTER_ADDR/
+    # MASTER_PORT (with defaults) and sets device to RANK.
     if dist.is_initialized():
         return
     rank = int(os.environ.get("RANK", "0"))
@@ -38,6 +45,10 @@ def setup_distributed_environment():
 
 
 def reference_all_to_all(x, scatter_dim, gather_dim, group):
+    # [FUNCTION DOC]
+    # HELPER: Splits x into world_size chunks along scatter_dim, exchanges them with
+    # dist.all_to_all over group, and concatenates received chunks along gather_dim.
+    # Returns a contiguous tensor.
     """Reference implementation using dist.all_to_all for comparison."""
     world_size = dist.get_world_size(group)
     input_list = list(torch.chunk(x, world_size, dim=scatter_dim))
@@ -48,6 +59,11 @@ def reference_all_to_all(x, scatter_dim, gather_dim, group):
 
 
 def test_correctness():
+    # [FUNCTION DOC]
+    # Creates an SP group over all ranks and registers it, broadcasts a [2, 64, 8, 32]
+    # tensor from rank 0, and asserts all_to_all_tensor equals the reference (atol 1e-6)
+    # for scatter heads/gather seq and then for the reverse direction on a matching
+    # reshaped input. Prints PASS lines and barriers.
     """Test that new implementation matches reference."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -113,6 +129,9 @@ def test_correctness():
 
 
 def test_backward():
+    # [FUNCTION DOC]
+    # Per-rank random input requiring grad; forward scatter-heads/gather-seq, backward with
+    # ones, and asserts the input gradient exists, is finite and matches input shape.
     """Test autograd backward pass."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -161,6 +180,10 @@ def test_backward():
 
 
 def test_compile():
+    # [FUNCTION DOC]
+    # Compiles a wrapper around all_to_all_tensor with inductor and over 3 seeded inputs
+    # asserts compiled output matches eager (atol 1e-5). Does not actually detect graph
+    # breaks or recompilation despite the module docstring.
     """Test torch.compile compatibility."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -178,6 +201,8 @@ def test_compile():
 
     # Define function to compile
     def forward_fn(x):
+        # [FUNCTION DOC]
+        # HELPER: Calls all_to_all_tensor on x with the enclosing scatter/gather dims and group.
         return all_to_all_tensor(x, scatter_dim, gather_dim, sp_group)
 
     # Compile with inductor backend
@@ -205,6 +230,9 @@ def test_compile():
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses required --test_name (correctness|backward|compile|all), sets up dist, runs
+    # the chosen test(s) and destroys the process group. Each test creates a new SP group.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--test_name",

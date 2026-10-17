@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Torchrun worker that compares Karmarkar-Karp (kk_allocate) and first-fit-decreasing
+# (ffd_allocate) balancing of synthetic bimodal sequence lengths across ranks and
+# pickles per-rank load metrics. No real tensors are moved; NCCL is used only for
+# process-group setup and a final barrier.
 """Torchrun worker script: compare KK vs FFD for trajectory redistribution.
 
 Launched by test_kk_e2e.py via torchrun. Each rank:
@@ -22,6 +27,11 @@ from areal.utils.seqpack import ffd_allocate, kk_allocate
 
 
 def redistribute_trajectories_sim(seqlens, world_size, algorithm="ffd"):
+    # [FUNCTION DOC]
+    # HELPER: Calls kk_allocate if algorithm == "kk" else ffd_allocate with an effectively
+    # unlimited capacity and min_groups=world_size. Returns (groups of indices, per-rank
+    # token loads padded with zeros / truncated to world_size).
+    # KNOWN ISSUE: returned groups are not padded/truncated like the loads.
     """Simulate trajectory redistribution: allocate seqlens to ranks.
     Uses the *real* kk_allocate / ffd_allocate from areal.utils.seqpack.
     This simulation mirrors the production logic where rank `i` takes group `i`.
@@ -44,6 +54,9 @@ def redistribute_trajectories_sim(seqlens, world_size, algorithm="ffd"):
 def generate_bimodal_seqlens(
     n, short_range=(50, 200), long_range=(800, 2048), long_ratio=0.3, seed=42
 ):
+    # [FUNCTION DOC]
+    # HELPER: Deterministically (seeded random.Random) generates n lengths: with
+    # probability long_ratio uniform in long_range, else uniform in short_range (inclusive).
     rng = random.Random(seed)
     seqlens = []
     for _ in range(n):
@@ -60,6 +73,11 @@ def generate_bimodal_seqlens(
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --output_dir (required), --n_seqs (200), --seed (42); inits NCCL; generates the
+    # same lengths on all ranks; runs both allocators; computes spread (max-min load), max
+    # load, kk_wins and improvement percentage; pickles the metrics dict to
+    # <output_dir>/rank_<rank>.pkl; barriers and destroys the process group.
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--n_seqs", type=int, default=200)

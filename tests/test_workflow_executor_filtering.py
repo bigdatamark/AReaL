@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Async tests for WorkflowExecutor's should_accept_fn filtering of rollout
+# trajectories containing remote RTensor shards: accepted trajectories keep their remote
+# payload; rejected or filter-raising ones trigger RTensor.clear_node for each shard
+# owner, with a per-node timeout so a hung cleanup does not block. Uses mocks only.
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -13,14 +18,24 @@ from areal.infra.workflow_executor import WorkflowExecutor, _RolloutTaskInput
 
 
 class _TrajectoryWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # HELPER: RolloutWorkflow that returns a fixed pre-built trajectory.
     def __init__(self, trajectory):
+        # [FUNCTION DOC]
+        # Stores the trajectory dict to return.
         self.trajectory = trajectory
 
     async def arun_episode(self, engine, data):
+        # [FUNCTION DOC]
+        # Returns the stored trajectory regardless of engine/data.
         return self.trajectory
 
 
 def _remote_trajectory(rewards: list[float]):
+    # [FUNCTION DOC]
+    # HELPER: Builds a trajectory dict with input_ids and loss_mask as RTensors pointing at
+    # shards "input"@node-a:1234 and "mask"@node-b:1234 (meta-device placeholders), plus
+    # rewards and original_rewards tensors from the given list.
     return {
         "input_ids": RTensor(
             shard=TensorShardInfo(shard_id="input", node_addr="node-a:1234"),
@@ -36,6 +51,10 @@ def _remote_trajectory(rewards: list[float]):
 
 
 def _executor():
+    # [FUNCTION DOC]
+    # HELPER: Creates a WorkflowExecutor (sglang:d1, consumer batch 1, no dumping) with
+    # mocked inference engine, mocked staleness manager and mocked logger. Returns
+    # (executor, staleness_manager_mock).
     manager = MagicMock()
     executor = WorkflowExecutor(
         config=InferenceEngineConfig(
@@ -54,6 +73,10 @@ def _executor():
 async def test_filter_accepts_local_rewards_without_clearing_remote_payload(
     monkeypatch,
 ):
+    # [FUNCTION DOC]
+    # Uses the SWE example filter_function with rewards [0,1]; asserts the task result
+    # keeps the same trajectory with RTensors intact, on_rollout_accepted is called once,
+    # and clear_node is never awaited.
     from examples.swe.filter_function import filter_function
 
     trajectory = _remote_trajectory([0.0, 1.0])
@@ -79,10 +102,14 @@ async def test_filter_accepts_local_rewards_without_clearing_remote_payload(
 
 
 def _reject(_trajectory):
+    # [FUNCTION DOC]
+    # HELPER: Filter predicate that always rejects.
     return False
 
 
 def _raise(_trajectory):
+    # [FUNCTION DOC]
+    # HELPER: Filter predicate that raises RuntimeError("filter failed").
     raise RuntimeError("filter failed")
 
 
@@ -91,6 +118,9 @@ def _raise(_trajectory):
 async def test_filter_rejection_or_failure_clears_remote_payload(
     monkeypatch, predicate
 ):
+    # [FUNCTION DOC]
+    # Parametrized over rejecting and raising predicates: asserts result None, the
+    # rejection callback fires once, and clear_node is awaited for both shard nodes.
     trajectory = _remote_trajectory([1.0, 1.0])
     executor, manager = _executor()
     clear_node = AsyncMock()
@@ -119,11 +149,17 @@ async def test_filter_rejection_or_failure_clears_remote_payload(
 
 @pytest.mark.asyncio
 async def test_filter_rejection_times_out_blocked_remote_cleanup(monkeypatch):
+    # [FUNCTION DOC]
+    # Replaces clear_node with one that hangs forever for node-a, patches the clear timeout
+    # to 0.01s, and asserts the task finishes within 1s, rejects, clears only node-b, and
+    # logs a single timeout warning for node-a.
     trajectory = _remote_trajectory([1.0, 1.0])
     executor, manager = _executor()
     cleared = []
 
     async def partially_blocked_clear(node_addr, shard_ids):
+        # [FUNCTION DOC]
+        # HELPER: Fake clear_node: blocks indefinitely for node-a, else records the call.
         if node_addr == "node-a:1234":
             await asyncio.Event().wait()
         cleared.append((node_addr, shard_ids))

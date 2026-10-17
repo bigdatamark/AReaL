@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Torchrun script testing FSDPEngine save/load with the DCP (distributed checkpoint)
+# weight format on Qwen3-0.6B: a plain weights round-trip and a train/save/train/
+# load/retrain round-trip with optimizer state. Rank 0 optionally writes the result.
 import argparse
 import copy
 import os
@@ -24,6 +28,8 @@ MODEL_PATH = get_model_path(
 
 
 def write_result(out: str, succ: bool):
+    # [FUNCTION DOC]
+    # HELPER: Writes "Passed" if succ else "Failed" to the file at path out.
     with open(out, "w") as f:
         if succ:
             f.write("Passed")
@@ -37,6 +43,11 @@ def mock_input(
     max_seqlen=1024,
     device=current_platform.device_type,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a random right-padded batch: per-sample lengths in
+    # [min_seqlen, max_seqlen), token ids in [10000, 50000), padding id 0. Returns dict with
+    # input_ids (long) and attention_mask (bool) of shape [batch, longest].
+    # KNOWN ISSUE: docstring claims position_ids are returned, but they are not.
     """Create mock padded input data for testing.
     Returns a dict with input_ids, attention_mask, and position_ids.
     """
@@ -64,6 +75,8 @@ def mock_input(
 def mock_loss_fn(
     logprobs: torch.Tensor, entropy: torch.Tensor, input_data: dict, **kwargs
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Loss = mean of logprobs; other args ignored.
     """Mock loss function for testing."""
     return torch.mean(logprobs)
 
@@ -71,6 +84,10 @@ def mock_loss_fn(
 def make_fsdp_engine(
     backend: str, mb_spec: MicroBatchSpec, init_optimizer: bool = False
 ):
+    # [FUNCTION DOC]
+    # HELPER: Builds a TrainEngineConfig for the model (optimizer default config only if
+    # init_optimizer), creates FSDPEngine, creates its process group from the parsed
+    # allocation string, initializes with a small FinetuneSpec and returns the engine.
     config = TrainEngineConfig(
         backend=backend,
         experiment_name="test_fsdp_dcp_distributed",
@@ -88,6 +105,11 @@ def make_fsdp_engine(
 
 
 def test_simple_dcp_save_load(alloc_mode: str, output: str | None = None):
+    # [FUNCTION DOC]
+    # Saves weights in DCP format to a temp dir (rank 0 creates it, barrier), zeroes all
+    # parameters, loads, and asserts every local shard equals a deep copy taken before
+    # save (printing diffs on mismatch). Then syncs, barriers, destroys the engine, and
+    # rank 0 writes the result to output if given.
     """Test simple DCP save and load in distributed setting."""
     rank = int(os.environ["RANK"])
 
@@ -157,6 +179,11 @@ def test_simple_dcp_save_load(alloc_mode: str, output: str | None = None):
 
 
 def test_train_dcp_save_load(alloc_mode: str, output: str | None = None):
+    # [FUNCTION DOC]
+    # With optimizer: train step 1 on mock data, save (weights+optim, DCP), train step 2
+    # and snapshot params, zero params, load, re-run step 2, and assert params match the
+    # snapshot (i.e. weights and optimizer state were restored). Barrier/destroy and rank 0
+    # writes the result as in the simple test.
     rank = int(os.environ["RANK"])
     print(f"Running train DCP save/load test on rank {rank}")
 
@@ -252,6 +279,10 @@ def test_train_dcp_save_load(alloc_mode: str, output: str | None = None):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --test_type (simple_dcp_save_load | train_dcp_save_load), --output and
+    # --backend (allocation string, default fsdp:d2t1c1) and runs the selected test;
+    # raises NotImplementedError for unknown types (unreachable due to choices).
     parser = argparse.ArgumentParser(description="Run FSDP DCP Distributed Test")
     parser.add_argument(
         "--test_type",

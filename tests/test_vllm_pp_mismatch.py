@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tests that vLLM rollout weight-sync uses a single flat NCCL group (so trainer and
+# vLLM pipeline-parallel sizes may differ), while the Archon dispatcher still enforces
+# train_pp_size == gen_pp_size for SGLang PP>1. No GPU or server; network helpers are
+# monkeypatched.
 """Unit tests for differing training/inference pipeline-parallel sizes with vLLM.
 
 The per-PP-rank weight-sync path (one NCCL group per inference PP stage) is
@@ -30,6 +35,10 @@ from areal.api.io_struct import WeightUpdateMeta
 
 
 def _make_meta(backend, tp=1, pp=1, dp=1, group_name="update_weight_group_0"):
+    # [FUNCTION DOC]
+    # HELPER: Returns an "xccl" WeightUpdateMeta whose gen_allocation is parsed from
+    # "<backend>:d<dp>p<pp>t<tp>", with fixed master address 127.0.0.1, port 12345 and the
+    # given group_name.
     """Build a WeightUpdateMeta whose rollout allocation uses ``backend``."""
     meta = WeightUpdateMeta(type="xccl")
     meta.gen_allocation = ModelAllocation.from_str(f"{backend}:d{dp}p{pp}t{tp}")
@@ -45,10 +54,14 @@ def _make_meta(backend, tp=1, pp=1, dp=1, group_name="update_weight_group_0"):
 
 
 class TestVLLMBackendFlatGroup:
+    # [CLASS DOC]
+    # Checks VLLMBackend.build_init_weights_group_request world_size/rank_offset math.
     """vLLM joins one group spanning all inference workers; its internal PP is
     just more flat workers and never appears as a per-PP group."""
 
     def test_pp2_single_flat_group_server0(self):
+        # [FUNCTION DOC]
+        # vllm tp4 pp2 dp1, server 0: asserts world_size 9, rank_offset 1, no pp_rank key.
         from areal.engine.vllm_remote import VLLMBackend
 
         meta = _make_meta("vllm", tp=4, pp=2, dp=1)
@@ -61,6 +74,8 @@ class TestVLLMBackendFlatGroup:
         assert "pp_rank" not in req.payload
 
     def test_pp2_flat_group_server_offset(self):
+        # [FUNCTION DOC]
+        # vllm tp4 pp2 dp2, server 1: asserts world_size 17, rank_offset 9, no pp_rank key.
         from areal.engine.vllm_remote import VLLMBackend
 
         meta = _make_meta("vllm", tp=4, pp=2, dp=2)
@@ -78,14 +93,22 @@ class TestVLLMBackendFlatGroup:
 
 
 class _FakeParallelDims:
+    # [CLASS DOC]
+    # HELPER: Stub of engine parallel_dims exposing only the pp size.
     def __init__(self, pp):
+        # [FUNCTION DOC]
+        # Stores pp.
         self.pp = pp
 
 
 class _FakeEngine:
+    # [CLASS DOC]
+    # HELPER: Fake engine exposing parallel_dims, PP head/rank and a no-op logger.
     """Minimal ArchonEngine stand-in for the weight-sync dispatcher."""
 
     def __init__(self, train_pp_size, train_pp_rank=0, is_head=False):
+        # [FUNCTION DOC]
+        # Stores fake PP size/rank/head flag and builds a logger whose info/debug do nothing.
         self.parallel_dims = _FakeParallelDims(pp=train_pp_size)
         self._pp_rank = train_pp_rank
         self._is_head = is_head
@@ -94,18 +117,27 @@ class _FakeEngine:
         )()
 
     def is_pipeline_parallel_head(self):
+        # [FUNCTION DOC]
+        # Returns the configured is_head flag.
         return self._is_head
 
     @property
     def pipeline_parallel_rank(self):
+        # [FUNCTION DOC]
+        # Property returning the configured PP rank.
         return self._pp_rank
 
 
 class TestArchonDispatcherBackendRouting:
+    # [CLASS DOC]
+    # Checks Archon init_weight_update_group routing by rollout backend.
     """``init_weight_update_group`` must select the per-PP-rank path only for
     SGLang PP>1, and fall back to the single-group path for vLLM."""
 
     def test_vllm_pp_mismatch_does_not_raise(self, monkeypatch):
+        # [FUNCTION DOC]
+        # vllm pp2 rollout with train pp4, non-head: asserts init_weight_update_group succeeds,
+        # marks initialized, records no per-PP groups and creates no group.
         """megatron:p4 actor + vllm:p2 rollout: differing PP sizes are valid.
 
         The dispatcher must route to the single-group path and skip the
@@ -129,6 +161,8 @@ class TestArchonDispatcherBackendRouting:
         assert state.group is None  # non-head does not create the group
 
     def test_sglang_pp_mismatch_still_raises(self, monkeypatch):
+        # [FUNCTION DOC]
+        # sglang pp2 with train pp4: asserts ValueError matching "train_pp_size == gen_pp_size".
         """SGLang PP>1 must still enforce the 1:1 training/inference mapping."""
         import areal.experimental.engine.archon_weight_sync as aws
 
@@ -143,6 +177,8 @@ class TestArchonDispatcherBackendRouting:
             aws.init_weight_update_group(state, meta, engine)
 
     def test_vllm_pp_matched_uses_single_group(self, monkeypatch):
+        # [FUNCTION DOC]
+        # vllm with matching PP sizes: asserts the single-group path is still used.
         """Routing is gated on backend, not PP size: vLLM with matching PP
         sizes still takes the single-group path (never per-PP)."""
         import areal.experimental.engine.archon_weight_sync as aws

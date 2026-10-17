@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Torchrun script (world = TP size, default group used as TP group) testing
+# vocab-parallel logprob/entropy helpers in areal.utils.functional.vocab_parallel and
+# the AReaL Megatron LM head replacement in areal.models.mcore.vocab_parallel_head
+# against full-vocab references: forward values, temperature, stability, gradients,
+# the in-place fused path, FP32 output/operand heads, packed dlogits and chunked FP32
+# heads under tensor and sequence parallelism. Failures raise; rank 0 prints progress.
 import os
 
 import torch
@@ -21,6 +28,8 @@ from areal.utils.functional.vocab_parallel import (
 
 
 def reference_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: log_softmax over float32 logits, gathered at labels. Returns per-token logprobs.
     """Reference implementation: compute logprobs from full logits."""
     log_softmax = torch.nn.functional.log_softmax(logits.float(), dim=-1)
     logprobs = log_softmax.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
@@ -30,6 +39,8 @@ def reference_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tens
 def reference_logprobs_entropy(
     logits: torch.Tensor, labels: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Returns (logprobs at labels, entropy) computed from float32 full logits.
     """Reference implementation: compute both logprobs and entropy."""
     log_softmax = torch.nn.functional.log_softmax(logits.float(), dim=-1)
     probs = log_softmax.exp()
@@ -39,6 +50,9 @@ def reference_logprobs_entropy(
 
 
 def setup_distributed_environment():
+    # [FUNCTION DOC]
+    # HELPER: If not initialized, inits NCCL over TCP from RANK/WORLD_SIZE/MASTER_ADDR/
+    # MASTER_PORT (with defaults) and sets device to RANK.
     if dist.is_initialized():
         return
     rank = int(os.environ.get("RANK", "0"))
@@ -56,11 +70,16 @@ def setup_distributed_environment():
 
 
 def get_tp_group() -> dist.ProcessGroup:
+    # [FUNCTION DOC]
+    # HELPER: Returns the default (world) process group, used as the TP group.
     """Get the tensor parallel process group."""
     return dist.distributed_c10d._get_default_group()
 
 
 def test_vocab_parallel_logprobs():
+    # [FUNCTION DOC]
+    # Same seeded [4,16,1024] logits on every rank; each rank keeps its vocab shard and
+    # _vocab_parallel_logprobs must match the reference (1e-5); raises ValueError otherwise.
     """Test _vocab_parallel_logprobs with actual TP distribution."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -98,6 +117,9 @@ def test_vocab_parallel_logprobs():
 
 
 def test_vocab_parallel_logprobs_entropy():
+    # [FUNCTION DOC]
+    # Like the logprobs test but for _vocab_parallel_logprobs_entropy, checking both
+    # outputs against the reference; raises ValueError on mismatch.
     """Test _vocab_parallel_logprobs_entropy with actual TP distribution."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -141,6 +163,9 @@ def test_vocab_parallel_logprobs_entropy():
 
 
 def test_vocab_parallel_with_temperature():
+    # [FUNCTION DOC]
+    # Checks _vocab_parallel_logprobs with temperature 0.7 matches the reference applied to
+    # logits / temperature.
     """Test vocab parallel functions with temperature scaling."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -177,6 +202,9 @@ def test_vocab_parallel_with_temperature():
 
 
 def test_vocab_parallel_numerical_stability():
+    # [FUNCTION DOC]
+    # Logits scaled by 100: asserts no NaN/Inf in logprobs/entropy and match with the
+    # reference at 1e-4; raises ValueError otherwise.
     """Test numerical stability with large logit values."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -226,6 +254,9 @@ def test_vocab_parallel_numerical_stability():
 
 
 def test_vocab_parallel_gradient():
+    # [FUNCTION DOC]
+    # Backprops through both vocab-parallel functions and asserts shard gradients exist,
+    # have the shard shape (first function) and contain no NaN.
     """Test gradient computation with vocab parallel."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -265,6 +296,9 @@ def test_vocab_parallel_gradient():
 
 
 def test_vocab_parallel_gradient_correctness():
+    # [FUNCTION DOC]
+    # Compares shard gradients of sum(logprobs) and sum(logprobs + entropy) with the
+    # corresponding slice of reference full-logit gradients (1e-5); raises ValueError.
     """Verify gradient correctness by comparing with reference implementation.
 
     Note: We don't use torch.autograd.gradcheck because the vocab parallel
@@ -328,6 +362,10 @@ def test_vocab_parallel_gradient_correctness():
 
 
 def test_vocab_parallel_different_shapes():
+    # [FUNCTION DOC]
+    # Checks _vocab_parallel_logprobs on [tokens, vocab] (twice, labelled 1D and 2D) and
+    # [batch, seq, vocab] inputs against the reference.
+    # KNOWN ISSUE: the "1D" and "2D" cases are both 2-D logits; no true 1-D case exists.
     """Test with different input shapes (1D, 2D, 3D)."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -383,6 +421,11 @@ def test_vocab_parallel_different_shapes():
 
 
 def test_inplace_vocab_parallel_logprobs_entropy():
+    # [FUNCTION DOC]
+    # Runs _inplace_vocab_parallel_logprobs_entropy (temperature 0.7, chunk 5) on a
+    # non-leaf shard while temporarily monkeypatching dist.all_reduce to count calls.
+    # Asserts storage reused, 2 all-reduces per chunk, entropy detached, logprobs/entropy
+    # match the reference, and weighted-logprob gradients equal the reference shard.
     """Test the destructive fused path with real TP collectives."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -413,6 +456,9 @@ def test_inplace_vocab_parallel_logprobs_entropy():
     original_all_reduce = dist.all_reduce
 
     def counted_all_reduce(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Wrapper incrementing the enclosing call counter, then delegating to the
+        # original all_reduce.
         nonlocal all_reduce_calls
         all_reduce_calls += 1
         return original_all_reduce(*args, **kwargs)
@@ -447,12 +493,22 @@ def test_inplace_vocab_parallel_logprobs_entropy():
 
 
 class _HeadContainer(torch.nn.Module):
+    # [CLASS DOC]
+    # HELPER: Module holding a head as output_layer, as expected by
+    # replace_output_layer_with_areal_lm_head.
     def __init__(self, head):
+        # [FUNCTION DOC]
+        # Stores head as self.output_layer.
         super().__init__()
         self.output_layer = head
 
 
 def test_areal_lm_head_tensor_and_sequence_parallel():
+    # [FUNCTION DOC]
+    # Initializes Megatron model parallel state (TP = world) if needed, then runs the case
+    # helper for every combination of sequence_parallel, (fp32_output, fp32_operands) in
+    # {(F,F),(T,F),(T,T)} and weight_requires_grad. Side effect: global parallel_state init
+    # that later tests rely on.
     """Test native, FP32-output, and FP32-operand heads with TP and SP."""
     if not parallel_state.is_initialized():
         parallel_state.initialize_model_parallel(
@@ -505,6 +561,14 @@ def _test_areal_lm_head_tensor_and_sequence_parallel_case(
     fp32_operands: bool,
     weight_requires_grad: bool,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Builds a bf16 ColumnParallelLinear (no weight allocation, tied weight passed
+    # at call time) and replaces it with the AReaL LM head with the given FP32 flags. Runs
+    # forward on a local [seq, 1, hidden] input and asserts exact (atol 0) equality with a
+    # manually computed matmul (sequence-gathered input when SP; float32 operands, float32
+    # output via out_dtype, or plain bf16). Backprops random grads and asserts exact input
+    # gradient (reduce-scattered under SP, all-reduced otherwise) and weight gradient
+    # (or that no weight grad exists when not required).
     config = TransformerConfig(
         num_layers=1,
         hidden_size=hidden_size,
@@ -619,6 +683,12 @@ def _test_areal_lm_head_tensor_and_sequence_parallel_case(
 
 
 def test_areal_lm_head_packed_dlogits_tensor_and_sequence_parallel():
+    # [FUNCTION DOC]
+    # For SP off/on: builds an FP32-output AReaL head, computes logits, builds a reference
+    # from all-gathered logits, then calls gather_logprobs_entropy with reuse_logits=True
+    # while counting calls to the module's _pack_fp32_to_half_inplace (monkeypatched and
+    # restored). Asserts exactly one pack call, detached entropy, logprobs match, and input
+    # and weight gradients match those implied by reference dlogits.
     """Test fused-loss storage packing through MCore TP/SP backward."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -629,7 +699,11 @@ def test_areal_lm_head_packed_dlogits_tensor_and_sequence_parallel():
     tp_group = get_tp_group()
 
     class HeadContainer(torch.nn.Module):
+        # [CLASS DOC]
+        # HELPER: Local duplicate of _HeadContainer.
         def __init__(self, head):
+            # [FUNCTION DOC]
+            # Stores head as self.output_layer.
             super().__init__()
             self.output_layer = head
 
@@ -696,6 +770,8 @@ def test_areal_lm_head_packed_dlogits_tensor_and_sequence_parallel():
         original_pack = lm_head_module._pack_fp32_to_half_inplace
 
         def counted_pack(*args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Increments the enclosing pack counter and delegates to the original packer.
             nonlocal pack_calls
             pack_calls += 1
             return original_pack(*args, **kwargs)
@@ -753,6 +829,11 @@ def test_areal_lm_head_packed_dlogits_tensor_and_sequence_parallel():
 
 
 def test_chunked_fp32_lm_head_tensor_and_sequence_parallel():
+    # [FUNCTION DOC]
+    # For SP off/on: FP32-operand AReaL head evaluated through
+    # chunked_lm_head_logprobs_entropy (temperature 0.7, chunk 3) and compared to a full
+    # float32 reference for logprobs, entropy, input gradient (tight tolerance) and weight
+    # gradient (looser 5e-3 / 3e-2 tolerance).
     """Compare chunked FP32-operand LM Head results under TP and SP."""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -890,6 +971,8 @@ def test_chunked_fp32_lm_head_tensor_and_sequence_parallel():
 
 
 def run_all_tests():
+    # [FUNCTION DOC]
+    # Runs all tests in order with barriers between them; rank 0 prints headers/summary.
     """Run all tensor parallel tests."""
     rank = dist.get_rank()
 

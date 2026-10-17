@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Torchrun script for MegatronEngine on Qwen3 / Qwen3-MoE / Qwen3.5 (dense + MoE)
+# models: forward consistency vs an FSDP reference, a train step, grad-norm
+# invariance to micro-batch count, DCP save/load round-trips (with/without optimizer)
+# and an HF safetensors save/load round-trip. Model paths come from testing_utils;
+# Qwen3.5 forces the megatron-bridge bridge type. Results optionally go to a file.
 import argparse
 import copy
 import os
@@ -61,6 +67,8 @@ _MODEL_SKIP_FSDP_COMPARE = {"qwen3_5_moe": True}
 
 
 def write_result(out: str, succ: bool):
+    # [FUNCTION DOC]
+    # HELPER: Writes "Passed" if succ else "Failed" to the file at path out.
     with open(out, "w") as f:
         if succ:
             f.write("Passed")
@@ -74,6 +82,10 @@ def mock_input(
     max_seqlen=1024,
     device=current_platform.device_type,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Random right-padded batch (lengths in [min_seqlen, max_seqlen), ids in
+    # [10000, 50000), pad 0) returning input_ids and bool attention_mask.
+    # KNOWN ISSUE: docstring mentions position_ids, which are not returned.
     """Create mock padded input data (same format for huggingface) for testing.
     Returns a dict with input_ids, attention_mask, and position_ids.
     """
@@ -99,6 +111,11 @@ def mock_input(
 
 
 def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
+    # [FUNCTION DOC]
+    # HELPER: Builds a TrainEngineConfig with the model path, backend allocation string,
+    # mb_spec, optional default optimizer, and MegatronEngineConfig(vpp_size, bridge_type
+    # from overrides else "mbridge"); creates the MegatronEngine, its process group from
+    # the parsed allocation, initializes it and returns it.
     bridge_type = _MODEL_BRIDGE_OVERRIDES.get(model_type, "mbridge")
     config = TrainEngineConfig(
         backend=backend,
@@ -121,6 +138,10 @@ def make_engine(model_type, backend, mb_spec, vpp_size=1, init_optimizer=False):
 
 
 def make_fsdp_engine(model_type, backend, mb_spec, init_optimizer=False):
+    # [FUNCTION DOC]
+    # HELPER: Builds an FSDP reference engine for the same model, collapsing the parsed
+    # allocation to pure data parallel over the full world size (pp/tp/cp = 1) so its
+    # forward output is stable; initializes and returns it.
     engine_config = TrainEngineConfig(
         backend="fsdp:d1",
         experiment_name="test",
@@ -145,6 +166,14 @@ def make_fsdp_engine(model_type, backend, mb_spec, init_optimizer=False):
 def test_forward(
     model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
 ):
+    # [FUNCTION DOC]
+    # Runs Megatron forward on a 16-sample mock batch broadcast from the DP head across the
+    # context+model-parallel group, asserts logprobs are identical across the model-parallel
+    # group, then (unless the model is in _MODEL_SKIP_FSDP_COMPARE) runs an FSDP forward and
+    # on DP heads raises AssertionError if cosine similarity of logprobs is below 0.99.
+    # Destroys engines; rank 0 writes the result.
+    # KNOWN ISSUE: the FSDP engine gets the un-broadcast input_ (local random batch) and
+    # "failed" is never set, so the written result is always Passed when no exception.
     rank = int(os.environ["RANK"])
 
     mb_spec = MicroBatchSpec(max_tokens_per_mb=256)
@@ -235,6 +264,8 @@ def test_forward(
 def mock_loss_fn(
     logprobs: torch.Tensor, entropy: torch.Tensor, input_data: dict, **kwargs
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Loss = mean of logprobs; other inputs ignored.
     """Mock loss function for testing."""
     return torch.mean(logprobs)
 
@@ -242,6 +273,10 @@ def mock_loss_fn(
 def test_train(
     model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
 ):
+    # [FUNCTION DOC]
+    # Builds a Megatron engine with optimizer, runs one train_batch on a broadcast mock
+    # batch (loss weight = total tokens), barriers, destroys; rank 0 writes Passed. Only
+    # verifies the step does not crash.
     print(f"running train test: model_type={model_type} alloc_mode={alloc_mode}")
     rank = int(os.environ["RANK"])
 
@@ -278,6 +313,12 @@ def test_train(
 def test_grad_norm_mb_invariance(
     model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
 ):
+    # [FUNCTION DOC]
+    # Builds two engines with identical seeding but max_tokens_per_mb 4096 vs 256 (so
+    # different micro-batch counts), trains one step each on the identical broadcast batch
+    # and records grad_norm. Passes if the two norms agree within 1e-3 relative; prints a
+    # FAIL line otherwise; rank 0 writes the result. Engines are destroyed at the end
+    # (both coexist in memory).
     """Regression guard for the `loss_multiplier` fix in `train_batch`.
 
     Megatron Core's pipeline schedule applies `loss /= num_microbatches` on the
@@ -362,6 +403,12 @@ def test_grad_norm_mb_invariance(
 def test_train_dcp_save_load(
     model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
 ):
+    # [FUNCTION DOC]
+    # Train step 1, save DCP checkpoint with optimizer to a temp dir, train step 2 and
+    # snapshot params, zero params, load, re-run step 2 and assert params equal the
+    # snapshot (proves weights + optimizer restored). Destroys the engine.
+    # KNOWN ISSUE: rank 0 creates the directory without a barrier before saving, and every
+    # rank (not just rank 0) writes "Passed" to output if given.
     print(
         f"running test_train_dcp_save_load(model_type={model_type} alloc_mode={alloc_mode})"
     )
@@ -468,6 +515,10 @@ def test_train_dcp_save_load(
 def test_simple_dcp_save_load(
     model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
 ):
+    # [FUNCTION DOC]
+    # Snapshots initial params, saves DCP checkpoint without optimizer, zeroes params,
+    # loads and asserts all params match the snapshot. Destroys the engine; every rank
+    # writes "Passed" to output if given.
     print(
         f"running test_simple_dcp_save_load(model_type={model_type} alloc_mode={alloc_mode})"
     )
@@ -532,6 +583,11 @@ def test_simple_dcp_save_load(
 def test_train_hf_save_load(
     model_type: str, alloc_mode: str, output: str | None = None, vpp_size: int = 1
 ):
+    # [FUNCTION DOC]
+    # Optionally trains one step (skipped for models in _MODEL_SAVELOAD_SKIP_TRAIN, which
+    # also get no optimizer), snapshots params, saves via engine._save_model_to_hf, zeroes
+    # params, reloads via _load_model_from_hf and asserts params match within atol 0.01
+    # (bf16 round-trip). Destroys the engine; writes "Passed" to output if given.
     """Train → HF save → zero params → HF load → retrain, verify weights match.
 
     Same structure as test_train_dcp_save_load but uses _save_model_to_hf /
@@ -641,6 +697,9 @@ def test_train_hf_save_load(
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --model_type, --backend (default megatron:d1p2t2c2), --vpp_size, --output and
+    # --test_type, prints the args, and dispatches to the matching test function.
     parser = argparse.ArgumentParser(description="Run Megatron Engine Distributed Test")
     parser.add_argument(
         "--model_type",

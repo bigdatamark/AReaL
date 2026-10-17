@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Torchrun worker validating the per-PP-rank SGLang weight-update group protocol
+# (group naming, head detection, payload layout, layer partitioning, NCCL broadcast)
+# without building real training engines; payload logic is re-implemented inline.
+# Rank 0 writes Passed/Failed to --output. Uses stdlib logging.
 """Distributed test worker for sglang PP weight synchronization.
 
 Run via torchrun from test_sglang_pp_distributed.py.
@@ -51,6 +56,8 @@ logger = logging.getLogger(__name__)
 
 
 def _write_result(output_path: str, passed: bool) -> None:
+    # [FUNCTION DOC]
+    # HELPER: If output_path is non-empty, writes "Passed" or "Failed" to it.
     if output_path:
         with open(output_path, "w") as f:
             f.write("Passed" if passed else "Failed")
@@ -62,6 +69,8 @@ def _write_result(output_path: str, passed: bool) -> None:
 
 
 def _get_weight_update_group_name(pp_rank: int) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns "update_weight_group_<pp_rank>".
     """Return the expected weight update group name for a given PP rank.
 
     All three engines use ``f"update_weight_group_{pp_rank}"``.
@@ -72,6 +81,9 @@ def _get_weight_update_group_name(pp_rank: int) -> str:
 def _is_pp_head(
     engine_type: str, rank: int, world_size: int, dp: int, pp: int, tp: int
 ) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: For fsdp, head iff rank 0. Otherwise assumes rank layout [dp, pp, tp] and
+    # returns True iff dp index and tp index are both 0. world_size is unused.
     """Determine whether this rank is a pipeline parallel head.
 
     Uses the same logic each engine applies:
@@ -90,6 +102,8 @@ def _is_pp_head(
 
 
 def _get_pp_rank(engine_type: str, rank: int, dp: int, pp: int, tp: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns 0 for fsdp (PP folded into DP); else (rank // tp) % pp.
     """Compute the PP rank for this worker.
 
     FSDP does not partition the model by PP on the training side (PP is
@@ -102,6 +116,8 @@ def _get_pp_rank(engine_type: str, rank: int, dp: int, pp: int, tp: int) -> int:
 
 
 def _get_pp_size(engine_type: str, dp: int, pp: int, tp: int) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns 1 for fsdp, otherwise pp.
     """Return the effective PP size on the training side.
 
     FSDP folds PP into DP, so its training-side PP size is always 1.
@@ -125,6 +141,13 @@ def _build_init_weights_group_payload(
     master_port: int,
     server_idx: int = 0,
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Mirrors SGLangBackend payload building. If gen_pp_size > 1 and the group name
+    # ends in an integer suffix, returns a per-PP payload: pp_rank from the suffix,
+    # rank_offset 1 + server_idx*tp, world_size n_servers*tp + 1 (n_servers =
+    # gen_world_size / (tp*pp)), plus pp_rank key. Otherwise returns a flat payload with
+    # rank_offset 1 + server_idx*tp*pp and world_size gen_world_size + 1. Both include
+    # master address/port (port as string), backend "nccl" and group_name.
     """Replicate ``SGLangBackend.build_init_weights_group_request`` payload.
 
     Avoids importing ``areal.engine.sglang_remote`` which would pull in
@@ -174,6 +197,14 @@ def _build_init_weights_group_payload(
 
 
 def test_group_init(backend: str, gen_pp_size: int, output: str, engine_type: str):
+    # [FUNCTION DOC]
+    # Parses the training allocation, then asserts: group name for this rank's pp_rank,
+    # head detection, per-PP inference world size equals tp for an sglang d1p<gen_pp>t<tp>
+    # allocation, and for each inference PP rank the payload's group_name, pp_rank presence
+    # and world_size. Barriers; rank 0 writes Passed, or on any exception logs, writes
+    # Failed and re-raises.
+    # KNOWN ISSUE: the head-detection check recomputes the same formula as _is_pp_head, so
+    # it is tautological; gen_world uses the training tp as inference tp.
     """Verify per-PP-rank group names, head detection, and world sizes.
 
     Checks:
@@ -285,6 +316,14 @@ def test_group_init(backend: str, gen_pp_size: int, output: str, engine_type: st
 
 
 def test_weight_sync(backend: str, gen_pp_size: int, output: str, engine_type: str):
+    # [FUNCTION DOC]
+    # Asserts the allocation world size equals WORLD_SIZE and dp*pp*tp; for fsdp asserts
+    # pp == 1. Simulates partitioning 28 layers across PP ranks; if PP > 1 creates every PP
+    # subgroup on all ranks (new_group is collective), all-gathers layer sets and on the
+    # group's first rank asserts they are disjoint and cover all layers. Checks a global
+    # all_reduce sum of ranks, and if PP > 1 creates all TP subgroups and broadcasts a
+    # pp-rank-specific value from each TP group's first rank, asserting receipt. Result
+    # writing/exception handling as in test_group_init. gen_pp_size is unused.
     """Verify allocation parsing, PP arithmetic, and distributed broadcast.
 
     Checks:
@@ -453,6 +492,10 @@ def test_weight_sync(backend: str, gen_pp_size: int, output: str, engine_type: s
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --backend, --output, --test_type, --gen_pp_size, --engine_type; sets the CUDA
+    # device from LOCAL_RANK, inits NCCL if needed, runs the chosen test and always
+    # destroys the process group.
     parser = argparse.ArgumentParser(
         description="Distributed test worker for sglang PP weight sync."
     )

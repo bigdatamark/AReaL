@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tests for inference CLI runtime teardown: process kill ordering (data proxy, worker,
+# gateway, router), forced slot replacement recovering pids from malformed state files,
+# and foreground cleanup reading the latest persisted model state. kill_pids is
+# monkeypatched, so no processes are signalled.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -14,6 +19,9 @@ from areal.v2.cli.inference.state import (
 
 
 def _service_state(gateway_pid: int = 30, router_pid: int = 40) -> ServiceState:
+    # [FUNCTION DOC]
+    # HELPER: Builds a local-backend ServiceState "svc" whose gateway/router TaskHandles
+    # carry the given pids in ref.
     return ServiceState(
         service="svc",
         backend="local",
@@ -29,6 +37,8 @@ def _service_state(gateway_pid: int = 30, router_pid: int = 40) -> ServiceState:
 
 
 def _replica(*, worker_pid: int, proxy_pid: int) -> ModelReplica:
+    # [FUNCTION DOC]
+    # HELPER: Builds a ModelReplica with data-proxy and worker TaskHandles with given pids.
     return ModelReplica(
         data_proxy=TaskHandle(
             host="127.0.0.1", ports=[5001], gpu_devices=[], ref={"pid": proxy_pid}
@@ -40,6 +50,9 @@ def _replica(*, worker_pid: int, proxy_pid: int) -> ModelReplica:
 
 
 def test_terminate_runtime_state_kills_in_order(monkeypatch):
+    # [FUNCTION DOC]
+    # Asserts terminate_runtime_state kills pids one group at a time in order proxy (20),
+    # worker (10), gateway (30), router (40), each with the given grace period.
     from areal.v2.cli.inference import common
     from areal.v2.cli.inference.state import RuntimeState
 
@@ -56,6 +69,8 @@ def test_terminate_runtime_state_kills_in_order(monkeypatch):
     calls = []
 
     def fake_kill_pids(pids, grace_s):
+        # [FUNCTION DOC]
+        # HELPER: Records (pids list, grace) for each kill call.
         calls.append((list(pids), grace_s))
 
     monkeypatch.setattr(common, "kill_pids", fake_kill_pids)
@@ -70,6 +85,10 @@ def test_terminate_runtime_state_kills_in_order(monkeypatch):
 
 
 def test_prepare_service_slot_force_recovers_raw_pids(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # Writes a service state JSON missing "backend" (so normal loading fails) plus a models
+    # state JSON, calls force_replace_slot and asserts a single kill of all recovered pids
+    # [100, 101, 300, 200] and deletion of both state files.
     from areal.v2.cli.inference import lifecycle as inf_lifecycle_mod
     from areal.v2.cli.inference.lifecycle import inf_lifecycle
     from areal.v2.cli.inference.state import store
@@ -129,6 +148,8 @@ def test_prepare_service_slot_force_recovers_raw_pids(tmp_path, monkeypatch):
     calls = []
 
     def fake_kill_pids(pids, grace_s):
+        # [FUNCTION DOC]
+        # HELPER: Records (pids list, grace) for each kill call.
         calls.append((list(pids), grace_s))
 
     monkeypatch.setattr(inf_lifecycle_mod, "kill_pids", fake_kill_pids)
@@ -141,6 +162,10 @@ def test_prepare_service_slot_force_recovers_raw_pids(tmp_path, monkeypatch):
 
 
 def test_foreground_cleanup_uses_latest_model_state(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # Saves a newer ModelState with a model "later", calls run._cleanup_runtime with an
+    # empty in-memory ModelState and asserts the persisted replica pids are still killed in
+    # data-flow order.
     from areal.v2.cli.inference import common
     from areal.v2.cli.inference.commands import run
 
@@ -155,6 +180,8 @@ def test_foreground_cleanup_uses_latest_model_state(tmp_path, monkeypatch):
     calls = []
 
     def fake_kill_pids(pids, grace_s):
+        # [FUNCTION DOC]
+        # HELPER: Records (pids list, grace) for each kill call.
         calls.append((list(pids), grace_s))
 
     monkeypatch.setattr(common, "kill_pids", fake_kill_pids)

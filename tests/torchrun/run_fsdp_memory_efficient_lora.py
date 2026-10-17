@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Torchrun script checking FSDPEngine with use_lora=True and memory_efficient_load=True
+# on Qwen3-0.6B: engine initializes, LoRA params exist, and a no-grad forward works.
+# Rank 0 optionally writes "Passed"/"Failed" to an output file.
 """Test memory_efficient_load with LoRA configuration."""
 
 import argparse
@@ -25,6 +29,8 @@ MODEL_PATH = get_model_path(
 
 
 def write_result(out: str, succ: bool):
+    # [FUNCTION DOC]
+    # HELPER: Writes "Passed" if succ else "Failed" to the file at path out.
     with open(out, "w") as f:
         if succ:
             f.write("Passed")
@@ -36,6 +42,10 @@ def make_fsdp_engine_with_lora(
     backend: str,
     memory_efficient_load: bool,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Builds a TrainEngineConfig with default optimizer, the given
+    # memory_efficient_load flag and LoRA (rank 8, alpha 16), creates the FSDPEngine and
+    # its process group from the backend allocation string, initializes it and returns it.
     """Create FSDPEngine with LoRA and optionally memory_efficient_load."""
     config = TrainEngineConfig(
         backend=backend,
@@ -60,6 +70,11 @@ def make_fsdp_engine_with_lora(
 
 
 def test_memory_efficient_lora(alloc_mode: str, output: str | None = None):
+    # [FUNCTION DOC]
+    # Creates the LoRA engine, fails if no parameter name contains "lora", warns (print
+    # only, not a failure) about non-LoRA trainable params, runs a forward on random
+    # [2, 32] ids catching any exception as failure, then syncs, barriers, destroys the
+    # engine and lets rank 0 write the result. Does not raise on failure itself.
     """Test that memory_efficient_load works correctly with LoRA.
 
     This test verifies:
@@ -131,6 +146,8 @@ def test_memory_efficient_lora(alloc_mode: str, output: str | None = None):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --output and --backend (default fsdp:d1t1c1) and runs the LoRA test.
     parser = argparse.ArgumentParser(description="Test memory_efficient_load with LoRA")
     parser.add_argument(
         "--output",

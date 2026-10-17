@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Tests for agent CLI state persistence (ServiceState save/load under AREAL_HOME) and
+# for loading click default maps from TOML config files.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -11,6 +14,9 @@ from areal.v2.cli.agent.state import (
 
 
 def test_service_state_round_trip(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # Saves a ServiceState with gateway/router processes and no pairs, reloads it by name,
+    # and asserts service name, gateway pid, component pids [11, 12] and file existence.
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
     state = ServiceState(
         service="svc",
@@ -42,6 +48,10 @@ def test_service_state_round_trip(tmp_path, monkeypatch):
 
 
 def test_config_maps_toml_sections_to_click_defaults(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # Writes <AREAL_HOME>/agent/config.toml with [default] and [run] sections plus an extra
+    # TOML overriding admin_api_key; asserts load_click_default_map(extra=...) merges
+    # [default] into the "run" command defaults with the extra file taking precedence.
     monkeypatch.setenv("AREAL_HOME", str(tmp_path / "home"))
     config_dir = tmp_path / "home" / "agent"
     config_dir.mkdir(parents=True)

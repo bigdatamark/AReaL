@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# CPU-only unit tests for areal.models.transformers.vision_sp_shard, which shards
+# vision-encoder work (images) across Ulysses sequence-parallel ranks: patch/embedding
+# counting from grid_thw, contiguous load-balanced image-to-rank assignment, slicing of
+# local pixel inputs, gathering embeddings, forward wrapping, class patching and
+# Qwen3-VL deepstack unpacking. Distributed calls are mocked or bypassed.
 """
 Unit tests for Vision SP Shard utilities (CPU-only, no distributed).
 
@@ -23,12 +29,17 @@ from areal.models.transformers.vision_sp_shard import (
 
 
 def _assert_all_images_assigned(assignments, num_images):
+    # [FUNCTION DOC]
+    # HELPER: Flattens per-rank index lists and asserts they are a permutation of
+    # 0..num_images-1 (each image assigned exactly once).
     """Assert every image index in [0, num_images) appears exactly once."""
     all_idx = [i for rank in assignments for i in rank]
     assert sorted(all_idx) == list(range(num_images))
 
 
 class TestGetImagePatchCounts:
+    # [CLASS DOC]
+    # Tests _get_image_patch_counts (product t*h*w per grid row).
     @pytest.mark.parametrize(
         "grid_thw,expected",
         [
@@ -39,15 +50,21 @@ class TestGetImagePatchCounts:
         ids=["multi-image", "single-image", "video-frames"],
     )
     def test_patch_counts_various_grids_correct_products(self, grid_thw, expected):
+        # [FUNCTION DOC]
+        # Parametrized: asserts per-image patch counts equal t*h*w for several grids.
         counts = _get_image_patch_counts(torch.tensor(grid_thw))
         assert counts == expected
 
     def test_patch_counts_empty_input_returns_empty_list(self):
+        # [FUNCTION DOC]
+        # Asserts an empty (0,3) grid yields an empty list.
         counts = _get_image_patch_counts(torch.empty((0, 3), dtype=torch.long))
         assert counts == []
 
 
 class TestGetImageEmbeddingCounts:
+    # [CLASS DOC]
+    # Tests _get_image_embedding_counts (patch count divided by merge_size squared).
     @pytest.mark.parametrize(
         "grid_thw,merge_size,expected",
         [
@@ -60,20 +77,28 @@ class TestGetImageEmbeddingCounts:
     def test_embedding_counts_with_merge_size_correct(
         self, grid_thw, merge_size, expected
     ):
+        # [FUNCTION DOC]
+        # Parametrized: asserts embedding counts for merge sizes 1 and 2.
         counts = _get_image_embedding_counts(torch.tensor(grid_thw), merge_size)
         assert counts == expected
 
     def test_embedding_counts_empty_input_returns_empty_list(self):
+        # [FUNCTION DOC]
+        # Asserts an empty grid yields an empty list (default merge size).
         counts = _get_image_embedding_counts(torch.empty((0, 3), dtype=torch.long))
         assert counts == []
 
     def test_embedding_counts_merge_1_equals_patch_counts(self):
+        # [FUNCTION DOC]
+        # Asserts merge_size=1 results equal the raw patch counts.
         """merge_size=1 path should produce identical results to _get_image_patch_counts."""
         grid = torch.tensor([[2, 4, 4], [1, 8, 8], [1, 6, 6]])
         assert _get_image_embedding_counts(grid, 1) == _get_image_patch_counts(grid)
 
 
 class TestAssignImagesToDpRanks:
+    # [CLASS DOC]
+    # Tests _assign_images_to_dp_ranks, which returns (per-rank index lists, per-rank loads).
     @pytest.mark.parametrize(
         "patch_counts,dp_size,expected_all_assigned",
         [
@@ -86,27 +111,39 @@ class TestAssignImagesToDpRanks:
     def test_assign_all_images_distributed_correctly(
         self, patch_counts, dp_size, expected_all_assigned
     ):
+        # [FUNCTION DOC]
+        # Parametrized: asserts every image is assigned once and loads sum to total patches.
+        # The expected_all_assigned parameter is unused.
         assignments, loads = _assign_images_to_dp_ranks(patch_counts, dp_size)
         _assert_all_images_assigned(assignments, len(patch_counts))
         assert sum(loads) == sum(patch_counts)
 
     def test_assign_fewer_images_than_ranks_all_assigned(self):
+        # [FUNCTION DOC]
+        # With 2 images and 4 ranks, asserts exactly 2 ranks are non-empty and all assigned.
         assignments, loads = _assign_images_to_dp_ranks([100, 200], dp_size=4)
         non_empty = sum(1 for a in assignments if len(a) > 0)
         assert non_empty == 2
         _assert_all_images_assigned(assignments, 2)
 
     def test_assign_empty_input_returns_empty_lists(self):
+        # [FUNCTION DOC]
+        # Asserts empty input yields empty assignments and zero loads for every rank.
         assignments, loads = _assign_images_to_dp_ranks([], dp_size=4)
         assert all(len(a) == 0 for a in assignments)
         assert all(load == 0 for load in loads)
 
     def test_assign_image_order_preserved_contiguous(self):
+        # [FUNCTION DOC]
+        # Asserts each rank's indices are in ascending order (contiguous assignment).
         assignments, _ = _assign_images_to_dp_ranks([10, 20, 30, 40, 50], dp_size=2)
         for rank_assignment in assignments:
             assert rank_assignment == sorted(rank_assignment)
 
     def test_assign_load_balanced_unequal_patches_reduces_imbalance(self):
+        # [FUNCTION DOC]
+        # With one large and three small images over 2 ranks, asserts max/min nonzero load
+        # ratio is below 8 (better than naive count-based split).
         """With unequal patch counts, greedy balancing should reduce imbalance."""
         # 4096 + 256 + 256 + 256 = 4864, target per rank = 2432
         patch_counts = [4096, 256, 256, 256]
@@ -118,6 +155,8 @@ class TestAssignImagesToDpRanks:
         assert max_load / min_load < 8.0
 
     def test_assign_contiguous_coverage_all_dp_sizes(self):
+        # [FUNCTION DOC]
+        # Asserts full exactly-once coverage for dp sizes 1, 2, 3, 4 and 7.
         """All images are covered exactly once across ranks for various dp_size."""
         patch_counts = [10, 20, 30, 40, 50, 60, 70]
         for dp_size in [1, 2, 3, 4, 7]:
@@ -126,7 +165,12 @@ class TestAssignImagesToDpRanks:
 
 
 class TestPrepareLocalVisionInputs:
+    # [CLASS DOC]
+    # Tests _prepare_local_vision_inputs, which slices pixel rows and grid rows for the
+    # images assigned to one dp rank and returns (pixels, grid, image indices).
     def test_prepare_two_images_splits_correctly(self):
+        # [FUNCTION DOC]
+        # Two images (36 and 64 patches) on two ranks: asserts each rank gets its slice.
         pixel_values = torch.randn(100, 768)
         grid_thw = torch.tensor([[1, 6, 6], [1, 8, 8]])  # 36 + 64 = 100
         image_assignments = [[0], [1]]
@@ -149,6 +193,8 @@ class TestPrepareLocalVisionInputs:
         assert torch.allclose(pix, pixel_values[36:100])
 
     def test_prepare_multiple_contiguous_images_per_rank(self):
+        # [FUNCTION DOC]
+        # Asserts rank 0 owning two contiguous 50-patch images gets the first 100 rows.
         pixel_values = torch.randn(200, 768)
         grid_thw = torch.tensor([[1, 5, 10]] * 4)  # 4 x 50 patches
         image_assignments = [[0, 1], [2, 3]]
@@ -162,6 +208,8 @@ class TestPrepareLocalVisionInputs:
         assert torch.allclose(pix, pixel_values[:100])
 
     def test_prepare_empty_rank_returns_empty_tensors(self):
+        # [FUNCTION DOC]
+        # Asserts a rank with no images gets zero-length pixel/grid tensors and no indices.
         pixel_values = torch.randn(100, 768)
         grid_thw = torch.tensor([[1, 10, 10]])
         image_assignments = [[0], []]
@@ -174,6 +222,8 @@ class TestPrepareLocalVisionInputs:
         assert indices == []
 
     def test_prepare_local_inputs_grid_thw_values_preserved(self):
+        # [FUNCTION DOC]
+        # Asserts the local grid rows equal the original grid rows for assigned images.
         pixel_values = torch.randn(150, 768)
         grid_thw = torch.tensor([[1, 5, 5], [2, 5, 5], [3, 5, 5]])  # 25 + 50 + 75
         image_assignments = [[0, 1], [2]]
@@ -187,7 +237,11 @@ class TestPrepareLocalVisionInputs:
 
 
 class TestGatherVisionEmbeddings:
+    # [CLASS DOC]
+    # Tests _gather_vision_embeddings.
     def test_gather_embeddings_none_group_returns_input_unchanged(self):
+        # [FUNCTION DOC]
+        # Asserts dp_group=None returns the very same tensor storage (no copy).
         """dp_group=None should short-circuit and return the same tensor (zero-copy)."""
         embeddings = torch.randn(10, 64)
         result = _gather_vision_embeddings(embeddings, dp_group=None, all_counts=[10])
@@ -197,11 +251,18 @@ class TestGatherVisionEmbeddings:
 
 
 class TestCreateDpVisionForward:
+    # [CLASS DOC]
+    # Tests create_dp_vision_forward wrapper behaviour.
     def test_dp_vision_forward_sp_size_1_calls_original_directly(self):
+        # [FUNCTION DOC]
+        # Patches Ulysses SP group/world size/rank to (None, 1, 0) and asserts the wrapped
+        # forward calls the original exactly once and returns its output.
         """When sp_size <= 1, the wrapper should call original_forward directly."""
         call_log = []
 
         def original_forward(self, hidden_states, grid_thw, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Fake original forward that logs the call and returns hidden_states.
             call_log.append("original")
             return hidden_states
 
@@ -232,12 +293,20 @@ class TestCreateDpVisionForward:
 
 
 class TestPatchVisionClass:
+    # [CLASS DOC]
+    # Tests _patch_vision_class monkeypatching of a vision class's forward.
     def test_patch_vision_class_replaces_forward(self):
+        # [FUNCTION DOC]
+        # Asserts patching replaces forward and sets _vision_sp_shard_patched=True.
         """_patch_vision_class should replace the class forward method."""
 
         class FakeVisionModel:
+            # [CLASS DOC]
+            # HELPER: Minimal stand-in vision model class.
             @staticmethod
             def forward(self, hidden_states, grid_thw, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Identity forward returning hidden_states.
                 return hidden_states
 
         original = FakeVisionModel.forward
@@ -246,11 +315,17 @@ class TestPatchVisionClass:
         assert getattr(FakeVisionModel, "_vision_sp_shard_patched", False) is True
 
     def test_patch_vision_class_idempotent_only_wraps_once(self):
+        # [FUNCTION DOC]
+        # Asserts a second patch call leaves the already-wrapped forward unchanged.
         """Calling _patch_vision_class twice should only wrap forward once."""
 
         class FakeVisionModel:
+            # [CLASS DOC]
+            # HELPER: Minimal stand-in vision model class.
             @staticmethod
             def forward(self, hidden_states, grid_thw, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Identity forward returning hidden_states.
                 return hidden_states
 
         _patch_vision_class(FakeVisionModel, "FakeVisionModel")
@@ -264,13 +339,23 @@ class TestPatchVisionClass:
 
 
 class TestApplyVisionSpShardPatch:
+    # [CLASS DOC]
+    # Tests apply_vision_sp_shard_patch.
     def test_apply_patch_import_error_does_not_raise(self):
+        # [FUNCTION DOC]
+        # Asserts the patch entry point does not raise even if some model classes are not
+        # importable. Side effect: may patch real installed transformers vision classes.
         """ImportError for unavailable models should not crash."""
         apply_vision_sp_shard_patch()  # should not raise
 
 
 class TestIntegration:
+    # [CLASS DOC]
+    # End-to-end (single process) checks combining counting, assignment and slicing.
     def test_full_workflow_all_patches_covered(self):
+        # [FUNCTION DOC]
+        # Five images over 2 ranks: asserts assignment coverage and that local slices across
+        # ranks add up to the total patch count with matching grid lengths.
         grid_thw = torch.tensor([[1, 4, 4], [1, 8, 8], [1, 4, 4], [1, 6, 6], [1, 4, 4]])
         total_patches = 16 + 64 + 16 + 36 + 16  # 148
         pixel_values = torch.randn(total_patches, 768)
@@ -294,6 +379,8 @@ class TestIntegration:
         assert total_local_patches == total_patches
 
     def test_same_size_images_4_ranks_balanced(self):
+        # [FUNCTION DOC]
+        # 50 equal images over 4 ranks: asserts each rank gets 12-13 images, loads 768 or 832.
         num_images = 50
         grid_thw = torch.tensor([[1, 8, 8]] * num_images)
         patch_counts = _get_image_patch_counts(grid_thw)
@@ -306,10 +393,16 @@ class TestIntegration:
 
 
 class TestUnpackDeepstack:
+    # [CLASS DOC]
+    # Tests _unpack_deepstack (splits vision output into embeddings + deepstack list).
     def test_unpack_no_deepstack_attr_returns_none(self):
+        # [FUNCTION DOC]
+        # Asserts None is returned for a model without deepstack_merger_list.
         """Model without deepstack_merger_list should return None."""
 
         class FakeModel:
+            # [CLASS DOC]
+            # HELPER: Model stub lacking deepstack attributes.
             pass
 
         emb = torch.randn(10, 64)
@@ -317,9 +410,13 @@ class TestUnpackDeepstack:
         assert _unpack_deepstack(FakeModel(), emb, hidden) is None
 
     def test_unpack_tuple_input_returns_unpacked(self):
+        # [FUNCTION DOC]
+        # Asserts a (embeddings, list) tuple is unpacked unchanged for a 3-layer deepstack model.
         """Qwen3-VL normal rank: forward returns (embeddings, list[Tensor])."""
 
         class FakeModel:
+            # [CLASS DOC]
+            # HELPER: Model stub with three deepstack merger slots.
             deepstack_merger_list = [None, None, None]  # 3 deepstack layers
 
         emb = torch.randn(10, 64)
@@ -335,9 +432,15 @@ class TestUnpackDeepstack:
             assert torch.equal(orig, unpacked)
 
     def test_unpack_empty_rank_creates_grad_tensors(self):
+        # [FUNCTION DOC]
+        # For a plain empty embedding tensor, asserts embeddings pass through and one empty
+        # (0, hidden) grad-requiring tensor per deepstack layer is created with hidden's
+        # dtype/device.
         """Empty rank must create empty deepstack tensors with requires_grad for NCCL."""
 
         class FakeModel:
+            # [CLASS DOC]
+            # HELPER: Model stub with two deepstack merger slots.
             deepstack_merger_list = [None, None]  # 2 deepstack layers
 
         emb = torch.empty(0, 64)  # empty rank, no images

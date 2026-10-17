@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Torchrun script for MegatronEngine vision-language model tests (init, forward,
+# THD-vs-BSHD packing parity, HF and DCP save/load, train step). Model path comes from
+# VLM_MODEL_PATH (default Qwen2.5-VL); bridge type from AREAL_TEST_BRIDGE_TYPE
+# (default mbridge). Rank 0 writes "Passed" (or "OOM") to --output when given.
 """Torchrun script for Megatron VLM integration tests.
 
 Launched via torchrun from test_megatron_engine_vlm.py. All integration
@@ -39,11 +44,19 @@ VLM_MODEL_PATH = os.environ.get("VLM_MODEL_PATH", DENSE_MODEL_PATHS["qwen2_5_vl"
 
 
 def write_result(path: str, result: str):
+    # [FUNCTION DOC]
+    # HELPER: Writes the result string to the file at path.
     with open(path, "w") as f:
         f.write(result)
 
 
 def mock_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds a single-sample VLM batch: 16 random text tokens followed by image
+    # tokens for a 1x4x4 patch grid (count reduced by spatial_merge_size squared), all-ones
+    # bool attention mask, random float32 pixel_values [patches, C*T*P*P] and
+    # image_grid_thw, using vision geometry from engine.hf_config with Qwen2.5-VL defaults.
+    # Returns input_ids, attention_mask and multi_modal_input (one dict per sample).
     """Create mock VLM input with vision tokens.
 
     Pulls patch geometry from ``engine.hf_config`` so this works for both
@@ -91,6 +104,8 @@ def mock_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
 
 
 def mock_text_only_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Two text-only samples of lengths 32 and 20 (padded with 0, bool mask).
     """Create a variable-length text-only batch for a VLM model."""
     device = engine.device
     seq_lens = torch.tensor([32, 20], dtype=torch.long, device=device)
@@ -101,6 +116,10 @@ def mock_text_only_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
 
 
 def mock_mixed_vlm_input(engine: "MegatronEngine") -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Two samples (lengths 24, 16): the first has image tokens at positions 8.. for
+    # a 1x4x4 grid plus pixel_values/grid_thw; the second is text-only with an empty
+    # multi-modal dict. Requires hf_config.image_token_id (no fallback).
     """Create a variable-length image-text plus text-only batch."""
     vc = engine.hf_config.vision_config
     patch_size = getattr(vc, "patch_size", 16)
@@ -143,6 +162,10 @@ def make_vlm_engine(
     init_optimizer: bool = False,
     wrap_with_ddp: bool = True,
 ) -> MegatronEngine:
+    # [FUNCTION DOC]
+    # HELPER: Builds and initializes a MegatronEngine for VLM_MODEL_PATH with
+    # max_tokens_per_mb 4096, gradient checkpointing, optional default optimizer and
+    # MegatronEngineConfig(bridge_type from env, wrap_with_ddp). Returns the engine.
     """Build a MegatronEngine for VLM tests.
 
     ``wrap_with_ddp=False`` skips the DDP grad-buffer allocation (~2× model
@@ -174,6 +197,9 @@ def make_vlm_engine(
 
 
 def _make_input(engine: MegatronEngine) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Builds mock_vlm_input and broadcasts it from the DP head over the
+    # context+model-parallel group; returns the broadcast batch.
     """Create mock input and broadcast across model-parallel ranks."""
     input_ = mock_vlm_input(engine)
     return broadcast_tensor_container(
@@ -184,12 +210,16 @@ def _make_input(engine: MegatronEngine) -> dict[str, Any]:
 
 
 def _cleanup(engine: MegatronEngine):
+    # [FUNCTION DOC]
+    # HELPER: CUDA synchronize, global barrier, then destroy the engine.
     torch.cuda.synchronize()
     dist.barrier()
     engine.destroy()
 
 
 def test_vlm_init(backend: str, output: str | None = None):
+    # [FUNCTION DOC]
+    # Asserts the engine detects a vision model and loads processor and tokenizer.
     """Test VLM engine initialization: model detection and processor loading."""
     rank = int(os.environ["RANK"])
     engine = make_vlm_engine(backend, init_optimizer=False)
@@ -205,6 +235,10 @@ def test_vlm_init(backend: str, output: str | None = None):
 
 
 def test_vlm_forward(backend: str, output: str | None = None):
+    # [FUNCTION DOC]
+    # Without DDP wrapping, runs an eval forward on the mock VLM batch and asserts a
+    # non-None result. If AREAL_TEST_EXPECT_MODEL_THD=1, first asserts the model is
+    # qwen3_vl_moe on megatron-bridge using model-owned THD packing (not padded).
     """Test VLM eval forward pass."""
     rank = int(os.environ["RANK"])
     # No DDP grad buffer — forward is inference-only. Saves ~2× model bytes
@@ -229,6 +263,11 @@ def test_vlm_forward(backend: str, output: str | None = None):
 
 
 def test_vlm_thd_bshd_parity(backend: str, output: str | None = None):
+    # [FUNCTION DOC]
+    # Requires qwen3_vl on megatron-bridge with model packed sequences. Runs no-grad
+    # forwards on text-only and mixed batches with BSHD (use_model_packed_seq toggled off)
+    # and THD, compares outputs on valid tokens and asserts max abs diff <= 0.15 and mean
+    # <= 0.035 per case. Cleans up in a finally block. Mutates engine.use_model_packed_seq.
     """Compare model-owned THD and padded BSHD forward outputs."""
     rank = int(os.environ["RANK"])
     torch.manual_seed(1234)
@@ -298,6 +337,10 @@ def test_vlm_thd_bshd_parity(backend: str, output: str | None = None):
 
 
 def test_vlm_save_load(backend: str, save_dir: str, output: str | None = None):
+    # [FUNCTION DOC]
+    # Runs forward, saves HF weights + tokenizer/processor to save_dir, rank 0 asserts a
+    # (pre)processor config exists, zeroes params, loads and asserts the forward output is
+    # unchanged.
     """Test VLM save/load weight round-trip."""
     rank = int(os.environ["RANK"])
     engine = make_vlm_engine(backend, init_optimizer=False)
@@ -337,6 +380,9 @@ def test_vlm_save_load(backend: str, save_dir: str, output: str | None = None):
 
 
 def test_vlm_dcp_save_load(backend: str, output: str | None = None):
+    # [FUNCTION DOC]
+    # Parameter-only DCP round-trip in a temp dir: snapshot params, save (no optimizer),
+    # zero, load and assert all params match. Engine built with an optimizer anyway.
     """Test VLM DCP save/load round-trip on parameters only.
 
     Parameter-only round-trip (no forward), so it works for any registered
@@ -394,6 +440,10 @@ def test_vlm_dcp_save_load(backend: str, output: str | None = None):
 
 
 def test_vlm_train(backend: str, output: str | None = None):
+    # [FUNCTION DOC]
+    # Builds an engine with optimizer, runs one train_batch (loss = mean logprobs, weight 1)
+    # and asserts grad_norm and lr are reported. A RuntimeError mentioning out of memory is
+    # swallowed and reported as "OOM" (cleanup is skipped in that case); others re-raise.
     """Test VLM training step."""
     rank = int(os.environ["RANK"])
 
@@ -429,6 +479,9 @@ def test_vlm_train(backend: str, output: str | None = None):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --backend (megatron:d1p1t2), --output, --save_dir, --test_type (default train)
+    # and dispatches; save_load requires --save_dir.
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", type=str, default="megatron:d1p1t2")
     parser.add_argument("--output", type=str, default=None)

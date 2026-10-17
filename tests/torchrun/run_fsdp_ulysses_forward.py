@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Torchrun script (2 GPUs) comparing FSDPEngine.forward logprobs with Ulysses sequence
+# parallel size 2 against a golden engine without SP, on Qwen3-0.6B.
 import argparse
 import os
 from typing import Any
@@ -27,6 +30,10 @@ MODEL_PATHS = {
 
 
 def setup_distributed_environment():
+    # [FUNCTION DOC]
+    # HELPER: If not already initialized, inits NCCL over TCP using RANK (default 0),
+    # WORLD_SIZE (default 1), MASTER_ADDR/MASTER_PORT (defaults localhost/29500) and sets
+    # the device index to RANK.
     if dist.is_initialized():
         return
     rank = int(os.environ.get("RANK", "0"))
@@ -49,6 +56,10 @@ def mock_input(
     min_seqlen=1,
     max_seqlen=1024,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Random right-padded batch (lengths in [min_seqlen, max_seqlen), ids in
+    # [10000, 50000), pad 0). Returns input_ids and bool attention_mask [batch, longest].
+    # KNOWN ISSUE: docstring mentions position_ids, which are not returned.
     """Create mock padded input data (same format for huggingface) for testing.
     Returns a dict with input_ids, attention_mask, and position_ids.
     """
@@ -74,6 +85,10 @@ def mock_input(
 
 
 def make_engine(model_type, mb_spec, ulysses_sp_size=1, init_optimizer=False):
+    # [FUNCTION DOC]
+    # HELPER: Builds and initializes an FSDPEngine for MODEL_PATHS[model_type] with
+    # data_parallel = world_size // ulysses_sp_size and context_parallel = ulysses_sp_size
+    # (optimizer only if init_optimizer). Prints the config; asserts world >= sp size.
     config = TrainEngineConfig(
         backend="fsdp:d2",
         experiment_name="test",
@@ -96,6 +111,13 @@ def make_engine(model_type, mb_spec, ulysses_sp_size=1, init_optimizer=False):
 
 
 def test_ulysses(model_type: str):
+    # [FUNCTION DOC]
+    # Requires world size 2. Builds an SP=2 engine and a golden SP=1 engine, runs eval
+    # forward on the same 4-sample batch with each, asserts SP outputs are identical on all
+    # ranks (all_gather), and on rank 0 compares SP vs golden logprobs on positions where
+    # both the token and its successor are valid (rtol/atol 1e-3). Destroys both engines.
+    # KNOWN ISSUE: the SP-vs-golden assert_close failure is caught and only printed, so a
+    # mismatch never fails the test.
     setup_distributed_environment()
 
     torch.manual_seed(42)
@@ -172,6 +194,8 @@ def test_ulysses(model_type: str):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --model_type (only "qwen3") and runs test_ulysses.
     parser = argparse.ArgumentParser(description="Run FSDP Ulysses Engine Test")
     parser.add_argument(
         "--model_type",

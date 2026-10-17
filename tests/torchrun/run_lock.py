@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Torchrun smoke test for areal.utils.lock.DistributedLock: all ranks repeatedly
+# acquire/hold/release a lock in a shared random namespace; exits non-zero on failure.
 import argparse
 import os
 import sys
@@ -11,6 +14,9 @@ from areal.utils.lock import DistributedLock
 
 
 def setup_distributed_environment(backend: str):
+    # [FUNCTION DOC]
+    # HELPER: If not initialized, inits a process group with the given backend over TCP
+    # from RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT (with defaults) and sets device to RANK.
     if dist.is_initialized():
         return
 
@@ -29,6 +35,9 @@ def setup_distributed_environment(backend: str):
 
 
 def _generate_namespace() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Rank 0 creates "dist_lock_test/<uuid4>" and broadcasts it; returns the shared
+    # namespace string on every rank.
     namespace = None
     if dist.get_rank() == 0:
         namespace = f"dist_lock_test/{uuid.uuid4()}"
@@ -40,6 +49,10 @@ def _generate_namespace() -> str:
 def distributed_lock_smoke_test(
     iters: int, timeout: float, hold_time: float, backoff: float
 ):
+    # [FUNCTION DOC]
+    # Creates DistributedLock("unittest") in a fresh namespace with the given backoff; for
+    # each iteration acquires with timeout (RuntimeError if not acquired), sleeps hold_time,
+    # releases, and barriers. Final barrier at the end.
     namespace = _generate_namespace()
     lock = DistributedLock("unittest", namespace=namespace, backoff=backoff)
 
@@ -59,6 +72,11 @@ def distributed_lock_smoke_test(
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --backend (nccl), --iters, --timeout, --hold-time, --backoff; sets up dist
+    # (re-raising any failure as RuntimeError without chaining the message), runs the smoke
+    # test with clamped hold time (>=0) and backoff (>=1e-6), always destroys the process
+    # group, prints success on rank 0 and returns 0.
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", default="nccl")
     parser.add_argument("--iters", type=int, default=10)

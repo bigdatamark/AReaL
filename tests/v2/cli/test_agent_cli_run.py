@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Test that the agent CLI run command (run.do_run) persists the launched service state
+# to the state store under AREAL_HOME; the actual stack launch is monkeypatched.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -12,9 +15,16 @@ from areal.v2.cli.agent.state import (
 
 
 def test_run_persists_service_state(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # Points AREAL_HOME at tmp_path, replaces launch_agent_stack with a fake returning a
+    # ServiceState (gateway, router, one worker/proxy pair), calls do_run with fixed
+    # options and asserts return code 0 and that the service state file exists.
     monkeypatch.setenv("AREAL_HOME", str(tmp_path))
 
     def fake_launch_agent_stack(**kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake launcher building a detached ServiceState from the keyword arguments
+        # (service, agent, admin key, timeouts) with hard-coded fake process entries.
         service = kwargs["service"]
         return ServiceState(
             service=service,

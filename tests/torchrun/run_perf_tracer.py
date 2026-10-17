@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Torchrun script that generates perf_tracer traces for tests: each rank runs traced
+# warmup and 1000-iteration matmul scopes with rank-dependent sizes and saves the
+# trace under AREAL_PERF_TRACE_BASE.
 import os
 from pathlib import Path
 
@@ -10,6 +14,13 @@ from areal.utils.perf_tracer import Category
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Reads AREAL_PERF_TRACE_BASE (required; created), RANK, WORLD_SIZE; inits gloo if
+    # multi-rank. Configures perf_tracer (experiment "torchrun", trial "world-<N>"),
+    # resets it, and inside a "torchrun-step" INSTR scope runs a warmup matmul and 1000
+    # matmuls (size 512 on even ranks, 4096 on odd; CUDA if available) in COMPUTE scopes,
+    # then emits an instant event with the result norm. Barriers if multi-rank; finally
+    # force-saves the trace and destroys the process group.
     base_dir = Path(os.environ["AREAL_PERF_TRACE_BASE"])
     base_dir.mkdir(parents=True, exist_ok=True)
 

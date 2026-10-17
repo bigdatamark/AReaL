@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Tests for areal.utils.functional.vocab_parallel: chunk-size forwarding of
+# gather_logprobs, the differentiable fallback entropy path, and the in-place
+# (logits-storage-reusing, Triton-backed) logprob/entropy path, compared against a
+# plain log_softmax reference. CUDA-only tests are skipped when CUDA is unavailable.
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
@@ -18,6 +23,10 @@ CUDA_AVAILABLE = torch.cuda.is_available()
 def test_gather_logprobs_forwards_explicit_chunk_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # [FUNCTION DOC]
+    # Monkeypatches vocab_parallel._chunked_gather_logprobs with a fake that records the
+    # chunk_size and returns a sentinel tensor; asserts gather_logprobs(chunk_size=3)
+    # returns that sentinel and passed chunk_size 3 through.
     """The public helper must honor its explicit chunk-size argument."""
     captured: dict[str, int] = {}
     expected = torch.zeros(5)
@@ -28,6 +37,9 @@ def test_gather_logprobs_forwards_explicit_chunk_size(
         temperature: float,
         chunk_size: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Fake replacement that discards logits/labels/temperature, stores chunk_size
+        # into the enclosing `captured` dict and returns the enclosing `expected` tensor.
         del logits, labels, temperature
         captured["chunk_size"] = chunk_size
         return expected
@@ -51,6 +63,9 @@ def test_gather_logprobs_forwards_explicit_chunk_size(
 def _reference(
     logits: torch.Tensor, labels: torch.Tensor, temperature: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Reference implementation. Computes log_softmax of logits/temperature over the
+    # last dim, returns (log-prob gathered at labels, entropy = -sum(p * log p)).
     log_probs = torch.log_softmax(logits / temperature, dim=-1)
     probabilities = log_probs.exp()
     selected = log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
@@ -59,6 +74,10 @@ def _reference(
 
 
 def _autograd_node_names(output: torch.Tensor) -> set[str]:
+    # [FUNCTION DOC]
+    # HELPER: Walks the autograd graph from output.grad_fn (DFS via next_functions) and
+    # returns the set of node class names encountered. Dedupes by class name, so distinct
+    # nodes of the same type are only expanded once.
     names: set[str] = set()
     pending = [output.grad_fn]
     while pending:
@@ -71,6 +90,10 @@ def _autograd_node_names(output: torch.Tensor) -> set[str]:
 
 
 def test_regular_entropy_path_remains_differentiable():
+    # [FUNCTION DOC]
+    # On CPU with reuse_logits=False, asserts gather_logprobs_entropy's entropy requires
+    # grad and that backprop of entropy.sum() gives the same logits gradients as the
+    # reference.
     """The safe fallback must preserve entropy-only loss gradients."""
     torch.manual_seed(456)
     logits = torch.randn(7, 31, dtype=torch.float32, requires_grad=True)
@@ -96,6 +119,12 @@ def test_regular_entropy_path_remains_differentiable():
 def test_inplace_vocab_parallel_matches_reference_and_reuses_storage(
     temperature: float,
 ):
+    # [FUNCTION DOC]
+    # CUDA, parametrized over temperature. Runs the in-place path (no TP group, chunk 5) on
+    # a non-leaf logits tensor and asserts: storage pointer unchanged, logits overwritten
+    # with probabilities (rows sum to 1), logprobs/entropy match reference, entropy has no
+    # grad, no SliceBackward0 in the logprob graph, and gradients of a weighted logprob
+    # loss match the reference (zero for rows with weight 0).
     """The fused path should preserve results while reusing logits storage."""
     torch.manual_seed(123)
     device = torch.device("cuda")
@@ -151,6 +180,9 @@ def test_inplace_vocab_parallel_matches_reference_and_reuses_storage(
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for Triton kernels")
 @pytest.mark.parametrize("temperature", [0.0, -1.0, float("inf"), float("nan")])
 def test_inplace_vocab_parallel_rejects_invalid_temperature(temperature: float):
+    # [FUNCTION DOC]
+    # CUDA, parametrized over 0, -1, inf, nan: asserts the in-place path raises ValueError
+    # matching "temperature must be positive".
     """Temperature must define a valid softmax distribution."""
     logits = torch.randn(2, 8, device="cuda")
     labels = torch.tensor([0, 1], device="cuda")
@@ -163,6 +195,11 @@ def test_inplace_vocab_parallel_rejects_invalid_temperature(temperature: float):
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for Triton kernels")
 def test_reuse_logits_accepts_full_storage_squeeze_view():
+    # [FUNCTION DOC]
+    # CUDA: for a squeeze(0) view covering the full storage of a non-leaf FP32 tensor,
+    # asserts reusable_vocab_parallel_logits returns the owner, gather_logprobs_entropy
+    # with reuse_logits=True matches the reference, storage is shared, entropy has no grad,
+    # and gradients flow back to the leaf.
     """Megatron's full-storage squeeze view should reuse its owning FP32 buffer."""
     torch.manual_seed(321)
     leaf = torch.randn(1, 7, 33, device="cuda", requires_grad=True)
@@ -187,6 +224,8 @@ def test_reuse_logits_accepts_full_storage_squeeze_view():
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for Triton kernels")
 def test_reuse_logits_rejects_partial_view():
+    # [FUNCTION DOC]
+    # CUDA: asserts reusable_vocab_parallel_logits returns None for a partial (sliced) view.
     """A partial view must not be mutated through the destructive fast path."""
     leaf = torch.randn(1, 7, 33, device="cuda", requires_grad=True)
     owner = leaf + 0.0

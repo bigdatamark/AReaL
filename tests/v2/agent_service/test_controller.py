@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Unit tests for the v2 AgentController, which uses a Scheduler to launch guard
+# workers and then, via HTTP calls to the guards (alloc_ports, fork, kill), starts a
+# router, a gateway and (worker, data-proxy) pairs, registers them, monitors health and
+# supports scale up/down with session draining. The module-level requests object and
+# scheduler are mocked; no processes or servers are started.
 # SPDX-License-Identifier: Apache-2.0
 
 """Unit tests for AgentController.
@@ -23,6 +29,8 @@ CTRL = "areal.v2.agent_service.controller.controller"
 
 @dataclass
 class _FakeWorker:
+    # [CLASS DOC]
+    # HELPER: Dataclass mimicking a scheduler Worker (id, ip, worker/engine port lists).
     id: str
     ip: str
     worker_ports: list[str]
@@ -30,6 +38,9 @@ class _FakeWorker:
 
 
 def _make_scheduler(*guard_specs: tuple[str, str]) -> MagicMock:
+    # [FUNCTION DOC]
+    # HELPER: Returns a MagicMock scheduler whose get_workers returns one _FakeWorker per
+    # (ip, port) spec, with ids agent-guard/<i> and the port as its single worker port.
     """Return a mock Scheduler whose get_workers returns _FakeWorkers."""
     workers = [
         _FakeWorker(id=f"agent-guard/{i}", ip=ip, worker_ports=[port], engine_ports=[])
@@ -41,6 +52,8 @@ def _make_scheduler(*guard_specs: tuple[str, str]) -> MagicMock:
 
 
 def _mock_alloc_ports_response(host: str, ports: list[int]) -> MagicMock:
+    # [FUNCTION DOC]
+    # HELPER: Mock successful /alloc_ports response returning host and ports.
     resp = MagicMock()
     resp.status_code = 200
     resp.json.return_value = {"status": "success", "host": host, "ports": ports}
@@ -49,6 +62,8 @@ def _mock_alloc_ports_response(host: str, ports: list[int]) -> MagicMock:
 
 
 def _mock_fork_response(host: str, pid: int) -> MagicMock:
+    # [FUNCTION DOC]
+    # HELPER: Mock successful /fork response returning host and pid.
     resp = MagicMock()
     resp.status_code = 200
     resp.json.return_value = {"status": "success", "host": host, "pid": pid}
@@ -57,6 +72,8 @@ def _mock_fork_response(host: str, pid: int) -> MagicMock:
 
 
 def _mock_kill_response() -> MagicMock:
+    # [FUNCTION DOC]
+    # HELPER: Mock successful /kill_forked_worker response (json and text bodies).
     resp = MagicMock()
     resp.status_code = 200
     resp.json.return_value = {"status": "success"}
@@ -65,6 +82,8 @@ def _mock_kill_response() -> MagicMock:
 
 
 def _mock_register_response() -> MagicMock:
+    # [FUNCTION DOC]
+    # HELPER: Mock 200 response for /register and /unregister.
     resp = MagicMock()
     resp.status_code = 200
     resp.raise_for_status = MagicMock()
@@ -72,6 +91,8 @@ def _mock_register_response() -> MagicMock:
 
 
 def _mock_health_response(active_sessions: int = 0) -> MagicMock:
+    # [FUNCTION DOC]
+    # HELPER: Mock health response with status ok and the given active_sessions.
     resp = MagicMock()
     resp.status_code = 200
     resp.json.return_value = {"status": "ok", "active_sessions": active_sessions}
@@ -80,6 +101,8 @@ def _mock_health_response(active_sessions: int = 0) -> MagicMock:
 
 @pytest.fixture()
 def config():
+    # [FUNCTION DOC]
+    # Fixture: AgentConfig with agent_cls_path "my.Agent" and admin key "test-key".
     return AgentConfig(
         agent_cls_path="my.Agent",
         admin_api_key="test-key",
@@ -87,9 +110,15 @@ def config():
 
 
 def _setup_mock_requests(mock_requests, port_start=9001):
+    # [FUNCTION DOC]
+    # HELPER: Installs fake post/get on the mocked requests module: alloc_ports hands out
+    # sequential ports from port_start, fork/register/kill/unregister succeed, others 404;
+    # get always returns a healthy zero-session response; RequestException = Exception.
     port_counter = iter(range(port_start, port_start + 100))
 
     def mock_post(url, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: URL-substring dispatcher returning the matching mock response.
         if "/alloc_ports" in url:
             return _mock_alloc_ports_response("10.0.0.1", [next(port_counter)])
         if "/fork" in url:
@@ -108,7 +137,11 @@ def _setup_mock_requests(mock_requests, port_start=9001):
 
 
 class TestConstruction:
+    # [CLASS DOC]
+    # Constructor tests.
     def test_construction(self, config):
+        # [FUNCTION DOC]
+        # Asserts a fresh controller has empty router/gateway addresses and no pairs.
         scheduler = _make_scheduler(("10.0.0.1", "8090"))
         ctrl = AgentController(config=config, scheduler=scheduler)
         assert ctrl.router_addr == ""
@@ -117,8 +150,13 @@ class TestConstruction:
 
 
 class TestInitialize:
+    # [CLASS DOC]
+    # initialize() tests.
     @patch(f"{CTRL}.requests")
     def test_initialize_forks_router_pairs_gateway(self, mock_requests, config):
+        # [FUNCTION DOC]
+        # Asserts initialize creates and fetches guard workers once, sets http router and
+        # gateway addresses, creates one pair, and tracks 4 forked services; then destroys.
         """Initialize should create guards via scheduler, then fork services."""
         _setup_mock_requests(mock_requests)
 
@@ -138,9 +176,15 @@ class TestInitialize:
 
     @patch(f"{CTRL}.requests")
     def test_initialize_uses_scheduling_spec_env_vars(self, mock_requests):
+        # [FUNCTION DOC]
+        # With a SchedulingSpec carrying env var ANTHROPIC_API_KEY, asserts the guard job's
+        # task has those env vars and runs "python -m areal.v2.agent_service.guard", and that
+        # every fork payload passes the same env.
         fork_payloads = []
 
         def mock_post(url, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Fake post recording fork JSON payloads; otherwise like the shared dispatcher.
             if "/alloc_ports" in url:
                 return _mock_alloc_ports_response("10.0.0.1", [9001])
             if "/fork" in url:
@@ -180,8 +224,12 @@ class TestInitialize:
 
 
 class TestScaleUp:
+    # [CLASS DOC]
+    # scale_up() tests.
     @patch(f"{CTRL}.requests")
     def test_scale_up_adds_pairs(self, mock_requests, config):
+        # [FUNCTION DOC]
+        # Asserts scale_up(3) returns new pair ids [1, 2, 3] and yields 4 pairs total.
         _setup_mock_requests(mock_requests)
 
         scheduler = _make_scheduler(("10.0.0.1", "8090"))
@@ -197,9 +245,14 @@ class TestScaleUp:
 
     @patch(f"{CTRL}.requests")
     def test_scale_up_round_robins_guards(self, mock_requests, config):
+        # [FUNCTION DOC]
+        # With two guards, asserts scale_up(4) spreads alloc_ports calls evenly (4 per guard,
+        # i.e. 2 services per pair, pairs round-robined).
         guards_called: list[str] = []
 
         def mock_post(url, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Fake post recording the guard base URL of each alloc_ports call.
             if "/alloc_ports" in url:
                 guards_called.append(url.split("/alloc_ports")[0])
                 return _mock_alloc_ports_response("10.0.0.1", [9001])
@@ -231,8 +284,12 @@ class TestScaleUp:
 
 
 class TestScaleDown:
+    # [CLASS DOC]
+    # scale_down() tests.
     @patch(f"{CTRL}.requests")
     def test_scale_down_removes_newest_first(self, mock_requests, config):
+        # [FUNCTION DOC]
+        # After scaling to 3 pairs, asserts scale_down(2) removes ids 2 and 1 leaving pair 0.
         _setup_mock_requests(mock_requests)
 
         scheduler = _make_scheduler(("10.0.0.1", "8090"))
@@ -250,8 +307,12 @@ class TestScaleDown:
 
 
 class TestDestroy:
+    # [CLASS DOC]
+    # destroy() tests.
     @patch(f"{CTRL}.requests")
     def test_destroy_clears_everything(self, mock_requests, config):
+        # [FUNCTION DOC]
+        # Asserts destroy resets addresses, pairs and forked services and deletes workers.
         _setup_mock_requests(mock_requests)
 
         scheduler = _make_scheduler(("10.0.0.1", "8090"))
@@ -268,9 +329,14 @@ class TestDestroy:
 
     @patch(f"{CTRL}.requests")
     def test_destroy_tolerates_kill_errors(self, mock_requests, config):
+        # [FUNCTION DOC]
+        # With kill requests raising ConnectionError, asserts destroy still attempts all 4
+        # kills and clears the forked service list.
         kill_count = 0
 
         def mock_post(url, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Fake post counting kill calls and raising on them.
             nonlocal kill_count
             if "/alloc_ports" in url:
                 return _mock_alloc_ports_response("10.0.0.1", [9001])
@@ -295,13 +361,21 @@ class TestDestroy:
 
 
 class TestDrain:
+    # [CLASS DOC]
+    # Draining behaviour during scale_down.
     @patch(f"{CTRL}.requests")
     def test_scale_down_waits_for_drain(self, mock_requests, config):
+        # [FUNCTION DOC]
+        # Health reports 2 active sessions for the first 5 calls then 0; with controller time
+        # patched (real monotonic, mocked sleep), asserts scale_down(1) polls more than once
+        # and removes the pair.
         """scale_down should poll DataProxy health until active_sessions reaches 0."""
         _setup_mock_requests(mock_requests)
         health_call_count = 0
 
         def mock_get(url, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Fake get counting calls; busy for the first 5 /health calls, then idle.
             nonlocal health_call_count
             health_call_count += 1
             if "/health" in url and health_call_count <= 5:
@@ -327,10 +401,16 @@ class TestDrain:
 
     @patch(f"{CTRL}.requests")
     def test_drain_uses_default_timeout(self, mock_requests, config):
+        # [FUNCTION DOC]
+        # Health always reports 5 active sessions; asserts scale_down polls at least once and
+        # eventually proceeds (default drain timeout).
+        # KNOWN ISSUE: time.sleep is not patched, so this test waits the full real timeout.
         _setup_mock_requests(mock_requests)
         get_count = 0
 
         def counting_get(url, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Fake get counting calls and always returning 5 active sessions.
             nonlocal get_count
             get_count += 1
             return _mock_health_response(active_sessions=5)
@@ -350,8 +430,12 @@ class TestDrain:
 
 
 class TestHealthMonitor:
+    # [CLASS DOC]
+    # Background health monitor thread lifecycle tests.
     @patch(f"{CTRL}.requests")
     def test_health_monitor_starts_and_stops(self, mock_requests, config):
+        # [FUNCTION DOC]
+        # Asserts initialize starts a live health thread and destroy stops and clears it.
         _setup_mock_requests(mock_requests)
 
         scheduler = _make_scheduler(("10.0.0.1", "8090"))

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Torchrun worker asserting FSDPEngine dtype invariants when optimizer_dtype differs
+# from the compute dtype: param/optimizer-state storage in optimizer_dtype, forward,
+# HF export and weight-sync casting in compute dtype. Avoids importing tests.utils.
 """Distributed worker for FSDP optimizer dtype invariants test.
 
 Asserts:
@@ -30,6 +34,10 @@ from areal.infra.platforms import current_platform
 
 
 def _resolve_model_path(local_path: str, hf_id: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns local_path if it exists, else downloads hf_id via
+    # huggingface_hub.snapshot_download (skipping gguf/ggml) and returns the cache path.
+    # Side effect: network/disk I/O.
     """Inline get_model_path, bypassing tests.utils.
 
     Importing tests.utils → areal.utils.testing_utils triggers
@@ -46,6 +54,11 @@ def _resolve_model_path(local_path: str, hf_id: str) -> str:
 
 
 def setup_distributed():
+    # [FUNCTION DOC]
+    # HELPER: If not initialized, inits an NCCL process group over TCP from RANK,
+    # WORLD_SIZE, MASTER_ADDR (default localhost), MASTER_PORT (default 29500) and sets the
+    # device to RANK.
+    # KNOWN ISSUE: uses global RANK instead of LOCAL_RANK for the device; wrong multi-node.
     if dist.is_initialized():
         return
     rank = int(os.environ["RANK"])
@@ -62,6 +75,8 @@ def setup_distributed():
 
 
 def get_local_dtype(t: torch.Tensor) -> torch.dtype:
+    # [FUNCTION DOC]
+    # HELPER: Returns the local shard dtype for a DTensor, else the tensor's dtype.
     """Extract dtype from DTensor or regular tensor."""
     if isinstance(t, DTensor):
         return t.to_local().dtype
@@ -69,6 +84,15 @@ def get_local_dtype(t: torch.Tensor) -> torch.dtype:
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --dtype (compute, default bfloat16), --optimizer_dtype (default float32) and
+    # --world_size (unused). Sets up dist, builds an FSDP engine (sdpa attention, adam,
+    # constant LR, no grad checkpointing) and asserts: (1) a trainable param's storage is
+    # optimizer_dtype; (3) forward logits are compute dtype; after one backward+step,
+    # (2) AdamW exp_avg/exp_avg_sq are optimizer_dtype; (4) rank 0 checks the first float
+    # tensor in an exported safetensors file (temp dir broadcast from rank 0, removed
+    # afterwards) is compute dtype; (5) _cast_to_compute_dtype of the full tensor gives
+    # compute dtype. Barriers, prints OK on rank 0 and destroys the engine.
     parser = argparse.ArgumentParser()
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--optimizer_dtype", default="float32")

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Torchrun correctness test for the Ulysses sequence-parallel monkey patch on a single
+# Qwen2 attention layer (flash_attention_3, bf16): SP output gathered across ranks must
+# match a full-sequence golden output.
 import os
 
 import torch
@@ -15,6 +19,9 @@ from areal.utils.constants import DIST_GROUP_DEFAULT_TIMEOUT
 
 
 def setup_distributed_environment():
+    # [FUNCTION DOC]
+    # HELPER: If not initialized, inits NCCL over TCP from RANK/WORLD_SIZE/MASTER_ADDR/
+    # MASTER_PORT (with defaults) and sets device to RANK.
     if dist.is_initialized():
         return
     rank = int(os.environ.get("RANK", "0"))
@@ -32,6 +39,13 @@ def setup_distributed_environment():
 
 
 def run_ulysses_correctness_test():
+    # [FUNCTION DOC]
+    # Builds a small Qwen2Attention (hidden 64, 4 heads, 2 KV heads, seq 2048), syncs
+    # weights and random hidden states from rank 0, computes the golden output, then
+    # creates an SP group over all ranks, applies the Ulysses patch, runs attention on this
+    # rank's sequence slice (with cu_seq_lens/max_length for the full sequence), all-gathers
+    # slices and on rank 0 raises ValueError if the concatenation differs from golden
+    # beyond atol 1e-3. Destroys the process group.
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device(f"{current_platform.device_type}:{rank}")

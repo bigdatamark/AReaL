@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Torchrun script exercising areal.infra.dist_rollout.redistribute_trajectories: each
+# rank builds random padded-free trajectories, redistributes them across ranks, and
+# pickles the result per rank so the pytest wrapper can verify it.
 import argparse
 import os
 import pickle
@@ -12,6 +16,13 @@ from areal.utils.data import tensor_container_to
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Inits an NCCL process group, binds the device from LOCAL_RANK, builds 16 random
+    # trajectories (random prompt/answer lengths 1-10; input_ids, bool loss_mask zero on
+    # prompt, negative random log_probs on answer, all-ones attention_mask; each with batch
+    # dim 1), calls redistribute_trajectories, moves all_data and data to CPU and pickles
+    # the result to <dump_path>/redistributed<global rank>.pkl. Input: args with dump_path.
+    # Side effects: NCCL collectives, file writes.
     dist.init_process_group("nccl")
     rank = int(os.environ["LOCAL_RANK"])
     current_platform.set_device(rank)

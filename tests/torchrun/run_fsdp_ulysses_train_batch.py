@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Torchrun script smoke-testing FSDPEngine.train_batch with Ulysses SP: with 2 ranks
+# each trains on its half of a broadcast batch with SP=2; with 1 rank a golden engine
+# trains on both halves sequentially. Only checks that training runs without error.
 import argparse
 import os
 from typing import Any
@@ -28,6 +32,9 @@ MODEL_PATHS = {
 
 
 def setup_distributed_environment():
+    # [FUNCTION DOC]
+    # HELPER: Same NCCL/TCP init as other scripts: RANK, WORLD_SIZE, MASTER_ADDR/PORT with
+    # defaults; sets the device to RANK. No-op if already initialized.
     if dist.is_initialized():
         return
     rank = int(os.environ.get("RANK", "0"))
@@ -50,6 +57,9 @@ def mock_input(
     min_seqlen=1,
     max_seqlen=1024,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Random right-padded batch returning input_ids and bool attention_mask.
+    # KNOWN ISSUE: docstring mentions position_ids, which are not returned.
     """Create mock padded input data (same format for huggingface) for testing.
     Returns a dict with input_ids, attention_mask, and position_ids.
     """
@@ -77,11 +87,16 @@ def mock_input(
 def mock_loss_fn(
     logprobs: torch.Tensor, entropy: torch.Tensor, input_data: dict, **kwargs
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Loss = mean of logprobs; other inputs ignored.
     """Mock loss function for testing."""
     return torch.mean(logprobs)
 
 
 def make_engine(model_type, mb_spec, ulysses_sp_size=1, init_optimizer=False):
+    # [FUNCTION DOC]
+    # HELPER: Builds/initializes an FSDPEngine (backend string "fsdp:d1") with
+    # data_parallel = world // sp and context_parallel = sp; optimizer optional.
     config = TrainEngineConfig(
         backend="fsdp:d1",
         experiment_name="test",
@@ -104,6 +119,12 @@ def make_engine(model_type, mb_spec, ulysses_sp_size=1, init_optimizer=False):
 
 
 def test_ulysses(model_type: str):
+    # [FUNCTION DOC]
+    # Asserts world size 1 or 2. Rank 0 creates an 8-sample batch, broadcasts it as an
+    # object, each rank moves it to its device and splits into two 4-sample chunks. With
+    # world 2: SP=2 engine trains one step on chunk[rank]; with world 1: golden engine
+    # trains a step per chunk. Engines are destroyed afterwards.
+    # KNOWN ISSUE: no comparison between SP and golden results is performed.
     setup_distributed_environment()
 
     torch.manual_seed(42)
@@ -166,6 +187,8 @@ def test_ulysses(model_type: str):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --model_type (only "qwen3") and runs test_ulysses.
     parser = argparse.ArgumentParser(description="Run FSDP Ulysses Engine Test")
     parser.add_argument(
         "--model_type",

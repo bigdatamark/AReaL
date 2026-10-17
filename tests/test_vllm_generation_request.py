@@ -1,9 +1,16 @@
+# [MODULE DOC]
+# Unit tests for VLLMBackend.build_generation_request: checks that sampling options
+# from GenerationHyperparameters are forwarded into the vLLM completion payload.
+# Pure in-process; no server is contacted.
 from areal.api.cli_args import GenerationHyperparameters
 from areal.api.io_struct import ModelRequest
 from areal.engine.vllm_remote import VLLMBackend
 
 
 def test_vllm_forwards_frequency_penalty_and_stop():
+    # [FUNCTION DOC]
+    # Builds a ModelRequest with frequency_penalty=0.5 and stop=["STOP"], builds the vLLM
+    # request (no LoRA, version 0) and asserts both fields appear unchanged in the payload.
     """The vLLM backend must forward frequency_penalty and stop like the SGLang
     backend does; both are GenerationHyperparameters and are accepted by vLLM's
     OpenAI-compatible /v1/completions endpoint."""
@@ -21,6 +28,8 @@ def test_vllm_forwards_frequency_penalty_and_stop():
 
 
 def test_vllm_forwards_explicit_seed():
+    # [FUNCTION DOC]
+    # Asserts an explicitly configured seed (12345) is forwarded as payload["seed"].
     """The V1 vLLM backend forwards an explicitly configured sampling seed."""
     req = ModelRequest(
         input_ids=[11, 12],
@@ -35,6 +44,8 @@ def test_vllm_forwards_explicit_seed():
 
 
 def test_vllm_omits_seed_when_unset():
+    # [FUNCTION DOC]
+    # Asserts the payload has no "seed" key when the gconfig seed is left unset.
     """The V1 vLLM backend leaves seed selection to vLLM when it is unset."""
     req = ModelRequest(
         input_ids=[11, 12],
