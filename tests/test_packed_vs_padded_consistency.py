@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# GPU tests checking that FSDPEngine produces matching logits for padded (batch x seq)
+# inputs and for packed microbatches built by engine._prepare_mb_list, for text LLMs
+# (Qwen3-0.6B, Qwen2.5-1.5B) and VLMs (Qwen2.5-VL, Qwen3-VL, optional Gemma3). Tolerances
+# are loose (atol/rtol 0.2) because of bf16.
 import os
 import random
 
@@ -24,6 +29,10 @@ VOCAB_SIZE = 100
 
 @pytest.fixture
 def mock_padded_llm_data():
+    # [FUNCTION DOC]
+    # Fixture: builds BS random sequences (prompt length 1..MAX_PROMPT_LEN-1, answer length
+    # 1..MAX_ANSWER_LEN-1) with random token ids < VOCAB_SIZE, loss_mask zero on prompt and
+    # one on answer, all-ones attention_mask; pads/concatenates them and moves to the device.
     """Generate mock padded input data."""
     prompt_lens = torch.randint(1, MAX_PROMPT_LEN, size=(BS,))
     answer_lens = torch.randint(1, MAX_ANSWER_LEN, size=(BS,))
@@ -59,6 +68,14 @@ QWEN25_PATH = get_model_path(
     [QWEN3_PATH, QWEN25_PATH],
 )
 def test_llm_consistency(model_path, mock_padded_llm_data):
+    # [FUNCTION DOC]
+    # Sets single-rank distributed env vars, creates an FSDPEngine from scratch-initialized
+    # weights (bf16, flash_attention_2, no optimizer) without the full initialize, then
+    # compares the unpadded padded-forward logits to the packed-forward logits of the single
+    # microbatch (trimming the trailing padding). Always destroys the engine and asserts the
+    # process group is gone.
+    # KNOWN ISSUE: slicing off padding with a negative index yields an empty tensor when the
+    # padding length is 0, which would make the shape assertion fail.
     os.environ["RANK"] = str(0)
     os.environ["WORLD_SIZE"] = str(1)
     os.environ["MASTER_ADDR"] = "localhost"
@@ -130,6 +147,14 @@ if os.path.exists(
 
 
 def mock_padded_vlm_data(model_path):
+    # [FUNCTION DOC]
+    # HELPER: Builds a padded VLM batch for the given model path (gemma3 / qwen25 / qwen3,
+    # else NotImplementedError). For each of BS samples, creates 1-4 random images with sides
+    # that are multiples of 28, runs the HF processor on the concatenated image placeholder
+    # tokens, and prepends random text tokens to the processed image token ids so the total
+    # length equals prompt+answer. Stores pixel_values (and image_grid_thw when present) in
+    # multi_modal_input. Pads, moves to device (including tensors nested in
+    # multi_modal_input) and returns the batch. Loads the processor from disk/hub.
     if model_path == GEMMA3_PATH:
         model_type = "gemma3"
     elif model_path == QWEN25_VL_PATH:
@@ -228,6 +253,11 @@ if GEMMA3_PATH is not None:
 @pytest.mark.slow
 @pytest.mark.parametrize("model_path", vlm_model_paths)
 def test_vlm_consistency(model_path):
+    # [FUNCTION DOC]
+    # Seeded (27010) VLM variant of the padded vs packed check using pretrained weights. For
+    # the padded forward it flattens multi_modal_input pixel_values and image_grid_thw into
+    # top-level batch keys. Compares logits per valid token, then destroys the engine.
+    # KNOWN ISSUE: same zero-padding slicing hazard as the LLM test.
     # Set random seed for reproducibility.
     # This test might fail on other seed on A100, so do not change this line.
     set_random_seed(27010, key="test_vlm_consistency")

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# CPU unit tests for grouped colocation in the Ray scheduler: group_colocated_gpus
+# chunking each node's GPUs into per-worker groups, create_workers routing colocation
+# jobs whose total GPU count matches the target role to the grouped path, and
+# _create_grouped_colocated_workers launching one node-pinned launcher per node with
+# role-specific env and physical device ids. Ray calls and launchers are stubbed; scheduler
+# helpers are reused from tests/test_ray_scheduler.py.
 # SPDX-License-Identifier: Apache-2.0
 """Grouped colocation on the HTTP-based Ray scheduler.
 
@@ -25,10 +32,16 @@ from areal.infra.scheduler.ray import group_colocated_gpus
 
 @pytest.fixture(autouse=True)
 def _disable_scheduler_destructor(monkeypatch):
+    # [FUNCTION DOC]
+    # Autouse fixture: replaces RayScheduler.__del__ with a no-op so test schedulers do not
+    # try to tear down Ray resources on garbage collection.
     monkeypatch.setattr(ray_scheduler.RayScheduler, "__del__", lambda self: None)
 
 
 def _node_info(node_idx: int, n_gpus: int = 8) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Returns a fake node info dict (host 10.0.0.<idx>, node_id "node<idx>",
+    # visible_devices "0".."n_gpus-1").
     return {
         "host": f"10.0.0.{node_idx}",
         "node_id": f"node{node_idx}",
@@ -37,6 +50,9 @@ def _node_info(node_idx: int, n_gpus: int = 8) -> dict:
 
 
 def test_group_colocated_gpus_chunks_each_node_without_crossing_nodes():
+    # [FUNCTION DOC]
+    # Four 8-GPU nodes with 4 GPUs per worker give 8 groups, each of 4 contiguous devices
+    # within a single node, covering every (node, gpu) exactly once, in node order.
     node_infos = [_node_info(node) for node in range(4)]
 
     groups = group_colocated_gpus(node_infos, gpus_per_worker=4)
@@ -52,16 +68,24 @@ def test_group_colocated_gpus_chunks_each_node_without_crossing_nodes():
 
 
 def test_group_colocated_gpus_rejects_non_divisible_node():
+    # [FUNCTION DOC]
+    # A node with 6 GPUs and group size 4 raises ValueError ("not a multiple").
     with pytest.raises(ValueError, match="not a multiple"):
         group_colocated_gpus([_node_info(0, n_gpus=6)], gpus_per_worker=4)
 
 
 def test_group_colocated_gpus_rejects_invalid_group_size():
+    # [FUNCTION DOC]
+    # gpus_per_worker of 0 raises ValueError.
     with pytest.raises(ValueError, match="gpus_per_worker"):
         group_colocated_gpus([_node_info(0)], gpus_per_worker=0)
 
 
 def test_create_workers_routes_gpu_conserving_colocation_to_grouped_path(tmp_path):
+    # [FUNCTION DOC]
+    # A non-fork colocation job of 2 x 4-GPU workers targeting 8 x 1-GPU actors is routed to
+    # _create_grouped_colocated_workers (mocked) and is not registered as a plain colocated
+    # role.
     scheduler = _scheduler(tmp_path)
     scheduler._workers["actor"] = [
         _worker_info(f"actor/{index}", role="actor") for index in range(8)
@@ -87,6 +111,9 @@ def test_create_workers_routes_gpu_conserving_colocation_to_grouped_path(tmp_pat
 
 
 def test_create_workers_still_rejects_non_conserving_replica_mismatch(tmp_path):
+    # [FUNCTION DOC]
+    # A colocation job whose replica count and GPU total do not match the target still raises
+    # WorkerCreationError ("Replica count").
     scheduler = _scheduler(tmp_path)
     scheduler._workers["actor"] = [_worker_info("actor/0", role="actor")]
     job = Job(
@@ -103,16 +130,29 @@ def test_create_workers_still_rejects_non_conserving_replica_mismatch(tmp_path):
 
 
 class _LauncherStub:
+    # [CLASS DOC]
+    # HELPER: Fake RayWorkerProcessLauncher actor class that records options, constructor
+    # args, and specs passed to start_workers into a shared captured list.
     def __init__(self, captured: list):
+        # [FUNCTION DOC]
+        # HELPER: Stores the shared captured list.
         self._captured = captured
 
     def options(self, **options):
+        # [FUNCTION DOC]
+        # HELPER: Mimics Ray's ActorClass.options; snapshots the options and returns a factory
+        # whose remote(*args) records options/init args, returns a fake launcher whose
+        # start_workers.remote stores the specs in the record, and saves the launcher in it.
         captured = self._captured
         options_snapshot = dict(options)
 
         class _Factory:
+            # [CLASS DOC]
+            # HELPER: Fake remote-actor factory returned by options().
             @staticmethod
             def remote(*args):
+                # [FUNCTION DOC]
+                # HELPER: Creates and records a fake launcher as described in options().
                 record = {"options": options_snapshot, "init_args": args}
                 captured.append(record)
                 launcher = SimpleNamespace()
@@ -128,6 +168,12 @@ class _LauncherStub:
 def test_grouped_launcher_env_is_role_specific_and_devices_are_physical(
     tmp_path, monkeypatch
 ):
+    # [FUNCTION DOC]
+    # Grouped creation of 2 x 2-GPU rollout workers over 4 actor workers on one 4-GPU node
+    # creates one launcher pinned (hard NodeAffinity) to the node's hex id with no GPU
+    # reservation, passes only the rollout env vars (target env unchanged), gives each worker
+    # all physical devices "0".."3", sets SLURM_LOCALID/NODEID/NNODES per worker, records the
+    # role's workers and launcher, and creates no placement group or colocated-role entry.
     scheduler = _scheduler(tmp_path)
     target_env = {"AWEX_ACTOR_ALLOC_CONF": "expandable_segments:True"}
     target_spec = SchedulingSpec(cpu=1, gpu=1, mem=1, env_vars=target_env)

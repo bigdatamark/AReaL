@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tests for areal.utils.perf_tracer: the PerfTracer (Chrome-trace style JSONL events per
+# rank under <fileroot>/logs/<user>/<experiment>/<trial>/perf_tracer[/<role>]/
+# traces-r<rank>.jsonl), the module-level global tracer helpers, rank filtering via env,
+# save intervals, torch profiler gating, and the SessionTracer (per-session JSONL records
+# under .../session_tracer[/<role>]/sessions-r<rank>.jsonl). An autouse fixture resets
+# the global tracer around every test; files are written under tmp_path.
 import asyncio
 import getpass
 import json
@@ -23,6 +30,9 @@ def _make_config(
     experiment: str = "test-exp",
     trial: str = "trial",
 ) -> PerfTracerConfig:
+    # [FUNCTION DOC]
+    # HELPER: Builds a PerfTracerConfig with the given experiment/trial names, fileroot=root
+    # and enabled flag.
     return PerfTracerConfig(
         experiment_name=experiment,
         trial_name=trial,
@@ -37,6 +47,9 @@ def _expected_trace_path(
     rank: int,
     role: str | None = None,
 ) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Returns the expected perf trace JSONL path for a config, rank and optional role
+    # (role adds a subdirectory). Expands "~" in fileroot and uses the current OS user.
     base_dir = Path(os.path.expanduser(config.fileroot))
     filename = f"traces-r{rank}.jsonl"
     path = (
@@ -58,6 +71,9 @@ def _expected_session_trace_path(
     rank: int,
     role: str | None = None,
 ) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Same as _expected_trace_path but for the session tracer directory and the
+    # "sessions-r<rank>.jsonl" filename.
     base_dir = Path(os.path.expanduser(config.fileroot))
     filename = f"sessions-r{rank}.jsonl"
     path = (
@@ -74,22 +90,36 @@ def _expected_session_trace_path(
 
 
 def _load_trace_events(path: Path) -> list[dict]:
+    # [FUNCTION DOC]
+    # HELPER: Reads a JSONL file and returns the parsed dicts of its non-blank lines.
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 def _install_fake_profiler(monkeypatch) -> dict[str, int]:
+    # [FUNCTION DOC]
+    # HELPER: Monkeypatches perf_tracer.profiler.profile to return a fake context-manager
+    # profiler that counts enters/exits and can export a one-event Chrome trace. Returns the
+    # shared counters dict {"enter", "exit"}.
     counters = {"enter": 0, "exit": 0}
 
     class _FakeProfiler:
+        # [CLASS DOC]
+        # HELPER: Stand-in for torch.profiler.profile recording usage in the enclosing counters.
         def __enter__(self):
+            # [FUNCTION DOC]
+            # HELPER: Increments counters["enter"] and returns self.
             counters["enter"] += 1
             return self
 
         def __exit__(self, exc_type, exc, exc_tb):
+            # [FUNCTION DOC]
+            # HELPER: Increments counters["exit"]; returns False so exceptions propagate.
             counters["exit"] += 1
             return False
 
         def export_chrome_trace(self, path: str) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Writes a JSON file at path with one dummy "X" event named "fake".
             payload = {
                 "traceEvents": [
                     {
@@ -112,17 +142,23 @@ def _install_fake_profiler(monkeypatch) -> dict[str, int]:
 
 @pytest.fixture(autouse=True)
 def clean_global_tracer():
+    # [FUNCTION DOC]
+    # Autouse fixture: resets the module-level global tracer before and after each test.
     perf_tracer.reset()
     yield
     perf_tracer.reset()
 
 
 def test_module_level_helpers_require_configuration():
+    # [FUNCTION DOC]
+    # get_tracer() must raise RuntimeError before configure() is called.
     with pytest.raises(RuntimeError):
         perf_tracer.get_tracer()
 
 
 def test_perf_tracer_records_events_and_save(tmp_path):
+    # [FUNCTION DOC]
+    # A scope plus two instants are saved to the expected rank-0 path and appear by name.
     config = _make_config(tmp_path, experiment="unit", trial="scope")
     tracer = perf_tracer.PerfTracer(config, rank=0)
     assert tracer._rank == 0  # noqa: SLF001
@@ -145,6 +181,9 @@ def test_perf_tracer_records_events_and_save(tmp_path):
 
 
 def test_perf_tracer_with_role(tmp_path):
+    # [FUNCTION DOC]
+    # With role "actor", the file goes into the role subdirectory, every payload event's
+    # args carry role and rank, and process_name metadata contains "[actor]" and "Rank 0".
     """Test that role parameter is properly handled in tracer."""
     config = _make_config(tmp_path, experiment="unit", trial="role_test")
     tracer = perf_tracer.PerfTracer(config, rank=0, role="actor")
@@ -180,6 +219,10 @@ def test_perf_tracer_with_role(tmp_path):
 
 
 def test_perf_tracer_emits_separate_rank_logs(tmp_path):
+    # [FUNCTION DOC]
+    # Two tracers (rank 0 and 1, rank 1 given a fake distinct pid and cleared thread metadata
+    # set) write separate files; each file contains only its own events, rank args and pid,
+    # a process_name exactly "Rank N, Process", and process_sort_index equal to the rank.
     config0 = _make_config(
         tmp_path,
         enabled=True,
@@ -213,9 +256,13 @@ def test_perf_tracer_emits_separate_rank_logs(tmp_path):
     events_rank1 = _load_trace_events(saved_path_rank1)
 
     def _non_meta(events: list[dict]) -> list[dict]:
+        # [FUNCTION DOC]
+        # HELPER: Filters out metadata (ph == "M") events.
         return [evt for evt in events if evt.get("ph") != "M"]
 
     def _meta(events: list[dict], name: str) -> list[dict]:
+        # [FUNCTION DOC]
+        # HELPER: Returns metadata events with the given name.
         return [
             evt for evt in events if evt.get("ph") == "M" and evt.get("name") == name
         ]
@@ -251,6 +298,8 @@ def test_perf_tracer_emits_separate_rank_logs(tmp_path):
 
 
 def test_perf_tracer_rank_filter_env(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # With AREAL_PERF_TRACER_RANKS="0", rank 0 writes its trace file while rank 1 writes none.
     monkeypatch.setenv("AREAL_PERF_TRACER_RANKS", "0")
     config = _make_config(tmp_path, experiment="rank-filter", trial="only-rank0")
 
@@ -266,6 +315,8 @@ def test_perf_tracer_rank_filter_env(tmp_path, monkeypatch):
 
 
 def test_rank_in_env_filter_supports_lists_and_ranges(monkeypatch):
+    # [FUNCTION DOC]
+    # rank_in_env_filter parses comma lists with inclusive ranges ("0,2-4": 0 and 3 in, 1 out).
     monkeypatch.setenv("AREAL_TEST_RANKS", "0,2-4")
     assert rank_in_env_filter("AREAL_TEST_RANKS", 0)
     assert not rank_in_env_filter("AREAL_TEST_RANKS", 1)
@@ -274,6 +325,9 @@ def test_rank_in_env_filter_supports_lists_and_ranges(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_global_tracer_configure_roundtrip(tmp_path):
+    # [FUNCTION DOC]
+    # configure() installs a global tracer; module-level atrace_scope, instant and trace_scope
+    # record into it and appear after save().
     config = _make_config(tmp_path, experiment="global", trial="roundtrip")
     tracer = perf_tracer.configure(
         config,
@@ -303,6 +357,9 @@ async def test_global_tracer_configure_roundtrip(tmp_path):
 
 @pytest.mark.asyncio
 async def test_configure_with_role(tmp_path):
+    # [FUNCTION DOC]
+    # configure() with rank 1 / role "learner" stores the role, saves to the role directory,
+    # tags events with the role and labels the process "[learner]" ... "Rank 1".
     """Test that configure() function accepts role parameter."""
     config = _make_config(tmp_path, experiment="global", trial="role_roundtrip")
     tracer = perf_tracer.configure(
@@ -344,6 +401,10 @@ async def test_configure_with_role(tmp_path):
 
 @pytest.mark.asyncio
 async def test_async_multi_session_cross_phase_trace(tmp_path):
+    # [FUNCTION DOC]
+    # Two concurrent asyncio sessions each run rollout/train/reward phases (blocking sleeps in
+    # the default executor) inside an async session scope; all (session, phase) complete
+    # events must be recorded and the two sessions' timestamp ranges must overlap.
     config = _make_config(tmp_path, experiment="async", trial="sessions")
     tracer = perf_tracer.configure(
         config,
@@ -366,6 +427,10 @@ async def test_async_multi_session_cross_phase_trace(tmp_path):
     async def run_session(
         session_id: str, phases: list[tuple[str, float]], offset: float
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: After an optional start offset, opens an async "session" scope with category
+        # "session.<id>" and runs each phase as a sync trace scope around an executor sleep of
+        # the given duration.
         if offset:
             await asyncio.sleep(offset)
         loop = asyncio.get_running_loop()
@@ -420,6 +485,8 @@ async def test_async_multi_session_cross_phase_trace(tmp_path):
 
 
 def test_configure_rejects_repeated_calls(tmp_path):
+    # [FUNCTION DOC]
+    # A second configure() call must raise RuntimeError.
     config = _make_config(tmp_path, experiment="ranked", trial="zero")
     perf_tracer.configure(
         config,
@@ -433,6 +500,10 @@ def test_configure_rejects_repeated_calls(tmp_path):
 
 
 def test_session_tracer_with_role(tmp_path):
+    # [FUNCTION DOC]
+    # With session tracing enabled (flush threshold 1) and role "critic", recording generate
+    # start/end and a FINALIZED "accepted" event then force-saving writes a session record to
+    # the role directory whose status is "accepted" and role is "critic".
     """Test SessionTracer with role parameter produces correct output paths."""
     config = _make_config(tmp_path, experiment="session", trial="role_enabled")
     config.session_tracer = SessionTracerConfig(enabled=True, flush_threshold=1)
@@ -469,6 +540,8 @@ def test_session_tracer_with_role(tmp_path):
 
 
 def test_module_level_save_helper(tmp_path):
+    # [FUNCTION DOC]
+    # Module-level instant() and save() write the event to the configured rank-0 path.
     config = _make_config(tmp_path, experiment="module", trial="helper")
     perf_tracer.configure(
         config,
@@ -486,6 +559,9 @@ def test_module_level_save_helper(tmp_path):
 
 
 def test_perf_tracer_respects_save_interval(tmp_path):
+    # [FUNCTION DOC]
+    # With save_interval 3, save(step) for steps 0 and 1 writes nothing; step 2 flushes all
+    # three marks; later marks 3 and 4 appear after a forced save.
     config = _make_config(tmp_path, experiment="interval", trial="steps")
     config.save_interval = 3
     tracer = perf_tracer.PerfTracer(config, rank=0)
@@ -515,6 +591,9 @@ def test_perf_tracer_respects_save_interval(tmp_path):
 
 
 def test_profiler_only_runs_on_configured_steps(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # With profile_steps [3], a profiler-enabled scope only starts the (fake) profiler when
+    # args.global_step is 3.
     counters = _install_fake_profiler(monkeypatch)
     config = _make_config(tmp_path, experiment="profile", trial="steps")
     config.profile_steps = [3]
@@ -530,6 +609,9 @@ def test_profiler_only_runs_on_configured_steps(tmp_path, monkeypatch):
 
 
 def test_profiler_request_is_skipped_when_active(tmp_path, monkeypatch):
+    # [FUNCTION DOC]
+    # A nested profiler-enabled scope does not start a second profiler while one is active;
+    # a later top-level scope starts a new one (enter count 1 then 2).
     counters = _install_fake_profiler(monkeypatch)
     config = _make_config(tmp_path, experiment="profile", trial="nesting")
     config.profile_steps = [0]
@@ -547,6 +629,9 @@ def test_profiler_request_is_skipped_when_active(tmp_path, monkeypatch):
 
 
 def test_session_tracer_configuration(tmp_path):
+    # [FUNCTION DOC]
+    # An enabled session tracer writes an "accepted" record after a forced save; a tracer
+    # built with session tracing disabled has session_tracer None.
     config = _make_config(tmp_path, experiment="session", trial="enabled")
     config.session_tracer = SessionTracerConfig(enabled=True, flush_threshold=1)
     tracer = perf_tracer.PerfTracer(config, rank=0)
@@ -582,6 +667,11 @@ def test_session_tracer_configuration(tmp_path):
 
 
 def _run_perf_tracer_torchrun(tmp_path: Path, world_size: int) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Runs tests/torchrun/run_perf_tracer.py under torchrun on one node with
+    # world_size processes and a free master port, passing AREAL_PERF_TRACE_BASE=tmp_path in
+    # the environment. Raises CalledProcessError on failure (output captured). Relative script
+    # path assumes the repo root as CWD.
     port = find_free_ports(1)[0]
     env = {
         **os.environ,
@@ -606,6 +696,10 @@ def _run_perf_tracer_torchrun(tmp_path: Path, world_size: int) -> None:
 @pytest.mark.multi_gpu
 @pytest.mark.parametrize("world_size", [2])
 def test_perf_tracer_torchrun_multi_rank(tmp_path, world_size):
+    # [FUNCTION DOC]
+    # Multi-GPU: skips if fewer devices than world_size; after the torchrun script, each
+    # rank's trace file for experiment "torchrun"/trial "world-N" must exist and the
+    # "torchrun-step" and "torchrun-mark" events must cover all ranks.
     device_count_fn = getattr(current_platform, "device_count", None)
     available_devices = device_count_fn() if callable(device_count_fn) else 0
     if available_devices < world_size:
@@ -640,6 +734,10 @@ def test_perf_tracer_torchrun_multi_rank(tmp_path, world_size):
 
 @pytest.mark.asyncio
 async def test_trace_session_phase(tmp_path):
+    # [FUNCTION DOC]
+    # With session tracing on, two atrace_session_phase blocks ("generate", "reward") for the
+    # current session id produce one flushed record with a single start/end interval per
+    # phase and positive generate_s / reward_s durations. Resets the tracer in finally.
     """Test that atrace_session_phase context manager works correctly."""
     config = PerfTracerConfig(
         experiment_name="test-phase",
@@ -720,6 +818,9 @@ async def test_trace_session_phase(tmp_path):
 
 @pytest.mark.asyncio
 async def test_trace_session_phase_with_exception(tmp_path):
+    # [FUNCTION DOC]
+    # A ValueError raised inside atrace_session_phase("generate") propagates, yet the phase
+    # is still recorded with both start and end timestamps in the flushed record.
     """Test that atrace_session_phase handles exceptions correctly."""
     config = PerfTracerConfig(
         experiment_name="test-phase-exc",

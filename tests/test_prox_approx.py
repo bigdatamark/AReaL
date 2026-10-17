@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# CPU unit tests for the proximal log-probability approximation used by decoupled PPO:
+# compute_prox_logp_approximations (loglinear / linear / rollout interpolation between
+# behavior logp and current logp, with alpha = (v_prox - v_behave) / (v_theta -
+# v_behave), v_prox = current_version - 1, clamped to [0, 1]), grpo_loss_fn handling of a
+# missing prox_logp, the ProxLogpMethod / ProxApproxMethod enums, the caller-side decision
+# whether to run compute_logp, PPOActorConfig fields, and stats logged per mode.
 """
 Unit tests for proximal log-probability approximation functionality.
 
@@ -19,9 +26,13 @@ from areal.utils.constants import (
 
 
 class TestProximalApproximations:
+    # [CLASS DOC]
+    # Numerical tests of compute_prox_logp_approximations on small hand-checked tensors.
     """Test suite for proximal log-probability approximation methods."""
 
     def test_basic_loglinear_interpolation(self):
+        # [FUNCTION DOC]
+        # Behavior version 0, current 2 gives alpha 0.5; loglinear = old + 0.5 * (new - old).
         """Test log-linear interpolation with simple version progression."""
         # Setup: behavior version=0, proximal version=1, current version=2
         old_logp = torch.tensor([[-1.0, -2.0, -3.0]], dtype=torch.float32)
@@ -44,6 +55,8 @@ class TestProximalApproximations:
         )
 
     def test_rollout_approximation(self):
+        # [FUNCTION DOC]
+        # The rollout method returns the behavior logp unchanged.
         """Test rollout approximation returns behavior logp unchanged."""
         old_logp = torch.tensor([[-1.0, -2.0]], dtype=torch.float32)
         logprobs = torch.tensor([[-5.0, -6.0]], dtype=torch.float32)
@@ -63,6 +76,8 @@ class TestProximalApproximations:
         )
 
     def test_alpha_clamping(self):
+        # [FUNCTION DOC]
+        # When behavior version equals the proximal version, alpha is 0 and loglinear == old.
         """Test that alpha is clamped to [0, 1] range."""
         # Case 1: alpha should be 0 when v_behave == v_proximal
         old_logp = torch.tensor([[-1.0]], dtype=torch.float32)
@@ -82,6 +97,8 @@ class TestProximalApproximations:
         torch.testing.assert_close(approx["loglinear"], old_logp, rtol=1e-4, atol=1e-4)
 
     def test_mixed_versions_in_batch(self):
+        # [FUNCTION DOC]
+        # Per-token alpha is computed from each token's own behavior version (0.75 and 0.5).
         """Test handling of samples with different behavior versions."""
         # Sample 1: v_behave=0, Sample 2: v_behave=2
         old_logp = torch.tensor([[-1.0], [-2.0]], dtype=torch.float32)
@@ -106,6 +123,9 @@ class TestProximalApproximations:
         )
 
     def test_linear_approximation_probabilities(self):
+        # [FUNCTION DOC]
+        # The linear method interpolates in probability space then takes the log
+        # (log(0.5*0.5 + 0.5*0.25)).
         """Test linear interpolation works in probability space (arithmetic mean)."""
         old_logp = torch.tensor([[-0.693]], dtype=torch.float32)  # log(0.5)
         logprobs = torch.tensor([[-1.386]], dtype=torch.float32)  # log(0.25)
@@ -127,6 +147,9 @@ class TestProximalApproximations:
         torch.testing.assert_close(approx["linear"], expected, rtol=1e-3, atol=1e-3)
 
     def test_all_methods_return_tensors(self):
+        # [FUNCTION DOC]
+        # Every method in PROX_APPROX_METHODS_ALL is present in the output as a tensor of the
+        # input shape.
         """Test that all approximation methods return valid tensors."""
         old_logp = torch.tensor([[-1.0, -2.0]], dtype=torch.float32)
         logprobs = torch.tensor([[-1.5, -2.5]], dtype=torch.float32)
@@ -148,6 +171,9 @@ class TestProximalApproximations:
             assert approx[method].dtype == torch.float32, f"{method} wrong dtype"
 
     def test_version_zero_division_handling(self):
+        # [FUNCTION DOC]
+        # Behavior version equal to current version (zero denominator) does not crash; alpha is
+        # treated as 0.
         """Test handling of same versions (zero division in alpha)."""
         old_logp = torch.tensor([[-1.0]], dtype=torch.float32)
         logprobs = torch.tensor([[-2.0]], dtype=torch.float32)
@@ -166,6 +192,8 @@ class TestProximalApproximations:
         torch.testing.assert_close(approx["loglinear"], old_logp, rtol=1e-4, atol=1e-4)
 
     def test_negative_versions_in_prompt(self):
+        # [FUNCTION DOC]
+        # Negative (prompt) versions give finite outputs and leave the prompt token at old_logp.
         """Test handling of negative versions (prompt tokens)."""
         # Prompt tokens have version=-1, should be handled gracefully
         old_logp = torch.tensor([[-1.0, -2.0, -3.0]], dtype=torch.float32)
@@ -187,6 +215,8 @@ class TestProximalApproximations:
         assert torch.isfinite(approx["loglinear"]).all(), "NaN/Inf in approximation"
 
     def test_batch_dimensions(self):
+        # [FUNCTION DOC]
+        # Random [4, 8] inputs produce finite [4, 8] outputs for every method.
         """Test handling of different batch shapes."""
         batch_size = 4
         seq_len = 8
@@ -208,9 +238,16 @@ class TestProximalApproximations:
 
 
 class TestProximalApproximationIntegration:
+    # [CLASS DOC]
+    # Tests about how approximations plug into the PPO update / loss.
     """Integration tests for proximal approximation in training flow."""
 
     def test_versions_not_popped_from_batch(self):
+        # [FUNCTION DOC]
+        # Simulates popping reward keys from a dict and asserts "versions" remains as the same
+        # object.
+        # KNOWN ISSUE: it only exercises plain dict operations, not the real ppo_update code, so
+        # it cannot detect a regression there.
         """Test that versions are kept in batch (not popped) for use in loss function."""
         # Simulate the code in ppo_update - versions should NOT be popped
         data = {
@@ -236,6 +273,9 @@ class TestProximalApproximationIntegration:
         )
 
     def test_approximation_metrics_only_with_metrics_method(self):
+        # [FUNCTION DOC]
+        # grpo_loss_fn with a ground-truth prox_logp and method "recompute" returns a tensor.
+        # KNOWN ISSUE: despite its name it never checks which metrics were (not) logged.
         """Test that metrics are only computed when prox_logp_method='metrics'."""
         from areal.trainer.ppo.actor import grpo_loss_fn
 
@@ -268,6 +308,8 @@ class TestProximalApproximationIntegration:
 
 
 def test_import_success():
+    # [FUNCTION DOC]
+    # compute_prox_logp_approximations is importable and callable.
     """Test that the approximation function can be imported."""
     from areal.trainer.ppo.actor import compute_prox_logp_approximations
 
@@ -275,33 +317,45 @@ def test_import_success():
 
 
 class TestProxLogpMethodEnum:
+    # [CLASS DOC]
+    # Tests for the ProxLogpMethod str-Enum (recompute / loglinear / metrics).
     """Test suite for ProxLogpMethod enum."""
 
     def test_enum_values(self):
+        # [FUNCTION DOC]
+        # Enum members have the expected string values.
         """Test that enum values match expected strings."""
         assert ProxLogpMethod.RECOMPUTE.value == "recompute"
         assert ProxLogpMethod.LOGLINEAR.value == "loglinear"
         assert ProxLogpMethod.METRICS.value == "metrics"
 
     def test_enum_from_string(self):
+        # [FUNCTION DOC]
+        # Members can be constructed from their string values.
         """Test enum construction from string."""
         assert ProxLogpMethod("recompute") == ProxLogpMethod.RECOMPUTE
         assert ProxLogpMethod("loglinear") == ProxLogpMethod.LOGLINEAR
         assert ProxLogpMethod("metrics") == ProxLogpMethod.METRICS
 
     def test_skips_forward_pass(self):
+        # [FUNCTION DOC]
+        # Only LOGLINEAR skips the proximal forward pass.
         """Test the skips_forward_pass() helper method."""
         assert not ProxLogpMethod.RECOMPUTE.skips_forward_pass()
         assert ProxLogpMethod.LOGLINEAR.skips_forward_pass()
         assert not ProxLogpMethod.METRICS.skips_forward_pass()
 
     def test_string_equality(self):
+        # [FUNCTION DOC]
+        # Members compare equal to their plain string values.
         """Test that enum compares equal to its string value (str, Enum behavior)."""
         assert ProxLogpMethod.RECOMPUTE == "recompute"
         assert ProxLogpMethod.LOGLINEAR == "loglinear"
         assert ProxLogpMethod.METRICS == "metrics"
 
     def test_backward_compat_constants(self):
+        # [FUNCTION DOC]
+        # Legacy string constant PROX_LOGP_METHOD_RECOMPUTE matches the enum value.
         """Test backward compatibility with old string constants."""
         assert PROX_LOGP_METHOD_RECOMPUTE == ProxLogpMethod.RECOMPUTE.value
         assert "loglinear" == ProxLogpMethod.LOGLINEAR.value
@@ -309,15 +363,21 @@ class TestProxLogpMethodEnum:
 
 
 class TestProxApproxMethodEnum:
+    # [CLASS DOC]
+    # Tests for the ProxApproxMethod enum (loglinear / linear / rollout).
     """Test suite for ProxApproxMethod enum."""
 
     def test_enum_values(self):
+        # [FUNCTION DOC]
+        # Enum members have the expected string values.
         """Test that enum values match expected strings."""
         assert ProxApproxMethod.LOGLINEAR.value == "loglinear"
         assert ProxApproxMethod.LINEAR.value == "linear"
         assert ProxApproxMethod.ROLLOUT.value == "rollout"
 
     def test_enum_from_string(self):
+        # [FUNCTION DOC]
+        # Members can be constructed from their string values.
         """Test enum construction from string."""
         assert ProxApproxMethod("loglinear") == ProxApproxMethod.LOGLINEAR
         assert ProxApproxMethod("linear") == ProxApproxMethod.LINEAR
@@ -325,6 +385,9 @@ class TestProxApproxMethodEnum:
 
 
 class TestComputeLogpOptimization:
+    # [CLASS DOC]
+    # Tests that PPOActor.compute_logp always runs a forward pass and the skip decision is
+    # made by the caller via ProxLogpMethod.skips_forward_pass.
     """Test suite for compute_logp() forward pass behavior.
 
     Note: compute_logp() now always performs forward pass and returns tensor.
@@ -333,6 +396,9 @@ class TestComputeLogpOptimization:
     """
 
     def test_compute_logp_always_returns_tensor(self):
+        # [FUNCTION DOC]
+        # With a MagicMock engine whose forward returns a tensor, compute_logp on a one-item
+        # list returns a one-element list of tensors and calls forward once.
         """Test that compute_logp() always returns a list of tensors (no longer returns None)."""
         from unittest.mock import MagicMock
 
@@ -370,6 +436,8 @@ class TestComputeLogpOptimization:
         mock_engine.forward.assert_called_once()
 
     def test_skips_forward_pass_determines_call_decision(self):
+        # [FUNCTION DOC]
+        # skips_forward_pass is True for loglinear and False for recompute/metrics.
         """Test that ProxLogpMethod.skips_forward_pass() determines whether to call compute_logp."""
         # This test verifies the caller pattern, not compute_logp itself
 
@@ -386,6 +454,9 @@ class TestComputeLogpOptimization:
         assert method_metrics.skips_forward_pass() is False
 
     def test_caller_pattern_for_decoupled_loss(self):
+        # [FUNCTION DOC]
+        # Table test of the caller rule: compute when decoupled loss and the method does not
+        # skip, or when not decoupled and recompute_logprob is set.
         """Test the expected caller pattern for decoupled loss scenarios."""
         from areal.api.cli_args import PPOActorConfig
 
@@ -420,9 +491,13 @@ class TestComputeLogpOptimization:
 
 
 class TestGrpoLossFnNoneHandling:
+    # [CLASS DOC]
+    # Tests for grpo_loss_fn when input_data["prox_logp"] is None.
     """Test suite for grpo_loss_fn() handling of None prox_logp."""
 
     def test_grpo_loss_fn_detects_none_prox_logp(self):
+        # [FUNCTION DOC]
+        # None prox_logp with method "recompute" raises ValueError.
         """Test that grpo_loss_fn() detects None prox_logp and validates configuration."""
         from areal.trainer.ppo.actor import grpo_loss_fn
 
@@ -455,6 +530,8 @@ class TestGrpoLossFnNoneHandling:
             )
 
     def test_grpo_loss_fn_requires_versions_when_prox_logp_none(self):
+        # [FUNCTION DOC]
+        # None prox_logp with "loglinear" and no versions raises ValueError.
         """Test that grpo_loss_fn() requires versions when prox_logp is None."""
         from areal.trainer.ppo.actor import grpo_loss_fn
 
@@ -488,6 +565,9 @@ class TestGrpoLossFnNoneHandling:
             )
 
     def test_grpo_loss_fn_computes_approximation_when_prox_logp_none(self):
+        # [FUNCTION DOC]
+        # None prox_logp with "loglinear" and versions computes an approximation and a finite
+        # loss tensor.
         """Test that grpo_loss_fn() successfully computes approximation when prox_logp is None."""
         from areal.trainer.ppo.actor import grpo_loss_fn
 
@@ -521,6 +601,8 @@ class TestGrpoLossFnNoneHandling:
         assert torch.isfinite(loss), "Loss should not contain NaN/Inf"
 
     def test_grpo_loss_fn_works_with_tensor_prox_logp(self):
+        # [FUNCTION DOC]
+        # A provided prox_logp tensor still yields a finite loss under "loglinear".
         """Test that grpo_loss_fn() still works normally with tensor prox_logp."""
         from areal.trainer.ppo.actor import grpo_loss_fn
 
@@ -553,6 +635,9 @@ class TestGrpoLossFnNoneHandling:
         assert torch.isfinite(loss), "Loss should not contain NaN/Inf"
 
     def test_grpo_loss_fn_metrics_disabled_when_prox_logp_none(self):
+        # [FUNCTION DOC]
+        # None prox_logp (prox_logp_recomputed False) yields a finite loss without crashing.
+        # KNOWN ISSUE: it does not actually assert that metrics were not logged.
         """Test that metrics are not logged when prox_logp is None (no ground truth)."""
         from areal.trainer.ppo.actor import grpo_loss_fn
 
@@ -587,6 +672,8 @@ class TestGrpoLossFnNoneHandling:
 
 
 class TestEndToEndOptimization:
+    # [CLASS DOC]
+    # End-to-end tests of the caller pattern with a real PPOActor over a mocked engine.
     """Integration tests for the full optimization flow.
 
     Note: The new pattern places the decision logic at the caller site:
@@ -595,6 +682,9 @@ class TestEndToEndOptimization:
     """
 
     def test_user_script_flow_with_enum_check(self):
+        # [FUNCTION DOC]
+        # With loglinear and decoupled loss the caller skips compute_logp, sets prox_logp to
+        # None, and the engine forward is never called.
         """Test the full flow as it would happen in user scripts (new pattern)."""
         from unittest.mock import MagicMock
 
@@ -634,6 +724,10 @@ class TestEndToEndOptimization:
         mock_engine.forward.assert_not_called()  # Forward pass was skipped!
 
     def test_configuration_matrix_with_caller_decision(self):
+        # [FUNCTION DOC]
+        # For each method, the caller decision matches the expected one; when computing,
+        # compute_logp returns a list of tensors and forward is called once; otherwise forward is
+        # not called. Resets the mock between cases.
         """Test all combinations of prox_logp_method values with caller decision pattern."""
         from unittest.mock import MagicMock
 
@@ -687,9 +781,14 @@ class TestEndToEndOptimization:
 
 
 class TestConfigValidation:
+    # [CLASS DOC]
+    # Tests for the prox_logp_method field on PPOActorConfig.
     """Test suite for PPOActorConfig with new prox_logp_method field."""
 
     def test_valid_prox_logp_methods(self):
+        # [FUNCTION DOC]
+        # Every value in PROX_LOGP_METHODS_ALL can construct a PPOActor (mock engine) and is
+        # preserved in actor.config.
         """Test that all valid prox_logp_method values work correctly."""
         from unittest.mock import MagicMock
 
@@ -711,6 +810,8 @@ class TestConfigValidation:
             assert actor.config.prox_logp_method == method
 
     def test_prox_logp_method_metadata_choices(self):
+        # [FUNCTION DOC]
+        # The dataclass field metadata "choices" equals PROX_LOGP_METHODS_ALL as a set and count.
         """Test that prox_logp_method has correct choices in metadata."""
         from dataclasses import fields as dataclass_fields
 
@@ -732,6 +833,8 @@ class TestConfigValidation:
             assert False, f"Expected {expected_choices}, got {config_choices}"
 
     def test_prox_logp_method_default(self):
+        # [FUNCTION DOC]
+        # The default prox_logp_method is "recompute".
         """Test that prox_logp_method has correct default value."""
         from areal.api.cli_args import PPOActorConfig
 
@@ -741,6 +844,9 @@ class TestConfigValidation:
             assert False, f"Default should be '{expected_default}'"
 
     def test_old_config_fields_removed(self):
+        # [FUNCTION DOC]
+        # Legacy fields use_prox_approx, prox_approx_method and log_prox_approx_metrics are gone
+        # and prox_logp_method exists.
         """Test that old config fields have been removed."""
         from dataclasses import fields as dataclass_fields
 
@@ -761,9 +867,17 @@ class TestConfigValidation:
 
 
 class TestComputeLogpMetricsLogging:
+    # [CLASS DOC]
+    # Tests which stats grpo_loss_fn logs per prox_logp_method, capturing stats_tracker.stat
+    # kwargs via a patched tracker.
+    # KNOWN ISSUE: each test guards its assertions with an "if key in logged_stats" check, so
+    # the tests pass vacuously if nothing is logged.
     """Test suite for compute_logp metrics logging in different modes."""
 
     def test_loglinear_mode_logs_basic_metrics(self):
+        # [FUNCTION DOC]
+        # loglinear mode (prox_logp None): if loglinear metrics are logged, they include
+        # approx_logp and both importance weights but no error metrics.
         """Test that loglinear mode logs approx_logp and importance weights without errors."""
         from unittest.mock import MagicMock, patch
 
@@ -785,6 +899,8 @@ class TestComputeLogpMetricsLogging:
         logged_stats = {}
 
         def mock_stat(**kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records stat kwargs into logged_stats.
             logged_stats.update(kwargs)
 
         with patch("areal.trainer.ppo.actor.stats_tracker") as mock_tracker:
@@ -817,6 +933,8 @@ class TestComputeLogpMetricsLogging:
             assert "loglinear/importance_weight_abs_error" not in logged_stats
 
     def test_recompute_mode_logs_ground_truth_only(self):
+        # [FUNCTION DOC]
+        # recompute mode: if prox_logp_gt is logged, no approximation metrics are logged.
         """Test that recompute mode logs only prox_logp_gt."""
         from unittest.mock import MagicMock, patch
 
@@ -837,6 +955,8 @@ class TestComputeLogpMetricsLogging:
         logged_stats = {}
 
         def mock_stat(**kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records stat kwargs into logged_stats.
             logged_stats.update(kwargs)
 
         with patch("areal.trainer.ppo.actor.stats_tracker") as mock_tracker:
@@ -866,6 +986,9 @@ class TestComputeLogpMetricsLogging:
             assert "linear/approx_logp" not in logged_stats
 
     def test_metrics_mode_logs_all_methods_with_errors(self):
+        # [FUNCTION DOC]
+        # metrics mode: if prox_logp_gt is logged, every approximation method logs approx_logp,
+        # abs/rel/squared errors and behave/importance weights with their errors.
         """Test that metrics mode logs all methods with complete error metrics."""
         from unittest.mock import MagicMock, patch
 
@@ -887,6 +1010,8 @@ class TestComputeLogpMetricsLogging:
         logged_stats = {}
 
         def mock_stat(**kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records stat kwargs into logged_stats.
             logged_stats.update(kwargs)
 
         with patch("areal.trainer.ppo.actor.stats_tracker") as mock_tracker:
@@ -931,6 +1056,8 @@ class TestComputeLogpMetricsLogging:
                 assert f"{method}/importance_weight_rel_error" in logged_stats
 
     def test_metrics_naming_consistency(self):
+        # [FUNCTION DOC]
+        # All logged "imp_weight" keys (other than importance_weight) use "behave_imp_weight".
         """Test that metric names use correct spelling (behave not behav)."""
         from unittest.mock import MagicMock, patch
 
@@ -951,6 +1078,8 @@ class TestComputeLogpMetricsLogging:
         logged_stats = {}
 
         def mock_stat(**kwargs):
+            # [FUNCTION DOC]
+            # HELPER: Records stat kwargs into logged_stats.
             logged_stats.update(kwargs)
 
         with patch("areal.trainer.ppo.actor.stats_tracker") as mock_tracker:

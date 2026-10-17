@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# CPU unit tests for reassembling context-parallel (CP) split packed log-probs in
+# areal.engine.megatron_utils.packed_context_parallel. Megatron CP splits each packed
+# sequence into 2*cp_size chunks and gives rank r chunk r and chunk (2*cp_size-1-r)
+# (load-balanced zigzag); reassembly all-gathers the local pieces and permutes them back.
+# Pure-Python reference split/reassemble functions are used as oracles; Megatron-backed
+# tests are skipped when megatron-core is not installed and mock mpu / dist_F.
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for reassemble_cp_packed_logprobs.
 
@@ -24,6 +31,9 @@ requires_megatron = pytest.mark.skipif(
 
 
 def _make_cu_seqlens(seq_lengths: list[int], device="cpu") -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns cumulative sequence offsets (length n+1, starting at 0, long dtype) for
+    # the given sequence lengths on the given device.
     """Build cu_seqlens from a list of sequence lengths."""
     cu = torch.zeros(len(seq_lengths) + 1, dtype=torch.long, device=device)
     for i, _len in enumerate(seq_lengths):
@@ -34,6 +44,11 @@ def _make_cu_seqlens(seq_lengths: list[int], device="cpu") -> torch.Tensor:
 def _split_for_cp_rank(
     tensor: torch.Tensor, cu_seqlens: torch.Tensor, cp_rank: int, cp_size: int
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Reference implementation of split_packed_seqs_for_context_parallel for one CP
+    # rank. For each sequence (length divisible by 2*cp_size), writes the rank's front chunk
+    # then its mirrored back chunk into a 1-D output of total_len/cp_size at offset
+    # cu_seqlens[i]/cp_size. Returns the local tensor.
     """Pure-Python reference implementation of split_packed_seqs_for_context_parallel."""
     input_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     batch_size = input_lens.shape[0]
@@ -63,6 +78,11 @@ def _split_for_cp_rank(
 def _reassemble_reference(
     local_tensors: list[torch.Tensor], cu_seqlens: torch.Tensor, cp_size: int
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Reference inverse of the split. Builds a destination-to-source index over the
+    # concatenation of all ranks' local tensors (rank j's front half-chunk goes to position
+    # j*half within the sequence, its back half-chunk to the mirrored position from the end)
+    # and gathers with advanced indexing, so it is differentiable. Returns the full tensor.
     """Pure-Python reference reassembly (inverse of split) using advanced indexing."""
     input_lens = cu_seqlens[1:] - cu_seqlens[:-1]
     batch_size = input_lens.shape[0]
@@ -93,10 +113,17 @@ def _reassemble_reference(
 
 
 class TestReassembleGradientFlow:
+    # [CLASS DOC]
+    # Gradient checks on the reference cat + indexing reassembly (no Megatron needed).
+    # KNOWN ISSUE: these exercise only the test's own reference implementation, not the
+    # production reassemble_cp_packed_logprobs.
     """Test gradient correctness of the index-based reassembly (no megatron needed)."""
 
     @pytest.mark.parametrize("cp_size", [2, 4])
     def test_gradient_through_advanced_indexing(self, cp_size):
+        # [FUNCTION DOC]
+        # Reassembly recovers the original exactly, and sum-loss gives a unit gradient for every
+        # element of every rank's split.
         """Verify grad flows back through cat + advanced indexing."""
         seq_lengths = [_len * 2 * cp_size for _len in [4, 6]]
         cu_seqlens = _make_cu_seqlens(seq_lengths)
@@ -134,6 +161,9 @@ class TestReassembleGradientFlow:
 
     @pytest.mark.parametrize("cp_size", [2, 4])
     def test_gradient_with_weighted_loss(self, cp_size):
+        # [FUNCTION DOC]
+        # With a weighted-sum loss, the concatenated split gradients equal the weights split the
+        # same way (i.e., gradient is the permuted weight).
         """Verify correct gradient with a non-uniform loss (weighted sum)."""
         seq_lengths = [_len * 2 * cp_size for _len in [3, 5]]
         cu_seqlens = _make_cu_seqlens(seq_lengths)
@@ -164,10 +194,15 @@ class TestReassembleGradientFlow:
 
 
 class TestReassembleGradientCorrectness:
+    # [CLASS DOC]
+    # More gradient checks on the reference reassembly, plus a check of the production index
+    # builder.
     """Verify gradient correctness of the cat + advanced-indexing reassembly."""
 
     @pytest.mark.parametrize("cp_size", [2, 4])
     def test_uniform_loss_gives_unit_gradient(self, cp_size):
+        # [FUNCTION DOC]
+        # Sum-loss yields gradient 1 everywhere (bijection), duplicating the flow test above.
         """With loss=sum(reassembled), each source position gets grad=1 (bijection)."""
         seq_lengths = [_len * 2 * cp_size for _len in [4, 3]]
         cu_seqlens = _make_cu_seqlens(seq_lengths)
@@ -195,6 +230,8 @@ class TestReassembleGradientCorrectness:
 
     @pytest.mark.parametrize("cp_size", [2, 4])
     def test_no_grad_duplication_or_loss(self, cp_size):
+        # [FUNCTION DOC]
+        # Squared-sum loss gives gradient 2 * source value for every source element.
         """Each source element contributes to exactly one output — no duplication."""
         seq_lengths = [_len * 2 * cp_size for _len in [5, 3]]
         cu_seqlens = _make_cu_seqlens(seq_lengths)
@@ -221,6 +258,9 @@ class TestReassembleGradientCorrectness:
 
     @requires_megatron
     def test_advanced_indexing_is_bijective_permutation(self):
+        # [FUNCTION DOC]
+        # Megatron-only: _build_cp_reassemble_indices returns total_len indices, all within
+        # range and all unique (a permutation).
         """Confirm index tensor is a valid permutation (no duplicates)."""
         cp_size = 2
         seq_lengths = [_len * 2 * cp_size for _len in [4, 6, 3]]
@@ -243,6 +283,8 @@ class TestReassembleGradientCorrectness:
 
 
 class TestSplitReassembleRoundtrip:
+    # [CLASS DOC]
+    # Round-trip identity tests: split for every rank then reference-reassemble.
     """Test that split → reassemble is an identity transformation."""
 
     @pytest.mark.parametrize("cp_size", [2, 4])
@@ -256,6 +298,10 @@ class TestSplitReassembleRoundtrip:
         ],
     )
     def test_roundtrip_single_sequence(self, cp_size, seq_lengths):
+        # [FUNCTION DOC]
+        # Parametrized over cp_size 2/4 and several length lists (scaled to be divisible by
+        # 2*cp_size); reassembly recovers the original exactly.
+        # KNOWN ISSUE: the name says "single sequence" but most cases contain several sequences.
         """Split then reassemble should recover the original tensor."""
         # Ensure all seqlens are divisible by 2*cp_size
         aligned_lengths = [_len * 2 * cp_size for _len in seq_lengths]
@@ -276,6 +322,8 @@ class TestSplitReassembleRoundtrip:
 
     @pytest.mark.parametrize("cp_size", [2, 4, 8])
     def test_roundtrip_large_batch(self, cp_size):
+        # [FUNCTION DOC]
+        # Seeded batch of 16 random-length sequences for cp_size 2/4/8 round-trips exactly.
         """Test with larger batch to stress edge cases."""
         torch.manual_seed(42)
         batch_size = 16
@@ -301,10 +349,18 @@ class TestSplitReassembleRoundtrip:
 
 @requires_megatron
 class TestReassembleCpPackedLogprobs:
+    # [CLASS DOC]
+    # Megatron-only tests of the real reassemble_cp_packed_logprobs with mpu and dist_F
+    # (differentiable all-gather) patched.
     """Test the actual distributed reassemble function with mocked dist."""
 
     @pytest.mark.parametrize("cp_size", [2, 4])
     def test_reassemble_matches_reference(self, cp_size):
+        # [FUNCTION DOC]
+        # For each rank, with all_gather faked to return all splits, the result equals the
+        # original packed tensor.
+        # KNOWN ISSUE: requires_grad_ is called in place on the shared splits[test_rank] tensor,
+        # mutating the fixture data used by later iterations (harmless here, but surprising).
         """reassemble_cp_packed_logprobs produces same result as reference."""
         seq_lengths = [_len * 2 * cp_size for _len in [8, 4, 6]]
         cu_seqlens = _make_cu_seqlens(seq_lengths)
@@ -334,6 +390,9 @@ class TestReassembleCpPackedLogprobs:
                 # Mock dist_F.all_gather to return all splits
                 # (simulates the distributed all-gather)
                 def fake_all_gather(tensor, group=None):
+                    # [FUNCTION DOC]
+                    # HELPER: Returns detached copies of all splits, with requires_grad only on the tested
+                    # rank's piece.
                     return [
                         s.detach().requires_grad_(r == test_rank)
                         for r, s in enumerate(splits)
@@ -350,6 +409,8 @@ class TestReassembleCpPackedLogprobs:
             torch.testing.assert_close(result, original, rtol=1e-5, atol=1e-5)
 
     def test_noop_when_cp_size_1(self):
+        # [FUNCTION DOC]
+        # With CP world size 1 the function returns the input tensor object unchanged.
         """When cp_size=1, returns input unchanged."""
         tensor = torch.randn(32, requires_grad=True)
         cu_seqlens = _make_cu_seqlens([32])
@@ -369,6 +430,9 @@ class TestReassembleCpPackedLogprobs:
 
     @pytest.mark.parametrize("cp_size", [2, 4])
     def test_gradient_flows_through_reassembly(self, cp_size):
+        # [FUNCTION DOC]
+        # With all_gather faked to pass the local tensor through for rank 0, sum-loss backward
+        # gives the local tensor a gradient of exactly 1 everywhere.
         """Verify that gradients flow back through the all-gather and reassembly."""
         seq_lengths = [_len * 2 * cp_size for _len in [4, 6]]
         cu_seqlens = _make_cu_seqlens(seq_lengths)
@@ -394,6 +458,9 @@ class TestReassembleCpPackedLogprobs:
             mock_mpu.get_context_parallel_group.return_value = MagicMock()
 
             def fake_all_gather(tensor, group=None):
+                # [FUNCTION DOC]
+                # HELPER: Returns a list with the live local tensor at test_rank and detached splits for
+                # other ranks.
                 result = []
                 for r in range(cp_size):
                     if r == test_rank:
@@ -423,10 +490,15 @@ class TestReassembleCpPackedLogprobs:
 
 @requires_megatron
 class TestSplitReassembleConsistencyWithMegatron:
+    # [CLASS DOC]
+    # Megatron-only check that the reference split matches the production split.
     """Test that our reference split matches the actual Megatron utility."""
 
     @pytest.mark.parametrize("cp_size", [2, 4])
     def test_split_matches_megatron_impl(self, cp_size):
+        # [FUNCTION DOC]
+        # For every rank (mpu mocked to that rank), split_packed_seqs_for_context_parallel equals
+        # _split_for_cp_rank exactly.
         """Verify our reference split matches split_packed_seqs_for_context_parallel."""
         seq_lengths = [_len * 2 * cp_size for _len in [5, 3, 7]]
         cu_seqlens = _make_cu_seqlens(seq_lengths)

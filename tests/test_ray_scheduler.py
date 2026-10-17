@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Tests for the Ray-based RayScheduler and its RayWorkerProcessLauncher actor: spec
+# validation, node/bundle planning for placement groups, worker command construction,
+# real worker process launching on a local Ray cluster (fake 8-GPU, 16-CPU resources),
+# and colocation routing. Unit tests build schedulers via object.__new__ to skip Ray
+# initialization; the module also exports _scheduler/_worker_info for other test files.
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
@@ -22,6 +28,12 @@ from areal.infra.scheduler.ray import RayScheduler, RayWorkerInfo
 
 
 def _scheduler(tmp_path, n_gpus_per_node: int = 8) -> RayScheduler:
+    # [FUNCTION DOC]
+    # HELPER: Builds a RayScheduler without __init__, setting the attributes the scheduler
+    # methods need: GPUs per node, experiment/trial names, fileroot=tmp_path, TMS offload
+    # off, "GPU" device resource with CUDA_VISIBLE_DEVICES control var, an NFS name-resolve
+    # config under tmp_path, timeouts, and empty worker/launcher/placement-group/colocation
+    # registries. Returns the scheduler.
     scheduler = object.__new__(RayScheduler)
     scheduler._n_gpus_per_node = n_gpus_per_node
     scheduler.experiment_name = "test_ray_scheduler"
@@ -47,6 +59,10 @@ def _scheduler(tmp_path, n_gpus_per_node: int = 8) -> RayScheduler:
 
 
 def _worker_info(worker_id: str, role: str = "actor") -> RayWorkerInfo:
+    # [FUNCTION DOC]
+    # HELPER: Returns a RayWorkerInfo for worker_id "<role>/<idx>" on 127.0.0.1 port 10000
+    # with the given role, task_index parsed from the id suffix, no launchers and a
+    # 1 CPU / 1 GPU / 1 mem spec.
     return RayWorkerInfo(
         worker=Worker(
             id=worker_id,
@@ -62,11 +78,16 @@ def _worker_info(worker_id: str, role: str = "actor") -> RayWorkerInfo:
 
 
 def _sleep_cmd(seconds: int = 60) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns a shell command string that runs the current Python interpreter to
+    # sleep for the given seconds (default 60).
     return f'{sys.executable} -c "import time; time.sleep({seconds})"'
 
 
 @pytest.fixture(autouse=True)
 def _disable_scheduler_destructor(monkeypatch):
+    # [FUNCTION DOC]
+    # Autouse fixture: no-ops RayScheduler.__del__ during the test and runs gc afterwards.
     monkeypatch.setattr(RayScheduler, "__del__", lambda self: None)
     yield
     gc.collect()
@@ -74,6 +95,9 @@ def _disable_scheduler_destructor(monkeypatch):
 
 @pytest.fixture(scope="module")
 def local_ray_cluster():
+    # [FUNCTION DOC]
+    # Module-scoped fixture: restarts Ray locally with 16 CPUs and 8 (logical) GPUs, skipping
+    # the test if Ray cannot start; shuts Ray down after the module.
     ray.shutdown()
     try:
         ray.init(
@@ -90,6 +114,8 @@ def local_ray_cluster():
 
 
 def test_ray_scheduler_rejects_cpu_only_cluster(monkeypatch):
+    # [FUNCTION DOC]
+    # Constructing RayScheduler when the resource type is "CPU" raises RuntimeError.
     """Test that RayScheduler fails clearly on CPU-only clusters."""
     monkeypatch.setattr(ray_scheduler.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(ray_scheduler, "ray_resource_type", lambda: "CPU")
@@ -99,6 +125,8 @@ def test_ray_scheduler_rejects_cpu_only_cluster(monkeypatch):
 
 
 def test_prepare_worker_specs_expands_single_spec(tmp_path):
+    # [FUNCTION DOC]
+    # A single spec is replicated for every replica.
     """Test that a single scheduling spec expands to all replicas."""
     scheduler = _scheduler(tmp_path)
     spec = SchedulingSpec(cpu=1, gpu=1, mem=1)
@@ -109,6 +137,8 @@ def test_prepare_worker_specs_expands_single_spec(tmp_path):
 
 
 def test_empty_scheduling_spec_fails(tmp_path):
+    # [FUNCTION DOC]
+    # A job with no task specs raises ValueError ("No scheduling specs").
     """Test that job with no scheduling specs fails."""
     scheduler = _scheduler(tmp_path)
 
@@ -117,6 +147,8 @@ def test_empty_scheduling_spec_fails(tmp_path):
 
 
 def test_mismatched_spec_count_fails(tmp_path):
+    # [FUNCTION DOC]
+    # A spec count other than 1 or replicas raises ValueError.
     """Test that mismatched spec count fails."""
     scheduler = _scheduler(tmp_path)
     job = Job(
@@ -133,6 +165,8 @@ def test_mismatched_spec_count_fails(tmp_path):
 
 
 def test_zero_replicas_fails(tmp_path):
+    # [FUNCTION DOC]
+    # replicas=0 raises WorkerCreationError.
     """Test that zero replicas fails."""
     scheduler = _scheduler(tmp_path)
     job = Job(role="zero_replicas", replicas=0, tasks=[SchedulingSpec()])
@@ -142,6 +176,8 @@ def test_zero_replicas_fails(tmp_path):
 
 
 def test_additional_bash_cmds_fails(tmp_path):
+    # [FUNCTION DOC]
+    # Ray rejects specs carrying additional_bash_cmds with ValueError.
     """Test that Ray rejects Slurm-style additional bash commands."""
     scheduler = _scheduler(tmp_path)
     job = Job(
@@ -155,6 +191,9 @@ def test_additional_bash_cmds_fails(tmp_path):
 
 
 def test_build_node_plan_large_training_keeps_contiguous_node_groups(tmp_path):
+    # [FUNCTION DOC]
+    # 32 one-GPU workers on 8-GPU nodes produce four full-node bundles of 8 GPUs with 8
+    # workers each.
     """Test full-node training creates contiguous node-sized bundles."""
     scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
     spec = SchedulingSpec(cpu=1, gpu=1, mem=1)
@@ -167,6 +206,9 @@ def test_build_node_plan_large_training_keeps_contiguous_node_groups(tmp_path):
 
 
 def test_build_node_plan_partial_single_node_role(tmp_path):
+    # [FUNCTION DOC]
+    # 6 workers (2 CPU, 1 GPU, 3 mem each) produce one partial bundle with 6 GPUs and 12 CPUs
+    # and a single plan entry.
     """Test partial-node Ray allocation builds one partial bundle."""
     scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
     spec = SchedulingSpec(cpu=2, gpu=1, mem=3)
@@ -183,6 +225,9 @@ def test_build_node_plan_partial_single_node_role(tmp_path):
 
 
 def test_build_node_plan_multi_node_instance_uses_head_and_worker_nodes(tmp_path):
+    # [FUNCTION DOC]
+    # Two 16-GPU workers span 2 nodes each: four 8-GPU bundles, with only the head node
+    # (node_rank 0) of each worker starting a process.
     """Test multi-node workers reserve all nodes but start only the head worker."""
     scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
     spec = SchedulingSpec(cpu=16, gpu=16, mem=32)
@@ -202,6 +247,8 @@ def test_build_node_plan_multi_node_instance_uses_head_and_worker_nodes(tmp_path
 
 
 def test_build_node_plan_multi_node_requires_even_cpu_mem_split(tmp_path):
+    # [FUNCTION DOC]
+    # A multi-node spec whose CPU count cannot be split evenly across nodes raises ValueError.
     """Test multi-node workers require CPU and memory to split across nodes."""
     scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
     spec = SchedulingSpec(cpu=15, gpu=16, mem=32)
@@ -211,6 +258,10 @@ def test_build_node_plan_multi_node_requires_even_cpu_mem_split(tmp_path):
 
 
 def test_launcher_worker_spec_defaults_to_rpc_server_and_auto_port():
+    # [FUNCTION DOC]
+    # Using the undecorated launcher class, _build_worker_spec with cmd None produces worker
+    # id "actor/0", an rpc_server command with "--port 0", the launcher env vars, and the
+    # device control var set to the joined GPU list.
     """Test launcher worker command defaults to rpc_server with port zero."""
     launcher_cls = (
         ray_scheduler.RayWorkerProcessLauncher.__ray_metadata__.modified_class
@@ -252,6 +303,8 @@ def test_launcher_worker_spec_defaults_to_rpc_server_and_auto_port():
     ],
 )
 def test_launcher_worker_spec_rejects_custom_port_argument(cmd):
+    # [FUNCTION DOC]
+    # Custom commands that include --port (either form) raise RuntimeError.
     """Test that custom commands cannot override scheduler-managed ports."""
     launcher_cls = (
         ray_scheduler.RayWorkerProcessLauncher.__ray_metadata__.modified_class
@@ -276,6 +329,10 @@ def test_launcher_worker_spec_rejects_custom_port_argument(cmd):
 
 
 def test_launcher_actor_starts_and_stops_worker_processes(tmp_path, local_ray_cluster):
+    # [FUNCTION DOC]
+    # Real Ray actor: a 2-GPU launcher reports 2 visible devices, starts two sleeping workers
+    # (one device each) that report running, stop_all_processes removes them; the actor is
+    # then killed.
     """Test RayWorkerProcessLauncher as a real Ray actor."""
     launcher = ray_scheduler.RayWorkerProcessLauncher.options(
         num_cpus=1,
@@ -344,6 +401,10 @@ def test_launcher_actor_starts_and_stops_worker_processes(tmp_path, local_ray_cl
 def test_create_workers_uses_real_ray_launchers_and_tracks_state(
     tmp_path, local_ray_cluster
 ):
+    # [FUNCTION DOC]
+    # create_workers with 2 single-GPU sleeping workers creates one launcher, registers both
+    # workers, both processes run; delete_workers clears workers, launchers and placement
+    # groups. Engine teardown on workers is stubbed out.
     """Test worker creation records real Ray launchers and worker metadata."""
     scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
     scheduler._destroy_engines_on_workers = lambda workers: None
@@ -383,6 +444,9 @@ def test_create_workers_uses_real_ray_launchers_and_tracks_state(
 def test_create_workers_multi_node_only_starts_head_launcher(
     tmp_path, local_ray_cluster
 ):
+    # [FUNCTION DOC]
+    # With 4 GPUs per node, one 8-GPU worker gets two launchers but only the head launcher
+    # runs the process; deletion clears all state.
     """Test multi-node worker creation starts only the head launcher process."""
     scheduler = _scheduler(tmp_path, n_gpus_per_node=4)
     scheduler._destroy_engines_on_workers = lambda workers: None
@@ -419,6 +483,9 @@ def test_create_workers_multi_node_only_starts_head_launcher(
 
 
 def test_delete_all_workers_removes_multiple_roles(tmp_path, local_ray_cluster):
+    # [FUNCTION DOC]
+    # delete_workers() with no role removes all roles' workers, launchers and placement
+    # groups.
     """Test deleting all Ray workers clears every owned role."""
     scheduler = _scheduler(tmp_path, n_gpus_per_node=8)
     scheduler._destroy_engines_on_workers = lambda workers: None
@@ -446,6 +513,9 @@ def test_delete_all_workers_removes_multiple_roles(tmp_path, local_ray_cluster):
 
 
 def test_create_workers_with_non_fork_colocation_reuses_target_workers(tmp_path):
+    # [FUNCTION DOC]
+    # Non-fork colocation returns the target role's worker ids, does not create new workers,
+    # and records the role mapping in _colocated_roles.
     """Test non-fork colocation reuses existing target workers."""
     scheduler = _scheduler(tmp_path)
     scheduler._workers["actor"] = [
@@ -471,6 +541,8 @@ def test_create_workers_with_non_fork_colocation_reuses_target_workers(tmp_path)
 def test_create_workers_with_fork_colocation_delegates_to_fork_workers(
     tmp_path, monkeypatch
 ):
+    # [FUNCTION DOC]
+    # Fork colocation calls fork_workers(role, target) and returns its ids.
     """Test fork colocation delegates worker creation to fork_workers."""
     scheduler = _scheduler(tmp_path)
     scheduler._workers["actor"] = [
@@ -480,6 +552,8 @@ def test_create_workers_with_fork_colocation_delegates_to_fork_workers(
     called = []
 
     def fake_fork_workers(role: str, target_role: str):
+        # [FUNCTION DOC]
+        # HELPER: Records the call and returns ["ref/0", "ref/1"].
         called.append((role, target_role))
         return ["ref/0", "ref/1"]
 
@@ -500,6 +574,8 @@ def test_create_workers_with_fork_colocation_delegates_to_fork_workers(
 
 
 def test_colocation_replica_mismatch_raises_error(tmp_path):
+    # [FUNCTION DOC]
+    # Colocation with a different replica count than the target raises WorkerCreationError.
     """Test that colocation fails if replica count does not match target."""
     scheduler = _scheduler(tmp_path)
     scheduler._workers["actor"] = [_worker_info("actor/0", role="actor")]
@@ -517,6 +593,8 @@ def test_colocation_replica_mismatch_raises_error(tmp_path):
 
 
 def test_colocation_target_not_found_raises_error(tmp_path):
+    # [FUNCTION DOC]
+    # Colocation with an unknown target role raises WorkerNotFoundError.
     """Test that colocation fails if target role does not exist."""
     scheduler = _scheduler(tmp_path)
     job = Job(

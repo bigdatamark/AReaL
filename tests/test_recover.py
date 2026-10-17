@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# CPU unit tests for training recovery: RecoverConfig validation and defaults,
+# check_if_recover / check_if_auto_recover (detect a resumable checkpoint), RecoverHandler
+# save/load behavior (optimizer flags, rejection of the v2 GatewayTrainController), the
+# AWEX colocated weight-transfer gate, and the colocated-rollout engine protocol check.
+# Uses temporary directories and Mock engines; no real checkpoints are written.
 """Tests for the recovery configuration and functionality."""
 
 import dataclasses
@@ -21,9 +27,13 @@ from areal.v2.training_service.controller.controller import (
 
 
 class TestRecoverConfig:
+    # [CLASS DOC]
+    # Validation and default-value tests for the RecoverConfig dataclass.
     """Tests for RecoverConfig dataclass validation."""
 
     def test_default_values(self):
+        # [FUNCTION DOC]
+        # Default mode is "disabled" and retries is 3.
         """Test that default values are set correctly."""
         config = RecoverConfig(
             experiment_name="test_exp",
@@ -34,6 +44,9 @@ class TestRecoverConfig:
         assert config.retries == 3
 
     def test_optimizer_state_is_saved_and_loaded_by_default(self):
+        # [FUNCTION DOC]
+        # no_save_optim and no_load_optim default to False so optimizer moments are kept across
+        # recovery.
         """Test that recovery round-trips optimizer state unless opted out.
 
         Megatron's optimizer save used to fail under megatron-core >=0.16 --
@@ -54,6 +67,9 @@ class TestRecoverConfig:
 
     @pytest.mark.parametrize("field_name", ["no_save_optim", "no_load_optim"])
     def test_optim_flag_help_does_not_claim_megatron_requirement(self, field_name):
+        # [FUNCTION DOC]
+        # The help metadata of the optim-skip flags no longer mentions "flattened_range" or calls
+        # them "required".
         """Test that the optim-skip flags are not documented as required.
 
         The old help text called no_save_optim "required" for Megatron with a
@@ -70,6 +86,8 @@ class TestRecoverConfig:
 
     @pytest.mark.parametrize("mode", ["on", "off", "auto", "disabled"])
     def test_valid_modes(self, mode):
+        # [FUNCTION DOC]
+        # Modes on/off/auto/disabled are accepted.
         """Test that all valid modes are accepted."""
         config = RecoverConfig(
             experiment_name="test_exp",
@@ -81,6 +99,9 @@ class TestRecoverConfig:
 
     @pytest.mark.parametrize("mode", ["fault", "resume", "invalid", "ON", "OFF", ""])
     def test_invalid_modes(self, mode):
+        # [FUNCTION DOC]
+        # Other modes (including legacy fault/resume and uppercase) raise ValueError whose message
+        # names the bad mode and mentions fault/resume as a migration hint.
         """Test that invalid modes raise ValueError with helpful message."""
         with pytest.raises(ValueError) as exc_info:
             RecoverConfig(
@@ -95,10 +116,14 @@ class TestRecoverConfig:
 
 
 class TestCheckIfRecover:
+    # [CLASS DOC]
+    # Tests for check_if_recover(config, run_id).
     """Tests for the check_if_recover function."""
 
     @pytest.mark.parametrize("mode", ["disabled", "off"])
     def test_disabled_modes_return_false(self, mode):
+        # [FUNCTION DOC]
+        # disabled/off always return False for any run_id.
         """Test that disabled modes always return False."""
         config = RecoverConfig(
             experiment_name="test_exp",
@@ -113,6 +138,8 @@ class TestCheckIfRecover:
 
     @pytest.mark.parametrize("mode", ["on", "auto"])
     def test_enabled_modes_check_for_checkpoint(self, mode):
+        # [FUNCTION DOC]
+        # on/auto return False when no checkpoint exists in an empty temp fileroot.
         """Test that enabled modes check for existing checkpoints."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config = RecoverConfig(
@@ -126,6 +153,8 @@ class TestCheckIfRecover:
 
     @pytest.mark.parametrize("run_id", [0, 1, 5, 100])
     def test_run_id_parameter_unused(self, run_id):
+        # [FUNCTION DOC]
+        # The result does not depend on run_id for disabled or enabled (no checkpoint) configs.
         """Test that run_id parameter doesn't affect the result."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Test with disabled mode
@@ -150,9 +179,13 @@ class TestCheckIfRecover:
 
 
 class TestCheckIfAutoRecover:
+    # [CLASS DOC]
+    # Tests for check_if_auto_recover(config).
     """Tests for the check_if_auto_recover function."""
 
     def test_no_checkpoint_returns_false(self):
+        # [FUNCTION DOC]
+        # Returns False when there is no recover checkpoint.
         """Test that missing checkpoint returns False."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config = RecoverConfig(
@@ -164,6 +197,9 @@ class TestCheckIfAutoRecover:
             assert check_if_auto_recover(config) is False
 
     def test_empty_directory_returns_false(self):
+        # [FUNCTION DOC]
+        # Returns False for an empty fileroot.
+        # KNOWN ISSUE: identical setup and assertion to test_no_checkpoint_returns_false.
         """Test that empty directory (no checkpoint) returns False."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config = RecoverConfig(
@@ -176,9 +212,13 @@ class TestCheckIfAutoRecover:
 
 
 class TestModeEquivalence:
+    # [CLASS DOC]
+    # Checks that "on" behaves like "auto" and "off" like "disabled".
     """Tests to verify mode equivalences (on=auto, off=disabled)."""
 
     def test_on_equals_auto(self):
+        # [FUNCTION DOC]
+        # on and auto give the same check_if_recover result.
         """Test that 'on' and 'auto' modes behave identically."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config_on = RecoverConfig(
@@ -197,6 +237,8 @@ class TestModeEquivalence:
             assert check_if_recover(config_on, 0) == check_if_recover(config_auto, 0)
 
     def test_off_equals_disabled(self):
+        # [FUNCTION DOC]
+        # off and disabled both return False.
         """Test that 'off' and 'disabled' modes behave identically."""
         with tempfile.TemporaryDirectory() as tmpdir:
             config_off = RecoverConfig(
@@ -217,8 +259,13 @@ class TestModeEquivalence:
 
 
 class TestRecoverHandler:
+    # [CLASS DOC]
+    # Tests for RecoverHandler.load/dump and its checkpoint helpers.
     @staticmethod
     def _make_handler(tmpdir: str, mode: str, **config_kwargs) -> RecoverHandler:
+        # [FUNCTION DOC]
+        # HELPER: Builds a RecoverHandler for the given temp dir and mode (plus extra config
+        # kwargs) with a 1-epoch, 8-sample, batch-2 FinetuneSpec.
         config = RecoverConfig(
             experiment_name="test_exp",
             trial_name="test_trial",
@@ -235,10 +282,15 @@ class TestRecoverHandler:
 
     @staticmethod
     def _make_gateway_controller() -> GatewayTrainController:
+        # [FUNCTION DOC]
+        # HELPER: Returns an uninitialized GatewayTrainController (via __new__).
         return GatewayTrainController.__new__(GatewayTrainController)
 
     @pytest.mark.parametrize("mode", ["on", "auto"])
     def test_load_rejects_gateway_train_controller(self, mode):
+        # [FUNCTION DOC]
+        # load() with a GatewayTrainController raises NotImplementedError mentioning the class
+        # and the `_version="v2"` setting.
         with tempfile.TemporaryDirectory() as tmpdir:
             handler = self._make_handler(tmpdir, mode)
 
@@ -256,6 +308,9 @@ class TestRecoverHandler:
 
     @pytest.mark.parametrize("mode", ["on", "auto"])
     def test_dump_rejects_gateway_train_controller(self, mode):
+        # [FUNCTION DOC]
+        # dump() with a GatewayTrainController raises NotImplementedError mentioning the class
+        # and recover.mode.
         with tempfile.TemporaryDirectory() as tmpdir:
             handler = self._make_handler(tmpdir, mode)
             step_info = StepInfo(
@@ -280,6 +335,8 @@ class TestRecoverHandler:
 
     @pytest.mark.parametrize("no_save_optim", [False, True])
     def test_save_checkpoint_passes_with_optim_from_config(self, no_save_optim):
+        # [FUNCTION DOC]
+        # _save_checkpoint calls engine.save with meta.with_optim equal to not no_save_optim.
         """Test that _save_checkpoint asks the engine for optimizer state
         exactly when no_save_optim is off."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -293,6 +350,9 @@ class TestRecoverHandler:
 
     @pytest.mark.parametrize("no_load_optim", [False, True])
     def test_load_checkpoint_passes_with_optim_from_config(self, no_load_optim):
+        # [FUNCTION DOC]
+        # After creating the recover checkpoint dir, _load_checkpoint calls engine.load with
+        # meta.with_optim equal to not no_load_optim.
         """Test that _load_checkpoint asks the engine for optimizer state
         exactly when no_load_optim is off."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -313,13 +373,20 @@ class TestRecoverHandler:
 
 
 class TestAwexColocateGate:
+    # [CLASS DOC]
+    # Tests for RecoverHandler._should_run_awex_colocate_transfer: True only with an
+    # inference engine, AWEX weight-update meta, and a colocated rollout.
     """The AWEX pre-transfer sequence must run only for colocated rollouts."""
 
     @staticmethod
     def _awex_meta():
+        # [FUNCTION DOC]
+        # HELPER: Returns a Mock weight-update meta with type "awex".
         return Mock(type="awex")
 
     def test_awex_transport_without_colocation_is_not_colocate(self):
+        # [FUNCTION DOC]
+        # AWEX without colocation returns False.
         assert not RecoverHandler._should_run_awex_colocate_transfer(
             inference_engine=Mock(),
             weight_update_meta=self._awex_meta(),
@@ -327,6 +394,8 @@ class TestAwexColocateGate:
         )
 
     def test_awex_transport_with_colocation_is_colocate(self):
+        # [FUNCTION DOC]
+        # AWEX with colocation returns True.
         assert RecoverHandler._should_run_awex_colocate_transfer(
             inference_engine=Mock(),
             weight_update_meta=self._awex_meta(),
@@ -335,6 +404,8 @@ class TestAwexColocateGate:
 
     @pytest.mark.parametrize("meta_type", ["disk", "xccl"])
     def test_non_awex_transport_is_never_colocate(self, meta_type):
+        # [FUNCTION DOC]
+        # disk / xccl transports return False even when colocated.
         assert not RecoverHandler._should_run_awex_colocate_transfer(
             inference_engine=Mock(),
             weight_update_meta=Mock(type=meta_type),
@@ -342,6 +413,8 @@ class TestAwexColocateGate:
         )
 
     def test_missing_inference_engine_is_not_colocate(self):
+        # [FUNCTION DOC]
+        # No inference engine returns False.
         assert not RecoverHandler._should_run_awex_colocate_transfer(
             inference_engine=None,
             weight_update_meta=self._awex_meta(),
@@ -349,6 +422,8 @@ class TestAwexColocateGate:
         )
 
     def test_meta_without_type_attribute_is_not_colocate(self):
+        # [FUNCTION DOC]
+        # A None weight-update meta returns False.
         assert not RecoverHandler._should_run_awex_colocate_transfer(
             inference_engine=Mock(),
             weight_update_meta=None,
@@ -357,15 +432,22 @@ class TestAwexColocateGate:
 
 
 class TestColocateRolloutProtocol:
+    # [CLASS DOC]
+    # Tests for RecoverHandler._require_colocate_rollout_protocol, which requires
+    # pause_generation_sync and an offload accepting a tags argument.
     """Engines lacking the colocate protocol must fail before any side effect."""
 
     def test_engine_with_full_protocol_is_accepted(self):
+        # [FUNCTION DOC]
+        # An engine with both methods (offload taking tags) passes without error.
         engine = Mock(spec=["pause_generation_sync", "offload"])
         engine.offload = lambda tags=None: None
 
         RecoverHandler._require_colocate_rollout_protocol(engine)
 
     def test_engine_without_pause_generation_sync_is_rejected(self):
+        # [FUNCTION DOC]
+        # Missing pause_generation_sync raises NotImplementedError naming it.
         engine = Mock(spec=["offload"])
         engine.offload = lambda tags=None: None
 
@@ -375,6 +457,8 @@ class TestColocateRolloutProtocol:
         assert "pause_generation_sync" in str(exc_info.value)
 
     def test_engine_with_untagged_offload_is_rejected(self):
+        # [FUNCTION DOC]
+        # An offload without a tags parameter raises NotImplementedError mentioning "tags".
         engine = Mock(spec=["pause_generation_sync", "offload"])
         engine.offload = lambda: None
 

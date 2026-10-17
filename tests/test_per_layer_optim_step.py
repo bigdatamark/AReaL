@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Multi-GPU tests for PerLayerOptimWrapper (FSDP2 per-layer optimizer step with CPU-held
+# optimizer states streamed to GPU). Workers are launched with mp.spawn over a file
+# rendezvous and NCCL; a tiny 4-layer Qwen2 model is wrapped with apply_fsdp2 in bf16 with
+# fp32 gradient reduction.
 """Tests for PerLayerOptimWrapper with FSDP2.
 
 Tests correctness of per-layer optim step against baseline optimizer.step().
@@ -25,6 +30,9 @@ CUDA_AVAILABLE = torch.cuda.is_available()
 
 
 def _create_tiny_config():
+    # [FUNCTION DOC]
+    # HELPER: Returns a tiny Qwen2Config (4 layers, hidden 256, intermediate 512, 4 heads /
+    # 2 KV heads, vocab 1000, max positions 128).
     """Create a tiny Qwen2 config for fast testing."""
     return Qwen2Config(
         num_hidden_layers=4,
@@ -38,6 +46,9 @@ def _create_tiny_config():
 
 
 def _setup_distributed(rank, world_size, rendezvous_file):
+    # [FUNCTION DOC]
+    # HELPER: Sets the CUDA device to rank, initializes an NCCL process group using a
+    # file:// rendezvous, and returns a 1-D "dp" device mesh of size world_size.
     """Initialize distributed process group and return device mesh."""
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -50,6 +61,10 @@ def _setup_distributed(rank, world_size, rendezvous_file):
 
 
 def _create_model_and_fsdp(config, device_mesh, use_cpu_offload=False):
+    # [FUNCTION DOC]
+    # HELPER: Instantiates a randomly initialized bf16 causal LM (eager attention) on CUDA
+    # from config, applies FSDP2 sharding on device_mesh with a bf16-param / fp32-reduce
+    # mixed precision policy and optional pinned CPU offload policy, and returns the model.
     """Create model with FSDP2 wrapping."""
     with torch.device("cuda"):
         model = AutoModelForCausalLM.from_config(
@@ -71,6 +86,9 @@ def _create_model_and_fsdp(config, device_mesh, use_cpu_offload=False):
 
 
 def _clip_grad_norm(model, device_mesh, max_norm=1.0):
+    # [FUNCTION DOC]
+    # HELPER: Clips all model gradients to max_norm with fsdp2_clip_grad_norm over the mesh's
+    # process group; returns the total grad norm.
     """Clip gradients using AReaL's fsdp2_clip_grad_norm."""
     return fsdp2_clip_grad_norm(
         list(model.parameters()),
@@ -80,6 +98,8 @@ def _clip_grad_norm(model, device_mesh, max_norm=1.0):
 
 
 def _offload_optimizer_states(optimizer):
+    # [FUNCTION DOC]
+    # HELPER: Moves every CUDA tensor in the optimizer's per-parameter state to CPU in place.
     """Move all optimizer states to CPU."""
     for state in optimizer.state.values():
         for k, v in state.items():
@@ -88,6 +108,8 @@ def _offload_optimizer_states(optimizer):
 
 
 def _snapshot_params(model):
+    # [FUNCTION DOC]
+    # HELPER: Returns a dict of parameter name to a float32 CPU clone of its local shard.
     """Snapshot all parameters as float32 CPU tensors."""
     return {
         n: _get_local_tensor(p.data).detach().float().cpu().clone()
@@ -96,6 +118,9 @@ def _snapshot_params(model):
 
 
 def _assert_params_close(model, baseline_params, atol=1e-4):
+    # [FUNCTION DOC]
+    # HELPER: Asserts every local parameter shard differs from the baseline snapshot by a
+    # max absolute difference below atol (default 1e-4); raises AssertionError otherwise.
     """Assert model params match baseline within tolerance."""
     for n, p in model.named_parameters():
         val = _get_local_tensor(p.data).detach().float().cpu()
@@ -104,6 +129,9 @@ def _assert_params_close(model, baseline_params, atol=1e-4):
 
 
 def _spawn_test(worker_fn, world_size, tmp_path, *extra_args):
+    # [FUNCTION DOC]
+    # HELPER: Skips if fewer than world_size GPUs, then mp.spawns worker_fn on world_size
+    # processes with args (world_size, rendezvous file under tmp_path, *extra_args) and joins.
     """Common mp.spawn boilerplate for distributed tests."""
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs")
@@ -122,6 +150,9 @@ def _spawn_test(worker_fn, world_size, tmp_path, *extra_args):
 
 
 def _test_layer_grouping_worker(rank, world_size, rendezvous_file):
+    # [FUNCTION DOC]
+    # HELPER: Worker asserting the wrapper creates at least num_hidden_layers param groups
+    # and that the groups together cover exactly the set of trainable parameters.
     device_mesh = _setup_distributed(rank, world_size, rendezvous_file)
     config = _create_tiny_config()
     model = _create_model_and_fsdp(config, device_mesh, use_cpu_offload=False)
@@ -144,6 +175,11 @@ def _test_layer_grouping_worker(rank, world_size, rendezvous_file):
 
 
 def _test_correctness_worker(rank, world_size, rendezvous_file, use_cpu_offload):
+    # [FUNCTION DOC]
+    # HELPER: Worker comparing one AdamW step done normally against the same step done via
+    # PerLayerOptimWrapper (prefetch 1, states offloaded to CPU first) from identical seeds,
+    # inputs and clipped gradients, optionally with FSDP CPU offload; final params must match
+    # within 1e-4.
     device_mesh = _setup_distributed(rank, world_size, rendezvous_file)
     config = _create_tiny_config()
 
@@ -198,6 +234,10 @@ def _test_correctness_worker(rank, world_size, rendezvous_file, use_cpu_offload)
 
 
 def _test_multi_step_worker(rank, world_size, rendezvous_file):
+    # [FUNCTION DOC]
+    # HELPER: Worker running three forward/backward/clip/wrapper.step iterations with one
+    # wrapper instance to exercise event reuse and state accumulation.
+    # KNOWN ISSUE: it makes no assertions; it only checks that nothing raises.
     device_mesh = _setup_distributed(rank, world_size, rendezvous_file)
     config = _create_tiny_config()
 
@@ -223,6 +263,11 @@ def _test_multi_step_worker(rank, world_size, rendezvous_file):
 
 
 def _test_prefetch_layers_worker(rank, world_size, rendezvous_file, prefetch_layers):
+    # [FUNCTION DOC]
+    # HELPER: Worker that runs one wrapper step with the given prefetch_layers and asserts
+    # some parameter has non-zero absolute sum.
+    # KNOWN ISSUE: randomly initialized params are already non-zero, so this check does not
+    # actually prove an update happened.
     device_mesh = _setup_distributed(rank, world_size, rendezvous_file)
     config = _create_tiny_config()
 
@@ -259,6 +304,8 @@ def _test_prefetch_layers_worker(rank, world_size, rendezvous_file, prefetch_lay
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize("world_size", [2])
 def test_layer_grouping(world_size, tmp_path):
+    # [FUNCTION DOC]
+    # Slow, CUDA-only: runs the layer-grouping worker on 2 GPUs.
     _spawn_test(_test_layer_grouping_worker, world_size, tmp_path)
 
 
@@ -266,6 +313,8 @@ def test_layer_grouping(world_size, tmp_path):
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize("world_size,use_cpu_offload", [(2, False), (2, True)])
 def test_correctness(world_size, use_cpu_offload, tmp_path):
+    # [FUNCTION DOC]
+    # Slow, CUDA-only: runs the correctness worker on 2 GPUs with and without CPU offload.
     _spawn_test(_test_correctness_worker, world_size, tmp_path, use_cpu_offload)
 
 
@@ -273,6 +322,8 @@ def test_correctness(world_size, use_cpu_offload, tmp_path):
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize("world_size", [2])
 def test_multi_step(world_size, tmp_path):
+    # [FUNCTION DOC]
+    # Slow, CUDA-only: runs the multi-step worker on 2 GPUs.
     _spawn_test(_test_multi_step_worker, world_size, tmp_path)
 
 
@@ -280,4 +331,6 @@ def test_multi_step(world_size, tmp_path):
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize("world_size,prefetch_layers", [(2, 0), (2, 1), (2, 2)])
 def test_prefetch_layers(world_size, prefetch_layers, tmp_path):
+    # [FUNCTION DOC]
+    # Slow, CUDA-only: runs the prefetch worker on 2 GPUs with prefetch_layers 0, 1 and 2.
     _spawn_test(_test_prefetch_layers_worker, world_size, tmp_path, prefetch_layers)

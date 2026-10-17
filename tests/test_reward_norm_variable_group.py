@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# CPU unit tests for variable-size group support in areal.utils.data.Normalization (the
+# group_sizes argument used when some rollout samples are dropped) and for batched_call
+# passing per-chunk trajectory group sizes via its meta argument.
 """Tests for variable-size group support in reward/advantage normalization.
 
 These cover the ``group_sizes`` argument added to ``Normalization`` so that
@@ -15,6 +19,9 @@ from areal.utils.data import Normalization, batched_call
 
 
 def _group_norm_config() -> NormConfig:
+    # [FUNCTION DOC]
+    # HELPER: Returns a NormConfig with group-level mean and std, group_size 2, no
+    # leave-one-out, biased std and eps 0.
     return NormConfig(
         mean_level="group",
         std_level="group",
@@ -26,6 +33,10 @@ def _group_norm_config() -> NormConfig:
 
 
 def _ref_group_norm(x: torch.Tensor, boundaries: list[int]) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Reference normalizer: for consecutive groups of the given sizes, subtracts the
+    # group mean and divides by the biased std in float64 (0 where std is 0). Returns a
+    # float64 tensor.
     """Reference: independently mean/std normalize each variable-size group."""
     out = torch.empty_like(x, dtype=torch.float64)
     offset = 0
@@ -39,6 +50,8 @@ def _ref_group_norm(x: torch.Tensor, boundaries: list[int]) -> torch.Tensor:
 
 
 def test_variable_group_sizes_normalize_each_group_independently():
+    # [FUNCTION DOC]
+    # With group_sizes [3, 2, 3], output matches the reference and each group has mean zero.
     """Unequal group sizes are sliced exactly, not by a fixed group_size."""
     norm = Normalization(_group_norm_config())
     # Three groups of sizes 3, 2, 3 (total 8); fixed group_size=2 would be wrong.
@@ -65,6 +78,8 @@ def test_variable_group_sizes_normalize_each_group_independently():
 
 
 def test_group_sizes_none_matches_fixed_group_size():
+    # [FUNCTION DOC]
+    # Omitting group_sizes equals passing [2, 2] with config group_size 2.
     """Without group_sizes, behavior is unchanged (backward compatible)."""
     norm = Normalization(_group_norm_config())  # group_size=2
     x = torch.tensor([0.0, 2.0, 10.0, 14.0], dtype=torch.float32)
@@ -76,6 +91,8 @@ def test_group_sizes_none_matches_fixed_group_size():
 
 
 def test_variable_group_with_zero_variance_group_is_finite():
+    # [FUNCTION DOC]
+    # With eps > 0, an all-equal group normalizes to exact zeros and all outputs are finite.
     """A zero-variance group stays finite thanks to eps in the denominator.
 
     When a group's rewards are all equal its std is 0; dividing by ``std + eps``
@@ -109,6 +126,9 @@ def test_variable_group_with_zero_variance_group_is_finite():
 
 
 def test_leave_one_out_singleton_group_outputs_zero():
+    # [FUNCTION DOC]
+    # With leave-one-out mean and unbiased std, a size-1 group outputs 0 and all outputs are
+    # finite.
     """A size-1 leave-one-out group has no peer baseline, so it is zeroed."""
     cfg = NormConfig(
         mean_level="group",
@@ -128,6 +148,8 @@ def test_leave_one_out_singleton_group_outputs_zero():
 
 
 def test_group_sizes_sum_mismatch_raises():
+    # [FUNCTION DOC]
+    # group_sizes not summing to the batch size raise ValueError ("must equal").
     """Boundaries whose sizes do not sum to the batch size are rejected."""
     norm = Normalization(_group_norm_config())
     x = torch.tensor([0.0, 1.0, 2.0, 3.0], dtype=torch.float32)  # bs=4
@@ -136,6 +158,8 @@ def test_group_sizes_sum_mismatch_raises():
 
 
 def test_group_sizes_non_positive_raises():
+    # [FUNCTION DOC]
+    # A zero group size raises ValueError ("positive").
     """Boundaries containing a non-positive size are rejected."""
     norm = Normalization(_group_norm_config())
     x = torch.tensor([0.0, 1.0, 2.0, 3.0], dtype=torch.float32)  # bs=4
@@ -144,6 +168,11 @@ def test_group_sizes_non_positive_raises():
 
 
 def test_adv_norm_style_2d_variable_groups_normalize_per_group():
+    # [FUNCTION DOC]
+    # A 2-D [batch, seq] tensor with a loss mask and group_sizes [3, 2] normalizes along the
+    # batch dimension producing a finite tensor of the same shape.
+    # KNOWN ISSUE: only finiteness and shape are checked, not the per-group values the name
+    # claims.
     """Token-level (2D) advantages normalize per variable-size group on dim 0.
 
     Mirrors how PPOActor.adv_norm is applied to the GAE advantage tensor.
@@ -163,6 +192,10 @@ def test_adv_norm_style_2d_variable_groups_normalize_per_group():
 
 
 def test_batched_call_pass_meta_provides_traj_group_sizes():
+    # [FUNCTION DOC]
+    # batched_call with pass_meta=True concatenates the two trajectory dicts, calls fn once
+    # with meta.traj_group_sizes == [2, 1] (per-input batch sizes), and splits the result
+    # back into per-input dicts in order.
     data = [
         {
             "attention_mask": torch.ones(2, 3, dtype=torch.bool),
@@ -175,6 +208,8 @@ def test_batched_call_pass_meta_provides_traj_group_sizes():
     ]
 
     def fn(batch, meta):
+        # [FUNCTION DOC]
+        # HELPER: Asserts meta.traj_group_sizes == [2, 1] and returns values + 1.
         assert meta.traj_group_sizes == [2, 1]
         return {"values": batch["values"] + 1}
 

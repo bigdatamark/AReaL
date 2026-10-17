@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Unit tests for MegatronEngine optimizer / LR-scheduler construction. Engines are built
+# via __new__ (no real init, no GPU/distributed setup) with minimal attributes, and the
+# Megatron factory functions (get_megatron_optimizer, OptimizerParamScheduler,
+# MegatronCheckpointManager) are monkeypatched to capture arguments.
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
@@ -11,6 +16,10 @@ from areal.engine import megatron_engine as megatron_engine_module
 
 
 def _make_test_engine(optimizer_config: OptimizerConfig):
+    # [FUNCTION DOC]
+    # HELPER: Builds a bare MegatronEngine (bypassing __init__) with the given optimizer
+    # config, a SimpleNamespace config with use_lora=False, default MegatronEngineConfig, a
+    # single dummy model chunk, bfloat16 dtype and FP8 disabled. Returns the engine.
     engine = megatron_engine_module.MegatronEngine.__new__(
         megatron_engine_module.MegatronEngine
     )
@@ -27,6 +36,12 @@ def _make_test_engine(optimizer_config: OptimizerConfig):
 def test_precision_aware_optimizer_fields_are_applied_before_validation(
     monkeypatch,
 ) -> None:
+    # [FUNCTION DOC]
+    # Verifies _create_optimizer forwards precision-aware optimizer settings from the mcore
+    # config into the Megatron OptimizerConfig: use_precision_aware_optimizer and its derived
+    # no-fp8 flag are True and the main grads / main params / exp_avg / exp_avg_sq dtypes are
+    # converted from strings to torch dtypes. Captures the config via a monkeypatched
+    # get_megatron_optimizer and stubs the scheduler and checkpoint manager.
     """MCore must derive its precision-aware mode from the final field values."""
     captured = {}
     engine = megatron_engine_module.MegatronEngine.__new__(
@@ -47,6 +62,9 @@ def test_precision_aware_optimizer_fields_are_applied_before_validation(
     engine.fp8_config = None
 
     def capture_optimizer(config, model):
+        # [FUNCTION DOC]
+        # HELPER: Fake get_megatron_optimizer; records config and model in the enclosing captured
+        # dict and returns a dummy object.
         captured["config"] = config
         captured["model"] = model
         return object()
@@ -82,6 +100,10 @@ def test_precision_aware_optimizer_fields_are_applied_before_validation(
 def test_scheduler_uses_fixed_warmup_and_resume_safe_initial_lr(
     monkeypatch,
 ) -> None:
+    # [FUNCTION DOC]
+    # Verifies the OptimizerParamScheduler receives init_lr=0.0, lr_warmup_steps equal to the
+    # configured warmup_steps (3), and lr_decay_steps / wd_incr_steps equal to total train
+    # steps (10) for a 10-sample, batch-size-1, one-epoch spec.
     captured = {}
     engine = _make_test_engine(OptimizerConfig(type="adam", warmup_steps=3))
 
@@ -92,6 +114,8 @@ def test_scheduler_uses_fixed_warmup_and_resume_safe_initial_lr(
     )
 
     def capture_scheduler(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fake scheduler constructor; merges its kwargs into captured and returns a dummy.
         captured.update(kwargs)
         return object()
 
@@ -117,6 +141,10 @@ def test_scheduler_uses_fixed_warmup_and_resume_safe_initial_lr(
 
 
 def test_dte_records_optimizer_step_lr_before_scheduler_advances() -> None:
+    # [FUNCTION DOC]
+    # Verifies that with DTE runtime enabled, optimizer_step stores each param group's current
+    # LR under the "_areal_last_step_lr" key before lr_scheduler_step mutates the "lr" values,
+    # using fake optimizer and scheduler objects sharing one param_groups list.
     """AdamW inversion must retain the LR consumed by the completed step."""
     engine = megatron_engine_module.MegatronEngine.__new__(
         megatron_engine_module.MegatronEngine
@@ -124,14 +152,26 @@ def test_dte_records_optimizer_step_lr_before_scheduler_advances() -> None:
     param_groups = [{"lr": 3e-6}, {"lr": 4e-6}]
 
     class _Optimizer:
+        # [CLASS DOC]
+        # HELPER: Fake Megatron optimizer exposing the shared param_groups and a step method.
         def __init__(self):
+            # [FUNCTION DOC]
+            # HELPER: Binds the enclosing param_groups list.
             self.param_groups = param_groups
 
         def step(self):
+            # [FUNCTION DOC]
+            # HELPER: Returns the Megatron-style tuple (update_successful=True, grad_norm tensor 1.0,
+            # num_zeros=None).
             return True, torch.tensor(1.0), None
 
     class _Scheduler:
+        # [CLASS DOC]
+        # HELPER: Fake LR scheduler that lowers the shared param group LRs on step.
         def step(self, increment):
+            # [FUNCTION DOC]
+            # HELPER: Asserts increment == 1 and sets group LRs to 2e-6 and 1e-6 (side effect on the
+            # shared param_groups).
             assert increment == 1
             param_groups[0]["lr"] = 2e-6
             param_groups[1]["lr"] = 1e-6
@@ -180,9 +220,15 @@ def test_scheduler_rejects_megatron_only_boundaries_before_optimizer_creation(
     ft_spec: FinetuneSpec,
     match: str,
 ) -> None:
+    # [FUNCTION DOC]
+    # Parametrized: for zero total steps, or warmup steps (absolute or proportion=1.0) >= total
+    # steps, _create_optimizer must raise ValueError with the given message before ever
+    # calling get_megatron_optimizer (which is patched to fail the test).
     engine = _make_test_engine(optimizer_config)
 
     def fail_if_called(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Fails the test immediately if the optimizer factory is invoked.
         pytest.fail("optimizer must not be created for an invalid scheduler config")
 
     monkeypatch.setattr(

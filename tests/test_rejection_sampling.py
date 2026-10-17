@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# CPU unit tests for off-policy rejection sampling: RejectionSamplingConfig validation and
+# apply_rejection_sampling(proximal_logprobs, old_logprobs, loss_mask, cu_seqlens, config)
+# in areal.utils.functional. The function computes per-token log ratio (proximal - old)
+# and a metric (ratio, kl_k1, kl_k2, kl_k3), optionally aggregates it per sequence (mean /
+# sum / max over valid tokens, for padded 2-D or cu_seqlens-packed 1-D inputs), and either
+# masks out-of-bounds tokens/sequences ("mask") or clamps the importance weight ("clamp").
+# It returns loss_mask, behave_imp_weight and filtered_fraction.
 import pytest
 import torch
 
@@ -6,29 +14,41 @@ from areal.utils.functional import apply_rejection_sampling
 
 
 class TestRejectionSamplingConfig:
+    # [CLASS DOC]
+    # Construction-time validation of RejectionSamplingConfig.
     """Tests for RejectionSamplingConfig validation."""
 
     def test_ratio_upper_must_exceed_one(self):
+        # [FUNCTION DOC]
+        # ratio metric with upper <= 1.0 raises ValueError.
         """ratio metric with upper <= 1.0 should raise ValueError."""
         with pytest.raises(ValueError, match="upper must be > 1.0"):
             RejectionSamplingConfig(metric="ratio", upper=1.0)
 
     def test_ratio_lower_must_be_positive(self):
+        # [FUNCTION DOC]
+        # ratio metric with negative lower raises ValueError.
         """ratio metric with lower <= 0 should raise ValueError."""
         with pytest.raises(ValueError, match="lower must be positive"):
             RejectionSamplingConfig(metric="ratio", lower=-0.1, upper=5.0)
 
     def test_kl_upper_must_be_positive(self):
+        # [FUNCTION DOC]
+        # KL metric with upper 0 raises ValueError.
         """KL metrics with upper <= 0 should raise ValueError."""
         with pytest.raises(ValueError, match="upper must be positive"):
             RejectionSamplingConfig(metric="kl_k2", upper=0.0)
 
     def test_agg_warning_for_token_level(self):
+        # [FUNCTION DOC]
+        # Non-mean agg with token level emits a UserWarning that agg is ignored.
         """agg != 'mean' with level='token' should warn."""
         with pytest.warns(UserWarning, match="agg=.*is ignored"):
             RejectionSamplingConfig(level="token", agg="max", metric="ratio", upper=5.0)
 
     def test_clamp_only_supports_ratio_metric(self):
+        # [FUNCTION DOC]
+        # action "clamp" with a KL metric raises ValueError.
         """action='clamp' with non-ratio metric should raise ValueError."""
         with pytest.raises(
             ValueError, match="action='clamp' only supports metric='ratio'"
@@ -36,15 +56,21 @@ class TestRejectionSamplingConfig:
             RejectionSamplingConfig(action="clamp", metric="kl_k2", upper=1.0)
 
     def test_clamp_sets_default_lower_to_zero(self):
+        # [FUNCTION DOC]
+        # action "clamp" without lower defaults lower to 0.0.
         """action='clamp' without explicit lower should default to 0.0."""
         config = RejectionSamplingConfig(action="clamp", metric="ratio", upper=5.0)
         assert config.lower == 0.0
 
 
 class TestRejectionSamplingMask:
+    # [CLASS DOC]
+    # Tests of action "mask".
     """Tests for apply_rejection_sampling with action='mask'."""
 
     def test_ratio_upper_bound_filters_high_ratio(self):
+        # [FUNCTION DOC]
+        # Token-level: a token with ratio e > 2 is masked, others kept, filtered_fraction > 0.
         """Token with ratio > upper should be filtered."""
         config = RejectionSamplingConfig(level="token", metric="ratio", upper=2.0)
         # ratio = exp(1) ~ 2.72 > 2.0
@@ -66,6 +92,8 @@ class TestRejectionSamplingMask:
         assert result.filtered_fraction > 0
 
     def test_ratio_lower_bound_filters_low_ratio(self):
+        # [FUNCTION DOC]
+        # Token-level: a token with ratio 1/e < 0.5 is masked.
         """Token with ratio < lower should be filtered."""
         config = RejectionSamplingConfig(
             level="token", metric="ratio", lower=0.5, upper=2.0
@@ -88,6 +116,9 @@ class TestRejectionSamplingMask:
         assert result.loss_mask[0, 2] == 1.0  # ratio = 1, keep
 
     def test_sequence_ratio_mask_uniform_weight(self):
+        # [FUNCTION DOC]
+        # Sequence-level ratio: behave_imp_weight is the per-sequence geometric mean ratio
+        # broadcast to all tokens.
         """Sequence-level ratio mask: behave_imp_weight = geometric mean for all tokens."""
         config = RejectionSamplingConfig(
             level="sequence", agg="mean", metric="ratio", upper=5.0
@@ -110,6 +141,8 @@ class TestRejectionSamplingMask:
         )
 
     def test_sequence_ratio_mask_uniform_weight_1d_packed(self):
+        # [FUNCTION DOC]
+        # Same as above for 1-D packed input split by cu_seqlens.
         """1D packed: sequence-level ratio mask should also use uniform weight."""
         config = RejectionSamplingConfig(
             level="sequence", agg="mean", metric="ratio", upper=5.0
@@ -144,6 +177,8 @@ class TestRejectionSamplingMask:
         )
 
     def test_sequence_kl_metric_keeps_per_token_weight(self):
+        # [FUNCTION DOC]
+        # Sequence-level KL metric leaves behave_imp_weight as per-token ratios.
         """Sequence-level KL metric: behave_imp_weight stays per-token (not uniform)."""
         config = RejectionSamplingConfig(
             level="sequence", agg="mean", metric="kl_k2", upper=5.0
@@ -163,6 +198,8 @@ class TestRejectionSamplingMask:
         )
 
     def test_kl_k2_sequence_mean_keeps_clean_sequences(self):
+        # [FUNCTION DOC]
+        # Sequences with mean kl_k2 below the bound are fully kept.
         """Sequence-level mean KL K2 should keep sequences below threshold."""
         config = RejectionSamplingConfig(
             level="sequence", agg="mean", metric="kl_k2", upper=0.5
@@ -186,6 +223,8 @@ class TestRejectionSamplingMask:
         assert torch.all(result.loss_mask[1] == 1.0)
 
     def test_kl_k2_sequence_mean_filters_stale_sequence(self):
+        # [FUNCTION DOC]
+        # A sequence whose mean kl_k2 exceeds the bound is masked entirely; others kept.
         """Sequence with high mean KL should be fully filtered."""
         config = RejectionSamplingConfig(
             level="sequence", agg="mean", metric="kl_k2", upper=0.1
@@ -208,6 +247,8 @@ class TestRejectionSamplingMask:
         assert torch.all(result.loss_mask[1] == 1.0)  # clean sequence kept
 
     def test_packed_1d_format_with_cu_seqlens(self):
+        # [FUNCTION DOC]
+        # Sequence filtering works on 1-D packed input with cu_seqlens.
         """1D packed format should work with cu_seqlens."""
         config = RejectionSamplingConfig(
             level="sequence", agg="mean", metric="kl_k2", upper=0.1
@@ -232,6 +273,8 @@ class TestRejectionSamplingMask:
         assert torch.all(result.loss_mask[3:] == 1.0)
 
     def test_padding_tokens_not_counted(self):
+        # [FUNCTION DOC]
+        # The sequence mean ignores loss_mask=0 tokens, so one stale valid token filters it.
         """Padding tokens (loss_mask=0) should not affect filtering."""
         config = RejectionSamplingConfig(
             level="sequence", agg="mean", metric="kl_k2", upper=0.5
@@ -254,9 +297,13 @@ class TestRejectionSamplingMask:
 
 
 class TestRejectionSamplingClamp:
+    # [CLASS DOC]
+    # Tests of action "clamp".
     """Tests for apply_rejection_sampling with action='clamp'."""
 
     def test_clamp_does_not_modify_loss_mask(self):
+        # [FUNCTION DOC]
+        # Clamp never changes loss_mask even for huge ratios.
         """Clamp mode should never modify loss_mask."""
         config = RejectionSamplingConfig(
             level="token", metric="ratio", action="clamp", upper=2.0
@@ -277,6 +324,8 @@ class TestRejectionSamplingClamp:
         assert torch.all(result.loss_mask == 1.0)
 
     def test_clamp_truncates_high_ratio(self):
+        # [FUNCTION DOC]
+        # Token weights above upper are clamped to upper; others unchanged.
         """Token with ratio > upper should have weight clamped to upper."""
         config = RejectionSamplingConfig(
             level="token", metric="ratio", action="clamp", upper=5.0
@@ -308,6 +357,9 @@ class TestRejectionSamplingClamp:
         )
 
     def test_clamp_sequence_level(self):
+        # [FUNCTION DOC]
+        # Sequence-level clamp uses the geometric-mean ratio as a uniform weight, clamped to
+        # upper, with loss_mask unchanged.
         """Sequence-level clamp with ratio metric uses geometric mean as uniform weight.
 
         geo_mean = exp(mean(log_ratio)), broadcast to all tokens in the sequence.
@@ -352,6 +404,8 @@ class TestRejectionSamplingClamp:
         assert torch.all(result.loss_mask == 1.0)
 
     def test_clamp_reports_clamped_fraction(self):
+        # [FUNCTION DOC]
+        # filtered_fraction reports a positive fraction of clamped tokens.
         """filtered_fraction should report proportion of clamped tokens."""
         config = RejectionSamplingConfig(
             level="token", metric="ratio", action="clamp", upper=2.0
@@ -373,9 +427,13 @@ class TestRejectionSamplingClamp:
 
 
 class TestBackwardCompatibility:
+    # [CLASS DOC]
+    # Equivalence with legacy behave_imp_weight_cap modes.
     """Verify new config reproduces old behave_imp_weight_cap behavior."""
 
     def test_equivalent_to_legacy_token_mask(self):
+        # [FUNCTION DOC]
+        # ratio/token/mask with upper 5 masks only the ratio-7.39 token.
         """New ratio/token/mask config should match old token_mask behavior."""
         config = RejectionSamplingConfig(level="token", metric="ratio", upper=5.0)
 
@@ -397,6 +455,8 @@ class TestBackwardCompatibility:
         assert result.loss_mask[0, 2] == 1.0
 
     def test_equivalent_to_legacy_token_truncate(self):
+        # [FUNCTION DOC]
+        # ratio/token/clamp with upper 5 keeps all tokens, clamps 7.39 to 5 and leaves 0.61.
         """New ratio/token/clamp config should match old token_truncate behavior."""
         config = RejectionSamplingConfig(
             level="token", metric="ratio", action="clamp", upper=5.0
@@ -430,9 +490,13 @@ class TestBackwardCompatibility:
 
 
 class TestKLK1Metric:
+    # [CLASS DOC]
+    # Tests for kl_k1 (the log ratio itself; may be negative).
     """Tests for kl_k1 metric (forward KL unbiased estimator, can be negative)."""
 
     def test_kl_k1_can_be_negative(self):
+        # [FUNCTION DOC]
+        # With bounds [-0.5, 1.0], a log ratio of -1 is masked and -0.3 kept.
         """kl_k1 = log(r) can be negative when proximal < old."""
         config = RejectionSamplingConfig(
             level="token", metric="kl_k1", upper=1.0, lower=-0.5
@@ -456,6 +520,8 @@ class TestKLK1Metric:
         assert result.loss_mask[0, 2] == 1.0  # kl_k1=-0.3, within bounds
 
     def test_kl_k1_filters_high_positive(self):
+        # [FUNCTION DOC]
+        # A log ratio of 1.0 above upper 0.5 is masked.
         """kl_k1 with high positive value should be filtered."""
         config = RejectionSamplingConfig(level="token", metric="kl_k1", upper=0.5)
         # log_ratio = 1.0, kl_k1 = 1.0 > 0.5 -> filtered
@@ -475,6 +541,8 @@ class TestKLK1Metric:
         assert result.loss_mask[0, 1] == 0.0  # kl_k1=1.0 > 0.5
 
     def test_kl_k1_sequence_level(self):
+        # [FUNCTION DOC]
+        # Sequence-mean kl_k1 keeps the sequence with mean 0.167 and masks the one with 1.33.
         """kl_k1 should work at sequence level with mean aggregation."""
         config = RejectionSamplingConfig(
             level="sequence", agg="mean", metric="kl_k1", upper=0.5
@@ -500,9 +568,15 @@ class TestKLK1Metric:
 
 
 class TestKLK3Metric:
+    # [CLASS DOC]
+    # Tests for kl_k3 (exp(-log ratio) - 1 + log ratio; non-negative).
     """Tests for kl_k3 metric (exact forward KL estimator, non-negative)."""
 
     def test_kl_k3_is_non_negative(self):
+        # [FUNCTION DOC]
+        # Small positive/negative log ratios give kl_k3 below 0.5, so all tokens are kept.
+        # KNOWN ISSUE: despite the name, it never checks non-negativity directly; it only checks
+        # the mask.
         """kl_k3 = exp(-log_ratio) - 1 - (-log_ratio) should be >= 0."""
         config = RejectionSamplingConfig(level="token", metric="kl_k3", upper=0.5)
         # log_ratio = 0.5, kl_k3 = exp(-0.5) - 1 - (-0.5) = 0.6065 - 0.5 = 0.1065
@@ -523,6 +597,8 @@ class TestKLK3Metric:
         assert torch.all(result.loss_mask == 1.0)
 
     def test_kl_k3_filters_stale_tokens(self):
+        # [FUNCTION DOC]
+        # A log ratio of 2 gives kl_k3 about 1.135 > 0.5, so that token is masked.
         """kl_k3 with large divergence should exceed threshold."""
         config = RejectionSamplingConfig(level="token", metric="kl_k3", upper=0.5)
         # log_ratio = 2.0, kl_k3 = exp(-2) - 1 - (-2) = 0.1353 + 1 = 1.1353
@@ -544,9 +620,13 @@ class TestKLK3Metric:
 
 
 class TestAggregationMethods:
+    # [CLASS DOC]
+    # Tests for sum and max sequence aggregation.
     """Tests for sum and max aggregation methods (Issue 10)."""
 
     def test_sequence_sum_is_length_sensitive(self):
+        # [FUNCTION DOC]
+        # Sum of kl_k2 keeps a sequence summing to 0.5 and masks one summing to 2.0 (bound 1.0).
         """Sum aggregation should be sensitive to sequence length."""
         config = RejectionSamplingConfig(
             level="sequence", agg="sum", metric="kl_k2", upper=1.0
@@ -571,6 +651,8 @@ class TestAggregationMethods:
         assert torch.all(result.loss_mask[1] == 0.0)  # sum > 1.0, filtered
 
     def test_sequence_max_filters_single_high_token(self):
+        # [FUNCTION DOC]
+        # Max ratio aggregation masks a sequence with one token at ratio 7.39 > 3.
         """Max aggregation should filter based on worst token in sequence."""
         config = RejectionSamplingConfig(
             level="sequence", agg="max", metric="ratio", upper=3.0
@@ -593,6 +675,8 @@ class TestAggregationMethods:
         assert torch.all(result.loss_mask[1] == 1.0)  # max < 3.0, kept
 
     def test_packed_sum_aggregation(self):
+        # [FUNCTION DOC]
+        # Sum aggregation on 1-D packed input: sum exactly at the bound (0.5) is kept.
         """Sum aggregation should work with 1D packed format."""
         config = RejectionSamplingConfig(
             level="sequence", agg="sum", metric="kl_k2", upper=0.5
@@ -616,6 +700,8 @@ class TestAggregationMethods:
         assert torch.all(result.loss_mask[3:] == 0.0)  # seq 1: sum=2.0 > 0.5, filtered
 
     def test_packed_max_aggregation(self):
+        # [FUNCTION DOC]
+        # Max aggregation on 1-D packed input masks the sequence containing ratio 7.39.
         """Max aggregation should work with 1D packed format."""
         config = RejectionSamplingConfig(
             level="sequence", agg="max", metric="ratio", upper=3.0
@@ -640,9 +726,13 @@ class TestAggregationMethods:
 
 
 class TestEdgeCases:
+    # [CLASS DOC]
+    # Edge-case tests.
     """Tests for edge cases (Issue 15)."""
 
     def test_empty_loss_mask(self):
+        # [FUNCTION DOC]
+        # An all-zero loss mask stays zero, weights are zero, and filtered_fraction is 0.
         """All-zero loss_mask should produce no filtering and zero fraction."""
         config = RejectionSamplingConfig(level="token", metric="ratio", upper=2.0)
         proximal_logprobs = torch.tensor([[5.0, 5.0, 5.0]])  # huge ratios
@@ -664,6 +754,8 @@ class TestEdgeCases:
         assert result.filtered_fraction == 0.0
 
     def test_single_token_sequence(self):
+        # [FUNCTION DOC]
+        # A one-token sequence with ratio e > 2 is masked.
         """Single-token sequences should work correctly."""
         config = RejectionSamplingConfig(
             level="sequence", agg="mean", metric="ratio", upper=2.0
@@ -683,6 +775,8 @@ class TestEdgeCases:
         assert result.loss_mask[0, 0] == 0.0  # filtered
 
     def test_all_tokens_filtered(self):
+        # [FUNCTION DOC]
+        # All tokens above the bound are masked and filtered_fraction is 1.0.
         """When all tokens exceed threshold, everything should be filtered."""
         config = RejectionSamplingConfig(level="token", metric="ratio", upper=1.5)
         # All ratios > 1.5
@@ -702,6 +796,8 @@ class TestEdgeCases:
         assert result.filtered_fraction == 1.0
 
     def test_clamp_with_lower_bound(self):
+        # [FUNCTION DOC]
+        # Clamp with lower 0.5 and upper 3.0 clamps from both sides.
         """Clamp mode with explicit lower bound should clamp from both sides."""
         config = RejectionSamplingConfig(
             level="token", metric="ratio", action="clamp", upper=3.0, lower=0.5
@@ -732,6 +828,8 @@ class TestEdgeCases:
         )
 
     def test_ratio_exactly_at_upper_bound(self):
+        # [FUNCTION DOC]
+        # A ratio exactly equal to upper is kept (inclusive bound).
         """Token with ratio exactly equal to upper should pass (<=)."""
         config = RejectionSamplingConfig(level="token", metric="ratio", upper=2.0)
         # log_ratio = ln(2.0) ~ 0.6931
@@ -751,6 +849,8 @@ class TestEdgeCases:
         assert result.loss_mask[0, 0] == 1.0  # exactly at boundary, kept
 
     def test_nan_from_inf_logprobs(self):
+        # [FUNCTION DOC]
+        # Both logprobs -inf at a position must not yield NaN weights or mask values.
         """Non-finite log-probs (both -inf) should not produce NaN."""
         config = RejectionSamplingConfig(level="token", metric="ratio", upper=5.0)
         proximal_logprobs = torch.tensor([[0.0, float("-inf")]])
@@ -770,6 +870,9 @@ class TestEdgeCases:
         assert not torch.isnan(result.loss_mask).any()
 
     def test_all_masked_sequence_with_max_agg(self):
+        # [FUNCTION DOC]
+        # A fully masked sequence with max aggregation is treated as in-bounds and stays zero;
+        # the valid sequence is kept.
         """Sequence with all tokens masked should pass bounds check with max agg."""
         config = RejectionSamplingConfig(
             level="sequence", agg="max", metric="ratio", upper=2.0
@@ -794,6 +897,8 @@ class TestEdgeCases:
         assert torch.all(result.loss_mask[1] == 1.0)
 
     def test_shape_mismatch_raises(self):
+        # [FUNCTION DOC]
+        # Mismatched input shapes raise ValueError mentioning "shape".
         """Mismatched tensor shapes should raise ValueError."""
         config = RejectionSamplingConfig(level="token", metric="ratio", upper=5.0)
         proximal_logprobs = torch.tensor([[0.0, 1.0]])
@@ -811,29 +916,41 @@ class TestEdgeCases:
 
 
 class TestConfigValidation:
+    # [CLASS DOC]
+    # Additional config validation tests.
     """Tests for new config validation rules (Issues 1, 9)."""
 
     def test_lower_greater_than_upper_raises(self):
+        # [FUNCTION DOC]
+        # lower > upper raises ValueError.
         """lower > upper should raise ValueError."""
         with pytest.raises(ValueError, match="lower.*cannot be greater than upper"):
             RejectionSamplingConfig(metric="ratio", lower=3.0, upper=2.0)
 
     def test_invalid_level_raises(self):
+        # [FUNCTION DOC]
+        # Unknown level raises ValueError.
         """Invalid level should raise ValueError."""
         with pytest.raises(ValueError, match="level must be one of"):
             RejectionSamplingConfig(level="invalid")
 
     def test_invalid_action_raises(self):
+        # [FUNCTION DOC]
+        # Unknown action raises ValueError.
         """Invalid action should raise ValueError."""
         with pytest.raises(ValueError, match="action must be one of"):
             RejectionSamplingConfig(action="invalid")
 
     def test_invalid_metric_raises(self):
+        # [FUNCTION DOC]
+        # Unknown metric raises ValueError.
         """Invalid metric should raise ValueError."""
         with pytest.raises(ValueError, match="metric must be one of"):
             RejectionSamplingConfig(metric="invalid")
 
     def test_invalid_agg_raises(self):
+        # [FUNCTION DOC]
+        # Unknown agg raises ValueError.
         """Invalid agg should raise ValueError."""
         with pytest.raises(ValueError, match="agg must be one of"):
             RejectionSamplingConfig(agg="invalid")

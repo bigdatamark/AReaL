@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# CPU unit tests for PPO generalized advantage estimation: token-level and turn-level GAE
+# recurrences (areal.trainer.ppo.gae), dynamic per-trajectory GAE lambda functions
+# (areal.trainer.ppo.lambda_fn: VAPO length-adaptive and relative-position), PPOActor's
+# _compute_gae_lambda / _compute_advantages integration, PPOActorConfig validation, and
+# turn_ids emitted by concat-template interactions. Expected values are hand-computed.
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +32,12 @@ def _make_actor(
     gae_lambda_kwargs: dict | None = None,
     kl_ctl: float = 0.0,
 ) -> PPOActor:
+    # [FUNCTION DOC]
+    # HELPER: Builds a PPOActor via __new__ (no engine) with a PPOActorConfig carrying the
+    # given GAE timestep unit ("token"/"turn"), lambda (float or dotted function path),
+    # lambda kwargs and KL coefficient, plus neutral reward shaping (bias 0, scale 1, clip
+    # 20, no reward/advantage norm), k1 KL estimator, discount 1.0 and a lambda function
+    # resolved via resolve_gae_lambda_fn (kwargs kept only for custom functions).
     config = PPOActorConfig(
         gae_timestep_unit=gae_timestep_unit,
         gae_lambda=gae_lambda,
@@ -60,6 +72,10 @@ def _make_interaction(
     *,
     parent: InteractionWithTokenLogpReward | None = None,
 ) -> InteractionWithTokenLogpReward:
+    # [FUNCTION DOC]
+    # HELPER: Builds an InteractionWithTokenLogpReward with a fake model response (given
+    # input/output tokens, logprob -0.1 and version 1 per output token), reward 1.0, the
+    # "concat" chat template, optional parent interaction, and a fake completion id.
     response = SimpleNamespace(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
@@ -79,6 +95,9 @@ def _make_interaction(
 
 
 def test_turn_level_gae_broadcasts_advantage_and_steps_once_per_turn():
+    # [FUNCTION DOC]
+    # Turn-level GAE with lambda 0.5 and zero values gives the same advantage/return (2.0)
+    # for every token, since decay applies between turns not tokens.
     """Lambda decay is applied between turns, not between action tokens."""
     rewards = torch.tensor([[0.0, 1.0, 0.0, 2.0]], dtype=torch.float32)
 
@@ -98,6 +117,10 @@ def test_turn_level_gae_broadcasts_advantage_and_steps_once_per_turn():
 
 
 def test_turn_level_gae_skips_gaps_and_uses_first_value_with_bootstrap():
+    # [FUNCTION DOC]
+    # Turn-level GAE skips masked gaps and missing turn ids when stepping discount/lambda,
+    # uses each turn's first value, bootstraps from the last value when no EOS, and leaves
+    # masked positions with advantage 0 and return equal to their value.
     """Prompt gaps and unused IDs do not consume discount or lambda steps."""
     rewards = torch.tensor([[0.0, 3.0, 0.0, 0.0, 4.0]], dtype=torch.float32)
     values = torch.tensor([[1.0, 5.0, 9.0, 2.0, 8.0]], dtype=torch.float32)
@@ -127,6 +150,8 @@ def test_turn_level_gae_skips_gaps_and_uses_first_value_with_bootstrap():
 
 
 def test_turn_level_gae_applies_one_lambda_per_sample():
+    # [FUNCTION DOC]
+    # A per-sample lambda tensor is applied independently per row in turn-level GAE.
     """Turn recurrence broadcasts each trajectory's own lambda across its turns."""
     rewards = torch.tensor(
         [[0.0, 1.0, 0.0, 2.0], [0.0, 1.0, 0.0, 2.0]],
@@ -152,6 +177,10 @@ def test_turn_level_gae_applies_one_lambda_per_sample():
 
 
 def test_token_level_gae_matches_legacy_recurrence():
+    # [FUNCTION DOC]
+    # Token-level GAE matches a reference backward recurrence that carries next value and
+    # running GAE only through masked-in positions, bootstraps only for no-EOS rows, and has
+    # returns = advantages + values (exact equality).
     """The default token mode remains numerically backward compatible."""
     rewards = torch.tensor(
         [[0.0, 0.5, 0.0, 2.0], [0.0, 1.0, 0.0, 0.0]], dtype=torch.float32
@@ -194,6 +223,8 @@ def test_token_level_gae_matches_legacy_recurrence():
 
 
 def test_token_level_gae_applies_one_lambda_per_sample():
+    # [FUNCTION DOC]
+    # A per-sample lambda tensor is applied independently per row in token-level GAE.
     """A batch lambda tensor changes recurrence independently per trajectory."""
     rewards = torch.tensor(
         [[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 0.0]],
@@ -222,6 +253,9 @@ def test_token_level_gae_applies_one_lambda_per_sample():
 
 
 def test_static_gae_lambda_ignores_kwargs_and_legacy_missing_turn_ids():
+    # [FUNCTION DOC]
+    # A static float lambda ignores lambda kwargs and broadcasts to one value per row even
+    # without turn_ids.
     """A float lambda remains compatible with token workflows lacking turn IDs."""
     actor = _make_actor(
         gae_lambda=0.25,
@@ -240,10 +274,15 @@ def test_static_gae_lambda_ignores_kwargs_and_legacy_missing_turn_ids():
 
 
 def test_static_gae_lambda_main_path_skips_dynamic_context(monkeypatch):
+    # [FUNCTION DOC]
+    # With a static lambda, _compute_advantages must not call _compute_gae_lambda (patched to
+    # raise) and still returns [1, 4]-shaped advantages.
     """A static lambda avoids per-batch trajectory length construction."""
     actor = _make_actor(gae_lambda=0.25)
 
     def fail_dynamic_resolution(*_args, **_kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Raises AssertionError if dynamic lambda resolution is invoked.
         raise AssertionError("static lambda should not use dynamic resolution")
 
     monkeypatch.setattr(actor, "_compute_gae_lambda", fail_dynamic_resolution)
@@ -262,6 +301,9 @@ def test_static_gae_lambda_main_path_skips_dynamic_context(monkeypatch):
 
 @pytest.mark.parametrize("gae_lambda", [float("nan"), float("inf")])
 def test_static_gae_lambda_main_path_rejects_non_finite_values(gae_lambda):
+    # [FUNCTION DOC]
+    # NaN or inf static lambda makes _compute_advantages raise ValueError ("Static gae_lambda
+    # must be finite").
     """The static fast path retains the dynamic path's finite-value check."""
     actor = _make_actor(gae_lambda=gae_lambda)
     batch = {
@@ -277,6 +319,9 @@ def test_static_gae_lambda_main_path_rejects_non_finite_values(gae_lambda):
 
 
 def test_vapo_gae_lambda_uses_selected_token_lengths_per_sample():
+    # [FUNCTION DOC]
+    # VAPO lambda in token mode uses masked token counts per row: lambda = 1 - 1/(alpha*len)
+    # style values 0.75 (len 4), 0.5 (len 2), and 0 for an empty row.
     """Token mode uses canonical generated-token counts for VAPO lambda."""
     actor = _make_actor(
         gae_lambda="areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae",
@@ -309,6 +354,9 @@ def test_vapo_gae_lambda_uses_selected_token_lengths_per_sample():
 
 
 def test_vapo_gae_lambda_uses_selected_turn_counts_per_sample():
+    # [FUNCTION DOC]
+    # VAPO lambda in turn mode uses the count of distinct active turns (2 -> 0.5, 1 -> 0.0,
+    # empty -> 0.0).
     """Turn mode uses unique active turn counts instead of generated tokens."""
     actor = _make_actor(
         gae_timestep_unit="turn",
@@ -342,6 +390,9 @@ def test_vapo_gae_lambda_uses_selected_turn_counts_per_sample():
 
 
 def test_relative_position_gae_lambda_preserves_endpoints_and_relative_positions():
+    # [FUNCTION DOC]
+    # relative_position_gae_lambda chooses lambda so that lambda^(L-1) equals q for each
+    # length and equal normalized positions get equal retention across lengths.
     """Different lengths share decay at equal endpoint-normalized positions."""
     q = 0.3
     lengths = torch.tensor([10, 19])
@@ -371,6 +422,8 @@ def test_relative_position_gae_lambda_preserves_endpoints_and_relative_positions
 
 
 def test_relative_position_gae_lambda_handles_empty_and_single_step_trajectories():
+    # [FUNCTION DOC]
+    # Length 0 yields lambda 0, length 1 yields 1, length 2 yields q.
     """Empty rows use zero while a single timestep cannot undergo decay."""
     lengths = torch.tensor([0, 1, 2])
     context = {
@@ -391,6 +444,8 @@ def test_relative_position_gae_lambda_handles_empty_and_single_step_trajectories
 
 @pytest.mark.parametrize("q", [True, -0.1, 0.0, 1.1, float("nan"), float("inf")])
 def test_relative_position_gae_lambda_rejects_invalid_q(q):
+    # [FUNCTION DOC]
+    # Booleans, non-positive, >1, NaN and inf q values raise ValueError.
     """The retained fraction must be finite and belong to (0, 1]."""
     lengths = torch.tensor([2])
     context = {
@@ -404,6 +459,9 @@ def test_relative_position_gae_lambda_rejects_invalid_q(q):
 
 
 def test_relative_position_gae_lambda_main_path_without_turn_ids():
+    # [FUNCTION DOC]
+    # End to end in token mode without turn_ids: a terminal reward of 1 over 10 action tokens
+    # gives advantages/returns q^((L-step)/(L-1)) for active steps and 0 at the final slot.
     """Token workflows need no turn metadata to decay a terminal reward."""
     q = 0.3
     trajectory_length = 10
@@ -434,6 +492,9 @@ def test_relative_position_gae_lambda_main_path_without_turn_ids():
 
 
 def test_relative_position_gae_lambda_turn_mode_uses_effective_turn_count():
+    # [FUNCTION DOC]
+    # In turn mode the relative-position lambda normalizes by turn count (3 turns -> q^(1/2),
+    # 1 turn -> 1.0).
     """Turn-level lambda normalizes decay by turns rather than action tokens."""
     q = 0.3
     actor = _make_actor(
@@ -461,6 +522,8 @@ def test_relative_position_gae_lambda_turn_mode_uses_effective_turn_count():
 
 
 def test_custom_token_gae_lambda_uses_lengths_without_turn_ids():
+    # [FUNCTION DOC]
+    # A custom token-mode lambda (VAPO) works when turn_ids is None, using row lengths.
     """A token-level custom lambda remains compatible with legacy workflows."""
     actor = _make_actor(
         gae_lambda="areal.trainer.ppo.lambda_fn.vapo_length_adaptive_gae",
@@ -479,10 +542,15 @@ def test_custom_token_gae_lambda_uses_lengths_without_turn_ids():
 
 
 def test_custom_gae_lambda_rejects_scalar_output():
+    # [FUNCTION DOC]
+    # A custom lambda function returning a 0-d tensor makes _compute_gae_lambda raise
+    # ValueError ("one value per local trajectory").
     """A custom function must return one explicit value per local trajectory."""
     actor = _make_actor()
 
     def scalar_lambda(context):
+        # [FUNCTION DOC]
+        # HELPER: Custom lambda stub that returns a scalar tensor 0.5.
         return torch.tensor(0.5)
 
     actor._gae_lambda_is_custom = True
@@ -497,6 +565,8 @@ def test_custom_gae_lambda_rejects_scalar_output():
 
 
 def test_vapo_gae_lambda_rejects_non_positive_alpha():
+    # [FUNCTION DOC]
+    # vapo_length_adaptive_gae raises ValueError for alpha 0 even on zero-length input.
     """VAPO requires a positive scale even when the batch is empty-length."""
     context = {
         "effective_token_lengths": torch.tensor([0]),
@@ -517,6 +587,9 @@ def test_vapo_gae_lambda_rejects_non_positive_alpha():
     ],
 )
 def test_turn_level_gae_rejects_malformed_active_turn_ids(turn_ids, message):
+    # [FUNCTION DOC]
+    # Parametrized: negative, out-of-range (>= seq len) or temporally decreasing active turn
+    # ids make turn-level GAE raise RuntimeError with the matching message.
     """Malformed action-token IDs fail before scatter/gather can misroute data."""
     rewards = torch.zeros(1, 4)
 
@@ -533,6 +606,8 @@ def test_turn_level_gae_rejects_malformed_active_turn_ids(turn_ids, message):
 
 
 def test_turn_level_gae_rejects_non_integral_ids():
+    # [FUNCTION DOC]
+    # Floating-point turn_ids raise ValueError mentioning "integer dtype".
     """Turn IDs must retain their structural integer representation."""
     rewards = torch.zeros(1, 2)
 
@@ -549,6 +624,9 @@ def test_turn_level_gae_rejects_non_integral_ids():
 
 
 def test_turn_level_main_path_keeps_kl_token_local_and_returns_task_only():
+    # [FUNCTION DOC]
+    # In turn mode with kl_ctl 1, per-token KL penalties change actor advantages and
+    # tot_rewards but the returns (critic targets) contain only the task reward.
     """Token KL affects actor advantages but does not enter critic targets."""
     actor = _make_actor(gae_timestep_unit="turn", kl_ctl=1.0)
     batch = {
@@ -584,11 +662,17 @@ def test_turn_level_main_path_keeps_kl_token_local_and_returns_task_only():
 
 
 def test_main_path_lambda_context_counts_shifted_training_tokens_including_eos():
+    # [FUNCTION DOC]
+    # The lambda context passed to a custom function reports 3 effective tokens (shifted
+    # loss mask including EOS) and 1 turn; captured via a stub lambda returning ones.
     """Dynamic lengths use the same canonical mask as GAE and critic training."""
     actor = _make_actor()
     captured_context = {}
 
     def capture_context(context):
+        # [FUNCTION DOC]
+        # HELPER: Copies (clones) the context tensors into captured_context and returns a lambda
+        # of 1.0 per row.
         captured_context.update({key: value.clone() for key, value in context.items()})
         return torch.ones_like(context["timestep_lengths"], dtype=torch.float32)
 
@@ -622,6 +706,8 @@ def test_main_path_lambda_context_counts_shifted_training_tokens_including_eos()
 
 
 def test_turn_level_main_path_requires_turn_ids():
+    # [FUNCTION DOC]
+    # Turn mode without turn_ids in the batch raises ValueError about missing turn_ids.
     """Enabling turn recurrence fails clearly for legacy rollout payloads."""
     actor = _make_actor(gae_timestep_unit="turn")
     batch = {
@@ -637,12 +723,16 @@ def test_turn_level_main_path_requires_turn_ids():
 
 
 def test_ppo_actor_config_rejects_unknown_gae_timestep_unit():
+    # [FUNCTION DOC]
+    # PPOActorConfig raises ValueError for gae_timestep_unit other than token/turn.
     """The string-backed config enforces the two supported timestep units."""
     with pytest.raises(ValueError, match="gae_timestep_unit"):
         PPOActorConfig(gae_timestep_unit="episode")
 
 
 def test_ppo_actor_config_is_omegaconf_structured_config_compatible():
+    # [FUNCTION DOC]
+    # PPOActorConfig works with OmegaConf.structured and defaults to "token".
     """The turn selector works with the project's pinned structured config path."""
     config = OmegaConf.structured(PPOActorConfig())
 
@@ -650,6 +740,8 @@ def test_ppo_actor_config_is_omegaconf_structured_config_compatible():
 
 
 def test_ppo_actor_config_accepts_lambda_function_path_and_kwargs():
+    # [FUNCTION DOC]
+    # OmegaConf preserves a string lambda function path and its kwargs dict.
     """OmegaConf preserves the dynamic lambda path and custom parameters."""
     config = OmegaConf.structured(
         PPOActorConfig(
@@ -663,6 +755,9 @@ def test_ppo_actor_config_accepts_lambda_function_path_and_kwargs():
 
 
 def test_concat_interaction_emits_structured_turn_ids():
+    # [FUNCTION DOC]
+    # A concat child interaction's tensor dict labels the parent's output tokens turn 0, its
+    # own output turn 1, and all prompt/inserted tokens -1.
     """A concat child preserves parent turns and labels its own output."""
     parent = _make_interaction("parent", [1, 2], [3, 4])
     child = _make_interaction("child", [1, 2, 3, 4, 5], [6, 7], parent=parent)

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# GPU integration tests for engine offload/onload via torch_memory_saver (TMS) on FSDP and
+# Megatron engines. Each test runs in a freshly spawned subprocess with TMS env vars set
+# (TMS needs LD_PRELOAD-style setup before CUDA init), creates a single-rank engine on
+# Qwen3-0.6B, and checks that offload frees GPU memory and onload restores it.
 """Integration tests for offload functionality in FSDP and Megatron engines using TMS."""
 
 import multiprocessing
@@ -25,6 +30,12 @@ MODEL_PATH = get_model_path(
 
 
 def _create_engine(engine_type: str):
+    # [FUNCTION DOC]
+    # HELPER: Sets single-rank torch.distributed env vars (WORLD_SIZE/RANK/LOCAL_RANK=0/1,
+    # localhost, free MASTER_PORT) in os.environ, builds a TrainEngineConfig for MODEL_PATH
+    # and instantiates FSDPEngine or MegatronEngine by engine_type ("FSDP"/"Megatron"; else
+    # ValueError). Creates the process group for allocation "fsdp:d1p1t1", initializes with a
+    # 1-epoch FinetuneSpec (128 samples, batch 8), prints a message and returns the engine.
     """Create FSDP/Megatron engine with TMS offload enabled."""
     os.environ.update(
         {
@@ -69,6 +80,10 @@ def _run_test(
     warmup_rounds: int = 3,
     output_queue=None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Subprocess entry point. Creates the engine, runs _test_offload_and_onload with
+    # the given thresholds, puts True into output_queue on success; always destroys the engine
+    # and the process group. On any exception prints the traceback, puts False and re-raises.
     """Function to run in subprocess. Creates engine and runs test."""
     try:
         print(f"[Subprocess] Starting test for {engine_type}...")
@@ -105,12 +120,21 @@ def _run_test(
 
 @contextmanager
 def _tms_env_context():
+    # [FUNCTION DOC]
+    # HELPER: Context manager that merges get_tms_env_vars() into os.environ and yields.
+    # KNOWN ISSUE: the variables are never removed/restored on exit, so they leak into the
+    # parent process environment for the rest of the session.
     tms_env = get_tms_env_vars()
     os.environ.update(tms_env)
     yield
 
 
 def _run_in_subprocess(target, kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Runs target(**kwargs) in a "spawn" multiprocessing Process with TMS env vars set
+    # (kwargs gains an output_queue; caller's dict is mutated). Waits for completion and fails
+    # the pytest test if the queue reports False, or if no result arrived (reporting a
+    # non-zero exit code when the process crashed).
     """Run function in a subprocess with TMS environment configured."""
     ctx = multiprocessing.get_context("spawn")
     output_queue = ctx.Queue()
@@ -136,6 +160,8 @@ def _run_in_subprocess(target, kwargs):
 
 
 def get_gpu_memory_allocated_gb() -> float:
+    # [FUNCTION DOC]
+    # HELPER: Returns device memory used on the current platform device, in GiB (float).
     """Get currently allocated GPU memory in GB."""
     device = current_platform.current_device()
     allocated = current_platform.device_memory_used(device)
@@ -149,6 +175,12 @@ def _test_offload_and_onload(
     memory_tolerance: float = 0.1,
     warmup_rounds: int = 3,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Core check. Measures baseline memory, runs warmup_rounds offload/onload cycles,
+    # then times one offload and asserts released memory > min_memory_release_gb, then times
+    # one onload and asserts post-onload memory is within memory_tolerance (fraction of
+    # initial) of the baseline. Prints memory and transfer speeds; synchronizes the device
+    # before each measurement. Raises AssertionError on failure.
     # Measure initial memory
     current_platform.synchronize()
     initial_memory_gb = get_gpu_memory_allocated_gb()
@@ -220,6 +252,9 @@ def _test_offload_and_onload(
 @pytest.mark.parametrize("engine_type", ["FSDP", "Megatron"])
 @pytest.mark.slow
 def test_engine_offload_and_onload(engine_type):
+    # [FUNCTION DOC]
+    # Parametrized over FSDP and Megatron (slow): runs _run_test in a TMS-configured
+    # subprocess with 0.1 GB min release, 10% tolerance and 3 warmup rounds.
     """Test engine offload releases memory and onload recovers it correctly.
 
     This test validates:
