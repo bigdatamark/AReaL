@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# ScaffoldingWorkflow: a RolloutWorkflow that delegates generation (SGLangWorker using
+# SGLang's OpenAI-compatible completions API) and reward (RLVRRewardController) to
+# scaffolding components assembled into a ScaffoldingLlm. Logprobs are placeholders, so
+# training must recompute logprobs.
 """
 ScaffoldingWorkflow - RolloutWorkflow with generation and reward via Scaffolding.
 
@@ -40,6 +45,10 @@ logger = logging.getLogger("ScaffoldingWorkflow")
 
 
 class ScaffoldingWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # Single-turn RLVR workflow over scaffolding. Worker and ScaffoldingLlm are created
+    # lazily on the first episode from the engine's first server address; subclasses can
+    # override build_scaffolding_llm to plug in other controllers.
     """RolloutWorkflow with generation and reward via scaffolding components.
 
     Both generation and reward computation go through scaffolding:
@@ -69,6 +78,13 @@ class ScaffoldingWorkflow(RolloutWorkflow):
         tokenizer: PreTrainedTokenizerFast | str,
         enable_thinking: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Resolves reward_fn from an import string if needed, loads the tokenizer if
+        # given as a
+        # path, derives gconfig with stop/pad token ids, stores enable_thinking, and
+        # initializes
+        # worker, gen_controller, reward_controller, trajectory_maker and
+        # scaffolding_llm to None.
         if isinstance(reward_fn, str):
             reward_fn = import_from_string(reward_fn)
         self.reward_fn = reward_fn
@@ -89,6 +105,10 @@ class ScaffoldingWorkflow(RolloutWorkflow):
         self.scaffolding_llm: ScaffoldingLlm | None = None
 
     def _lazy_init_scaffolding(self, engine: InferenceEngine) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Builds an AsyncOpenAI client for http://<engine.addresses[0]>/v1 (key
+        # "EMPTY"), wraps it in an SGLangWorker (model "default"), then calls
+        # build_scaffolding_llm and logs the server address. Mutates self.
         """Create Worker, PipelineTrajectoryMaker, and ScaffoldingLlm."""
         import openai
 
@@ -106,6 +126,17 @@ class ScaffoldingWorkflow(RolloutWorkflow):
         logger.info("Initialized scaffolding components with server at %s", addr)
 
     def build_scaffolding_llm(self, engine: InferenceEngine) -> ScaffoldingLlm:
+        # [FUNCTION DOC]
+        # Converts gconfig into sampling params (max_tokens = max_new_tokens,
+        # temperature, and
+        # stop strings obtained by decoding each stop token id, skipping empty decodes),
+        # creates a
+        # NativeGenerationController, an RLVRRewardController around reward_fn and a
+        # PipelineTrajectoryMaker combining them (all stored on self), and returns a
+        # ScaffoldingLlm mapping the generation worker tag to self.worker.
+        # KNOWN ISSUE: a temperature of 0 is replaced with 1.0 because of the falsy
+        # fallback, so
+        # greedy decoding cannot be requested.
         """Build the ScaffoldingLlm instance.
 
         Override this method in subclasses to use different scaffolding
@@ -154,6 +185,23 @@ class ScaffoldingWorkflow(RolloutWorkflow):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Lazily initializes scaffolding, tokenizes data["messages"] with the chat
+        # template
+        # (generation prompt, enable_thinking), decodes it to a prompt string, sets
+        # task_data,
+        # prompt_str and input_tokens on the shared trajectory maker (cloned per request
+        # by the
+        # scaffolding LLM), awaits generate_async, and takes the first interaction from
+        # the first
+        # output. If its model response has no output tokens, re-tokenizes the output
+        # text and
+        # fills placeholder logprobs (0.0) and versions (-1). Returns
+        # interaction.to_tensor_dict().
+        # KNOWN ISSUE: per-episode data is written to a shared trajectory maker;
+        # correctness under
+        # concurrent episodes relies on generate_async cloning it before the next
+        # episode writes.
         """Run a single episode via scaffolding pipeline.
 
         Delegates the full episode (generation + reward) to

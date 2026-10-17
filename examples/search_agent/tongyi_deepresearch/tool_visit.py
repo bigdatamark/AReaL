@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# qwen-agent "visit" tool for the Tongyi DeepResearch agent: fetches pages through the
+# Jina Reader service and summarizes them toward a goal with an LLM extractor. Env
+# config
+# read at import: VISIT_SERVER_TIMEOUT (unused here), WEBCONTENT_MAXLENGTH (unused
+# here),
+# JINA_API_KEYS (bearer token). OSS_JSON_FORMAT documents the expected extractor JSON
+# schema (unused in this file). Imports EXTRACTOR_PROMPT from a top-level "prompt"
+# module,
+# so this directory must be on sys.path.
 import asyncio
 import copy
 import json
@@ -21,6 +31,10 @@ JINA_API_KEYS = os.getenv("JINA_API_KEYS", "")
 
 
 def truncate_to_tokens(text: str, max_tokens: int = 95000) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Encodes text with tiktoken cl100k_base and, if longer than max_tokens
+    # (95000),
+    # returns the decoded first max_tokens tokens; else returns text unchanged.
     encoding = tiktoken.get_encoding("cl100k_base")
 
     tokens = encoding.encode(text)
@@ -38,6 +52,12 @@ OSS_JSON_FORMAT = """# Response Formats
 
 @register_tool("visit", allow_overwrite=True)
 class Visit(BaseTool):
+    # [CLASS DOC]
+    # qwen-agent BaseTool registered as "visit" (overwriting). Params: url (string or
+    # list)
+    # and goal. Uses an optional injected OpenAI-compatible summary client, otherwise an
+    # AsyncOpenAI client configured from API_KEY / API_BASE / SUMMARY_MODEL_NAME env
+    # vars.
     # The `description` tells the agent the functionality of this tool.
     name = "visit"
     description = "Visit webpage(s) and return the summary of the content."
@@ -61,10 +81,24 @@ class Visit(BaseTool):
 
     # The `call` method is the main function of the tool.
     def __init__(self, cfg: dict | None = None, summary_client=None):
+        # [FUNCTION DOC]
+        # Initializes the qwen-agent base with cfg and stores summary_client (may be
+        # None).
         super().__init__(cfg)
         self._llm_client = summary_client
 
     async def call(self, params: str | dict, **kwargs) -> str:  # type: ignore[override]
+        # [FUNCTION DOC]
+        # Tool entry. Reads params url and goal (invalid input returns an error string).
+        # Creates a
+        # "log" directory in the cwd. A single URL is summarized via readpage_jina; a
+        # list is
+        # processed sequentially, each failure rendered as an error string and, once 900
+        # s have
+        # elapsed, remaining URLs get a canned "could not be accessed" block; results
+        # are joined
+        # by a "=======" separator. Returns the stripped string.
+        # KNOWN ISSUE: params typed as str | dict but a JSON string is never parsed.
         try:
             url = params["url"]
             goal = params["goal"]
@@ -110,6 +144,16 @@ class Visit(BaseTool):
         return response.strip()
 
     async def call_server(self, msgs, max_retries=2):
+        # [FUNCTION DOC]
+        # HELPER: Sends chat messages to the summary LLM (temperature 0.7; model name
+        # only when
+        # using the env-configured client), up to max_retries attempts with 0.5 s sleeps
+        # after
+        # exceptions. Non-empty content is returned, trimmed to the outermost braces if
+        # it is not
+        # valid JSON. Returns "" if the last attempt raises.
+        # KNOWN ISSUE: if every attempt returns empty content, the loop ends and None is
+        # returned implicitly.
         if not self._llm_client:
             api_key = os.environ.get("API_KEY")
             url_llm = os.environ.get("API_BASE")
@@ -149,6 +193,15 @@ class Visit(BaseTool):
                 continue
 
     async def jina_readpage(self, url: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: GETs the Jina Reader URL for url with the bearer key and a 50 s
+        # timeout, up to 3
+        # attempts with 0.5 s sleeps. Returns page text on HTTP 200, else "[visit]
+        # Failed to read
+        # page.". Network I/O.
+        # KNOWN ISSUE: the docstring lists a goal argument that does not exist, and the
+        # debug log
+        # prints the Jina API key.
         """
         Read webpage content using Jina service.
 
@@ -189,6 +242,12 @@ class Visit(BaseTool):
         return "[visit] Failed to read page."
 
     async def html_readpage_jina(self, url: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Calls jina_readpage up to 8 times until it returns content that is
+        # non-empty
+        # and not a failure / empty / document-parser marker; otherwise returns the
+        # failure
+        # marker string.
         max_attempts = 8
         for attempt in range(max_attempts):
             logger.debug(
@@ -205,6 +264,26 @@ class Visit(BaseTool):
         return "[visit] Failed to read page."
 
     async def readpage_jina(self, url: str, goal: str) -> str:
+        # [FUNCTION DOC]
+        # Reads url and builds a goal-oriented summary. If the page could not be read,
+        # returns a
+        # canned "useful information" block saying it could not be accessed. Otherwise
+        # truncates
+        # to 95000 tokens, asks the extractor LLM (EXTRACTOR_PROMPT, retries from
+        # VISIT_SERVER_MAX_RETRIES env, default 1). While the reply is a string shorter
+        # than 10
+        # chars, retries up to 4 more times shrinking the content to 70% each time and
+        # finally to
+        # 25000 chars. Strips code fences, then tries to parse JSON up to 3 times (re-
+        # querying on
+        # failure). If parsing never succeeds returns the first 1000 chars of the raw
+        # page;
+        # otherwise returns a block with the evidence and summary fields.
+        # KNOWN ISSUE: the debug call passes len(raw) as a logging argument without a
+        # placeholder (logging formatting error), and len fails if raw is None; the
+        # final
+        # "< 10 chars" check can never trigger since the block always has its header
+        # text.
         """Read and summarize a webpage using Jina + LLM extractor."""
         summary_page_func = self.call_server
         max_retries = int(os.getenv("VISIT_SERVER_MAX_RETRIES", 1))

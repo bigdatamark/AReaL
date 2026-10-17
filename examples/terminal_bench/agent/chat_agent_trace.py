@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# ChatAgentTrace: a CAMEL ChatAgent whose async non-streaming step loop is instrumented
+# with AReaL perf-tracer scopes and recovers from malformed Qwen-style tool_call JSON by
+# feeding an error tool result back to the model. Also registers an atexit hook that
+# deletes paths in the module-level _temp_files set, and defines SIMPLE_FORMAT_PROMPT.
 import asyncio
 import atexit
 import json
@@ -43,6 +48,10 @@ _temp_files_lock = threading.Lock()
 
 
 def _cleanup_temp_files():
+    # [FUNCTION DOC]
+    # HELPER: atexit hook that, under a lock, tries to delete every path in _temp_files,
+    # ignoring errors.
+    # KNOWN ISSUE: nothing in this module ever adds to _temp_files, so it is a no-op.
     with _temp_files_lock:
         for path in _temp_files:
             try:
@@ -65,15 +74,39 @@ SIMPLE_FORMAT_PROMPT = TextPrompt(
 
 
 class ChatAgentTrace(ChatAgent):
+    # [CLASS DOC]
+    # ChatAgent subclass adding per-step JSON parse-error handling (limit
+    # max_parse_errors,
+    # default 3) and tracing of model calls and tool executions.
     """A ChatAgent with performance tracing capabilities."""
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Forwards all args to ChatAgent, then sets max_parse_errors from kwargs
+        # (default 3) and
+        # resets parse_error_count to 0.
+        # KNOWN ISSUE: max_parse_errors is also forwarded to ChatAgent's initializer,
+        # which does
+        # not accept it, so it cannot actually be configured.
         """Initialize ChatAgentTrace with parse error tracking."""
         super().__init__(*args, **kwargs)
         self.max_parse_errors = kwargs.get("max_parse_errors", 3)
         self.parse_error_count = 0
 
     async def adetect_tool_calls_parse_error(self, response):
+        # [FUNCTION DOC]
+        # Checks the first output message for tool_call blocks (tag followed by newline
+        # ... newline
+        # and closing tag). Returns None if the error limit is reached, there is no
+        # content or no
+        # block. For the first block whose content is not valid JSON: increments
+        # parse_error_count, logs warnings, writes a fake assistant function-call
+        # message and a
+        # function-result message ("json_parse_error" with an explanatory error text)
+        # into memory
+        # with consecutive timestamps, and returns a ToolCallingRecord describing the
+        # error.
+        # Returns None if all blocks parse.
         r"""
         Asynchronously detect tool calls in the response content using Qwen25Detector.
         if the model is Qwen 2.5 or Qwen 3.
@@ -192,6 +225,30 @@ class ChatAgentTrace(ChatAgent):
         input_message: BaseMessage | str,
         response_format: type[BaseModel] | None = None,
     ) -> ChatAgentResponse:
+        # [FUNCTION DOC]
+        # Override of CAMEL's async step loop. Extracts the task name from a "Task
+        # name:" line in
+        # a string input (else "default") for trace labels, resets the parse-error
+        # counter, sets
+        # the Langfuse session id if available, adapts response_format for non-strict
+        # tools, and
+        # records the user message in memory. Loop: honors pause_event; gets context
+        # from memory
+        # (a RuntimeError ends the step with "max_tokens_exceeded"); calls the model
+        # inside trace
+        # scopes; accumulates token usage; stops on stop_event. If the response has tool
+        # calls,
+        # external ones are collected (ending the loop) and internal ones executed with
+        # tracing;
+        # the loop continues until max_iteration is reached. Without tool calls it
+        # checks for
+        # tool-call JSON parse errors and retries until the limit, otherwise exits.
+        # Finally
+        # formats/parses the response if needed, records the output, prunes tool calls
+        # from
+        # memory if configured and returns the ChatAgentResponse with tool records,
+        # context token
+        # count, external requests and token usage.
         r"""Internal async method for non-streaming astep logic."""
 
         # try to extract task name if exists in input_message

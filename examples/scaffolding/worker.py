@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Scaffolding Worker implementations backed by AReaL SGLang servers through their
+# OpenAI-compatible API.
 """
 Worker implementations for Scaffolding Framework.
 
@@ -28,6 +31,12 @@ worker_logger = logging.getLogger("SGLangWorker")
 
 
 class SGLangWorker(OpenaiWorker):
+    # [CLASS DOC]
+    # OpenaiWorker subclass (KV-cache hints disabled) that handles GenerationTask via
+    # the
+    # completions API and ChatTask via chat completions, recording extra details on
+    # tasks.
+    # Keeps a reference to the AReaL engine. task_handlers maps task types to handlers.
     """Worker that wraps an SGLang engine for scaffolding.
 
     This worker connects to an SGLang server via its OpenAI-compatible API
@@ -49,10 +58,25 @@ class SGLangWorker(OpenaiWorker):
         model: str,
         engine: RemoteSGLangEngine,
     ):
+        # [FUNCTION DOC]
+        # Initializes the base OpenaiWorker with the async client and model name, and
+        # stores
+        # engine.
         super().__init__(async_client, model, kv_cache_hint_enabled=False)
         self.engine = engine
 
     async def chat_handler(self, task: ChatTask) -> TaskStatus:
+        # [FUNCTION DOC]
+        # Builds request params from the task (base conversion), sets messages, model
+        # and tool
+        # schemas, logs, and awaits chat.completions.create. On success stores the raw
+        # completion
+        # on task.completion, sets finish_reason and optional perf_metrics, appends an
+        # AssistantMessage (content, reasoning, reasoning_content, tool_calls) to
+        # task.messages,
+        # and if token counting is enabled records prompt/completion/reasoning token
+        # counts.
+        # Returns SUCCESS; any exception is logged and returns WORKER_EXECEPTION (sic).
         """Handle chat completion requests.
 
         This method extends the base OpenaiWorker's chat handler to also
@@ -119,6 +143,14 @@ class SGLangWorker(OpenaiWorker):
             return TaskStatus.WORKER_EXECEPTION
 
     async def generation_handler(self, task: GenerationTask) -> TaskStatus:
+        # [FUNCTION DOC]
+        # Builds params from the task, sets model and prompt (input_str when present),
+        # logs and
+        # awaits completions.create. Stores output text, token_ids (if the choice has
+        # them),
+        # finish_reason, logprobs (if present) and perf_metrics on the task. Returns
+        # SUCCESS, or
+        # logs and returns WORKER_EXECEPTION on any exception.
         """Handle text generation requests.
 
         Parameters
@@ -170,6 +202,17 @@ def CreateWorkerFromEngine(
     engine: RemoteSGLangEngine,
     model: str = "default",
 ) -> SGLangWorker:
+    # [FUNCTION DOC]
+    # Factory creating an SGLangWorker for an initialized RemoteSGLangEngine. Raises
+    # RuntimeError if the engine is not initialized or has no server addresses. Takes
+    # the
+    # first address from the engine's private inner engine, normalizes it to an http URL
+    # ending in /v1, creates an AsyncOpenAI client (key "EMPTY") and returns the worker
+    # with
+    # the given model name (default "default").
+    # KNOWN ISSUE: relies on private attributes of the engine (inner engine and its
+    # server
+    # address list), which may break if engine internals change.
     """Create a scaffolding Worker from an AReaL SGLang engine.
 
     This function creates a Worker that wraps the given SGLang engine,

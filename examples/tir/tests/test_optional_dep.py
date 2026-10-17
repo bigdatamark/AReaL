@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Tests that the TIR tools package and the AReaL sandbox module import cleanly when the
+# optional daytona dependency is absent.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -12,11 +15,23 @@ from areal.infra.sandbox import DaytonaRunner
 
 
 def test_tools_import_without_daytona():
+    # [FUNCTION DOC]
+    # Monkeypatches importlib.util.find_spec to report daytona as missing, evicts the
+    # cached
+    # daytona tool module and reloads the tools package; asserts PythonTool and
+    # CalculatorTool
+    # are exported but DaytonaPythonTool is not. Reloads tools again afterwards to
+    # restore
+    # the normal state (global module mutation).
     original_find_spec = importlib.util.find_spec
 
     with __import__("pytest").MonkeyPatch.context() as monkeypatch:
 
         def fake_find_spec(name, *args, **kwargs):
+            # [FUNCTION DOC]
+            # HELPER: find_spec replacement returning None for "daytona" and delegating
+            # to the
+            # original find_spec otherwise.
             if name == "daytona":
                 return None
             return original_find_spec(name, *args, **kwargs)
@@ -33,4 +48,7 @@ def test_tools_import_without_daytona():
 
 
 def test_sandbox_import_is_safe_without_daytona():
+    # [FUNCTION DOC]
+    # Asserts that DaytonaRunner from areal.infra.sandbox imported successfully (not
+    # None).
     assert DaytonaRunner is not None

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Entry script for Terminal-Bench agentic GRPO training. Side effect at import: sets
+# TOKENIZERS_PARALLELISM=false. Uses CamelRLVRWorkflow (WORKFLOW_PATH, resolved relative
+# to this directory, which must be on sys.path).
 import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -18,6 +22,17 @@ WORKFLOW_PATH = "workflow.camel_rlvr_workflow.CamelRLVRWorkflow"
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Parses args into AgentRLConfig, reads RANK (default 0), loads the tokenizer, seeds
+    # RNGs
+    # per rank, asserts the allocation mode has a train part, loads a parquet "train"
+    # split
+    # from the repo-level dataset directory joined with train_dataset.path, and runs
+    # PPOTrainer.train with the workflow kwargs (gconfig, tokenizer object, n_trajs,
+    # max_tokens, dump_dir under the stats logger path "generated", iterations, workers,
+    # non_think_mode, timeouts, reward filtering/shaping flags). The same dataset and
+    # kwargs
+    # are used for evaluation.
     config, _ = load_expr_config(args, AgentRLConfig)
 
     rank = int(os.getenv("RANK", "0"))

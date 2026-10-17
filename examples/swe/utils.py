@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Config dataclasses for SWE-bench agent RL training driven by the external
+# AReaL-SWEAgent project.
 """Utilities for SWE-bench agent training with AReaL."""
 
 from dataclasses import dataclass, field
@@ -7,6 +10,16 @@ from areal.api.cli_args import PPOConfig
 
 @dataclass
 class SWEEnvConfig:
+    # [CLASS DOC]
+    # Environment config: dataset_path (JSONL), agent_type ("swe", "cc", "oh",
+    # "opencode",
+    # "codex"), agent_config (generic YAML name overriding the per-type fields),
+    # swe_agent_config / cc_agent_config (per-type YAML names), agent_root and legacy
+    # alias
+    # swe_agent_root (external checkout location; empty means default resolution
+    # elsewhere),
+    # llm_model / opencode_provider / codex_provider overrides, step_limit (100),
+    # max_completion_tokens (16384) and per-episode timeout seconds (1800). Pure data.
     """Environment configuration for AReaL-SWEAgent-backed SWE-bench training.
 
     Attributes:
@@ -112,6 +125,10 @@ class SWEEnvConfig:
 
 @dataclass
 class SWEPPOConfig(PPOConfig):
+    # [CLASS DOC]
+    # PPOConfig extension adding econfig (SWEEnvConfig) and should_accept_fn, an
+    # optional
+    # import path of a rollout-group filter function (e.g. swe filter_function).
     """PPO configuration with SWE-bench-specific settings."""
 
     econfig: SWEEnvConfig = field(default_factory=SWEEnvConfig)

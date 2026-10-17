@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Entry script for RL training of the Tongyi DeepResearch ReAct search agent. Defines
+# the
+# rollout workflow, dataset loader and main, which also launches an SGLang judge LLM
+# server. Imports MultiTurnReactAgent relatively or, when run as a script, by adding
+# this
+# directory to sys.path. A random 4-hex worker_id names the module logger.
 from __future__ import annotations
 
 import hashlib
@@ -36,6 +43,10 @@ logger = logging.getLogger(f"ASearcher-Reasoning @ {worker_id}")
 
 
 def hash(numbers):
+    # [FUNCTION DOC]
+    # HELPER: Returns the SHA-256 hex digest of the JSON serialization (sorted keys) of
+    # the
+    # given list of numbers. Shadows the builtin hash within this module.
     """Hash an entire list of integers as a single string"""
     # Convert list to string representation
     list_str = json.dumps(numbers, sort_keys=True)  # sort_keys for consistency
@@ -43,6 +54,11 @@ def hash(numbers):
 
 
 class TongyiDeepResearchReactWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow that runs one MultiTurnReactAgent trajectory per episode against
+    # the
+    # policy engine (via ArealOpenAI in concat mode) and an OpenAI-compatible judge
+    # endpoint.
     def __init__(
         self,
         gconfig: GenerationHyperparameters,
@@ -51,6 +67,12 @@ class TongyiDeepResearchReactWorkflow(RolloutWorkflow):
         max_llm_calls_per_run: int = 100,
         judge_engine_addr: str | None = None,
     ):
+        # [FUNCTION DOC]
+        # Loads the tokenizer if given as a path, copies gconfig with stop/pad token ids
+        # and forces
+        # n_samples=1, stores max_tokens (per-trajectory budget, 32768),
+        # max_llm_calls_per_run
+        # (100) and judge_engine_addr (base URL of the judge proxy, may be None).
         if isinstance(tokenizer, str):
             from areal.utils.hf_utils import load_hf_tokenizer
 
@@ -64,6 +86,21 @@ class TongyiDeepResearchReactWorkflow(RolloutWorkflow):
         self.max_llm_calls_per_run = max_llm_calls_per_run
 
     async def arun_episode(self, engine, data):
+        # [FUNCTION DOC]
+        # Opens an AsyncOpenAI judge client on the shared httpx client, builds the agent
+        # with
+        # per-turn/total token budgets, determines a question id from the first present
+        # of
+        # query_id/id/qid and writes it to data["qid"] (mutates input), creates an
+        # ArealOpenAI
+        # client for the engine, runs agent.make_trajectory, logs the returned stats to
+        # the
+        # workflow stat scope, and returns the exported concat-style interactions
+        # (asserts exactly
+        # one). Network I/O to the judge and inference engine.
+        # KNOWN ISSUE: str(None) is "None", which is truthy, so the uuid fallback for a
+        # missing
+        # id never triggers and qid becomes the string "None".
         http_client = await workflow_context.get_httpx_client()
         async with AsyncOpenAI(
             base_url=self.judge_engine_addr, api_key="EMPTY", http_client=http_client
@@ -101,6 +138,10 @@ class TongyiDeepResearchReactWorkflow(RolloutWorkflow):
 
 
 def get_search_dataset(dataset_path, tokenizer):
+    # [FUNCTION DOC]
+    # Loads the JSON/JSONL file(s) at dataset_path as a HuggingFace "train" split and
+    # returns
+    # it. tokenizer is unused (length filter commented out).
     dataset = load_dataset(
         path="json",
         split="train",
@@ -111,6 +152,18 @@ def get_search_dataset(dataset_path, tokenizer):
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Parses AgentRLConfig, loads the tokenizer and dataset, and inside a PPOTrainer (no
+    # validation set) launches a judge SGLang engine: parses judge_engine.backend as a
+    # ModelAllocation (asserts sglang), builds SGLang server args with its tensor-
+    # parallel
+    # size, disables off-policyness limits for the judge, creates a RemoteSGLangEngine
+    # controller on the trainer's scheduler, initializes it with role "judge_engine" and
+    # starts the proxy and proxy gateway. Runs trainer.train with this module's workflow
+    # (no
+    # eval workflow) and passes the gateway address as judge_engine_addr. Always
+    # destroys the
+    # controller afterwards. Spawns GPU server processes.
     config, _ = load_expr_config(args, AgentRLConfig)
 
     tokenizer = load_hf_tokenizer(config.tokenizer_path)

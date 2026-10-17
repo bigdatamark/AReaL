@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Entry script for GRPO training of a vision-language model on geometry3k with
+# PPOTrainer and
+# VisionRLVRWorkflow. Reward combines answer accuracy and output format.
 import re
 import sys
 
@@ -10,12 +14,19 @@ from areal.utils.hf_utils import load_hf_processor_and_tokenizer
 
 
 def format_reward(predict_str: str) -> float:
+    # [FUNCTION DOC]
+    # Returns 1.0 if the whole prediction matches: a think block, then text, then a
+    # boxed
+    # expression (dot matches newline); else 0.0.
     pattern = re.compile(r"<think>.*</think>.*\\boxed\{.*\}.*", re.DOTALL)
     match_result = re.fullmatch(pattern, predict_str)
     return 1.0 if match_result else 0.0
 
 
 def acc_reward(predict_str: str, ground_truth: str) -> float:
+    # [FUNCTION DOC]
+    # Extracts the boxed content from the prediction with mathruler and returns 1.0 if
+    # grade_answer judges it equal to ground_truth, else 0.0.
     answer = extract_boxed_content(predict_str)
     return 1.0 if grade_answer(answer, ground_truth) else 0.0
 
@@ -23,6 +34,13 @@ def acc_reward(predict_str: str, ground_truth: str) -> float:
 def geometry3k_reward_fn(
     prompt, completions, prompt_ids, completion_ids, answer, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Reward function: 0.9 * accuracy reward + 0.1 * format reward on completions vs
+    # answer.
+    # Other args ignored. Returns a float in [0, 1].
+    # KNOWN ISSUE: VisionRLVRWorkflow is run with enable_thinking=False, yet the format
+    # reward
+    # requires think tags, so the 0.1 format component may rarely be earned.
     format_reward_val = format_reward(completions)
     acc_reward_val = acc_reward(completions, answer)
     format_score = 0.1
@@ -31,6 +49,14 @@ def geometry3k_reward_fn(
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Parses args into GRPOConfig, loads processor and tokenizer, builds train/test
+    # datasets
+    # with the processor, and runs PPOTrainer.train with VisionRLVRWorkflow for
+    # training and eval. Workflow kwargs pass the reward function as its import path
+    # string, gconfig,
+    # tokenizer and processor paths and enable_thinking=False; eval uses temperature
+    # 0.6.
     config, _ = load_expr_config(args, GRPOConfig)
     processor, tokenizer = load_hf_processor_and_tokenizer(config.tokenizer_path)
 

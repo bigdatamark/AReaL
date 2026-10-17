@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Tool-Integrated Reasoning (TIR) rollout workflow: generates in segments, stopping at
+# tool start/end markers, executes detected tool calls via ToolManager, appends tool
+# output
+# (loss-masked) to the context and repeats up to max_turns tool calls, then computes the
+# reward. Imports prompts and tool_manager as top-level modules (examples/tir must be on
+# sys.path).
 import ast
 import copy
 import re
@@ -32,6 +39,13 @@ logger = logging.getLogger("TIR workflow")
 
 @dataclass
 class TIRConfig:
+    # [CLASS DOC]
+    # TIR options: max_turns tool calls (2), max_length total token budget for prompt
+    # plus
+    # completion (3000), tool_timeout seconds (30), enable_tools (semicolon-separated
+    # tool
+    # names, "python"), is_chat_model (False: use the ToRL plain prompt; True: chat
+    # template).
     max_turns: int = field(default=2)
     max_length: int = field(default=3000)
     tool_timeout: float = field(default=30)
@@ -41,10 +55,16 @@ class TIRConfig:
 
 @dataclass
 class TIRGRPOConfig(GRPOConfig):
+    # [CLASS DOC]
+    # GRPOConfig extension with a tir: TIRConfig field.
     tir: TIRConfig = field(default_factory=TIRConfig)
 
 
 class TIRWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow implementing multi-turn tool-integrated generation. Holds a
+    # default
+    # ToolManager (for markers and fallback) but builds a fresh one per episode.
     """Tool-Integrated Reasoning Workflow for multi-turn tool calling."""
 
     def __init__(
@@ -55,6 +75,13 @@ class TIRWorkflow(RolloutWorkflow):
         tir_config: TIRConfig,
         enable_thinking: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Loads the tokenizer and resolves reward_fn from strings if needed, derives
+        # gconfig with
+        # stop/pad ids, stores tool and TIR settings, creates a ToolManager (non-debug),
+        # wraps
+        # reward_fn in AsyncRewardWrapper and caches all tool start/end markers
+        # (logged).
         super().__init__()
         if isinstance(tokenizer, str):
             from areal.utils.hf_utils import load_hf_tokenizer
@@ -86,10 +113,21 @@ class TIRWorkflow(RolloutWorkflow):
         )
 
     def _build_tool_manager(self) -> ToolManager:
+        # [FUNCTION DOC]
+        # HELPER: Returns a new non-debug ToolManager with the workflow's timeout and
+        # enabled
+        # tools.
         return ToolManager(self.tool_timeout, self.enable_tools, debug_mode=False)
 
     @staticmethod
     def _process_tool_result(tool_result) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Tries to literal-eval the tool result as a (result, status) pair; if
+        # that fails
+        # treats the whole text as the result with status "Done". Returns the result (or
+        # "Error: <status>" when status is not "Done") wrapped in an output-fenced block
+        # with
+        # surrounding newlines.
         try:
             run_result, run_status = ast.literal_eval(tool_result)
         except Exception:
@@ -101,6 +139,15 @@ class TIRWorkflow(RolloutWorkflow):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Builds a per-episode tool manager, replaces or inserts the system message with
+        # SYSTEM_PROMPT filled with tool descriptions (mutating data["messages"] in
+        # place), and
+        # tokenizes the prompt either via the chat template (chat models) or as
+        # TORL_PROMPT
+        # around messages[1] content. Returns _multi_round_response's tensor dict.
+        # Always cleans up
+        # the tool manager (important for remote sandboxes).
         """Run a complete TIR inference episode.
         :param engine: The inference engine.
         :param data: The input data.
@@ -145,6 +192,35 @@ class TIRWorkflow(RolloutWorkflow):
             await tool_manager.acleanup()
 
     async def _multi_round_response(self, engine, prompt_ids, data, tool_manager=None):
+        # [FUNCTION DOC]
+        # Core loop. Tracks context ids, full sequence, logprobs, loss mask (1 for
+        # generated, 0
+        # for prompt/tool tokens), versions (-1 for non-generated) and the completion
+        # string.
+        # While turn <= max_turns and context is under max_length: generates with stop
+        # markers
+        # depending on state; stops on pad/eos as last token or when the boxed answer
+        # pattern
+        # appears in the latest segment. When waiting and the segment ends with a start
+        # marker,
+        # records the marker position and switches to waiting for an end marker. When a
+        # tool call
+        # is open and generation stopped, executes the text from the marker; NOT_FOUND
+        # continues
+        # generating, otherwise increments turn and counters (success requires SUCCESS
+        # and no
+        # "Error" in output), appends the formatted tool output tokens and resets the
+        # state.
+        # Then awaits the reward with prompt/completion strings and ids plus tool_using,
+        # tool_status (the call count) and all data fields, logs tool_call_count and
+        # tool_success_count to the stat scope, and returns batch-1 tensors input_ids,
+        # logprobs,
+        # loss_mask, versions, attention_mask (all truncated to max_length) and rewards.
+        # KNOWN ISSUE: generation length is not capped by the remaining budget (max_len
+        # is not
+        # used in _generate_response), so the final sequence may be silently truncated;
+        # and the
+        # reward is computed on the untruncated completion.
         if tool_manager is None:
             tool_manager = self.tool_manager
 
@@ -279,6 +355,12 @@ class TIRWorkflow(RolloutWorkflow):
         max_len: int,
         waiting_for_tool_start: bool,
     ) -> tuple[ModelResponse, str]:
+        # [FUNCTION DOC]
+        # HELPER: Requests one generation from the engine with a fresh rid, n_samples=1
+        # and stop
+        # strings equal to the start markers (when waiting for a tool) or end markers.
+        # Returns
+        # (ModelResponse, stop_reason). max_len is ignored.
         """Generate response with tool call detection support"""
 
         # Select stop condition based on state flag
@@ -306,6 +388,8 @@ class TIRWorkflow(RolloutWorkflow):
         return resp, resp.stop_reason
 
     def _detect_tool_start_marker(self, text: str) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns the first start marker that text ends with, else None.
         """Detect if text ends with tool start marker"""
         for marker in self.start_markers:
             if text.endswith(marker):
@@ -315,6 +399,10 @@ class TIRWorkflow(RolloutWorkflow):
     async def _execute_tools(
         self, response: str, tool_manager=None
     ) -> tuple[str, ToolCallStatus]:
+        # [FUNCTION DOC]
+        # HELPER: Awaits aexecute_tool_call on the given (or default) tool manager for
+        # the text
+        # and returns (result, status).
         """Execute tool call"""
         if tool_manager is None:
             tool_manager = self.tool_manager

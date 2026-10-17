@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Training entry script for tau2-bench customer-service agents using AReaL's PPOTrainer
+# with the proxy-mode Tau2AgentWorkflow.
 """Training script for Tau2 benchmark with AReaL proxy mode."""
 
 import sys
@@ -21,6 +24,15 @@ def get_tau2_dataset(
     type: str = "rl",
     split: str = "train",
 ) -> Dataset:
+    # [FUNCTION DOC]
+    # Builds a HuggingFace Dataset of {"task_id", "split"} rows from the tau2 registry's
+    # task
+    # split for a domain (e.g. retail, airline, telecom). type must be "rl" (assertion).
+    # Raises ValueError if the domain has no split loader or the split is unknown. If
+    # fewer
+    # than 128 tasks, the list is repeatedly duplicated until it has at least 128 rows
+    # (for
+    # batching). Logs the resulting size. Returns the Dataset.
     """Create a HuggingFace Dataset from tau2 task IDs.
 
     Args:
@@ -60,10 +72,25 @@ def get_tau2_dataset(
 
 
 def group_filter(x: dict[str, Any]):
+    # [FUNCTION DOC]
+    # Dynamic filter: keeps a rollout group iff the mean of its "rewards" tensor is <=
+    # 0.95
+    # (drops nearly-solved groups). Returns a bool-like tensor/value.
     return x["rewards"].mean() <= 0.95
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Suppresses pydantic UserWarnings, parses args into Tau2PPOConfig, builds
+    # train/valid
+    # datasets for econfig.domain using the last path component of each dataset path as
+    # the
+    # split name, converts econfig to a dict, and runs PPOTrainer.train with
+    # Tau2AgentWorkflow (by import path) for train and eval. Workflow kwargs: econfig
+    # dict,
+    # gen_args (gconfig temperature and max_new_tokens as max_completion_tokens) and a
+    # 600 s
+    # timeout; eval uses temperature 0.6. Uses group_filter as dynamic_filter_fn.
     # Suppress pydantic UserWarning
     warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 

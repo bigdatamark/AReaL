@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Proxy-mode agent workflow that runs AReaL-SWEAgent agents (swe, cc, oh, opencode,
+# codex) on SWE-bench records. The external AReaL-SWEAgent checkout is located via
+# config, env vars or a sibling directory and added to sys.path. The proxy base_url and
+# per-rollout api_key are passed explicitly (not via os.environ) to avoid cross-rollout
+# races. _DEFAULT_AGENT_CONFIGS maps agent type to its default YAML config name.
 """AReaL-SWEAgent workflow for AReaL proxy mode.
 
 This module runs AReaL-SWEAgent-backed SWE-bench agents through AReaL's proxy
@@ -28,6 +34,10 @@ _DEFAULT_AGENT_CONFIGS = {
 
 
 def _default_aweagent_root() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the path of an "AReaL-SWEAgent" directory next to the AReaL
+    # repository
+    # root (three directory levels above this file).
     """Return the default sibling checkout path for AReaL-SWEAgent."""
     areal_root = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +46,15 @@ def _default_aweagent_root() -> str:
 
 
 def _ensure_aweagent_importable(aweagent_root: str = "") -> str:
+    # [FUNCTION DOC]
+    # HELPER: Resolves the AReaL-SWEAgent root from the explicit argument, else the
+    # first set
+    # of AWEAGENT_ROOT / SWE_AGENT_ROOT / SWEAGENT_ROOT env vars, else the default
+    # sibling
+    # path (made absolute). If it is a directory not yet on sys.path, prepends it
+    # (mutating
+    # sys.path) and logs; if it does not exist, logs a warning. Returns the resolved
+    # root.
     """Add the AReaL-SWEAgent checkout root to ``sys.path``.
 
     Resolution order:
@@ -74,6 +93,9 @@ def _ensure_aweagent_importable(aweagent_root: str = "") -> str:
 
 
 def _configured_aweagent_root(econfig: dict[str, Any]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: First truthy of econfig agent_root, aweagent_root, swe_agent_root; else
+    # "".
     return (
         econfig.get("agent_root")
         or econfig.get("aweagent_root")
@@ -83,6 +105,10 @@ def _configured_aweagent_root(econfig: dict[str, Any]) -> str:
 
 
 def _configured_agent_type(econfig: dict[str, Any]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns econfig agent_type (default "swe") stripped and lower-cased.
+    # Raises
+    # ValueError if it becomes empty (e.g. whitespace only).
     agent_type = str(econfig.get("agent_type") or "swe").strip().lower()
     if not agent_type:
         raise ValueError("econfig.agent_type must not be empty")
@@ -90,6 +116,13 @@ def _configured_agent_type(econfig: dict[str, Any]) -> str:
 
 
 def _configured_agent_config(econfig: dict[str, Any], agent_type: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the first truthy of agent_config, <agent_type>_agent_config,
+    # swe_agent_config, the built-in default for the type, or the type name itself.
+    # KNOWN ISSUE: swe_agent_config is consulted before the type default, so for types
+    # other
+    # than swe/cc (which have their own keys) a non-empty swe_agent_config (non-empty by
+    # default in SWEEnvConfig) overrides the oh/opencode/codex defaults.
     return (
         econfig.get("agent_config")
         or econfig.get(f"{agent_type}_agent_config")
@@ -100,6 +133,11 @@ def _configured_agent_config(econfig: dict[str, Any], agent_type: str) -> str:
 
 
 class SWEAgentWorkflow:
+    # [CLASS DOC]
+    # Proxy-mode agent workflow object (run is invoked by AReaL's proxy infrastructure,
+    # which
+    # supplies base_url and api_key). Delegates episodes to AReaL-SWEAgent's
+    # run_agent_with_reward and returns its scalar reward.
     """AReaL-SWEAgent workflow for AReaL proxy mode.
 
     This workflow runs an AReaL-SWEAgent agent type (``swe``, ``cc``, ``oh``,
@@ -128,6 +166,11 @@ class SWEAgentWorkflow:
         gen_args: dict | None = None,
         timeout: float = 1800.0,
     ):
+        # [FUNCTION DOC]
+        # Stores econfig (default {}), gen_args (unused, default {}) and timeout
+        # (econfig
+        # "timeout" overrides the argument, default 1800 s), and eagerly ensures the
+        # AReaL-SWEAgent root is on sys.path so a wrong path warns early.
         if econfig is None:
             econfig = {}
         self.econfig = econfig
@@ -141,6 +184,21 @@ class SWEAgentWorkflow:
     async def run(
         self, data: dict[str, Any], **extra_kwargs: Any
     ) -> dict[str, float] | float:
+        # [FUNCTION DOC]
+        # Runs one episode. Requires extra_kwargs base_url (else ValueError); api_key
+        # defaults to
+        # OPENAI_API_KEY env or "dummy". Merges a per-record data["econfig"] over a copy
+        # of
+        # econfig, resolves agent type and config name, and optional llm_model /
+        # opencode_provider / codex_provider from econfig or LLM_MODEL /
+        # OPENCODE_PROVIDER /
+        # CODEX_PROVIDER env vars. Awaits _run_episode with the instance timeout; on
+        # timeout logs
+        # an error and re-raises TimeoutError (trajectory discarded). Logs start/finish
+        # with
+        # elapsed time and returns float(reward).
+        # KNOWN ISSUE: return annotation allows a dict but only a float is ever
+        # returned.
         """Run one SWE-bench style agent episode.
 
         Args:
@@ -222,6 +280,15 @@ class SWEAgentWorkflow:
         opencode_provider: str | None,
         codex_provider: str | None,
     ) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Lazily imports aweagent.lifecycle.run_agent_with_reward and awaits it
+        # with the
+        # record, agent type, config name, result_dir (LOG_DIR env or ./logs) and
+        # override
+        # api key/base url/model/providers. Returns float(reward); any exception is
+        # logged with
+        # its traceback and yields 0.0 (so agent failures become zero reward rather than
+        # discards).
         """Execute one episode through AReaL-SWEAgent and return the reward.
 
         Delegates to ``aweagent.lifecycle.run_agent_with_reward``, which

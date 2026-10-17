@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Standalone CLI that patches an installed SGLang (0.5.9 / 0.5.10.post1) source tree in
+# place to enable radix (prefix) cache support for Bailing hybrid (BailingMoeV2_5)
+# models,
+# matching the Ling hybrid SGLang fork. PATCHES is a list of dicts, each with a name, a
+# path relative to the sglang package root, an "old" snippet, its "new" replacement,
+# optional alternative old/new "variants" for other SGLang versions, and a "check"
+# string
+# whose presence means the patch is already applied. Supports dry-run and revert; writes
+# .bak backups and clears bytecode caches after applying.
 """
 Patch: Enable Bailing Hybrid model radix cache support in SGLang 0.5.9 / 0.5.10.post1
 Aligned with the Ling hybrid SGLang fork behavior
@@ -279,6 +289,9 @@ PATCHES = [
 
 
 def find_sglang_root():
+    # [FUNCTION DOC]
+    # HELPER: Imports sglang and returns its package directory, or None if not
+    # importable.
     try:
         import sglang
 
@@ -288,6 +301,10 @@ def find_sglang_root():
 
 
 def resolve(root, rel):
+    # [FUNCTION DOC]
+    # HELPER: Returns root/rel if it exists, else root/python/sglang/rel if that exists
+    # (a
+    # source checkout), else root/rel.
     p = os.path.join(root, rel)
     if os.path.exists(p):
         return p
@@ -296,12 +313,25 @@ def resolve(root, rel):
 
 
 def _candidates(patch):
+    # [FUNCTION DOC]
+    # HELPER: Generator yielding the patch's primary (old, new) pair followed by each
+    # variant's pair.
     yield patch["old"], patch["new"]
     for variant in patch.get("variants", []):
         yield variant["old"], variant["new"]
 
 
 def apply_patch(root, patch, dry_run=False):
+    # [FUNCTION DOC]
+    # Applies one patch. Returns a (status, message) tuple: MISSING if the file is
+    # absent,
+    # SKIP if the check string is already present, FAIL if no candidate old snippet is
+    # found,
+    # DRY in dry-run mode, otherwise backs up the file to .bak (only if no backup
+    # exists),
+    # replaces the first occurrence of the matching old snippet, rewrites the file and
+    # returns
+    # OK if the check string is now present, else FAIL. File I/O side effects.
     fp = resolve(root, patch["rel_path"])
     if not os.path.exists(fp):
         return "MISSING", f"File not found: {fp}"
@@ -330,6 +360,14 @@ def apply_patch(root, patch, dry_run=False):
 
 
 def revert_patch(root, patch):
+    # [FUNCTION DOC]
+    # Reverts one patch. Returns SKIP if the file is missing. If a .bak exists, restores
+    # it
+    # and deletes the backup (reverting every patch in that file at once). Otherwise
+    # replaces
+    # the first occurrence of any candidate's new snippet with its old snippet and
+    # writes the
+    # file. Returns (status, message): OK or SKIP "Not patched".
     fp = resolve(root, patch["rel_path"])
     if not os.path.exists(fp):
         return "SKIP", "File not found"
@@ -350,6 +388,10 @@ def revert_patch(root, patch):
 
 
 def clear_pycache(root):
+    # [FUNCTION DOC]
+    # HELPER: Runs find subprocesses to delete all __pycache__ directories and .pyc
+    # files
+    # under root, ignoring output and errors.
     subprocess.run(
         [
             "find",
@@ -370,6 +412,15 @@ def clear_pycache(root):
 
 
 def main():
+    # [FUNCTION DOC]
+    # CLI entry: parses --sglang-path (default: the importable sglang package), --dry-
+    # run and
+    # --revert; exits 1 if sglang cannot be located. Applies or reverts every patch,
+    # printing a
+    # status icon per patch and the message for FAIL/MISSING. After a real apply clears
+    # bytecode caches. Prints a summary (list of changes on success) and exits with code
+    # 1 if
+    # any patch failed or was missing.
     parser = argparse.ArgumentParser(
         description="Patch SGLang for Bailing Hybrid radix cache"
     )

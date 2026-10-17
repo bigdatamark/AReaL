@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Custom prefix matcher for InteractionCache parent/child matching in the SWE example.
+# Treats messages as equivalent when role, content, thinking and tool-call IDs match
+# even
+# if tool arguments or tool outputs were rewritten between turns (as Anthropic-
+# compatible
+# agent frontends do), so concatenated trajectory export stays stable.
 """Custom prefix matchers for InteractionCache parent-child matching.
 
 The default cache matcher requires exact message equality. SWE-bench agents,
@@ -11,11 +18,24 @@ from __future__ import annotations
 
 
 def _tool_call_ids(tool_calls: list[dict]) -> list[str]:
+    # [FUNCTION DOC]
+    # HELPER: Returns the ordered list of "id" values (missing id becomes "") of the
+    # dict
+    # entries in a tool_calls list; non-dict entries are skipped.
     """Extract ordered tool_call IDs from a tool_calls list."""
     return [tc.get("id", "") for tc in tool_calls if isinstance(tc, dict)]
 
 
 def _messages_match(a: dict, b: dict) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Semantic equality of two chat message dicts. Roles must match. For role
+    # "tool"
+    # only tool_call_id is compared (output text may differ). Otherwise content (default
+    # "")
+    # and thinking must be equal; if either side has tool_calls, both must have them
+    # and, if
+    # both are lists, the same length and same ordered IDs (arguments ignored); non-list
+    # tool_calls fall back to plain equality. Returns bool.
     """Check whether two message dicts are semantically equivalent."""
     if a.get("role") != b.get("role"):
         return False
@@ -47,6 +67,10 @@ def _messages_match(a: dict, b: dict) -> bool:
 
 
 def swe_prefix_matcher(a: list[dict], b: list[dict]) -> bool:
+    # [FUNCTION DOC]
+    # Returns True iff message list a is a semantic prefix of b: a is not longer than b
+    # and
+    # each paired message is either exactly equal or matches per _messages_match.
     """Return True if ``a`` is a semantic prefix of ``b``."""
     if len(a) > len(b):
         return False

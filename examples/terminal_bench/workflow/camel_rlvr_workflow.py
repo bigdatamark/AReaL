@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Rollout workflow for Terminal-Bench RL: builds the task's docker image, runs several
+# CAMEL terminal-agent trajectories concurrently and exports rewarded interactions. Sets
+# TOKENIZERS_PARALLELISM=false at import. Requires the terminal_bench example root on
+# sys.path for agent and agent_rl_config imports.
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +27,12 @@ from .pre_build_tasks_utils import build_docker_image
 
 
 class CamelRLVRWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow running n_trajs CamelTerminalAgent episodes per task through
+    # ArealOpenAI clients (qwen25 tool-call parser) and returning individual-style
+    # completions keyed by interaction id. Blocking work (docker, agent env) runs in a
+    # shared
+    # ThreadPoolExecutor. Logs progress with print.
     def __init__(
         self,
         gconfig: GenerationHyperparameters,
@@ -37,6 +48,16 @@ class CamelRLVRWorkflow(RolloutWorkflow):
         filter_uniform_reward: bool = False,
         encourage_completion_reward: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Stores gconfig (mutated: n_samples forced to 1), tokenizer, dump_dir (created
+        # if
+        # missing), max_tokens total per trajectory, max_iteration agent turns (default
+        # 50),
+        # rollout_stat_scope, n_trajs, non_think_mode, task_timeouts (default
+        # TaskTimeouts()),
+        # filter_uniform_reward and encourage_completion_reward flags; creates a thread
+        # pool with
+        # max_workers threads.
         self.gconfig = gconfig
         self.gconfig.n_samples = 1
         self.tokenizer = tokenizer
@@ -55,6 +76,28 @@ class CamelRLVRWorkflow(RolloutWorkflow):
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
 
     async def arun_episode(self, engine, data):
+        # [FUNCTION DOC]
+        # Runs one task. Creates n_trajs ArealOpenAI clients and random 8-hex uids.
+        # Builds the
+        # docker image in the executor with timeout _reset_env (wrapped in an async wait
+        # of
+        # _reset_env + 60 s and a perf-trace scope); on timeout prints and returns None.
+        # Then runs
+        # all agents concurrently, each returning a reward or None on failure. If
+        # filter_uniform_reward and all non-None rewards are equal, or all failed,
+        # returns an
+        # empty dict. For each trajectory: failures are recorded to
+        # dump_dir/failed_tasks/<task>_traj_<i>.txt; successes log reward to stats,
+        # apply a turn
+        # reward discount of 0.9 and merge exported individual interactions into the
+        # result. If
+        # none succeeded returns None. Also logs num_full_passes (reward == 1.0) and
+        # num_trajectories_failed.
+        # KNOWN ISSUE: build failures other than timeout propagate as exceptions; the
+        # uniform
+        # reward filter returns an empty dict while other "no data" paths return None;
+        # and dump
+        # paths are built from dump_dir even if it is None.
         clients = [
             ArealOpenAI(
                 engine=engine,

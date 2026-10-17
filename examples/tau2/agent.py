@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Proxy-mode tau2-bench agent workflow: runs a tau2 customer-service simulation where
+# the agent LLM calls go to AReaL's OpenAI-compatible proxy (so they are recorded for
+# RL)
+# and the user simulator calls go to a separate user LLM server. Import-time side
+# effects:
+# importing examples.tau2.utils (which patches tau2 cost logging and loguru), silencing
+# litellm debug output, and registering a zero-cost "dummy" litellm model name used as
+# the
+# agent LLM id.
 """Tau2 Agent Workflow for AReaL proxy mode.
 
 This module implements a Tau2 agent that uses the AReaL proxy server
@@ -47,6 +57,10 @@ register_model(
 
 
 def _get_task(domain: str, task_id: str, split: str | None = None) -> Task:
+    # [FUNCTION DOC]
+    # HELPER: Loads the tasks of a domain/split from the tau2 registry and returns the
+    # one
+    # with the given id; raises ValueError if absent.
     """Get a task by ID from the tau2 registry."""
     tasks: list[Task] = registry.get_tasks_loader(domain)(split)
     for task in tasks:
@@ -56,6 +70,9 @@ def _get_task(domain: str, task_id: str, split: str | None = None) -> Task:
 
 
 def think(thoughts: str):
+    # [FUNCTION DOC]
+    # Optional "think" tool given to the agent: ignores its input and returns a fixed
+    # acknowledgement string. The docstring is the tool description shown to the model.
     """Use this tool to think. The thoughts will be visible in the history.
     Only use this tool to think when necessary.
     """
@@ -63,6 +80,9 @@ def think(thoughts: str):
 
 
 class Tau2Runner:
+    # [CLASS DOC]
+    # Runs one tau2 simulation with async OpenAI clients injected as tau2 completion
+    # functions, collecting timings, messages, reward and errors in a Tau2RunInfo.
     """Runner for Tau2 environment using AsyncOpenAI clients."""
 
     def __init__(
@@ -72,6 +92,10 @@ class Tau2Runner:
         agent_client: AsyncOpenAI,
         user_client: AsyncOpenAI | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores econfig, gen_args (agent llm args), the agent client and optional user
+        # client,
+        # and caches domain and solo_mode.
         self.econfig = econfig
         self.gen_args = gen_args
         self.agent_client = agent_client
@@ -80,11 +104,18 @@ class Tau2Runner:
         self.solo_mode = econfig.solo_mode
 
     def _get_environment(self) -> Environment:
+        # [FUNCTION DOC]
+        # HELPER: Builds the domain environment via the registry constructor with
+        # solo_mode.
         environment_constructor = registry.get_env_constructor(self.domain)
         return environment_constructor(solo_mode=self.solo_mode)
 
     @staticmethod
     def _convert_to_model_response(completion: ChatCompletion) -> ModelResponse:
+        # [FUNCTION DOC]
+        # HELPER: Converts an OpenAI ChatCompletion into a LiteLLM ModelResponse by
+        # dumping and
+        # re-constructing it (tau2 expects LiteLLM responses).
         """Convert OpenAI ChatCompletion to LiteLLM ModelResponse format.
 
         tau2-bench expects ModelResponse format from litellm, so we need to convert.
@@ -93,6 +124,12 @@ class Tau2Runner:
 
     @staticmethod
     def _clean_messages(messages: list[dict], for_user: bool = False) -> list[dict]:
+        # [FUNCTION DOC]
+        # HELPER: Returns copies of message dicts with a None tool_calls key removed;
+        # when
+        # for_user, also drops tool-role messages and strips tool_calls from assistant
+        # messages.
+        # Non-dict messages pass through unchanged.
         """Clean messages for OpenAI API compatibility.
 
         Args:
@@ -122,9 +159,21 @@ class Tau2Runner:
         time_list: list[float],
         is_agent: bool = True,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Returns an async completion function for tau2 bound to client. It
+        # drops
+        # LiteLLM's num_retries, for the agent sets extra_body chat_template_kwargs
+        # enable_thinking=True, for the user defaults top_p to 1.0, cleans messages,
+        # calls
+        # chat.completions.create and returns a ModelResponse. Errors are logged and re-
+        # raised.
+        # Each call's wall time is appended to time_list.
         """Create a completion function for the given client."""
 
         async def _completion(*args, **kwargs):
+            # [FUNCTION DOC]
+            # Async completion function implementing the behavior described for the
+            # factory above.
             start_time = time.perf_counter()
             # Remove litellm-specific arguments
             kwargs.pop("num_retries", None)
@@ -158,6 +207,20 @@ class Tau2Runner:
         return _completion
 
     def _get_agent_and_user(self, task: Task, env: Environment, run_info: Tau2RunInfo):
+        # [FUNCTION DOC]
+        # HELPER: Gets the policy, agent tools and (if available) user tools from the
+        # env,
+        # optionally adds the think tool, builds agent/user completion functions
+        # recording times
+        # into run_info. Solo mode: LLMSoloAgent with agent plus user tools and the
+        # task, and a
+        # DummyUser. Otherwise: LLMAgent and a UserSimulator with user tools (or None),
+        # the task's
+        # user scenario as instructions and user_llm / user_llm_args. Returns (agent,
+        # user).
+        # KNOWN ISSUE: in non-solo mode without user_llm_base_url the user client is
+        # None and the
+        # user simulator's first completion fails with AttributeError.
         agent_policy_doc = env.get_policy()
         tools: list[Tool] = env.get_tools()
         try:
@@ -208,6 +271,10 @@ class Tau2Runner:
         env: Environment,
         task: Task,
     ) -> Orchestrator:
+        # [FUNCTION DOC]
+        # HELPER: Builds a tau2 Orchestrator for the domain, agent, user, env and task
+        # with
+        # econfig.max_steps.
         return Orchestrator(
             domain=self.domain,
             agent=agent,
@@ -218,6 +285,16 @@ class Tau2Runner:
         )
 
     async def run(self, task: Task) -> Tau2RunInfo:
+        # [FUNCTION DOC]
+        # Runs a simulation for task: creates the env and a Tau2RunInfo (reward 0.0),
+        # builds
+        # agent, user and orchestrator, awaits orchestrator.arun. On a simulation
+        # exception logs,
+        # stores the partial trajectory and error and returns (reward 0). Then evaluates
+        # with
+        # EvaluationType.ALL; on error logs and returns with the error recorded.
+        # Otherwise stores
+        # reward_info and reward, logs and returns the run info.
         """Run a simulation for the given task."""
         domain = self.domain
         solo_mode = self.solo_mode
@@ -283,6 +360,12 @@ class Tau2Runner:
 
 
 class Tau2AgentWorkflow:
+    # [CLASS DOC]
+    # Proxy-mode workflow object whose run is invoked by AReaL's proxy infrastructure
+    # with
+    # base_url/api_key/http_client; returns the simulation reward (the proxy assigns it
+    # to
+    # the recorded completions).
     """Tau2 agent workflow for AReaL proxy mode.
 
     This workflow runs a Tau2 customer service simulation using the proxy server
@@ -301,6 +384,10 @@ class Tau2AgentWorkflow:
         gen_args: dict | None = None,
         timeout: float = 600.0,
     ):
+        # [FUNCTION DOC]
+        # Normalizes econfig (None gives defaults, a dict is converted to
+        # Tau2EnvConfig), stores
+        # gen_args (default {}) and the per-episode timeout (600 s).
         if econfig is None:
             econfig = Tau2EnvConfig()
         elif isinstance(econfig, dict):
@@ -312,6 +399,21 @@ class Tau2AgentWorkflow:
     async def run(
         self, data: dict[str, Any], **extra_kwargs: Any
     ) -> dict[str, float] | float:
+        # [FUNCTION DOC]
+        # Resolves base_url and api_key from extra_kwargs or OPENAI_BASE_URL /
+        # OPENAI_API_KEY env
+        # vars (ValueError if no base_url) and an optional httpx client. Per-record
+        # "econfig"
+        # replaces the config entirely and "gconfig" updates a copy of gen_args. Loads
+        # the task
+        # by task_id and split (default "train"), creates the agent AsyncOpenAI client
+        # (no
+        # retries) and, if not solo and user_llm_base_url is set, a user client (3
+        # retries, 120 s
+        # timeout). Runs Tau2Runner with the timeout; on timeout logs and re-raises so
+        # the
+        # trajectory is discarded. Returns the float reward.
+        # KNOWN ISSUE: return annotation allows a dict but only a float is returned.
         """Run a Tau2 simulation episode.
 
         Args:

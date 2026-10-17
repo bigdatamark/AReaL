@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# CPU-only tests proving the vendored scaffolding framework under examples/scaffolding
+# is
+# self-contained: no tensorrt_llm dependency, every public symbol importable, core
+# primitives (tasks, controllers, workers, results, task collections, math utils) behave
+# correctly, AReaL wrapper modules import, and wrappers subclass the core types. Each
+# test
+# imports lazily inside its body. Runnable directly via pytest.main.
 """Tests proving the vendored scaffolding modules are self-contained.
 
 These tests verify that:
@@ -26,13 +34,23 @@ import pytest
 
 
 class TestNoTensorRTLLMDependency:
+    # [CLASS DOC]
+    # Checks tensorrt_llm is neither loaded nor imported by any scaffolding source file.
     """Verify that tensorrt_llm is not required at runtime."""
 
     def test_tensorrt_llm_not_installed(self):
+        # [FUNCTION DOC]
+        # Asserts tensorrt_llm is absent from sys.modules (or mapped to None).
         """tensorrt_llm should not be importable in the test environment."""
         assert "tensorrt_llm" not in sys.modules or sys.modules["tensorrt_llm"] is None
 
     def test_no_live_tensorrt_llm_imports_in_source(self):
+        # [FUNCTION DOC]
+        # Parses every .py file under examples/scaffolding with ast (skipping files with
+        # syntax
+        # errors) and collects file:line of any import or from-import of tensorrt_llm or
+        # its
+        # submodules; asserts the list is empty.
         """No .py file under scaffolding/ should have a live import of tensorrt_llm.
 
         Comments and docstrings are allowed; only top-level or function-level
@@ -74,9 +92,14 @@ class TestNoTensorRTLLMDependency:
 
 
 class TestCoreImports:
+    # [CLASS DOC]
+    # Import checks for the core package.
     """Verify every public symbol in core/ is importable."""
 
     def test_core_init_imports(self):
+        # [FUNCTION DOC]
+        # Imports all public names from the core package and spot-checks a few are
+        # callable.
         """All symbols in core/__init__.py should import successfully."""
         from examples.scaffolding.core import (  # noqa: F401
             AssistantMessage,
@@ -113,6 +136,9 @@ class TestCoreImports:
         assert callable(with_task_collection)
 
     def test_compat_reexports_match_core(self):
+        # [FUNCTION DOC]
+        # Asserts _compat.__all__ equals core.__all__ minus the three math_utils
+        # functions.
         """_compat.py should re-export the same symbols as core/__init__.py
         (minus math_utils which is not in _compat)."""
         from examples.scaffolding import _compat, core
@@ -128,6 +154,8 @@ class TestCoreImports:
         assert compat_all == core_all_minus_math
 
     def test_core_submodule_imports(self):
+        # [FUNCTION DOC]
+        # Imports each core submodule individually.
         """Each core submodule should import independently."""
         import examples.scaffolding.core.controller  # noqa: F401
         import examples.scaffolding.core.math_utils  # noqa: F401
@@ -144,9 +172,13 @@ class TestCoreImports:
 
 
 class TestTask:
+    # [CLASS DOC]
+    # Tests for task dataclasses and chat message types.
     """Tests for Task, GenerationTask, ChatTask, and related dataclasses."""
 
     def test_task_creation(self):
+        # [FUNCTION DOC]
+        # Default Task has no worker tag, streaming flag False and empty streaming list.
         from examples.scaffolding.core.task import Task
 
         t = Task()
@@ -155,6 +187,9 @@ class TestTask:
         assert t.streaming_output_list == []
 
     def test_generation_task_create_from_prompt(self):
+        # [FUNCTION DOC]
+        # create_from_prompt sets input_str and leaves tokenizer/detokenizer skipping
+        # off.
         from examples.scaffolding.core.task import GenerationTask
 
         t = GenerationTask.create_from_prompt("Hello world")
@@ -163,6 +198,8 @@ class TestTask:
         assert t.skip_detokenizer is False
 
     def test_generation_task_scaffolding_output(self):
+        # [FUNCTION DOC]
+        # create_scaffolding_output copies output text and tokens.
         from examples.scaffolding.core.task import GenerationTask
 
         t = GenerationTask(output_str="result", output_tokens=[10, 20])
@@ -171,6 +208,10 @@ class TestTask:
         assert output.token_ids == [10, 20]
 
     def test_stream_generation_task_from_generation(self):
+        # [FUNCTION DOC]
+        # StreamGenerationTask built from a GenerationTask keeps input/max_tokens and
+        # sets the
+        # streaming step.
         from examples.scaffolding.core.task import (
             GenerationTask,
             StreamGenerationTask,
@@ -183,6 +224,8 @@ class TestTask:
         assert stream.streaming_step == 5
 
     def test_chat_task_create_from_prompt(self):
+        # [FUNCTION DOC]
+        # Prompt plus a system prompt yields a system then a user message.
         from examples.scaffolding.core.task import (
             ChatTask,
             SystemMessage,
@@ -197,6 +240,8 @@ class TestTask:
         assert t.messages[1].role == "user"
 
     def test_chat_task_create_from_messages(self):
+        # [FUNCTION DOC]
+        # ChatTask from two messages has two messages.
         from examples.scaffolding.core.task import (
             ChatTask,
             UserMessage,
@@ -207,6 +252,8 @@ class TestTask:
         assert len(t.messages) == 2
 
     def test_chat_task_add_message(self):
+        # [FUNCTION DOC]
+        # add_message appends user then assistant messages in order.
         from examples.scaffolding.core.task import (
             AssistantMessage,
             ChatTask,
@@ -221,6 +268,8 @@ class TestTask:
         assert t.messages[1].role == "assistant"
 
     def test_chat_task_messages_to_dict(self):
+        # [FUNCTION DOC]
+        # messages_to_dict_content returns role/content dicts.
         from examples.scaffolding.core.task import (
             ChatTask,
             UserMessage,
@@ -232,6 +281,8 @@ class TestTask:
         assert dicts == [{"role": "user", "content": "hello"}]
 
     def test_role_message_str_repr(self):
+        # [FUNCTION DOC]
+        # String form is JSON containing the role; repr mentions the role.
         from examples.scaffolding.core.task import UserMessage
 
         m = UserMessage("hi")
@@ -239,6 +290,8 @@ class TestTask:
         assert "user" in repr(m)
 
     def test_role_message_from_dict(self):
+        # [FUNCTION DOC]
+        # RoleMessage.from_dict restores role and content.
         from examples.scaffolding.core.task import RoleMessage
 
         m = RoleMessage.from_dict({"role": "user", "content": "test"})
@@ -246,6 +299,8 @@ class TestTask:
         assert m.content == "test"
 
     def test_assistant_message_with_reasoning(self):
+        # [FUNCTION DOC]
+        # AssistantMessage keeps reasoning and includes it in its string form.
         from examples.scaffolding.core.task import AssistantMessage
 
         m = AssistantMessage("answer", reasoning="chain of thought")
@@ -254,6 +309,8 @@ class TestTask:
         assert '"reasoning"' in str(m)
 
     def test_openai_tool_description(self):
+        # [FUNCTION DOC]
+        # to_dict yields an OpenAI function tool schema with name and description.
         from examples.scaffolding.core.task import OpenAIToolDescription
 
         tool = OpenAIToolDescription(
@@ -265,6 +322,9 @@ class TestTask:
         assert d["function"]["description"] == "Does something"
 
     def test_task_status_values(self):
+        # [FUNCTION DOC]
+        # Checks the string values of SUCCESS, WORKER_NOT_SUPPORTED and the (misspelled)
+        # WORKER_EXECEPTION statuses.
         from examples.scaffolding.core.task import TaskStatus
 
         assert TaskStatus.SUCCESS.value == "success"
@@ -273,9 +333,15 @@ class TestTask:
 
 
 class TestController:
+    # [CLASS DOC]
+    # Tests for Controller and built-in controllers.
     """Tests for Controller and built-in controller subclasses."""
 
     def test_controller_is_abstract(self):
+        # [FUNCTION DOC]
+        # Base Controller has task_collections and its process raises
+        # NotImplementedError when
+        # iterated.
         from examples.scaffolding.core.controller import Controller
 
         ctrl = Controller()
@@ -284,14 +350,22 @@ class TestController:
             list(ctrl.process([]))
 
     def test_controller_clone(self):
+        # [FUNCTION DOC]
+        # clone of a subclass instance copies attributes into a distinct object.
         from examples.scaffolding.core.controller import Controller
 
         class MyCtrl(Controller):
+            # [CLASS DOC]
+            # HELPER: Minimal controller subclass with a val attribute.
             def __init__(self, val):
+                # [FUNCTION DOC]
+                # Initializes the base controller and stores val.
                 super().__init__()
                 self.val = val
 
             def process(self, tasks, **kw):
+                # [FUNCTION DOC]
+                # Yields the task list once.
                 yield tasks
 
         original = MyCtrl(42)
@@ -300,6 +374,10 @@ class TestController:
         assert cloned is not original
 
     def test_native_generation_controller(self):
+        # [FUNCTION DOC]
+        # Processing a task yields once, tags it for the generation worker and applies
+        # the
+        # sampling params (temperature, max_tokens) to it.
         from examples.scaffolding.core.controller import (
             NativeGenerationController,
         )
@@ -317,6 +395,8 @@ class TestController:
         assert task.max_tokens == 100
 
     def test_native_generation_controller_ignores_invalid_params(self):
+        # [FUNCTION DOC]
+        # Unknown sampling params are dropped while valid ones are kept.
         from examples.scaffolding.core.controller import (
             NativeGenerationController,
         )
@@ -328,6 +408,9 @@ class TestController:
         assert "invalid_param_xyz" not in ctrl.sampling_params
 
     def test_native_chat_controller(self):
+        # [FUNCTION DOC]
+        # NativeChatController wraps a generation task into a ChatTask in the yielded
+        # list.
         from examples.scaffolding.core.controller import (
             NativeChatController,
         )
@@ -346,6 +429,8 @@ class TestController:
         assert isinstance(yielded_tasks[0], ChatTask)
 
     def test_native_reward_controller(self):
+        # [FUNCTION DOC]
+        # NativeRewardController tags the task for the reward worker and yields once.
         from examples.scaffolding.core.controller import (
             NativeRewardController,
         )
@@ -359,6 +444,8 @@ class TestController:
         assert task.worker_tag == NativeRewardController.WorkerTag.REWARD
 
     def test_parallel_process_creation(self):
+        # [FUNCTION DOC]
+        # ParallelProcess over two controllers creates two sub-generators.
         from examples.scaffolding.core.controller import (
             NativeGenerationController,
             ParallelProcess,
@@ -379,9 +466,13 @@ class TestController:
 
 
 class TestWorker:
+    # [CLASS DOC]
+    # Tests for the Worker base class.
     """Tests for Worker base class."""
 
     def test_worker_is_abstract(self):
+        # [FUNCTION DOC]
+        # Base Worker exposes task_handlers.
         from examples.scaffolding.core.worker import Worker
 
         w = Worker()
@@ -389,10 +480,14 @@ class TestWorker:
 
     @pytest.mark.asyncio
     async def test_worker_unsupported_task(self):
+        # [FUNCTION DOC]
+        # A worker without handlers returns WORKER_NOT_SUPPORTED for a Task.
         from examples.scaffolding.core.task import Task, TaskStatus
         from examples.scaffolding.core.worker import Worker
 
         class EmptyWorker(Worker):
+            # [CLASS DOC]
+            # HELPER: Worker subclass with no task handlers.
             task_handlers = {}
 
         w = EmptyWorker()
@@ -401,6 +496,10 @@ class TestWorker:
 
     @pytest.mark.asyncio
     async def test_worker_register_handler(self):
+        # [FUNCTION DOC]
+        # Registering an async handler for GenerationTask makes run_task invoke it
+        # (SUCCESS,
+        # output set).
         from examples.scaffolding.core.task import (
             GenerationTask,
             TaskStatus,
@@ -408,9 +507,14 @@ class TestWorker:
         from examples.scaffolding.core.worker import Worker
 
         class MyWorker(Worker):
+            # [CLASS DOC]
+            # HELPER: Worker subclass starting with no handlers.
             task_handlers = {}
 
         async def my_handler(self, task):
+            # [FUNCTION DOC]
+            # HELPER: Async handler setting output_str to "handled" and returning
+            # SUCCESS.
             task.output_str = "handled"
             return TaskStatus.SUCCESS
 
@@ -422,6 +526,8 @@ class TestWorker:
         assert task.output_str == "handled"
 
     def test_worker_context_manager(self):
+        # [FUNCTION DOC]
+        # Worker's enter method returns the worker itself.
         from examples.scaffolding.core.worker import Worker
 
         w = Worker()
@@ -429,6 +535,10 @@ class TestWorker:
         assert result is w
 
     def test_is_deterministic_mode(self):
+        # [FUNCTION DOC]
+        # is_deterministic_mode is False by default and True with
+        # SCAFFOLDING_DETERMINISTIC=1
+        # (env patched temporarily).
         from examples.scaffolding.core.worker import is_deterministic_mode
 
         assert is_deterministic_mode() is False
@@ -438,9 +548,13 @@ class TestWorker:
 
 
 class TestResult:
+    # [CLASS DOC]
+    # Tests for ScaffoldingOutput and ScaffoldingResult.
     """Tests for ScaffoldingOutput and ScaffoldingResult."""
 
     def test_scaffolding_output(self):
+        # [FUNCTION DOC]
+        # Output stores text and token ids; data defaults to None.
         from examples.scaffolding.core.result import ScaffoldingOutput
 
         o = ScaffoldingOutput(text="hello", token_ids=[1, 2, 3])
@@ -449,6 +563,8 @@ class TestResult:
         assert o.data is None
 
     def test_scaffolding_output_with_data(self):
+        # [FUNCTION DOC]
+        # Output keeps the given data object by identity.
         from examples.scaffolding.core.result import ScaffoldingOutput
 
         payload = {"key": "value", "nested": [1, 2, 3]}
@@ -458,6 +574,10 @@ class TestResult:
         assert o.data is payload
 
     def test_scaffolding_result_set_output(self):
+        # [FUNCTION DOC]
+        # After set_output, awaiting aresult on a fresh event loop yields a done result
+        # whose
+        # first output has the given text and tokens.
         from examples.scaffolding.core.result import (
             ScaffoldingOutput,
             ScaffoldingResult,
@@ -481,6 +601,8 @@ class TestResult:
             loop.close()
 
     def test_scaffolding_result_set_output_none(self):
+        # [FUNCTION DOC]
+        # set_output(None) still completes the result.
         from examples.scaffolding.core.result import ScaffoldingResult
 
         result = ScaffoldingResult()
@@ -494,6 +616,8 @@ class TestResult:
             loop.close()
 
     def test_scaffolding_result_task_collections(self):
+        # [FUNCTION DOC]
+        # task_collections is None initially and set by set_task_collections.
         from examples.scaffolding.core.result import ScaffoldingResult
 
         result = ScaffoldingResult()
@@ -503,9 +627,13 @@ class TestResult:
 
 
 class TestTaskCollection:
+    # [CLASS DOC]
+    # Tests for task collections and the with_task_collection decorator.
     """Tests for TaskCollection and the with_task_collection decorator."""
 
     def test_task_collection_base(self):
+        # [FUNCTION DOC]
+        # Base hooks are no-ops and get_global_info returns None.
         from examples.scaffolding.core.task_collection import TaskCollection
 
         tc = TaskCollection()
@@ -514,6 +642,10 @@ class TestTaskCollection:
         assert TaskCollection.get_global_info() is None
 
     def test_with_task_collection_decorator(self):
+        # [FUNCTION DOC]
+        # Decorating a controller registers a collection instance under the name;
+        # processing
+        # calls before_yield and after_yield once each.
         from examples.scaffolding.core.controller import Controller
         from examples.scaffolding.core.task import Task
         from examples.scaffolding.core.task_collection import (
@@ -522,20 +654,32 @@ class TestTaskCollection:
         )
 
         class MyCollection(TaskCollection):
+            # [CLASS DOC]
+            # HELPER: Collection counting before/after hook calls.
             def __init__(self):
+                # [FUNCTION DOC]
+                # Initializes the base and both counters to 0.
                 super().__init__()
                 self.before_count = 0
                 self.after_count = 0
 
             def before_yield(self, tasks):
+                # [FUNCTION DOC]
+                # Increments before_count.
                 self.before_count += 1
 
             def after_yield(self, tasks):
+                # [FUNCTION DOC]
+                # Increments after_count.
                 self.after_count += 1
 
         @with_task_collection("my_tc", MyCollection)
         class MyController(Controller):
+            # [CLASS DOC]
+            # HELPER: Decorated controller that yields its tasks once.
             def process(self, tasks, **kwargs):
+                # [FUNCTION DOC]
+                # Yields the task list once.
                 yield tasks
 
         ctrl = MyController()
@@ -548,6 +692,9 @@ class TestTaskCollection:
         assert tc.after_count == 1
 
     def test_generation_token_counter(self):
+        # [FUNCTION DOC]
+        # GenerationTokenCounter counts tokens added between before_yield and
+        # after_yield (2).
         from examples.scaffolding.core.task import GenerationTask
         from examples.scaffolding.core.task_collection import (
             GenerationTokenCounter,
@@ -564,6 +711,10 @@ class TestTaskCollection:
         assert counter.generation_token_count == 2  # 5 - 3 = 2 new tokens
 
     def test_task_metrics_collector_reset(self):
+        # [FUNCTION DOC]
+        # reset(name) empties one controller's stats; reset() clears all (mutates class-
+        # level
+        # state).
         from examples.scaffolding.core.task_collection import (
             TaskMetricsCollector,
         )
@@ -576,9 +727,13 @@ class TestTaskCollection:
 
 
 class TestMathUtils:
+    # [CLASS DOC]
+    # Tests for math answer extraction and majority voting.
     """Tests for math_utils functions."""
 
     def test_extract_answer_from_boxed_simple(self):
+        # [FUNCTION DOC]
+        # Extracts "42" from a boxed answer.
         from examples.scaffolding.core.math_utils import (
             extract_answer_from_boxed,
         )
@@ -586,6 +741,8 @@ class TestMathUtils:
         assert extract_answer_from_boxed("The answer is \\boxed{42}") == "42"
 
     def test_extract_answer_from_boxed_nested(self):
+        # [FUNCTION DOC]
+        # Handles nested braces inside the box.
         from examples.scaffolding.core.math_utils import (
             extract_answer_from_boxed,
         )
@@ -593,6 +750,8 @@ class TestMathUtils:
         assert extract_answer_from_boxed("\\boxed{x^{2}}") == "x^{2}"
 
     def test_extract_answer_from_boxed_none(self):
+        # [FUNCTION DOC]
+        # Returns None without a boxed answer.
         from examples.scaffolding.core.math_utils import (
             extract_answer_from_boxed,
         )
@@ -600,6 +759,8 @@ class TestMathUtils:
         assert extract_answer_from_boxed("No boxed answer here") is None
 
     def test_extract_answer_with_regex(self):
+        # [FUNCTION DOC]
+        # Extracts "42" from "The final answer is 42".
         from examples.scaffolding.core.math_utils import (
             extract_answer_with_regex,
         )
@@ -608,6 +769,8 @@ class TestMathUtils:
         assert result == "42"
 
     def test_extract_answer_with_regex_no_match(self):
+        # [FUNCTION DOC]
+        # Returns None when no answer pattern matches.
         from examples.scaffolding.core.math_utils import (
             extract_answer_with_regex,
         )
@@ -615,6 +778,8 @@ class TestMathUtils:
         assert extract_answer_with_regex("Nothing relevant") is None
 
     def test_get_digit_majority_vote_result(self):
+        # [FUNCTION DOC]
+        # Majority vote over boxed answers picks "42".
         from examples.scaffolding.core.math_utils import (
             get_digit_majority_vote_result,
         )
@@ -628,6 +793,8 @@ class TestMathUtils:
         assert answer == "42"
 
     def test_get_digit_majority_vote_no_valid(self):
+        # [FUNCTION DOC]
+        # Returns answer None when no response has a valid answer.
         from examples.scaffolding.core.math_utils import (
             get_digit_majority_vote_result,
         )
@@ -643,9 +810,13 @@ class TestMathUtils:
 
 
 class TestWrapperImports:
+    # [CLASS DOC]
+    # Import checks for AReaL wrapper modules.
     """Verify AReaL wrapper modules import without tensorrt_llm."""
 
     def test_compat_module_imports(self):
+        # [FUNCTION DOC]
+        # Imports all public names from _compat.
         from examples.scaffolding._compat import (  # noqa: F401
             AssistantMessage,
             BestOfNController,
@@ -673,6 +844,8 @@ class TestWrapperImports:
         )
 
     def test_controllers_module_imports(self):
+        # [FUNCTION DOC]
+        # Imports the AReaL scaffolding controllers.
         from examples.scaffolding.controllers import (  # noqa: F401
             ChatTracer,
             PipelineTrajectoryMaker,
@@ -681,6 +854,8 @@ class TestWrapperImports:
         )
 
     def test_task_module_imports(self):
+        # [FUNCTION DOC]
+        # Imports the AReaL scaffolding task types.
         from examples.scaffolding.task import (  # noqa: F401
             ChatRewardTask,
             RLVRRewardTask,
@@ -688,17 +863,23 @@ class TestWrapperImports:
         )
 
     def test_worker_module_imports(self):
+        # [FUNCTION DOC]
+        # Imports CreateWorkerFromEngine and SGLangWorker.
         from examples.scaffolding.worker import (  # noqa: F401
             CreateWorkerFromEngine,
             SGLangWorker,
         )
 
     def test_workflow_module_imports(self):
+        # [FUNCTION DOC]
+        # Imports ScaffoldingWorkflow.
         from examples.scaffolding.workflow import (
             ScaffoldingWorkflow,  # noqa: F401
         )
 
     def test_top_level_package_imports(self):
+        # [FUNCTION DOC]
+        # Imports the public names re-exported by the examples.scaffolding package.
         from examples.scaffolding import (  # noqa: F401
             ChatRewardTask,
             ChatTracer,
@@ -719,9 +900,13 @@ class TestWrapperImports:
 
 
 class TestCrossModuleIntegration:
+    # [CLASS DOC]
+    # Checks wrapper classes integrate with core types.
     """Verify that core primitives and AReaL wrappers interoperate."""
 
     def test_rlvr_reward_task_inherits_from_core_task(self):
+        # [FUNCTION DOC]
+        # RLVRRewardTask instances are core Tasks.
         from examples.scaffolding.core.task import Task
         from examples.scaffolding.task import RLVRRewardTask
 
@@ -729,24 +914,33 @@ class TestCrossModuleIntegration:
         assert isinstance(t, Task)
 
     def test_sglang_worker_inherits_from_core_openai_worker(self):
+        # [FUNCTION DOC]
+        # SGLangWorker subclasses the core OpenaiWorker.
         from examples.scaffolding.core.worker import OpenaiWorker
         from examples.scaffolding.worker import SGLangWorker
 
         assert issubclass(SGLangWorker, OpenaiWorker)
 
     def test_rlvr_reward_controller_inherits_from_core_controller(self):
+        # [FUNCTION DOC]
+        # RLVRRewardController subclasses Controller.
         from examples.scaffolding.controllers import RLVRRewardController
         from examples.scaffolding.core.controller import Controller
 
         assert issubclass(RLVRRewardController, Controller)
 
     def test_pipeline_trajectory_maker_inherits_from_core_controller(self):
+        # [FUNCTION DOC]
+        # PipelineTrajectoryMaker subclasses Controller.
         from examples.scaffolding.controllers import PipelineTrajectoryMaker
         from examples.scaffolding.core.controller import Controller
 
         assert issubclass(PipelineTrajectoryMaker, Controller)
 
     def test_native_gen_controller_process_with_compat_import(self):
+        # [FUNCTION DOC]
+        # NativeGenerationController imported via _compat applies temperature and yields
+        # once.
         """Using _compat imports should produce the same result as core imports."""
         from examples.scaffolding._compat import (
             GenerationTask,
@@ -760,6 +954,8 @@ class TestCrossModuleIntegration:
         assert task.temperature == 0.5
 
     def test_scaffolding_workflow_is_rollout_workflow(self):
+        # [FUNCTION DOC]
+        # ScaffoldingWorkflow subclasses AReaL's RolloutWorkflow.
         from examples.scaffolding.workflow import ScaffoldingWorkflow
 
         from areal.api.workflow_api import RolloutWorkflow
@@ -767,6 +963,8 @@ class TestCrossModuleIntegration:
         assert issubclass(ScaffoldingWorkflow, RolloutWorkflow)
 
     def test_compat_classes_are_same_as_core_classes(self):
+        # [FUNCTION DOC]
+        # _compat re-exports are the identical class objects from core.
         """Verify _compat re-exports are the exact same class objects as core."""
         from examples.scaffolding._compat import (
             Controller as CompatController,

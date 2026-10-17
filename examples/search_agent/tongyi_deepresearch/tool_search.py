@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# qwen-agent "search" tool for the Tongyi DeepResearch agent, backed by the Serper
+# Google
+# Search API. SERPER_KEY is read from env var SERPER_KEY_ID at import (may be None).
 import asyncio
 import json
 import os
@@ -10,6 +14,12 @@ SERPER_KEY = os.environ.get("SERPER_KEY_ID")
 
 @register_tool("search", allow_overwrite=True)
 class Search(BaseTool):
+    # [CLASS DOC]
+    # qwen-agent BaseTool registered as "search" (overwriting existing registrations).
+    # Takes
+    # a JSON params object with "query" (string or list of strings) and returns
+    # formatted
+    # text of top web results per query. All network calls are async via aiohttp.
     name = "search"
     description = "Performs batched web searches: supply an array 'query'; the tool retrieves the top 10 results for each query in one call."
     parameters = {
@@ -25,10 +35,31 @@ class Search(BaseTool):
     }
 
     def __init__(self, cfg: dict | None = None):
+        # [FUNCTION DOC]
+        # Forwards the optional qwen-agent tool cfg dict to BaseTool.
         super().__init__(cfg)
 
     async def google_search_with_serp(self, query: str):
+        # [FUNCTION DOC]
+        # POSTs one query to the Serper search endpoint, using China/zh-cn locale if the
+        # query
+        # contains CJK ideographs, otherwise United States/en. Up to 5 attempts with a
+        # 0.5 s sleep
+        # after any exception. On a response: unparsable JSON returns a parse-failure
+        # message;
+        # missing "organic" returns a no-results hint; otherwise returns a markdown-ish
+        # listing
+        # "A Google search for ... found N results" with numbered title/link, optional
+        # date,
+        # source and snippet per result (stripping a video-player boilerplate string).
+        # After all
+        # attempts fail returns a timeout/error message containing the last exception.
+        # Never
+        # raises.
         def contains_chinese_basic(text: str) -> bool:
+            # [FUNCTION DOC]
+            # HELPER: True if any character lies in the CJK Unified Ideographs range
+            # U+4E00..U+9FFF.
             return any("\u4e00" <= char <= "\u9fff" for char in text)
 
         if contains_chinese_basic(query):
@@ -90,9 +121,23 @@ class Search(BaseTool):
         return f"Google search Timeout or error ({last_exc}); return None, Please try again later."  # noqa: E501
 
     async def search_with_serp(self, query: str):
+        # [FUNCTION DOC]
+        # HELPER: Thin alias awaiting google_search_with_serp for one query.
         return await self.google_search_with_serp(query)
 
     async def call(self, params: str | dict, **kwargs) -> str:  # type: ignore[override]
+        # [FUNCTION DOC]
+        # Tool entry point. Reads params["query"]; on failure (e.g. params is a raw
+        # string or
+        # lacks the key) returns an invalid-format message. A string query is searched
+        # directly;
+        # a list is searched concurrently and the results joined by a "======="
+        # separator line.
+        # Returns str.
+        # KNOWN ISSUE: params typed as str | dict but a JSON string is never parsed, and
+        # a
+        # non-list, non-string query triggers an AssertionError instead of an error
+        # message.
         try:
             query = params["query"]
         except Exception:

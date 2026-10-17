@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Tool registry, marker-based routing and execution helpers for the TIR example. Imports
+# the tools package as a top-level module (examples/tir must be on sys.path).
 """Tool registry, routing, and execution helpers for the TIR example."""
 
 from __future__ import annotations
@@ -19,6 +22,10 @@ logger = logging.getLogger("Tool Manager")
 
 
 def _build_daytona_python_tool(timeout: int, debug_mode: bool) -> BaseTool:
+    # [FUNCTION DOC]
+    # HELPER: Factory for DaytonaPythonTool(timeout, debug_mode). Raises ImportError
+    # with an
+    # install hint if the daytona package is unavailable; imports the tool lazily.
     if importlib.util.find_spec("daytona") is None:
         raise ImportError(
             "daytona_python requires the optional 'daytona' dependency. Install it with `uv sync --extra sandbox`."
@@ -30,6 +37,10 @@ def _build_daytona_python_tool(timeout: int, debug_mode: bool) -> BaseTool:
 
 
 class ToolRegistry:
+    # [CLASS DOC]
+    # Maps tool names (python, calculator, daytona_python) to ToolTypes and lazily
+    # constructs
+    # only the enabled tools. Default when enabled_tools is None: python and calculator.
     """Tool registry that manages all available tools."""
 
     TOOL_NAMES = {
@@ -45,6 +56,14 @@ class ToolRegistry:
         enabled_tools: str = "python;calculator",
         debug_mode: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Parses enabled_tools as a semicolon-separated list (None means defaults),
+        # warns and
+        # skips unknown names, raises ValueError if both python and daytona_python are
+        # enabled
+        # (they share markers), then instantiates each enabled tool via its factory with
+        # timeout
+        # and debug_mode (Daytona may raise ImportError) and logs the enabled set.
         self._tool_factories = {
             ToolType.PYTHON: lambda: PythonTool(timeout, debug_mode),
             ToolType.CALCULATOR: lambda: CalculatorTool(timeout, debug_mode),
@@ -83,14 +102,20 @@ class ToolRegistry:
         )
 
     def get_tool(self, tool_type: ToolType) -> BaseTool | None:
+        # [FUNCTION DOC]
+        # Returns the tool instance for tool_type or None.
         """Get tool instance."""
         return self.tools.get(tool_type)
 
     def get_all_tools(self) -> dict[ToolType, BaseTool]:
+        # [FUNCTION DOC]
+        # Returns the internal dict of ToolType to tool instance (not a copy).
         """Get all tool instances."""
         return self.tools
 
     def get_tool_markers(self) -> dict[ToolType, tuple[list[str], list[str]]]:
+        # [FUNCTION DOC]
+        # Returns a dict of ToolType to (start markers, end markers) for enabled tools.
         """Get marker information for enabled tools only.
 
         Returns:
@@ -103,6 +128,8 @@ class ToolRegistry:
         }
 
     def get_all_start_markers(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns a flat list of start markers of all enabled tools, in registry order.
         """Get all start markers for enabled tools only.
 
         Returns:
@@ -114,6 +141,8 @@ class ToolRegistry:
         return start_markers
 
     def get_all_end_markers(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns a flat list of end markers of all enabled tools, in registry order.
         """Get all end markers for enabled tools only.
 
         Returns:
@@ -125,6 +154,8 @@ class ToolRegistry:
         return end_markers
 
     def get_all_markers(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Returns start markers followed by end markers.
         """Get all markers (start and end) for enabled tools only.
 
         Returns:
@@ -136,6 +167,12 @@ class ToolRegistry:
         return all_markers
 
     def get_tool_descriptions_prompt(self) -> str:
+        # [FUNCTION DOC]
+        # Builds the tools section for the system prompt: a "Tools List:" header then,
+        # per tool,
+        # name, description, parameter description, usage example and a "---" separator,
+        # joined
+        # by newlines.
         """Generate tool description prompt text for external calls."""
         prompt_parts = ["Tools List:\n"]
         for tool in self.tools.values():
@@ -148,6 +185,8 @@ class ToolRegistry:
         return "\n".join(prompt_parts)
 
     def get_enabled_tools(self) -> list[ToolType]:
+        # [FUNCTION DOC]
+        # Returns a copy of the enabled ToolType list.
         """Get list of enabled tools.
 
         Returns:
@@ -157,13 +196,22 @@ class ToolRegistry:
 
 
 class ToolRouter:
+    # [CLASS DOC]
+    # Chooses which tool handles a text by matching start/end marker regexes.
     """Tool router that determines which tool to call based on markers."""
 
     def __init__(self, registry: ToolRegistry):
+        # [FUNCTION DOC]
+        # Stores the registry and precomputes marker patterns.
         self.registry = registry
         self.tool_markers = self._build_tool_markers()
 
     def _build_tool_markers(self) -> list[tuple[ToolType, str]]:
+        # [FUNCTION DOC]
+        # HELPER: For every enabled tool and every combination of its start and end
+        # markers,
+        # builds an escaped non-greedy "start ... end" regex; returns a list of
+        # (ToolType, pattern) in registry order.
         """Build tool markers based on enabled tools."""
         markers = []
         for tool_type, tool in self.registry.tools.items():
@@ -176,6 +224,10 @@ class ToolRouter:
         return markers
 
     def route(self, text: str) -> ToolType | None:
+        # [FUNCTION DOC]
+        # Strips text and returns the ToolType of the first pattern found (dot matches
+        # newline,
+        # case-insensitive), or None.
         """Determine tool type to call based on markers."""
         text = text.strip()
         for tool_type, pattern in self.tool_markers:
@@ -185,6 +237,9 @@ class ToolRouter:
 
 
 class ToolManager:
+    # [CLASS DOC]
+    # Facade over ToolRegistry and ToolRouter used by TIRWorkflow: exposes markers and
+    # descriptions and executes a tool call found in text, sync or async.
     """General tool manager responsible for coordinating tool calls."""
 
     def __init__(
@@ -193,6 +248,10 @@ class ToolManager:
         enabled_tools: str = "python;calculator",
         debug_mode: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Stores timeout and debug_mode, creates the registry (may raise
+        # ValueError/ImportError)
+        # and router, and logs the configuration.
         self.timeout = timeout
         self.debug_mode = debug_mode
         self.registry = ToolRegistry(timeout, enabled_tools, debug_mode)
@@ -203,10 +262,14 @@ class ToolManager:
         )
 
     def get_tool_descriptions_prompt(self) -> str:
+        # [FUNCTION DOC]
+        # Delegates to the registry's description prompt.
         """Get tool description prompt text for external calls."""
         return self.registry.get_tool_descriptions_prompt()
 
     def get_tool_markers(self) -> dict[ToolType, tuple[list[str], list[str]]]:
+        # [FUNCTION DOC]
+        # Delegates to the registry's per-tool marker dict.
         """Get marker information for all tools.
 
         Returns:
@@ -216,6 +279,11 @@ class ToolManager:
         return self.registry.get_tool_markers()
 
     def get_all_start_markers(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Delegates to the registry; used as stop strings while waiting for a tool call.
+        # KNOWN ISSUE: docstring examples show markers with newlines that differ from
+        # the actual
+        # markers.
         """Get all start markers for setting stop tokens.
 
         Returns:
@@ -224,6 +292,8 @@ class ToolManager:
         return self.registry.get_all_start_markers()
 
     def get_all_end_markers(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Delegates to the registry; used as stop strings inside a tool call.
         """Get all end markers for setting stop tokens.
 
         Returns:
@@ -232,6 +302,8 @@ class ToolManager:
         return self.registry.get_all_end_markers()
 
     def get_all_markers(self) -> list[str]:
+        # [FUNCTION DOC]
+        # Delegates to the registry for all start and end markers.
         """Get all markers (start and end) for setting stop tokens.
 
         Returns:
@@ -244,6 +316,12 @@ class ToolManager:
     ) -> tuple[
         BaseTool | None, dict[str, str] | None, tuple[str, ToolCallStatus] | None
     ]:
+        # [FUNCTION DOC]
+        # HELPER: Routes text to a tool and parses its parameters. Returns (tool,
+        # params, None) on
+        # success, or (None, None, (error text, status)) with NOT_FOUND when no route or
+        # tool
+        # exists, or ERROR (logged) when parameter parsing raises.
         tool_type = self.router.route(text)
         if not tool_type:
             return (
@@ -286,6 +364,10 @@ class ToolManager:
     def _finalize_tool_result(
         result: str, status: ToolCallStatus
     ) -> tuple[str, ToolCallStatus]:
+        # [FUNCTION DOC]
+        # HELPER: Passes SUCCESS results through (debug log); otherwise logs an error
+        # and prefixes
+        # the result with "Error: Tool execution failed - ", keeping the status.
         if status == ToolCallStatus.SUCCESS:
             logger.debug(f"Tool execution completed: {result}")
             return result, status
@@ -294,6 +376,10 @@ class ToolManager:
         return f"Error: Tool execution failed - {result}", status
 
     def execute_tool_call(self, text: str) -> tuple[str, ToolCallStatus]:
+        # [FUNCTION DOC]
+        # Synchronous call: prepares the call (returning its error tuple if any), runs
+        # the tool's
+        # execute and finalizes the result. Returns (result, status).
         """Unified synchronous tool call interface.
 
         Returns:
@@ -309,6 +395,8 @@ class ToolManager:
         return self._finalize_tool_result(result, status)
 
     async def aexecute_tool_call(self, text: str) -> tuple[str, ToolCallStatus]:
+        # [FUNCTION DOC]
+        # Async counterpart using the tool's aexecute.
         """Unified asynchronous tool call interface.
 
         Returns:
@@ -324,11 +412,15 @@ class ToolManager:
         return self._finalize_tool_result(result, status)
 
     def cleanup(self) -> None:
+        # [FUNCTION DOC]
+        # Calls close on every tool (synchronous).
         """Release any resources held by enabled tools."""
         for tool in self.registry.get_all_tools().values():
             tool.close()
 
     async def acleanup(self) -> None:
+        # [FUNCTION DOC]
+        # Awaits aclose on every tool sequentially.
         """Asynchronously release any resources held by enabled tools."""
         for tool in self.registry.get_all_tools().values():
             await tool.aclose()

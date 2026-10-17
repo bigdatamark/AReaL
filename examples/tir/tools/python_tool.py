@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Local (unsandboxed) Python execution tool for TIR, built on a trimmed copy of
+# qwen-agent's PythonExecutor, plus a helper to extract code blocks from model output.
 import io
 import os
 import pickle
@@ -24,6 +27,11 @@ logger = logging.getLogger("Python Tool")
 
 
 def extract_python_code(text: str) -> str:
+    # [FUNCTION DOC]
+    # Returns the stripped body of the last python-fenced block (fence, newline, code,
+    # newline, closing fence; case-insensitive), else of the last python-tagged block,
+    # else
+    # "" with a warning. Logs the first 100 chars at debug.
     """Extract Python code from text, supporting two formats:
     1. ```python\n...\n```
     2. <python>...</python>
@@ -63,6 +71,13 @@ def extract_python_code(text: str) -> str:
 # Copied from https://github.com/QwenLM/Qwen-Agent/blob/main/qwen_agent/tools/python_executor.py
 # Removed unused `self.pool=Pool(multiprocess.cpu_count())` to avoid hang when exiting experiments.
 class PythonExecutor(QwenAgentBaseTool):
+    # [CLASS DOC]
+    # Copy of qwen-agent's python_executor tool without its process pool created at init
+    # (to
+    # avoid hangs at exit). Executes code via a GenericRuntime in a pebble ProcessPool
+    # with a
+    # per-snippet timeout. Not sandboxed. cfg keys: runtime, get_answer_symbol,
+    # get_answer_expr, get_answer_from_stdout (default True), timeout_length (20 s).
     name = "python_executor"
     description = "For executing python code. Not sandboxed. Do not use it for production purposes."
     parameters = {
@@ -77,6 +92,12 @@ class PythonExecutor(QwenAgentBaseTool):
     }
 
     def __init__(self, cfg: dict | None = None):
+        # [FUNCTION DOC]
+        # Checks optional executor dependencies (raises if missing), initializes the
+        # qwen-agent
+        # base with cfg, and stores runtime (new GenericRuntime if not provided) and
+        # answer
+        # extraction settings and timeout.
         _check_deps_for_python_executor()
         super().__init__(cfg)
 
@@ -93,6 +114,13 @@ class PythonExecutor(QwenAgentBaseTool):
         self.timeout_length = timeout_length
 
     def call(self, params: str | dict, **kwargs) -> list:
+        # [FUNCTION DOC]
+        # qwen-agent tool entry: takes code from a dict, or parses a string as JSON5
+        # (falling
+        # back to extracting a code block from the raw string); other types give empty
+        # code.
+        # Returns ["", ""] for blank code, else the (result, report) pair from apply.
+        # KNOWN ISSUE: returns a list for blank code but a tuple otherwise.
         if isinstance(params, dict):
             code = params.get("code", "")
         elif isinstance(params, str):
@@ -111,9 +139,14 @@ class PythonExecutor(QwenAgentBaseTool):
         return predictions
 
     def apply(self, code: str) -> list:
+        # [FUNCTION DOC]
+        # Runs a single code string through batch_apply and returns its (result,
+        # report).
         return self.batch_apply([code])[0]
 
     def process_generation_to_code(self, gens: str):
+        # [FUNCTION DOC]
+        # HELPER: Splits each code string into a list of lines.
         return [g.split("\n") for g in gens]
 
     @staticmethod
@@ -125,6 +158,18 @@ class PythonExecutor(QwenAgentBaseTool):
         answer_expr=None,
         timeout_length=20,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Static worker function executed in a pool process. Given code as a
+        # list of
+        # lines and the runtime, either captures stdout of executing the code (default),
+        # returns
+        # the runtime global named answer_symbol, evaluates answer_expr after execution,
+        # or
+        # executes all but the last line and evaluates the last line. Each step is
+        # wrapped in a
+        # timeout_decorator timeout. Verifies the result is stringifiable and picklable.
+        # Returns
+        # (result, "Done") or ("", last traceback line) on any exception.
         from timeout_decorator import timeout
 
         try:
@@ -153,12 +198,25 @@ class PythonExecutor(QwenAgentBaseTool):
 
     @staticmethod
     def truncate(s, max_length=256):
+        # [FUNCTION DOC]
+        # HELPER: If s is longer than max_length (256), keeps the first and last half
+        # lengths
+        # joined by "..."; returns s.
         half = max_length // 2
         if len(s) > max_length:
             s = s[:half] + "..." + s[-half:]
         return s
 
     def batch_apply(self, batch_code: list[str]) -> list:
+        # [FUNCTION DOC]
+        # Executes several code strings in a pebble ProcessPool (workers = min(count,
+        # CPU count))
+        # with the timeout per task, iterating results in order; timeouts produce
+        # ("", "Timeout Error") and other errors ("", "Internal Error"), logged at info.
+        # Shows a
+        # tqdm bar for more than 100 snippets. Returns a list of (result, report) string
+        # pairs,
+        # stripped and truncated to 256 chars. Spawns processes.
         from pebble import ProcessPool
 
         all_code_snippets = self.process_generation_to_code(batch_code)
@@ -213,18 +271,32 @@ class PythonExecutor(QwenAgentBaseTool):
 
 
 class PythonTool(BaseTool):
+    # [CLASS DOC]
+    # TIR BaseTool of type PYTHON using python fence / python tag markers, executing
+    # code
+    # locally via PythonExecutor. In debug_mode returns a fake output.
     """Qwen Python code execution tool"""
 
     def __init__(self, timeout: int = 30, debug_mode: bool = False):
+        # [FUNCTION DOC]
+        # Initializes BaseTool fields and creates a PythonExecutor with default config.
+        # KNOWN ISSUE: the timeout argument is stored but not passed to the executor,
+        # which uses
+        # its own 20 s default.
         super().__init__(timeout, debug_mode)
         self.python_executor = PythonExecutor()
 
     @property
     def tool_type(self) -> ToolType:
+        # [FUNCTION DOC]
+        # Returns ToolType.PYTHON.
         return ToolType.PYTHON
 
     @property
     def description(self) -> ToolDescription:
+        # [FUNCTION DOC]
+        # Returns a ToolDescription "python_executor" with a "code" parameter and
+        # examples.
         return ToolDescription(
             name="python_executor",
             description="Execute Python code. Supports variable calculation, data processing, algorithm implementation, etc.",
@@ -235,16 +307,31 @@ class PythonTool(BaseTool):
 
     @property
     def markers(self) -> ToolMarkers:
+        # [FUNCTION DOC]
+        # Returns start markers python fence / python tag and matching end markers.
         return ToolMarkers(
             start_markers=["```python", "<python>"], end_markers=["```", "</python>"]
         )
 
     def parse_parameters(self, text: str) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns {"code": extract_python_code(text)}.
         """Extract Python code from text, supporting two formats: ```python``` and <python>"""
         code = extract_python_code(text)
         return {"code": code}
 
     def execute(self, parameters: dict[str, Any]) -> tuple[str, ToolCallStatus]:
+        # [FUNCTION DOC]
+        # Runs parameters["code"]: empty gives ("Error: No code provided", ERROR); debug
+        # mode gives
+        # ("dummy python output", SUCCESS). Otherwise calls the executor's apply; a
+        # report other
+        # than "Done" is logged and returned as ("Error: <report>", ERROR); success
+        # returns
+        # (str(result), SUCCESS). Exceptions are logged and returned as ERROR.
+        # KNOWN ISSUE: the inline comment says this avoids the ProcessPool, but apply
+        # delegates to
+        # batch_apply, which always uses a ProcessPool.
         """Execute Python code"""
         code = parameters.get("code", "")
         if not code:

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Async-only TIR Python tool executing code in a stateful, ephemeral Daytona cloud
+# sandbox. The daytona SDK is optional and loaded lazily; module-level globals cache the
+# SDK classes once loaded.
 """Daytona-backed Python tool for stateful TIR code execution."""
 
 from __future__ import annotations
@@ -23,6 +27,14 @@ DaytonaNotFoundError = None
 
 
 def _load_daytona_sdk() -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # HELPER: Returns a dict of the Daytona SDK symbols (sandbox create params from
+    # image and
+    # from snapshot, DaytonaError, DaytonaNotFoundError), importing them on first call
+    # and
+    # caching them in module globals. Raises ImportError with an install hint if daytona
+    # is
+    # missing.
     global CreateSandboxFromImageParams
     global CreateSandboxFromSnapshotParams
     global DaytonaError
@@ -71,6 +83,11 @@ def _load_daytona_sdk() -> dict[str, Any]:
 
 
 class DaytonaPythonTool(BaseTool):
+    # [CLASS DOC]
+    # BaseTool of type DAYTONA_PYTHON using python fence or python tag markers. Lazily
+    # creates one sandbox per tool instance (from a snapshot or an image, not both) and
+    # reuses
+    # it across calls so interpreter state persists. Sync execute is unsupported.
     def __init__(
         self,
         timeout: int = 30,
@@ -84,6 +101,13 @@ class DaytonaPythonTool(BaseTool):
         labels: dict[str, str] | None = None,
         create_timeout: float = 60.0,
     ):
+        # [FUNCTION DOC]
+        # Stores timeout/debug_mode via BaseTool plus sandbox options: snapshot, image,
+        # resources, env_vars, network_block_all, labels and create_timeout (60 s).
+        # Raises
+        # ValueError if both image and snapshot are given, or if resources are given
+        # without an
+        # image. Initializes sandbox id None, an asyncio lock and SDK cache None.
         super().__init__(timeout, debug_mode)
         if image is not None and snapshot is not None:
             raise ValueError("Pass either snapshot or image, not both")
@@ -105,10 +129,16 @@ class DaytonaPythonTool(BaseTool):
 
     @property
     def tool_type(self) -> ToolType:
+        # [FUNCTION DOC]
+        # Returns ToolType.DAYTONA_PYTHON.
         return ToolType.DAYTONA_PYTHON
 
     @property
     def description(self) -> ToolDescription:
+        # [FUNCTION DOC]
+        # Returns a ToolDescription "daytona_python_executor" with a "code" parameter
+        # and
+        # fenced/tagged examples.
         return ToolDescription(
             name="daytona_python_executor",
             description="Execute Python code in a Daytona cloud sandbox with state preserved across calls.",
@@ -119,18 +149,30 @@ class DaytonaPythonTool(BaseTool):
 
     @property
     def markers(self) -> ToolMarkers:
+        # [FUNCTION DOC]
+        # Returns start markers python fence / python tag and the matching end markers.
         return ToolMarkers(
             start_markers=["```python", "<python>"],
             end_markers=["```", "</python>"],
         )
 
     def parse_parameters(self, text: str) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Returns {"code": extract_python_code(text)}.
         return {"code": extract_python_code(text)}
 
     def execute(self, parameters: dict[str, Any]) -> tuple[str, ToolCallStatus]:
+        # [FUNCTION DOC]
+        # Always raises NotImplementedError directing callers to aexecute.
         raise NotImplementedError("DaytonaPythonTool is async-only; use aexecute().")
 
     def _build_create_params(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds the SDK create-params object: image-based (with resources) if
+        # image is
+        # set, else snapshot-based; language python, env vars and labels (None if
+        # empty),
+        # network_block_all and ephemeral=True. Asserts the SDK has been loaded.
         assert self._sdk is not None
 
         if self.image is not None:
@@ -154,6 +196,11 @@ class DaytonaPythonTool(BaseTool):
         )
 
     async def _aget_sandbox(self):
+        # [FUNCTION DOC]
+        # HELPER: Loads the SDK, gets the shared async Daytona client and returns the
+        # existing
+        # sandbox by id, or, under the lock with a double check, creates one with
+        # create_timeout and stores its id. Network I/O.
         self._sdk = _load_daytona_sdk()
         client = await DaytonaClientManager.get_client()
 
@@ -173,6 +220,21 @@ class DaytonaPythonTool(BaseTool):
             return sandbox
 
     async def aexecute(self, parameters: dict[str, Any]) -> tuple[str, ToolCallStatus]:
+        # [FUNCTION DOC]
+        # Runs parameters["code"]. Empty code returns an error with ERROR; debug mode
+        # returns a
+        # dummy output with SUCCESS. Otherwise gets the sandbox and runs the code
+        # through its code
+        # interpreter with the tool timeout. DaytonaError is returned as (message,
+        # ERROR); other
+        # exceptions propagate. If the result has an error, returns ERROR with stdout,
+        # stderr and
+        # the traceback (prefixed with a "Traceback (most recent call last):" header if
+        # missing,
+        # or synthesized from the error name and value when the traceback is empty).
+        # Otherwise
+        # returns the right-stripped non-empty stdout and stderr joined by newlines with
+        # SUCCESS.
         code = parameters.get("code", "")
         if not code:
             return "Error: No code provided", ToolCallStatus.ERROR
@@ -215,6 +277,13 @@ class DaytonaPythonTool(BaseTool):
         return output, ToolCallStatus.SUCCESS
 
     async def _aclose(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If a sandbox exists, clears the id and deletes the sandbox via the
+        # client;
+        # not-found errors are logged at debug, other errors as warnings.
+        # KNOWN ISSUE: if loading the SDK fails, self._sdk may still be None and
+        # evaluating the
+        # except clause raises TypeError instead of logging.
         if self._sandbox_id is None:
             return
 
@@ -232,9 +301,20 @@ class DaytonaPythonTool(BaseTool):
             logger.warning("DaytonaPythonTool cleanup error: %s", exc)
 
     async def aclose(self) -> None:
+        # [FUNCTION DOC]
+        # Async cleanup: awaits _aclose.
         await self._aclose()
 
     def close(self) -> None:
+        # [FUNCTION DOC]
+        # Synchronous cleanup. No-op without a sandbox. If called with no running event
+        # loop:
+        # schedules _aclose on the Daytona client manager's active loop and waits, or,
+        # if none,
+        # runs _aclose with asyncio.run and then closes the client manager. If called
+        # inside a
+        # running loop it only logs a warning (callers should use a thread) and does
+        # nothing.
         if self._sandbox_id is None:
             return
 

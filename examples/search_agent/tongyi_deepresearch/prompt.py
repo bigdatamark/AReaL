@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Prompt constants for the Tongyi DeepResearch agent. SYSTEM_PROMPT describes the
+# research-assistant role, requires the final answer in answer tags, and declares only
+# the
+# "search" and "visit" function tools with the tool_call XML calling convention; it ends
+# with "Current date: " so the caller appends the date. EXTRACTOR_PROMPT is formatted
+# with
+# webpage_content and goal and asks an LLM to return JSON with rational/evidence/summary
+# fields. A commented-out larger system prompt with more tools is kept for reference.
 # SYSTEM_PROMPT = """You are a deep research assistant. Your core function is to conduct thorough, multi-source investigations into any topic. You must handle both broad, open-domain inquiries and queries within specialized academic fields. For every request, synthesize information from credible, diverse sources to deliver a comprehensive, accurate, and objective response. When you have gathered sufficient information and are ready to provide the definitive response, you must enclose the entire final answer within <answer></answer> tags.
 
 # # Tools

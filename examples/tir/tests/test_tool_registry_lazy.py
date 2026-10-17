@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Tests that ToolRegistry constructs only enabled tools, uses built-in defaults when
+# none
+# are specified, and rejects enabling two Python backends at once.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -9,7 +13,12 @@ from tools.python_tool import PythonTool
 
 
 def test_tool_registry_only_constructs_enabled_tools(monkeypatch):
+    # [FUNCTION DOC]
+    # Makes PythonTool construction raise, builds a registry with only "calculator" and
+    # asserts enabled and constructed tools are exactly [CALCULATOR].
     def fail_python_tool_init(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Replacement initializer that always raises RuntimeError.
         raise RuntimeError("should-not-be-called")
 
     monkeypatch.setattr(PythonTool, "__init__", fail_python_tool_init)
@@ -21,7 +30,12 @@ def test_tool_registry_only_constructs_enabled_tools(monkeypatch):
 
 
 def test_tool_registry_none_uses_builtin_defaults(monkeypatch):
+    # [FUNCTION DOC]
+    # Makes the Daytona tool factory raise, builds a registry with enabled_tools=None in
+    # debug mode and asserts defaults are [PYTHON, CALCULATOR] (Daytona not built).
     def fail_daytona_factory(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Replacement factory that always raises RuntimeError.
         raise RuntimeError("daytona factory should not be called")
 
     monkeypatch.setattr(
@@ -36,6 +50,10 @@ def test_tool_registry_none_uses_builtin_defaults(monkeypatch):
 
 
 def test_tool_registry_rejects_two_python_backends():
+    # [FUNCTION DOC]
+    # Constructs a registry with "python;daytona_python"; passes on ImportError (daytona
+    # missing) or on ValueError mentioning "enable only one Python backend"; otherwise
+    # raises AssertionError.
     try:
         ToolRegistry(enabled_tools="python;daytona_python")
     except ImportError:

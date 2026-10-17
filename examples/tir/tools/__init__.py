@@ -1,3 +1,12 @@
+# [PACKAGE DOC]
+# Tools package for the TIR example. Re-exports the base tool types (BaseTool, ToolCall,
+# ToolCallStatus, ToolDescription, ToolMarkers, ToolType), CalculatorTool, PythonTool
+# and
+# extract_python_code. If the optional daytona package is installed, also lazily imports
+# and exports DaytonaPythonTool (appending it to __all__); on ImportError or if daytona
+# is
+# absent, any stale DaytonaPythonTool global is removed so that module reloads reflect
+# the current environment.
 # Export base types and classes
 from __future__ import annotations
 

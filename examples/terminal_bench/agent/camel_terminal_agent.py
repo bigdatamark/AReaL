@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# CAMEL-based terminal agent that solves one Terminal-Bench task inside its docker
+# environment and returns a test-based reward. Blocking terminal_bench / docker work
+# runs
+# in a provided thread pool; LLM calls go through an AReaL OpenAI-compatible client so
+# interactions are recorded for RL. DATASET_ROOT is the repo-level "dataset" directory.
 from __future__ import annotations
 
 import asyncio
@@ -36,6 +42,13 @@ DATASET_ROOT = Path(__file__).resolve().parents[3] / "dataset"
 
 
 class CamelTerminalAgent:
+    # [CLASS DOC]
+    # One-shot agent per trajectory: resets the task environment (docker-compose
+    # terminal),
+    # builds a ChatAgentTrace with terminal tools, runs one agent step (which internally
+    # iterates tool calls up to max_iteration), evaluates the task's unit tests and
+    # cleans up.
+    # Records progress with print and perf-tracer scopes.
     def __init__(
         self,
         tokenizer: PreTrainedTokenizerFast | None = None,
@@ -48,6 +61,14 @@ class CamelTerminalAgent:
         non_think_mode: bool = True,
         encourage_completion_reward: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Stores tokenizer (optional), max_tokens_per_turn (1024), max_total_tokens
+        # context
+        # limit (40000), output_path for trial outputs, max_iteration (50), executor
+        # (required;
+        # AssertionError if None), task_timeouts (default TaskTimeouts()),
+        # non_think_mode and
+        # encourage_completion_reward.
         self.tokenizer = tokenizer
         self.max_tokens_per_turn = max_tokens_per_turn
         self.max_total_tokens = max_total_tokens
@@ -70,6 +91,24 @@ class CamelTerminalAgent:
         uid: str | None = None,
         traj_i: int = 0,
     ) -> float | None:
+        # [FUNCTION DOC]
+        # Full episode under a perf-tracer session. Sets task_name/uid/traj_i/meta_info
+        # on self,
+        # then with per-phase timeouts and trace scopes: runs _reset_env in the executor
+        # to get
+        # the prompt, _reset_agent with the client, awaits agent.astep(prompt) (a
+        # TimeoutError
+        # there is printed and evaluation still proceeds), runs
+        # _evaluate_completion_sync inside a
+        # "reward" session phase and sets it as the client's last reward. Timeouts and
+        # other
+        # exceptions are printed (with traceback). Always attempts to close the terminal
+        # in the
+        # executor. Returns the reward float, or None if the episode failed before
+        # scoring.
+        # KNOWN ISSUE: the return inside the finally block suppresses any in-flight
+        # exception,
+        # including cancellation.
         """Execute a complete agent workflow: setup environment, run agent, cleanup."""
         task_name = data.get("task_name")
         self.task_name = task_name
@@ -162,10 +201,19 @@ class CamelTerminalAgent:
                 return reward
 
     def _close_env(self):
+        # [FUNCTION DOC]
+        # HELPER: Stops the terminal (docker-compose) with the cleanup timeout if one
+        # exists.
         if self.terminal:
             self.terminal.stop(timeout=self.task_timeouts._cleanup)
 
     async def run_in_executor(self, fn, *args, timeout: float | None = None, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Runs fn(*args, **kwargs) in self.executor from the running loop; if
+        # timeout is
+        # given wraps it in asyncio.wait_for (raising TimeoutError, though the thread
+        # keeps
+        # running). Returns fn's result.
         loop = asyncio.get_running_loop()
         executor_task = loop.run_in_executor(
             self.executor,
@@ -176,6 +224,18 @@ class CamelTerminalAgent:
         return await executor_task
 
     def _reset_env(self, task: dict, uid: str | None):
+        # [FUNCTION DOC]
+        # HELPER (blocking): Creates output_path, builds a TrialHandler for the task
+        # path under
+        # DATASET_ROOT named <task>.<uid>.areal-run, selects the test-output parser from
+        # the task
+        # config, creates a Terminal for the task's compose file (no rebuild, no
+        # cleanup) and
+        # starts it with the reset timeout. Stores trial_handler, parser,
+        # client_container_name
+        # and terminal on self. Returns the prompt string "Task name:<name>" plus the
+        # task
+        # instruction.
         output_path = Path(self.output_path).resolve()
         output_path.mkdir(parents=True, exist_ok=True)
 
@@ -213,6 +273,21 @@ class CamelTerminalAgent:
         return f"Task name:{self.task_name}\nTask instruction: {instruction}"
 
     def _reset_agent(self, client):
+        # [FUNCTION DOC]
+        # HELPER (blocking): Builds a docker-backed CAMEL TerminalToolkit (20 s command
+        # timeout,
+        # unsafe mode, session logs under the trial sessions path) exposing shell_exec,
+        # shell_view, shell_write_to_process and shell_write_content_to_file tools;
+        # builds the
+        # developer system prompt (Linux in Docker, aarch64); sets process-wide env vars
+        # CAMEL_MODEL_LOG_ENABLED and CAMEL_LOG_DIR; wraps the AReaL client in an
+        # AReaLOpenAICompatibleModel with max_completion_tokens per turn; creates and
+        # resets a
+        # ChatAgentTrace with the token limit and step timeout and sets its
+        # max_iteration.
+        # KNOWN ISSUE: env vars are mutated process-wide, so concurrent trajectories
+        # overwrite
+        # each other's CAMEL_LOG_DIR; machine architecture is hard-coded.
         session_logs_dir = (
             self.trial_handler.trial_paths.sessions_path
             / "terminal_toolkit_session_logs"
@@ -267,6 +342,22 @@ class CamelTerminalAgent:
         print(f"{self.task_name}: agent started")
 
     def _evaluate_completion_sync(self) -> float:
+        # [FUNCTION DOC]
+        # HELPER (blocking): Copies the task's run-tests script and test dir into the
+        # container,
+        # runs the script in a fresh non-interactive session (timeout = min of the
+        # evaluation
+        # timeout and 4x the task's max test timeout), parses the captured pane into
+        # per-test
+        # statuses and computes pass_ratio (passed / total, 0 if none). Writes
+        # test_results.json
+        # (per-test pass flags, all_passed, pass_ratio, plus iteration count and usage
+        # from the
+        # agent response when available) next to the sessions directory. Any exception
+        # is printed
+        # and yields 0.0. If encourage_completion_reward and all tests pass, returns
+        # 2.0;
+        # otherwise returns pass_ratio.
         assert self.trial_handler is not None and self.terminal is not None
 
         paths = [self.trial_handler.task_paths.run_tests_path]

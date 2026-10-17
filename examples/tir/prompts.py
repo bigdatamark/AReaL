@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Prompt template constants for the Tool-Integrated Reasoning (TIR) workflow.
+# SYSTEM_PROMPT (chat models; formatted with tool_descriptions), BASE_MODEL_PROMPT (base
+# models; formatted with tool_descriptions and question, ends with an opening think
+# tag),
+# TORL_PROMPT (ToRL-style prompt formatted with prompt) and ANSWER, a regex matching a
+# boxed final answer. Doubled braces are str.format escapes for literal braces.
 """
 Prompt templates for TIR (Tool-Integrated Reasoning) workflow.
 """

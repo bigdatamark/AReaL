@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Entry script for GRPO training of a vision-language model on CLEVR-Count-70k with
+# PPOTrainer and VisionRLVRWorkflow; reward is exact match of the predicted count.
 import re
 import sys
 
@@ -11,6 +14,10 @@ logger = logging.getLogger("clevr_count_70k_grpo")
 
 
 def extract_answer(pred_str, data_name, use_last_number=True):
+    # [FUNCTION DOC]
+    # Returns the last number found inside square brackets in pred_str (as a string), or
+    # ""
+    # if none. data_name and use_last_number are unused.
     match = re.findall(r"\[([0-9\.]+)\]", pred_str)
     if match:
         return match[-1]
@@ -21,6 +28,12 @@ def extract_answer(pred_str, data_name, use_last_number=True):
 def clevr_count_70k_reward_fn(
     prompt, completions, prompt_ids, completion_ids, answer, **kwargs
 ):
+    # [FUNCTION DOC]
+    # Reward function: extracts the bracketed count from str(completions) and returns
+    # 1.0 if
+    # it equals str(answer) after stripping, 0.0 otherwise or if either is empty.
+    # Exceptions
+    # are logged as warnings and yield 0.0.
     try:
         sol = extract_answer(str(completions), data_name="")  # str number
         ans = str(answer)
@@ -35,6 +48,12 @@ def clevr_count_70k_reward_fn(
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Parses args into GRPOConfig, loads processor and tokenizer, builds train/test
+    # datasets
+    # with the processor and runs PPOTrainer.train with VisionRLVRWorkflow for training
+    # and
+    # eval (reward_fn by import path, enable_thinking=False; eval temperature 0.6).
     config, _ = load_expr_config(args, GRPOConfig)
     processor, tokenizer = load_hf_processor_and_tokenizer(config.tokenizer_path)
 

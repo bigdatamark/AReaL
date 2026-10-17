@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Entry script for Tool-Integrated Reasoning (TIR) GRPO training on math data with
+# PPOTrainer and the TIRWorkflow. Expects examples/tir on sys.path for tir_workflow.
 import sys
 
 from areal import PPOTrainer
@@ -13,6 +16,11 @@ logger = logging.getLogger("TIR Training")
 
 
 def math_reward_fn(prompt, completions, prompt_ids, completion_ids, answer, **kwargs):
+    # [FUNCTION DOC]
+    # Reward function: verifies str(completions) against str(answer) with AReaL's
+    # math-verify worker and returns its score; any exception yields 0.0. Other
+    # arguments
+    # (prompt, ids, kwargs such as tool usage) are ignored.
     # tool_using = 0.01 if 'tool_using' in kwargs and kwargs['tool_using'] else 0
     # tool_success = 0.05 if 'tool_status' in kwargs and kwargs['tool_status'] else 0
 
@@ -24,6 +32,13 @@ def math_reward_fn(prompt, completions, prompt_ids, completion_ids, answer, **kw
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Parses args into TIRGRPOConfig, logs experiment name/model/batch size, loads the
+    # tokenizer, builds train ("train") and validation ("test") datasets, and runs
+    # PPOTrainer.train with TIRWorkflow (by import path) for both training and eval;
+    # eval
+    # uses the same kwargs but temperature 0.6. Workflow kwargs: reward_fn import path,
+    # gconfig, tokenizer path, tir config, enable_thinking=False.
     config, _ = load_expr_config(args, TIRGRPOConfig)
 
     logger.info("Starting TIR training")

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Regression test ensuring TIRWorkflow's multi-round generation dispatches tool calls
+# via
+# the async aexecute_tool_call path rather than the sync one.
 # SPDX-License-Identifier: Apache-2.0
 
 """Focused async-path regression tests for TIR workflow tool execution."""
@@ -15,19 +19,40 @@ from areal.api.io_struct import ModelResponse
 
 
 class FakeTokenizer:
+    # [CLASS DOC]
+    # Character-level fake tokenizer: pad id 0, eos id 1; encodes each character to its
+    # code
+    # point and decodes back.
     pad_token_id = 0
     eos_token_id = 1
 
     def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        # [FUNCTION DOC]
+        # Returns the list of code points of text; add_special_tokens is ignored.
         del add_special_tokens
         return [ord(ch) for ch in text]
 
     def decode(self, tokens: list[int]) -> str:
+        # [FUNCTION DOC]
+        # Joins chr of each token id into a string.
         return "".join(chr(token) for token in tokens)
 
 
 @pytest.mark.asyncio
 async def test_tir_workflow_invokes_aexecute(monkeypatch):
+    # [FUNCTION DOC]
+    # Builds a TIRWorkflow without running its initializer, sets
+    # tokenizer/turn/length/marker
+    # attributes and an async reward of 1.0, and a fake tool manager whose async call
+    # records
+    # the text and returns success while the sync call fails the test. Monkeypatches
+    # _generate_response to return three scripted responses (text ending with the python
+    # start
+    # marker, the code plus end marker, then EOS), stats_tracker.get to a recorder and
+    # workflow_context.stat_scope. Runs _multi_round_response and asserts reward 1.0, a
+    # single
+    # stats record of 1 tool call / 1 success, and that the tool received the full
+    # fenced code.
     tokenizer = FakeTokenizer()
     workflow = object.__new__(TIRWorkflow)
     workflow.tokenizer = tokenizer
@@ -38,13 +63,20 @@ async def test_tir_workflow_invokes_aexecute(monkeypatch):
     workflow.async_reward_fn = lambda *args, **kwargs: _return_reward()
 
     async def _return_reward():
+        # [FUNCTION DOC]
+        # HELPER: Async function returning 1.0 (used by the lambda reward).
         return 1.0
 
     async def aexecute_tool_call(text: str):
+        # [FUNCTION DOC]
+        # HELPER: Fake async tool call; records text and returns ("async-tool-result",
+        # SUCCESS).
         aexecute_calls.append(text)
         return "async-tool-result", ToolCallStatus.SUCCESS
 
     def execute_tool_call(text: str):
+        # [FUNCTION DOC]
+        # HELPER: Fake sync tool call that raises AssertionError if used.
         raise AssertionError("sync execute_tool_call should not be used")
 
     aexecute_calls: list[str] = []
@@ -80,6 +112,10 @@ async def test_tir_workflow_invokes_aexecute(monkeypatch):
     async def fake_generate_response(
         engine, context_ids, max_len, waiting_for_tool_start
     ):
+        # [FUNCTION DOC]
+        # HELPER: Ignores its arguments and returns the next scripted ModelResponse with
+        # its
+        # stop_reason.
         del engine, context_ids, max_len, waiting_for_tool_start
         response = next(responses)
         return response, response.stop_reason
@@ -87,7 +123,11 @@ async def test_tir_workflow_invokes_aexecute(monkeypatch):
     stats_calls: list[dict[str, int]] = []
 
     class FakeStatsTracker:
+        # [CLASS DOC]
+        # HELPER: Stats tracker stub recording scalar kwargs.
         def scalar(self, **kwargs):
+            # [FUNCTION DOC]
+            # Appends the kwargs dict to stats_calls.
             stats_calls.append(kwargs)
 
     monkeypatch.setattr(workflow, "_generate_response", fake_generate_response)

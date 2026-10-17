@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# System prompt builder for the CAMEL "Lead Software Engineer" terminal agent.
 def get_developer_agent_prompt(
     current_date: str,
     system: str,
@@ -5,6 +7,24 @@ def get_developer_agent_prompt(
     is_workforce: bool,
     non_think_mode: bool = True,
 ):
+    # [FUNCTION DOC]
+    # Builds and returns the agent system prompt string by concatenating tagged
+    # sections:
+    # role, (empty) team structure, operating environment (system/machine, Docker note,
+    # date),
+    # mandatory instructions, capabilities, philosophy, terminal tips and an empty
+    # collaboration section. Inputs: current_date, system (OS name, may contain
+    # "Docker"),
+    # machine (arch), is_workforce (unused), non_think_mode (default True; appends a
+    # "/no_think" suffix to disable Qwen thinking). Pure function.
+    # KNOWN ISSUE: due to conditional-expression precedence, when system contains
+    # "Docker"
+    # the environment section has the system line and Docker note but lacks the date and
+    # the
+    # closing tag; otherwise it contains only the date line and closing tag (no opening
+    # tag or
+    # system line).
+    # KNOWN ISSUE: is_workforce is documented but never used.
     """
     Generate the prompt for the Lead Software Engineer agent.
     Args:

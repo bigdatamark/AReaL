@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Multi-turn ReAct research agent (Tongyi DeepResearch style) driven through AReaL's
+# ArealOpenAI client: the model alternates reasoning with tool_call XML invocations of
+# the
+# search and visit tools until it emits an answer, and an LLM judge scores the final
+# answer. Imports prompt/tools relatively or, when run directly, via sys.path. OBS_START
+# /
+# OBS_END delimit tool responses; MAX_LLM_CALL_PER_RUN (env, default 100) is unused
+# here.
 import datetime
 import json
 import os
@@ -36,10 +45,23 @@ MAX_LLM_CALL_PER_RUN = int(os.getenv("MAX_LLM_CALL_PER_RUN", 100))
 
 
 def today_date():
+    # [FUNCTION DOC]
+    # HELPER: Returns today's local date formatted YYYY-MM-DD.
     return datetime.date.today().strftime("%Y-%m-%d")
 
 
 def parse_judge_result(raw_response):
+    # [FUNCTION DOC]
+    # HELPER: Converts a judge LLM reply to a 0/1 score. Takes the text after the last
+    # json
+    # fence (up to the next fence), tries JSON then Python literal parsing (warning on
+    # each
+    # failure), falls back to substring checks for an incorrect / correct judgement,
+    # else
+    # "unknown" with a warning. Returns 1.0 only if judgement == "correct".
+    # KNOWN ISSUE: a successfully parsed non-dict (e.g. a list or string) makes the
+    # membership
+    # test misbehave or the indexing raise.
     # parse results
     import ast
     import json
@@ -63,6 +85,14 @@ def parse_judge_result(raw_response):
 
 
 class MultiTurnReactAgent(FnCallAgent):
+    # [CLASS DOC]
+    # qwen-agent FnCallAgent subclass (base initializer not called) holding the
+    # tokenizer,
+    # per-turn and total token budgets (finishing is forced at 80% of the total), max
+    # LLM
+    # calls, a judge client, and Visit (using the judge client as summarizer) and Search
+    # tool
+    # instances keyed by name.
     def __init__(
         self,
         tokenizer: PreTrainedTokenizer,
@@ -71,6 +101,11 @@ class MultiTurnReactAgent(FnCallAgent):
         max_total_tokens: int = 32768,
         judge_client: ArealOpenAI | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores tokenizer, max_tokens_per_turn (10000), max_llm_calls_per_run (100),
+        # max_total_tokens (32768) and its 80% soft limit, judge_client, and builds the
+        # tool list
+        # and name-to-tool map.
         self.tokenizer = tokenizer
         self.max_tokens_per_turn = max_tokens_per_turn
         self.max_llm_calls_per_run = max_llm_calls_per_run
@@ -81,6 +116,11 @@ class MultiTurnReactAgent(FnCallAgent):
         self.tool_map = {tool.name: tool for tool in self.tool_class}
 
     def count_tokens(self, messages):
+        # [FUNCTION DOC]
+        # Approximates prompt length: renders each message (pydantic models dumped to
+        # dicts) in
+        # ChatML form, appends an assistant header, tokenizes and returns the token
+        # count.
         message_strs = []
         for msg in messages:
             if isinstance(msg, BaseModel):
@@ -96,6 +136,16 @@ class MultiTurnReactAgent(FnCallAgent):
     async def call_server(
         self, client: ArealOpenAI, messages: list[dict], max_attempts: int = 100
     ) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Calls client.chat.completions.create with the messages, temperature
+        # 1.0, stop
+        # at the tool_response tag and max_completion_tokens per turn. Returns a
+        # (completion, message) tuple. RuntimeError is logged and retried; after
+        # max_attempts
+        # raises RuntimeError.
+        # KNOWN ISSUE: the attempts counter is never incremented, so persistent
+        # RuntimeErrors loop
+        # forever; the annotation says str but a tuple is returned.
         attempts = 0
         while attempts < max_attempts:
             try:
@@ -120,6 +170,38 @@ class MultiTurnReactAgent(FnCallAgent):
     async def run_agent(
         self, data, client: ArealOpenAI, save_path: str | None = None
     ) -> list[list[Message]]:
+        # [FUNCTION DOC]
+        # Runs the ReAct loop for data (requires qid, question, answer). Starts with the
+        # system
+        # prompt plus today's date and the question. Each round (until LLM calls are
+        # exhausted)
+        # calls the model, appends the message, and if it contains a tool_call block
+        # parses it
+        # with JSON5, executes the tool (counting search/visit in stats) or produces an
+        # error
+        # text, and appends the result wrapped in tool_response tags as a user message.
+        # Breaks on
+        # an answer block. When calls run out without an answer, appends a final
+        # "provide your
+        # answer" instruction. If the token count exceeds the soft limit, appends a
+        # context-limit instruction, makes one more call and returns immediately with
+        # the
+        # prediction and termination reason. After a 150-minute wall clock limit returns
+        # early.
+        # Otherwise extracts the prediction from the answer block (or "No answer
+        # found."), sets
+        # termination, optionally dumps the result without completions to save_path as
+        # JSON, and
+        # returns a dict with question, answer, messages, prediction, termination,
+        # completions
+        # (all raw completions) and stats (turns, num_search, num_access).
+        # KNOWN ISSUE: the time-limit early return omits completions and stats
+        # (make_trajectory
+        # would raise KeyError); None message content raises TypeError; return
+        # annotation says a
+        # list of message lists but a dict is returned; with zero allowed calls content
+        # is
+        # undefined.
         start_time = time.time()
         data["qid"]
         question = data["question"]
@@ -263,6 +345,11 @@ class MultiTurnReactAgent(FnCallAgent):
         return result
 
     async def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: If tool_name is known, sets tool_args["params"] to tool_args itself (a
+        # self-reference) and awaits the tool's call with it, returning the result
+        # string;
+        # otherwise returns a not-found error string.
         if tool_name in self.tool_map:
             tool_args["params"] = tool_args
             raw_result = await self.tool_map[tool_name].call(tool_args, **kwargs)
@@ -275,6 +362,14 @@ class MultiTurnReactAgent(FnCallAgent):
         self,
         result: dict[str, str],
     ):
+        # [FUNCTION DOC]
+        # Builds a judge prompt with the question, ground truth (single-element lists
+        # unwrapped)
+        # and the first 200 chars of the prediction, asking for JSON with rationale and
+        # judgement;
+        # calls the judge client (temperature 1.0, 8192 max tokens, store=False) and
+        # returns
+        # parse_judge_result of the reply. Any exception logs a warning and returns 0.0.
         # Compute reward with LLM-as-Judge
         # judge_client = ArealOpenAI(engine=rollout_engine, tokenizer=tokenizer)
         judge_prompt_template = (
@@ -322,6 +417,12 @@ class MultiTurnReactAgent(FnCallAgent):
         client: ArealOpenAI,
         save_path: str | None = None,
     ) -> dict:
+        # [FUNCTION DOC]
+        # Runs run_agent, computes the judge reward, assigns it to the last completion
+        # via
+        # client.set_reward (so the ArealOpenAI client can export rewarded
+        # interactions), and
+        # returns the stats dict.
         result = await self.run_agent(data, client, save_path=save_path)
         reward = await self.calc_reward_with_llm_judge(result)
         completions = result["completions"]

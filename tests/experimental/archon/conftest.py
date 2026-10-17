@@ -1,3 +1,18 @@
+# [MODULE DOC]
+# Pytest conftest for Archon engine tests. At import time it: computes torch and
+# transformers versions and sets collect_ignore_glob to skip all tests when torch <
+# 2.9.1
+# and Qwen3.5 tests when transformers < 5.2; imports transformers before any stubbing;
+# tries to import the real areal package and, if that fails, purges partial areal
+# modules
+# and registers lightweight package stubs (real __path__, no __init__ executed) for
+# areal
+# subpackages plus bare stubs for areal.infra/areal.infra.platforms with a no-op
+# current_platform.synchronize, breaking a circular import; and registers bare stubs for
+# triton and the torchao blockwise FP8 modules when those are not importable (exposing a
+# placeholder fp8_blockwise_mm). All of this mutates sys.modules globally so FP8 pure-
+# logic
+# tests can run on CPU-only machines.
 """Pytest configuration for archon tests.
 
 NOTE: Archon engine requires PyTorch >= 2.9.1.
@@ -43,6 +58,12 @@ if _TF_VERSION < _MIN_TF_QWEN3_5:
 
 
 def pytest_collection_modifyitems(config, items):
+    # [FUNCTION DOC]
+    # Pytest hook: if torch is too old, adds a skip marker (with the found version in
+    # the
+    # reason) to every collected item whose path contains "experimental/archon";
+    # otherwise
+    # does nothing.
     """Skip archon tests based on version requirements."""
     if _TORCH_VERSION >= _MIN_TORCH_VERSION:
         return
@@ -73,6 +94,13 @@ _REPO = Path(__file__).parent.parent.parent.parent  # /path/to/AReaL
 
 
 def _pkg_stub(dotted: str, rel_dir: str) -> types.ModuleType:
+    # [FUNCTION DOC]
+    # HELPER: Creates and registers in sys.modules a module object named dotted that
+    # acts as
+    # a package rooted at the repo-relative directory rel_dir (sets __path__,
+    # __package__,
+    # __file__ and a ModuleSpec with submodule search locations) without executing its
+    # __init__.py, so real submodules can be imported. Returns the module.
     """Register a package stub with a real filesystem __path__.
 
     Using a real __path__ means that `import dotted.submod` will find the
@@ -94,6 +122,10 @@ def _pkg_stub(dotted: str, rel_dir: str) -> types.ModuleType:
 
 
 def _bare_stub(name: str) -> types.ModuleType:
+    # [FUNCTION DOC]
+    # HELPER: Creates and registers in sys.modules an empty module named name with a
+    # loader-less spec and empty __path__ (so it looks like a package with no contents).
+    # Returns the module.
     """Register a minimal no-path stub (for leaf modules / blocked packages)."""
     mod = types.ModuleType(name)
     mod.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
@@ -165,6 +197,12 @@ if _NEED_AREAL_STUBS:
 
 
 def _try_real_import(name: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True if name is already in sys.modules (stub or real) or imports
+    # successfully; False if importing raises any exception.
+    # KNOWN ISSUE: the docstring says "not already a stub" but a module already present
+    # in
+    # sys.modules (including a stub) returns True.
     """Return True if *name* can be imported (not already a stub)."""
     if name in sys.modules:
         return True

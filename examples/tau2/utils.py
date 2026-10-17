@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Utilities for tau2-bench training: env/PPO config dataclasses and a run-info model.
+# Import-time side effects: reconfigures the global loguru logger (removes handlers,
+# adds a
+# stderr INFO handler) and monkeypatches tau2.utils.llm_utils.get_response_cost with a
+# version that silently returns 0.0 for models LiteLLM cannot price.
 """Utilities for Tau2 benchmark training with AReaL."""
 
 import sys
@@ -18,6 +24,13 @@ from areal.api.cli_args import PPOConfig
 
 @dataclass
 class Tau2EnvConfig:
+    # [CLASS DOC]
+    # Environment config: domain ("telecom"), max_steps per episode (100),
+    # add_thinking_tool (False), solo_mode (False, agent works without a simulated
+    # user),
+    # user_llm_base_url / user_llm / user_llm_args for the user simulator LLM (None
+    # defaults),
+    # turn_discount (1.0) and invalid_format_penalty (0.1).
     """Environment configuration for Tau2 benchmark."""
 
     domain: str = field(
@@ -56,6 +69,8 @@ class Tau2EnvConfig:
 
 @dataclass
 class Tau2PPOConfig(PPOConfig):
+    # [CLASS DOC]
+    # PPOConfig extension adding econfig: Tau2EnvConfig.
     """PPO configuration with Tau2-specific settings."""
 
     econfig: Tau2EnvConfig = field(default_factory=Tau2EnvConfig)
@@ -69,6 +84,12 @@ logger.add(sys.stderr, level="INFO", format="{time} {level} {message}")
 
 
 def _get_response_cost_silent(response: ModelResponse) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Replacement for tau2's get_response_cost. Normalizes response.model via
+    # tau2's
+    # fine-tuned-name parser (mutating the response), then returns LiteLLM
+    # completion_cost;
+    # any exception returns 0.0 without logging.
     """Get cost from response, silently returning 0.0 for unmapped models.
 
     This is a patched version of tau2.utils.llm_utils.get_response_cost that
@@ -93,6 +114,9 @@ tau2.utils.llm_utils.get_response_cost = _get_response_cost_silent
 
 
 class Tau2RunInfo(BaseModel):
+    # [CLASS DOC]
+    # Pydantic model summarizing one tau2 simulation: reward, per-turn agent_time and
+    # user_time lists, messages, task, optional reward_info and error string.
     """Information about a Tau2 simulation run."""
 
     reward: float
@@ -104,6 +128,14 @@ class Tau2RunInfo(BaseModel):
     error: str | None = None
 
     def __str__(self):
+        # [FUNCTION DOC]
+        # Renders a human-readable report: reward, YAML dump of the task, optional YAML
+        # reward
+        # info, turn count, each message as [turn][role]: content (with YAML-dumped tool
+        # calls and
+        # usage when present), total/average agent and user times if non-empty, and the
+        # error if
+        # set. Returns str.
         s = f"[REWARD]: {self.reward}\n\n"
         s += "[TASK]\n"
         s += yaml.dump(self.task.model_dump()) + "\n"

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# GPU integration tests for the scaffolding SGLangWorker against a real SGLang server
+# serving Qwen3-0.6B (local path or HF id). Picks two free ports and the host IP at
+# import
+# time.
 """Tests for SGLangWorker with a real SGLang server (requires GPU)."""
 
 from __future__ import annotations
@@ -42,6 +47,9 @@ RUN_SERVER_TIMEOUT = 180
 
 
 def _check_server_health(base_url: str) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: GETs base_url/health with a 30 s timeout; True on HTTP 200, False on any
+    # requests exception or other status.
     try:
         response = requests.get(f"{base_url}/health", timeout=30)
         return response.status_code == 200
@@ -51,6 +59,15 @@ def _check_server_health(base_url: str) -> bool:
 
 @pytest.fixture(scope="module")
 def sglang_server():
+    # [FUNCTION DOC]
+    # Module-scoped fixture: seeds RNGs, builds an SGLang launch command (tokenizer init
+    # enabled, 0.3 static memory fraction, TP 1, GPU 0), spawns it as a subprocess with
+    # output
+    # to stdout, polls health every second for up to 180 s, kills the process tree and
+    # raises
+    # RuntimeError on timeout, yields the base URL, and kills the server on teardown.
+    # KNOWN ISSUE: the docstring says skip_tokenizer_init=True but the code passes
+    # False.
     """Launch a real SGLang server.
 
     Uses skip_tokenizer_init=True (AReaL default). Chat template is applied
@@ -89,12 +106,18 @@ def sglang_server():
 
 @pytest.fixture(scope="module")
 def tokenizer():
+    # [FUNCTION DOC]
+    # Module-scoped fixture returning the HF tokenizer for the model.
     """Load the tokenizer for client-side chat template application."""
     return load_hf_tokenizer(MODEL_PATH)
 
 
 @pytest.fixture(scope="module")
 def sglang_worker(sglang_server):
+    # [FUNCTION DOC]
+    # Module-scoped fixture building an SGLangWorker with an AsyncOpenAI client pointed
+    # at the
+    # server's /v1 endpoint (api key "EMPTY"), model "default" and a MagicMock engine.
     """Create an SGLangWorker connected to the real SGLang server."""
     base_url = sglang_server
     if not base_url.endswith("/v1"):
@@ -115,6 +138,10 @@ def sglang_worker(sglang_server):
 
 @pytest.mark.asyncio
 async def test_generation_handler(sglang_worker):
+    # [FUNCTION DOC]
+    # Runs generation_handler on a short plain prompt and asserts SUCCESS, non-empty
+    # output
+    # and a finish reason of stop or length.
     """generation_handler should generate text from real server."""
     task = GenerationTask(
         input_str="What is 1 + 1? Answer briefly:",
@@ -130,6 +157,11 @@ async def test_generation_handler(sglang_worker):
 
 @pytest.mark.asyncio
 async def test_generation_max_tokens(sglang_worker):
+    # [FUNCTION DOC]
+    # Temporarily wraps the client's completions.create to force max_tokens=5, runs a
+    # long
+    # prompt and asserts SUCCESS with finish_reason "length"; restores the original
+    # method.
     """generation_handler should respect max_tokens and finish with 'length'."""
     task = GenerationTask(
         input_str="Write a very long essay about the history of mathematics.",
@@ -138,6 +170,8 @@ async def test_generation_max_tokens(sglang_worker):
     original_create = sglang_worker.async_client.completions.create
 
     async def _create_with_limit(**kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Overrides max_tokens to 5 and forwards to the original create.
         kwargs["max_tokens"] = 5
         return await original_create(**kwargs)
 
@@ -158,6 +192,10 @@ async def test_generation_max_tokens(sglang_worker):
 
 @pytest.mark.asyncio
 async def test_generation_with_chat_template(sglang_worker, tokenizer):
+    # [FUNCTION DOC]
+    # Applies the chat template client-side to a single user message, decodes it to a
+    # prompt
+    # string and asserts generation succeeds with non-empty output.
     """Client-side chat template + completions API, matching ScaffoldingWorkflow."""
     messages = [{"role": "user", "content": "What is the capital of France?"}]
     input_ids = apply_chat_template(
@@ -178,6 +216,10 @@ async def test_generation_with_chat_template(sglang_worker, tokenizer):
 
 @pytest.mark.asyncio
 async def test_multi_turn_generation(sglang_worker, tokenizer):
+    # [FUNCTION DOC]
+    # Runs two turns: generates a reply to a first user message, appends it and a
+    # follow-up
+    # question, re-templates and asserts the second generation succeeds.
     """Multi-turn via client-side chat template + completions API."""
     # Turn 1
     messages = [{"role": "user", "content": "My name is Alice."}]
