@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# CLI script that keeps derived copies of the /review-pr reference markdown files in
+# sync with the canonical copies under .agents/skills/review-pr/references. Derived
+# targets live in .opencode/data and .claude/data; each copy has the SKILL.md path
+# rewritten for its platform. Run with exactly one of --write (rewrite stale targets) or
+# --check (print unified diffs and exit 1 if stale). Exit code comes from main().
 """Sync review-pr reference data from canonical .agents files.
 
 Canonical source:
@@ -29,18 +35,27 @@ Transform = Callable[[str], str]
 
 @dataclass(frozen=True)
 class SyncSpec:
+    # [CLASS DOC]
+    # Frozen dataclass describing one sync job: src (canonical Path), dst (derived Path)
+    # and transform (str -> str function applied to the source text before writing).
     src: Path
     dst: Path
     transform: Transform
 
 
 def transform_for_opencode(text: str) -> str:
+    # [FUNCTION DOC]
+    # Returns text with the literal backticked path to .agents/skills/review-pr/SKILL.md
+    # replaced by the .opencode/command/review-pr.md path. Pure function.
     return text.replace(
         "`.agents/skills/review-pr/SKILL.md`", "`.opencode/command/review-pr.md`"
     )
 
 
 def transform_for_claude(text: str) -> str:
+    # [FUNCTION DOC]
+    # Returns text with the backticked .agents/skills/review-pr/SKILL.md path replaced
+    # by .claude/commands/review-pr.md. Pure function.
     out = text
     out = out.replace(
         "`.agents/skills/review-pr/SKILL.md`", "`.claude/commands/review-pr.md`"
@@ -49,6 +64,10 @@ def transform_for_claude(text: str) -> str:
 
 
 def find_repo_root(start: Path) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Walks from the resolved start path up through its parents and returns the
+    # first directory containing a .git entry (file or dir). Raises RuntimeError if none
+    # is found.
     cur = start.resolve()
     for parent in [cur, *cur.parents]:
         if (parent / ".git").exists():
@@ -57,6 +76,9 @@ def find_repo_root(start: Path) -> Path:
 
 
 def normalized(text: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Converts CRLF and lone CR line endings to LF and guarantees a trailing
+    # newline. Returns the new string.
     norm = text.replace("\r\n", "\n").replace("\r", "\n")
     if not norm.endswith("\n"):
         norm += "\n"
@@ -64,6 +86,13 @@ def normalized(text: str) -> str:
 
 
 def sync_one(spec: SyncSpec, check_only: bool) -> tuple[bool, str]:
+    # [FUNCTION DOC]
+    # Syncs one SyncSpec. Reads and normalizes the source, applies the transform and
+    # normalizes again to get the expected text; reads the existing destination (empty
+    # string if missing). If equal returns (False, ""). In check mode returns (True,
+    # unified diff of existing vs expected) without writing. Otherwise creates parent
+    # dirs, writes the expected text as UTF-8 and returns (True, ""). Any OSError on
+    # read/write is re-raised as RuntimeError naming the file.
     try:
         source_text = normalized(spec.src.read_text(encoding="utf-8"))
     except OSError as exc:
@@ -100,6 +129,10 @@ def sync_one(spec: SyncSpec, check_only: bool) -> tuple[bool, str]:
 
 
 def build_specs(repo_root: Path) -> list[SyncSpec]:
+    # [FUNCTION DOC]
+    # Builds the fixed list of four SyncSpecs: the domains-and-signals and templates
+    # markdown files, each mapped to .opencode/data (opencode transform) and
+    # .claude/data (claude transform), all relative to repo_root.
     canonical_dir = repo_root / ".agents/skills/review-pr/references"
     domains_and_signals = canonical_dir / "review-pr-domains-and-signals.md"
     templates = canonical_dir / "review-pr-templates.md"
@@ -129,6 +162,11 @@ def build_specs(repo_root: Path) -> list[SyncSpec]:
 
 
 def parse_mode(argv: list[str]) -> str:
+    # [FUNCTION DOC]
+    # Parses argv (without program name). -h/--help prints usage to stdout and raises
+    # SystemExit(0). Otherwise requires exactly one of --write/--check (other args are
+    # ignored); if zero or both are given prints an error to stderr and raises
+    # SystemExit(2). Returns the chosen flag string.
     if "-h" in argv or "--help" in argv:
         print("usage: sync_review_pr_refs.py [--write | --check]")
         print()
@@ -149,6 +187,11 @@ def parse_mode(argv: list[str]) -> str:
 
 
 def main() -> int:
+    # [FUNCTION DOC]
+    # Entry point: parses the mode, locates the repo root from this file's location,
+    # runs sync_one on every spec. In write mode prints "updated:" or "up-to-date:" per
+    # target. In check mode, if anything is stale prints a message plus all diffs to
+    # stderr and returns 1, else prints an in-sync message. Returns 0 otherwise.
     mode = parse_mode(sys.argv[1:])
     check_only = mode == "--check"
     write_mode = mode == "--write"

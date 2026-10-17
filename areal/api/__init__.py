@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Public API package for AReaL contracts (engines, schedulers, workflows, rewards,
+# allocation modes and IO structs). Nothing is imported eagerly: __all__ lists the
+# public names and _LAZY_IMPORTS maps each to its defining submodule, resolved on first
+# access by the module-level __getattr__.
 # SPDX-License-Identifier: Apache-2.0
 
 __all__ = [
@@ -54,6 +59,10 @@ _LAZY_IMPORTS = {
 
 
 def __getattr__(name: str):
+    # [FUNCTION DOC]
+    # HELPER: PEP 562 lazy loader. If name is in _LAZY_IMPORTS, imports the mapped
+    # submodule, fetches the attribute, caches it in module globals and returns it;
+    # otherwise raises AttributeError.
     if name in _LAZY_IMPORTS:
         import importlib
 
@@ -65,4 +74,7 @@ def __getattr__(name: str):
 
 
 def __dir__():
+    # [FUNCTION DOC]
+    # HELPER: Returns a list copy of __all__ so dir() / tab completion shows the lazily
+    # exported names.
     return list(__all__)

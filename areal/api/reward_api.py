@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Reward API: a placeholder reward function signature and AsyncRewardWrapper, which runs
+# a synchronous (picklable) reward function in a shared ProcessPoolExecutor from async
+# code with a timeout, retries and broken-pool recovery. Uses the "RewardAPI" logger.
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -15,6 +19,11 @@ logger = logging.getLogger("RewardAPI")
 
 
 def _get_device_count_safely() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Counts accelerator device nodes in /dev without touching CUDA: for
+    # prefixes "nvidia" then "davinci" (Ascend NPU), counts entries named prefix
+    # followed only by digits and returns the first nonzero count. On OSError/ValueError
+    # logs at debug. Falls back to 8 if /dev is missing or no devices match.
     """
     Safely get device count without initializing CUDA context.
     """
@@ -44,6 +53,11 @@ def reward_fn(
     completion_ids: list[int],
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Placeholder documenting the expected reward function signature: prompt string,
+    # completion string, prompt token IDs, completion token IDs, plus arbitrary dataset
+    # fields as kwargs; should return a float. The body is only a docstring, so calling
+    # it returns None.
     """This function is a placeholder for the reward function that will be used in the RLVR pipeline.
 
     In general, there's no restriction on the signature and implementation of this function in customized rollout workflows.
@@ -60,6 +74,11 @@ def reward_fn(
 
 
 class AsyncRewardWrapper:
+    # [CLASS DOC]
+    # Wraps a synchronous reward function so it can be awaited. Class-level state:
+    # _executors maps max_workers value to a shared ProcessPoolExecutor (so wrappers
+    # with the same worker count share one pool), _lock guards it, and
+    # _atexit_registered ensures a single atexit hook that shuts all pools down.
     """Wraps a synchronous reward function for async execution with timeout and retries.
 
     Executors are shared by ``max_workers`` key and cleaned up via ``atexit``.
@@ -80,6 +99,12 @@ class AsyncRewardWrapper:
         max_workers: int | None = None,
         max_retries: int = 3,
     ):
+        # [FUNCTION DOC]
+        # Stores reward_fn, timeout_seconds (default 15) and max_retries (default 3). If
+        # max_workers is None, computes max(cpu_count // device_count // 2, 1). Under
+        # the class lock creates the shared executor for that worker count if absent and
+        # registers the atexit shutdown hook once. Side effects: may spawn a process
+        # pool (lazily started by the executor) and mutate class state.
         self.reward_fn = reward_fn
         self.timeout_seconds = timeout_seconds
         if max_workers is None:
@@ -101,6 +126,10 @@ class AsyncRewardWrapper:
 
     @classmethod
     def _atexit_shutdown_all(cls):
+        # [FUNCTION DOC]
+        # HELPER: atexit hook. Under the lock shuts down every shared executor with
+        # wait=True and cancel_futures=True (logging warnings on errors) and clears the
+        # registry, avoiding worker deadlocks at interpreter exit.
         """Shut down all executors before ``_python_exit`` to prevent
         worker processes deadlocking in ``_finalize_join``.
         Must use ``wait=True`` so the result queue is fully drained.
@@ -120,6 +149,13 @@ class AsyncRewardWrapper:
         max_workers: int,
         broken: ProcessPoolExecutor,
     ) -> ProcessPoolExecutor | None:
+        # [FUNCTION DOC]
+        # HELPER: Replaces a broken shared executor. Under the lock, if the registry
+        # entry for executor_key is no longer the broken instance (already replaced or
+        # removed), returns the current entry (may be None). Otherwise shuts down the
+        # broken pool without waiting, creates a new ProcessPoolExecutor with
+        # max_workers, stores and returns it, logging at info. If creation fails, logs
+        # the exception, removes the key and returns None.
         with cls._lock:
             current = cls._executors.get(executor_key)
             if current is not broken:
@@ -139,6 +175,16 @@ class AsyncRewardWrapper:
             return new_executor
 
     async def __call__(self, *args, **kwargs) -> float:
+        # [FUNCTION DOC]
+        # Awaitable call: runs reward_fn(*args, **kwargs) in the shared executor with
+        # asyncio.wait_for(timeout_seconds), for up to max_retries+1 attempts. Raises
+        # RuntimeError if the executor for this key is gone. On timeout logs a warning
+        # and retries, returning 0.0 after the last attempt. On BrokenProcessPool tries
+        # to recreate the pool and retries; re-raises on the last attempt or if
+        # recreation fails. Other exceptions are logged and retried, re-raised on the
+        # last attempt. Returns the reward value (float).
+        # KNOWN ISSUE: On timeout only the asyncio future is cancelled; the worker
+        # process keeps computing the timed-out task, occupying a pool slot.
         for attempt in range(self.max_retries + 1):
             executor = self._executors.get(self._executor_key)
             if executor is None:

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Geometry3K vision-language math dataset loaders for SFT and RL. Images are center-
+# cropped to a fixed size and JPEG-encoded; prompts have "<image>" replaced by the
+# model-specific image token (Qwen vision tokens, Gemma3 boi_token, or
+# processor.image_token).
 # SPDX-License-Identifier: Apache-2.0
 
 from io import BytesIO
@@ -10,6 +15,9 @@ from torchvision import transforms
 
 
 def pad_to_square(img: Image.Image, fill=(0, 0, 0)) -> Image.Image:
+    # [FUNCTION DOC]
+    # HELPER: Returns a new square PIL image of side max(width, height) filled with fill
+    # (default black) with the input pasted centered. Not used elsewhere in this module.
     w, h = img.size
     side = max(w, h)
     new_img = Image.new(img.mode, (side, side), color=fill)
@@ -23,6 +31,13 @@ def convert_image(
     fixed_width: int | None = None,
     fixed_height: int | None = None,
 ) -> ImageObject:
+    # [FUNCTION DOC]
+    # HELPER: If both fixed_width and fixed_height are given and the image size differs,
+    # center-crops it to that size (torchvision CenterCrop). Converts to RGB if needed,
+    # then encodes as JPEG and returns the raw bytes.
+    # KNOWN ISSUE: Annotated to accept dict/str and return an Image, but it only works
+    # with PIL images and returns JPEG bytes. CenterCrop expects (height, width) yet is
+    # given (width, height); harmless only for square sizes.
     if (
         fixed_width is not None
         and fixed_height is not None
@@ -47,6 +62,17 @@ def get_geometry3k_sft_dataset(
     processor,
     max_length: int | None = None,
 ):
+    # [FUNCTION DOC]
+    # Loads the split and, per example, swaps "<image>" for the image token, removes the
+    # word "different" from the problem, converts images to 512x512 JPEG bytes and
+    # builds seq = problem + answer + eos. Then runs the multimodal processor on seq and
+    # images to get input_ids, mm_token_type_ids, multi_modal_input (pixel_values and
+    # optional image_grid_thw), and a loss_mask of 1 over the last len(tokenized answer)
+    # tokens and 0 elsewhere. Drops raw columns, optionally filters by max_length,
+    # returns the Dataset.
+    # KNOWN ISSUE: The loss mask counts answer tokens without eos, so the eos token is
+    # masked as 1 and the first answer token may be masked 0; the "processor is not
+    # None" check occurs after processor was already dereferenced.
     """
     "geometry3k": {
         "image_key": "images",
@@ -59,6 +85,8 @@ def get_geometry3k_sft_dataset(
     tokenizer = processor.tokenizer
 
     def process_example(example, idx):
+        # [FUNCTION DOC]
+        # HELPER: Per-example text/image preprocessing described above; idx is unused.
         # Add query_id column
         images = example["images"]
         image_processor_type = processor.image_processor.image_processor_type.lower()
@@ -85,6 +113,9 @@ def get_geometry3k_sft_dataset(
     )
 
     def _process(example):
+        # [FUNCTION DOC]
+        # HELPER: Runs the processor on one example and adds input_ids,
+        # mm_token_type_ids, multi_modal_input and loss_mask.
         text = example["seq"]
         processed_input = processor(
             text=[text],
@@ -128,9 +159,19 @@ def get_geometry3k_rl_dataset(
     processor,
     max_length: int | None = None,
 ):
+    # [FUNCTION DOC]
+    # Loads the split and maps each sample to: messages (single user turn with image
+    # token substituted, "different" removed and a think/boxed instruction appended,
+    # rendered to a string via the tokenizer chat template with a generation prompt),
+    # messages_chat (OpenAI-style content list with an empty image_url placeholder
+    # filled later by the engine plus the text), and images (448x448 JPEG bytes).
+    # Removes problem. If max_length is set, filters by the processor's total token
+    # count including image tokens. Returns the Dataset.
     dataset = load_dataset(path=path, split=split)
 
     def process(sample):
+        # [FUNCTION DOC]
+        # HELPER: Builds messages, messages_chat and images for one sample.
         processed_images = [
             convert_image(image, 448, 448) for image in sample["images"]
         ]
@@ -190,6 +231,9 @@ def get_geometry3k_rl_dataset(
     if max_length is not None:
 
         def filter_length(sample):
+            # [FUNCTION DOC]
+            # HELPER: Runs the processor on the rendered prompt and images and returns
+            # True if the input_ids length is <= max_length.
             # Process the sample to get the total token count including image tokens
             processed_input = processor(
                 text=[sample["messages"]],

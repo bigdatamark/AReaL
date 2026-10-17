@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Plain data structures exchanged between workflows, inference engines, train engines
+# and controllers: generation requests/responses, finetune/step bookkeeping, parameter
+# specs, weight-update metadata and HTTP request descriptors, save/load metadata,
+# rollout counters, local server info, and device memory snapshots. Uses the "IOStruct"
+# logger.
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
@@ -27,6 +33,11 @@ logger = logging.getLogger("IOStruct")
 
 @dataclass
 class ModelRequest:
+    # [CLASS DOC]
+    # Dataclass for one generation request: rid (random UUID string by default),
+    # input_ids, gconfig (GenerationHyperparameters), metadata dict, optional tokenizer
+    # for encode/decode, VLM fields image_data (list of image strings, e.g. base64) and
+    # processor, and vision_msg_vllm (vLLM-specific vision message list).
     rid: str = field(default_factory=lambda: str(uuid.uuid4()))
     input_ids: list[int] = field(default_factory=list)
     gconfig: GenerationHyperparameters = field(
@@ -44,6 +55,12 @@ class ModelRequest:
     vision_msg_vllm: list | None = None
 
     def copy(self):
+        # [FUNCTION DOC]
+        # Returns a new ModelRequest with the same rid, a shallow-copied input_ids list,
+        # metadata dict, image_data and vision_msg_vllm (None preserved), a fresh
+        # gconfig via gconfig.new(), and shared tokenizer/processor references.
+        # KNOWN ISSUE: metadata is only shallow-copied, so nested mutable values are
+        # shared with the original.
         return ModelRequest(
             rid=self.rid,
             input_ids=self.input_ids.copy(),
@@ -62,6 +79,12 @@ class ModelRequest:
 
 @dataclass
 class ModelResponse:
+    # [CLASS DOC]
+    # Dataclass for a generation result: input_tokens, output_tokens, per-token
+    # output_logprobs and output_versions (policy weight version that produced each
+    # token), stop_reason (length/stop/tool_calls/abort), optional tokenizer, VLM
+    # input_images and processor, timing stats (latency, ttft, per-token itl; inf when
+    # unset), and optional MoE routed_experts array.
     # outputs
     input_tokens: list[int] = field(default_factory=list)
     output_tokens: list[int] = field(default_factory=list)
@@ -85,14 +108,22 @@ class ModelResponse:
 
     @property
     def input_len(self) -> int:
+        # [FUNCTION DOC]
+        # Property: number of input tokens.
         return len(self.input_tokens)
 
     @property
     def output_len(self) -> int:
+        # [FUNCTION DOC]
+        # Property: number of output tokens.
         return len(self.output_tokens)
 
     @property
     def end_with_stop(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: True if the last output token equals the tokenizer's eos or pad id
+        # (ignoring ids that are None); False for empty output. Raises ValueError if
+        # tokenizer is None.
         if self.tokenizer is None:
             raise ValueError("tokenizer is None, cannot check end_with_stop")
         eos_id = self.tokenizer.eos_token_id
@@ -106,6 +137,13 @@ class ModelResponse:
 
     @property
     def output_tokens_without_stop(self) -> list[int]:
+        # [FUNCTION DOC]
+        # Property: output tokens with trailing stop tokens stripped. Requires a
+        # tokenizer (ValueError otherwise). For stop_reason length/abort or empty output
+        # returns output_tokens unchanged. Otherwise requires the output to end with
+        # eos/pad (ValueError if not), counts the trailing run of eos/pad ids and
+        # returns the prefix before them; raises ValueError if every token is a stop
+        # token.
         if self.tokenizer is None:
             raise ValueError("tokenizer is None, cannot get output_tokens_without_stop")
         if self.stop_reason not in ["length", "abort"] and self.output_tokens:
@@ -133,38 +171,58 @@ class ModelResponse:
 
 @dataclass
 class FinetuneSpec:
+    # [CLASS DOC]
+    # Dataclass of training schedule sizes: total_train_epochs, dataset_size,
+    # train_batch_size.
     total_train_epochs: int
     dataset_size: int
     train_batch_size: int
 
     @property
     def total_train_steps(self):
+        # [FUNCTION DOC]
+        # Property: epochs times floor(dataset_size / train_batch_size), assuming the
+        # last partial batch is dropped.
         # assuming drop_last
         return self.total_train_epochs * (self.dataset_size // self.train_batch_size)
 
     @property
     def steps_per_epoch(self):
+        # [FUNCTION DOC]
+        # Property: floor(dataset_size / train_batch_size).
         return self.dataset_size // self.train_batch_size
 
 
 @dataclass
 class ParamSpec:
+    # [CLASS DOC]
+    # Dataclass describing a model parameter for weight transfer: name, shape tuple and
+    # dtype as a torch attribute name string (e.g. "bfloat16").
     name: str
     shape: tuple
     dtype: str
 
     @property
     def size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: byte size computed as torch dtype itemsize times product of shape.
+        # KNOWN ISSUE: Returns a numpy scalar (and a float for an empty shape) rather
+        # than a Python int as annotated.
         """Param bytes"""
         return getattr(torch, self.dtype).itemsize * np.prod(self.shape)
 
 
 def get_versioned_lora_name(lora_name: str, version: int) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns "<lora_name>-v<version>".
     """Get versioned LoRA adapter name (e.g., 'lora-v1')."""
     return f"{lora_name}-v{version}"
 
 
 def detect_image_mime(base64_data: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Infers MIME type from base64 magic prefixes: PNG, JPEG, GIF, WebP;
+    # defaults to image/jpeg for anything unrecognized.
     """Detect image MIME type from the first bytes of base64-encoded data.
 
     Examines base64 magic byte prefixes to determine the actual image format.
@@ -182,6 +240,14 @@ def detect_image_mime(base64_data: str) -> str:
 
 @dataclass
 class WeightUpdateMeta:
+    # [CLASS DOC]
+    # Dataclass describing how trained weights are pushed to inference servers. type is
+    # disk (save to path then reload), xccl (NCCL/HCCL broadcast using gen_allocation
+    # and the nccl master address/port/group name, chunked by weight_chunked_mem_mb) or
+    # awex. LoRA fields: use_lora, lora_name, lora_int_id, base_model_name, peft_config,
+    # lora_keep_versions (number of adapter versions kept loaded; 0 disables unloading).
+    # clear_checkpoint_after_load controls deleting the disk checkpoint after loading;
+    # version is the weight version tag.
     type: Literal["disk", "xccl", "awex"]
     path: str | None = None
     gen_allocation: ModelAllocation | None = None
@@ -205,6 +271,10 @@ class WeightUpdateMeta:
     version: int | None = None
 
     def with_version(self, version: int) -> "WeightUpdateMeta":
+        # [FUNCTION DOC]
+        # Returns a shallow copy with version set and, if path is set, path replaced by
+        # sibling directory "weight_update_v<version>" (same parent). Raises ValueError
+        # for negative version. peft_config dict is shared with the original.
         """Return a copy of this meta with versioned path.
 
         Changes path from 'weight_update' to 'weight_update_v{version}'.
@@ -232,6 +302,10 @@ class WeightUpdateMeta:
         base_model_name: str = "",
         lora_keep_versions: int = 0,
     ) -> "WeightUpdateMeta":
+        # [FUNCTION DOC]
+        # Factory for disk updates: path is "<Saver model save root for
+        # experiment/trial/file_root/name>/weight_update"; forwards the LoRA and cleanup
+        # options. Note lora_int_id defaults to 1 here (field default is 0).
         from areal.utils.saver import Saver
 
         path = os.path.join(
@@ -259,6 +333,10 @@ class WeightUpdateMeta:
         lora_int_id: int = 1,
         base_model_name: str = "",
     ):
+        # [FUNCTION DOC]
+        # Factory for xccl updates from a Megatron engine with the given gen_allocation,
+        # chunk size and LoRA options; NCCL address fields are left None to be filled
+        # later.
         return cls(
             type="xccl",
             gen_allocation=gen_allocation,
@@ -279,6 +357,8 @@ class WeightUpdateMeta:
         lora_int_id: int = 1,
         base_model_name: str = "",
     ):
+        # [FUNCTION DOC]
+        # Factory for xccl updates from an FSDP engine; identical to from_megatron_xccl.
         return cls(
             type="xccl",
             gen_allocation=gen_allocation,
@@ -298,6 +378,9 @@ class WeightUpdateMeta:
         lora_int_id: int = 1,
         base_model_name: str = "",
     ):
+        # [FUNCTION DOC]
+        # Factory for awex updates; stores meta_server_addr in nccl_master_address plus
+        # LoRA options.
         return cls(
             type="awex",
             nccl_master_address=meta_server_addr,
@@ -310,6 +393,9 @@ class WeightUpdateMeta:
 
 @dataclass
 class HttpRequest:
+    # [CLASS DOC]
+    # Dataclass for one HTTP call to an inference server: endpoint path, JSON payload,
+    # method (default POST) and best_effort (log and ignore failures).
     """Represents an HTTP request to be sent to a remote inference server."""
 
     endpoint: str
@@ -322,6 +408,9 @@ class HttpRequest:
 
 @dataclass
 class HttpGenerationResult:
+    # [CLASS DOC]
+    # Dataclass of parsed generation output: output_tokens, output_logprobs, stop_reason
+    # string and optional routed_experts array; validated on construction.
     """Parsed result from a generation response."""
 
     output_tokens: list[int]
@@ -330,6 +419,10 @@ class HttpGenerationResult:
     routed_experts: np.ndarray | None = None
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Validates that tokens and logprobs have equal length and that every logprob is
+        # a finite int/float (bool rejected); raises ValueError describing the first
+        # problem.
         if len(self.output_tokens) != len(self.output_logprobs):
             raise ValueError(
                 "Malformed generation result: received "
@@ -354,6 +447,8 @@ class HttpGenerationResult:
 
 @dataclass
 class WeightUpdateRequests:
+    # [CLASS DOC]
+    # Dataclass wrapping the ordered list of HttpRequests for one weight update.
     """Collection of HTTP requests needed for a weight update operation."""
 
     requests: list[HttpRequest]
@@ -361,6 +456,10 @@ class WeightUpdateRequests:
 
 @dataclass
 class SaveLoadMeta:
+    # [CLASS DOC]
+    # Dataclass of checkpoint save/load options: path, weight_format (e.g. hf or dcp),
+    # with_optim, optional tokenizer/processor to save alongside, base_model_path
+    # (source of config/extra files), naive_distributed flag.
     path: str
     weight_format: str
     with_optim: bool
@@ -372,6 +471,9 @@ class SaveLoadMeta:
 
 @dataclass
 class RolloutStat:
+    # [CLASS DOC]
+    # Dataclass of rollout counters: accepted, enqueued, rejected, running (all default
+    # 0).
     accepted: int = 0
     enqueued: int = 0
     rejected: int = 0
@@ -380,12 +482,18 @@ class RolloutStat:
 
 @dataclass
 class StepInfo:
+    # [CLASS DOC]
+    # Dataclass of training position: epoch, epoch_step (0-based within epoch),
+    # global_step, steps_per_epoch.
     epoch: int
     epoch_step: int
     global_step: int
     steps_per_epoch: int
 
     def next(self):
+        # [FUNCTION DOC]
+        # Returns the following StepInfo: global_step+1, epoch_step+1, or rolls over to
+        # epoch+1 with epoch_step 0 when the current step is the last of the epoch.
         return StepInfo(
             epoch=self.epoch + (self.epoch_step == self.steps_per_epoch - 1),
             epoch_step=(
@@ -400,6 +508,9 @@ class StepInfo:
 
 @dataclass
 class LocalInfServerInfo:
+    # [CLASS DOC]
+    # Dataclass for a locally launched inference server: host, port and the Popen handle
+    # (None if not owned).
     """Information about a locally launched inference server."""
 
     host: str
@@ -409,6 +520,9 @@ class LocalInfServerInfo:
 
 @dataclass
 class DeviceRuntimeInfo:
+    # [CLASS DOC]
+    # Dataclass snapshot of accelerator memory: allocated, reserved, used (total minus
+    # free) and total, in the given unit string.
     mem_allocated: float
     mem_reserved: float
     mem_used: float
@@ -417,6 +531,10 @@ class DeviceRuntimeInfo:
 
     @classmethod
     def get_current(cls, unit: str = "GB"):
+        # [FUNCTION DOC]
+        # Classmethod: queries current_platform for allocated, reserved and (free,
+        # total) memory and returns an instance scaled to unit GB, MB or KB (binary).
+        # Raises ValueError for other units.
         unit_divisors = {"GB": 1024**3, "MB": 1024**2, "KB": 1024}
         if unit not in unit_divisors:
             raise ValueError(
@@ -437,6 +555,11 @@ class DeviceRuntimeInfo:
         )
 
     def log(self, head: str = "", rank: int = 0, precision: int = 2):
+        # [FUNCTION DOC]
+        # Logs an info line with the memory figures formatted to precision decimals,
+        # prefixed by head, if torch.distributed is not initialized, rank is None, or
+        # the current rank equals rank. Appends host RssAnon/RssShmem in MB parsed from
+        # /proc/self/status when readable (errors silently ignored).
         mem_allocated = f"{self.mem_allocated:.{precision}f}"
         mem_reserved = f"{self.mem_reserved:.{precision}f}"
         mem_used = f"{self.mem_used:.{precision}f}"

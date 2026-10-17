@@ -1,3 +1,9 @@
+# [PACKAGE DOC]
+# Dataset package entry point. Lists VALID_DATASETS (built-in loader keys) and exposes
+# get_custom_dataset, which dispatches a dataset path + training type (sft/rl/rw/dpo) to
+# the matching loader submodule (imported lazily), falls back to a HuggingFace
+# load_from_disk dataset, or returns a remote RDataset in single-controller mode. Uses
+# the "Dataset" logger.
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import TYPE_CHECKING, Optional
@@ -33,6 +39,19 @@ def _get_custom_dataset(
     processor: Optional["ProcessorMixin"] = None,
     **kwargs,
 ) -> "Dataset":
+    # [FUNCTION DOC]
+    # HELPER: Dispatches on substrings of path and type: gsm8k (sft/rl, tokenizer),
+    # clevr_count_70k (sft/rl, processor), geometry3k (sft/rl, processor), virl39k (rl,
+    # case-insensitive match, processor), hh-rlhf (rw/dpo, tokenizer), torl_data (rl,
+    # tokenizer). Calls the matching loader with path, split, max_length and kwargs and
+    # returns its Dataset. Otherwise tries datasets.load_from_disk(path): for a
+    # DatasetDict returns the requested split (ValueError listing available splits if
+    # missing) or the first split when split is None (ValueError if empty); a plain
+    # Dataset is returned as is. Any failure in the fallback is wrapped in a ValueError
+    # listing supported datasets and the load error.
+    # KNOWN ISSUE: The ValueError raised for a missing split inside the fallback is
+    # caught by the broad except and re-wrapped as "not supported", obscuring the
+    # message; the final raise also omits "from load_err".
     if "gsm8k" in path and type == "sft":
         from .gsm8k import get_gsm8k_sft_dataset
 
@@ -169,6 +188,16 @@ def get_custom_dataset(
     processor: Optional["ProcessorMixin"] = None,
     **kwargs,
 ) -> "Dataset | RDataset":
+    # [FUNCTION DOC]
+    # Public loader. In single-controller mode with a dataset_config that has a
+    # scheduling_spec, returns an RDataset (remote data-service dataset) built from the
+    # config path, type, split, max_length and dataset_kwargs;
+    # tokenizer/processor/kwargs are not forwarded there. Otherwise with a config, calls
+    # _get_custom_dataset using the config's path, type and max_length plus tokenizer,
+    # processor and kwargs. Without a config logs a warning and calls
+    # _get_custom_dataset with only split/tokenizer/processor/kwargs.
+    # KNOWN ISSUE: The no-config branch passes no path, so it raises TypeError unless
+    # the caller supplies path in kwargs.
     from areal.utils.environ import is_single_controller
 
     if (

@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# GSM8K grade-school math loaders (HuggingFace "main" config) for SFT (tokenized
+# question+answer with loss mask) and RL (chat messages prompting a boxed final answer).
 # SPDX-License-Identifier: Apache-2.0
 
 from datasets import load_dataset
@@ -9,9 +12,19 @@ def get_gsm8k_sft_dataset(
     tokenizer,
     max_length: int | None = None,
 ):
+    # [FUNCTION DOC]
+    # Loads the split, tokenizes each sample as question + answer + eos into input_ids,
+    # and builds loss_mask with 0 for the question-token prefix length and 1 for the
+    # rest. Drops question/answer columns and, if max_length is set, filters out samples
+    # whose input_ids exceed it. Returns the mapped datasets.Dataset.
+    # KNOWN ISSUE: The mask assumes tokenizing the question alone yields an exact prefix
+    # of the full tokenization, which may not hold at the boundary for BPE tokenizers.
     dataset = load_dataset(path=path, name="main", split=split)
 
     def process(sample):
+        # [FUNCTION DOC]
+        # HELPER: Per-sample map function returning input_ids and loss_mask as described
+        # above.
         seq_token = tokenizer.encode(
             sample["question"] + sample["answer"] + tokenizer.eos_token
         )
@@ -34,9 +47,16 @@ def get_gsm8k_rl_dataset(
     tokenizer,
     max_length: int | None = None,
 ):
+    # [FUNCTION DOC]
+    # Loads the split and converts each sample into messages: a single user turn with
+    # the question plus an instruction to put the final answer in \boxed{}. Removes the
+    # question column (answer is kept for reward). If max_length is set, filters samples
+    # whose tokenized user content exceeds it. Returns the Dataset.
     dataset = load_dataset(path=path, name="main", split=split)
 
     def process(sample):
+        # [FUNCTION DOC]
+        # HELPER: Builds the one-message user chat list for a sample.
         messages = [
             {
                 "role": "user",
@@ -52,6 +72,9 @@ def get_gsm8k_rl_dataset(
     if max_length is not None:
 
         def filter_length(sample):
+            # [FUNCTION DOC]
+            # HELPER: Returns True if the tokenized first message content length is <=
+            # max_length (no chat template applied).
             # Tokenize the user content to check length
             content = sample["messages"][0]["content"]
             tokens = tokenizer.encode(content)

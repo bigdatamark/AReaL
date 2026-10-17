@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Resource allocation and parallelism description. Defines ParallelStrategy
+# (tp/pp/dp/cp/ep/etp sizes) and its FSDP/Megatron variants, ModelAllocation (backend +
+# optional name + parallel strategy + scheduling strategy) parsed from strings like
+# "fsdp:d4t2" or "megatron:(attn:d1p2t4|ffn:d1p2e4)", the deprecated multi-component
+# _AllocationMode for SPMD launchers ("+" = separate GPUs, "|" = colocate, "|" binds
+# tighter), and a Lark Earley grammar plus transformer that build these objects with
+# validation. Importing the removed AllocationMode name raises an explanatory
+# AttributeError. Uses the "AllocMode" logger (currently unused).
 # SPDX-License-Identifier: Apache-2.0
 
 import enum
@@ -14,6 +23,9 @@ logger = logging.getLogger("AllocMode")
 
 
 class AllocationType(enum.Enum):
+    # [CLASS DOC]
+    # Legacy enum of allocation kinds: COLOCATE (training and inference share GPUs, also
+    # training-only), DECOUPLED_TRAIN (separate GPUs), LLM_SERVER_ONLY (inference only).
     """Backward Compatible: Type of resource allocation strategy."""
 
     COLOCATE = 0  # Shared resources between training and inference (including SFT/training-only)
@@ -22,15 +34,27 @@ class AllocationType(enum.Enum):
 
 
 class AllocationValidationError(Exception):
+    # [CLASS DOC]
+    # Exception for semantic allocation validation failures (duplicate/missing names,
+    # incompatible sizes, missing backend).
     """Raised when allocation mode validation fails."""
 
 
 class InvalidAllocationModeError(Exception):
+    # [CLASS DOC]
+    # Legacy exception kept for compatibility; raised when hybrid MoE attention and
+    # expert world sizes differ.
     """Legacy exception for backward compatibility with existing code."""
 
 
 @dataclass
 class ParallelStrategy:
+    # [CLASS DOC]
+    # Dataclass with tensor, pipeline, data, context, expert and expert-tensor parallel
+    # sizes (all default 1), following Megatron MoE parallel folding: world_size =
+    # dp*cp*tp*pp; expert modules re-fold the same devices as edp*ep*etp*pp. Provides
+    # short alias properties (tp_size, pp_size, dp_size, cp_size, ep_size, etp_size,
+    # edp_size).
     """5D parallel strategy supporting tensor, pipeline, data, context, and expert parallelism.
 
     This class represents a comprehensive parallelization strategy for distributed ML workloads,
@@ -91,6 +115,10 @@ class ParallelStrategy:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # When expert_parallel_size > 1, sets the dynamic attribute
+        # expert_model_parallel_size = pp*etp*ep and asserts it divides world_size
+        # (AssertionError otherwise).
         """Initialize computed properties and validate configuration."""
         if self.expert_parallel_size > 1:
             # Calculate expert model parallel size for validation
@@ -108,6 +136,9 @@ class ParallelStrategy:
 
     @property
     def expert_data_parallel_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: world_size // expert_model_parallel_size if that attribute was set
+        # (ep > 1), else data_parallel_size.
         """Data parallelism size for expert modules in MoE models."""
         if not hasattr(self, "expert_model_parallel_size"):
             return self.data_parallel_size
@@ -116,41 +147,58 @@ class ParallelStrategy:
     # Abbreviated properties for convenience
     @property
     def tp_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property alias of tensor_parallel_size.
         """Tensor parallelism size (abbreviated)."""
         return self.tensor_parallel_size
 
     @property
     def pp_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property alias of pipeline_parallel_size.
         """Pipeline parallelism size (abbreviated)."""
         return self.pipeline_parallel_size
 
     @property
     def dp_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property alias of data_parallel_size.
         """Data parallelism size (abbreviated)."""
         return self.data_parallel_size
 
     @property
     def cp_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property alias of context_parallel_size.
         """Context parallelism size (abbreviated)."""
         return self.context_parallel_size
 
     @property
     def ep_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property alias of expert_parallel_size.
         """Expert parallelism size (abbreviated)."""
         return self.expert_parallel_size
 
     @property
     def etp_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property alias of expert_tensor_parallel_size.
         """Expert tensor parallelism size (abbreviated)."""
         return self.expert_tensor_parallel_size
 
     @property
     def edp_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property alias of expert_data_parallel_size.
         """Expert data parallelism size (abbreviated)."""
         return self.expert_data_parallel_size
 
     @property
     def world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Property: total devices, dp * cp * tp * pp (expert dims are folded into these,
+        # not multiplied).
         """Total number of devices required for this parallelization strategy."""
         return (
             self.data_parallel_size
@@ -160,6 +208,11 @@ class ParallelStrategy:
         )
 
     def __str__(self):
+        # [FUNCTION DOC]
+        # Returns "Parallel(tp=..,pp=..,dp=..[,cp=..][,ep=..[,ep_tp=..]])", including cp
+        # only if > 1, ep only if > 1 and ep_tp only alongside ep when != 1.
+        # KNOWN ISSUE: The docstring says it shows only non-default dimensions, but
+        # tp/pp/dp are always shown.
         """String representation showing all non-default parallelism dimensions."""
         parts = [
             f"tp={self.tensor_parallel_size}",
@@ -178,6 +231,9 @@ class ParallelStrategy:
 
     @staticmethod
     def parallelism_eq(this, other):
+        # [FUNCTION DOC]
+        # Static method: True if all six parallel sizes of this and other match. Static
+        # (not __eq__) to avoid OmegaConf issues.
         """Compare two parallelism configurations for equality.
 
         Args:
@@ -202,16 +258,23 @@ class ParallelStrategy:
 
 @dataclass
 class FSDPParallelStrategy(ParallelStrategy):
+    # [CLASS DOC]
+    # ParallelStrategy subclass for FSDP; adds no fields.
     """FSDP parallel strategy."""
 
     @staticmethod
     def parallelism_eq(this, other):
+        # [FUNCTION DOC]
+        # Static method delegating to ParallelStrategy.parallelism_eq.
         """Compare FSDP parallelism configurations."""
         return ParallelStrategy.parallelism_eq(this, other)
 
 
 @dataclass
 class MegatronParallelStrategy(ParallelStrategy):
+    # [CLASS DOC]
+    # ParallelStrategy subclass adding virtual_pipeline_parallel_size (interleaved
+    # schedule, default 1) and use_sequence_parallel (default False).
     """Megatron parallel strategy with additional sequence parallelism and virtual pipeline parallelism."""
 
     virtual_pipeline_parallel_size: int = field(
@@ -229,6 +292,9 @@ class MegatronParallelStrategy(ParallelStrategy):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs the base validation, clamps vpp values <= 1 to 1, and raises
+        # AllocationValidationError if vpp > 1 while pipeline_parallel_size <= 1.
         super().__post_init__()
         vpp = self.virtual_pipeline_parallel_size
         if vpp <= 1:
@@ -240,6 +306,9 @@ class MegatronParallelStrategy(ParallelStrategy):
 
     @staticmethod
     def parallelism_eq(this, other):
+        # [FUNCTION DOC]
+        # Static method: base parallelism equality plus equal virtual pipeline sizes
+        # (sequence parallel flag ignored).
         """Compare Megatron parallelism configurations (excluding sequence parallelism)."""
         return ParallelStrategy.parallelism_eq(this, other) and (
             this.virtual_pipeline_parallel_size == other.virtual_pipeline_parallel_size
@@ -248,6 +317,10 @@ class MegatronParallelStrategy(ParallelStrategy):
 
 @dataclass
 class ModelAllocation:
+    # [CLASS DOC]
+    # Dataclass for one model component: backend (fsdp, megatron, archon, vllm, sglang),
+    # optional name (role), parallel strategy and scheduling_strategy (separation or
+    # colocation with a target).
     """Single model allocation with backend, name, parallel strategy, and scheduling.
 
     Parameters
@@ -272,6 +345,9 @@ class ModelAllocation:
     scheduling_strategy: SchedulingStrategy
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises AllocationValidationError for the fsdp backend if pipeline or expert
+        # parallel size is > 1.
         if self.backend == "fsdp":
             if (
                 self.parallel.pipeline_parallel_size > 1
@@ -289,6 +365,14 @@ class ModelAllocation:
         name: str | None = None,
         scheduling_strategy: SchedulingStrategy | None = None,
     ) -> "ModelAllocation":
+        # [FUNCTION DOC]
+        # Parses a single-component spec string (backend prefix required). Raises
+        # ValueError if it contains "+". Parses with _LLMParallelParser; accepts a one-
+        # element list or a ModelAllocation result (ValueError otherwise, e.g. a "|"
+        # spec producing several). Overrides name if given and sets scheduling_strategy
+        # to the given one or a default separation strategy. Returns the
+        # ModelAllocation. Parser errors propagate as
+        # ValueError/AllocationValidationError.
         """Parse a single backend:parallelism string into a ModelAllocation.
 
         Parameters
@@ -351,11 +435,17 @@ class ModelAllocation:
 
     @property
     def world_size(self):
+        # [FUNCTION DOC]
+        # Property: 0 for colocated allocations (they reuse the target's GPUs), else
+        # parallel.world_size.
         if self.scheduling_strategy.type == SchedulingStrategyType.colocation.value:
             return 0
         return self.parallel.world_size
 
     def __str__(self):
+        # [FUNCTION DOC]
+        # Returns "backend[(name)]:dims" where dims concatenates d,p,t,c,e sizes that
+        # differ from 1 in that order, or "d1" if all are 1.
         dims = []
         if self.parallel.data_parallel_size != 1:
             dims.append(f"d{self.parallel.data_parallel_size}")
@@ -381,6 +471,11 @@ class ModelAllocation:
 
 @dataclass
 class _AllocationMode:
+    # [CLASS DOC]
+    # Deprecated container of ModelAllocations for SPMD launchers (local/ray/slurm).
+    # Supports lookup by name and legacy properties (type_, gen, train, gen_backend,
+    # train_backend, gen_instance_size) that assume at most one inference and one
+    # training component.
     """DEPRECATED — Legacy resource allocation configuration for SPMD launchers only.
 
     Use :class:`ModelAllocation` with per-engine ``backend`` fields instead.
@@ -421,6 +516,11 @@ class _AllocationMode:
 
     @classmethod
     def from_str(cls, allocation_mode: str):
+        # [FUNCTION DOC]
+        # Classmethod: parses a full allocation-mode string (with "+" and "|") via
+        # _LLMParallelParser and wraps the result in _AllocationMode. Raises
+        # AllocationValidationError / InvalidAllocationModeError for semantic errors,
+        # ValueError (with syntax hints) for parse errors.
         """Parse allocation mode string into _AllocationMode object.
 
         Parameters
@@ -471,6 +571,8 @@ class _AllocationMode:
         return parser._convert_to_allocation_mode(result)
 
     def __getitem__(self, name: str) -> ModelAllocation:
+        # [FUNCTION DOC]
+        # Returns the allocation whose name equals name; raises KeyError if none.
         """Get allocation by name."""
         for alloc in self.allocations:
             if alloc.name == name:
@@ -479,13 +581,19 @@ class _AllocationMode:
 
     @property
     def world_size(self):
+        # [FUNCTION DOC]
+        # Property: sum of component world sizes (colocated components contribute 0).
         return sum(alloc.world_size for alloc in self.allocations)
 
     def _get_inference_allocations(self) -> list[ModelAllocation]:
+        # [FUNCTION DOC]
+        # HELPER: Returns allocations with sglang or vllm backend.
         """Get all inference allocations (sglang, vllm backends)."""
         return [a for a in self.allocations if a.backend in ("sglang", "vllm")]
 
     def _get_training_allocations(self) -> list[ModelAllocation]:
+        # [FUNCTION DOC]
+        # HELPER: Returns allocations with fsdp, megatron or archon backend.
         """Get all training allocations (fsdp, megatron, archon backends)."""
         return [
             a for a in self.allocations if a.backend in ("fsdp", "megatron", "archon")
@@ -496,6 +604,11 @@ class _AllocationMode:
     # These properties are only retained for SPMD launcher compatibility and will be removed.
     @property
     def type_(self) -> AllocationType:
+        # [FUNCTION DOC]
+        # Deprecated property. Requires 1 or 2 allocations (AttributeError otherwise).
+        # One allocation: LLM_SERVER_ONLY if inference backend else COLOCATE. Two:
+        # requires exactly one inference and one training allocation (AttributeError
+        # otherwise); DECOUPLED_TRAIN if both use separation scheduling, else COLOCATE.
         """DEPRECATED: Infer allocation type from allocations. Use ModelAllocation directly."""
         if len(self.allocations) not in [1, 2]:
             raise AttributeError(
@@ -524,6 +637,10 @@ class _AllocationMode:
 
     @property
     def gen(self) -> ParallelStrategy:
+        # [FUNCTION DOC]
+        # Deprecated property: parallel strategy of the single inference allocation,
+        # None if none, AttributeError if several.
+        # KNOWN ISSUE: Annotated as returning ParallelStrategy but may return None.
         """Backward compatible: returns parallel strategy for single inference allocation."""
         inf_allocs = self._get_inference_allocations()
         if len(inf_allocs) == 0:
@@ -537,6 +654,9 @@ class _AllocationMode:
 
     @property
     def train(self) -> ParallelStrategy | None:
+        # [FUNCTION DOC]
+        # Deprecated property: parallel strategy of the single training allocation, None
+        # if none, AttributeError if several.
         """Backward compatible: returns parallel strategy for single training allocation."""
         train_allocs = self._get_training_allocations()
         if len(train_allocs) == 0:
@@ -550,6 +670,9 @@ class _AllocationMode:
 
     @property
     def gen_backend(self) -> str | None:
+        # [FUNCTION DOC]
+        # Deprecated property: backend of the single inference allocation, None if none,
+        # AttributeError if several.
         """Backward compatible: returns backend for single inference allocation."""
         inf_allocs = self._get_inference_allocations()
         if len(inf_allocs) == 0:
@@ -563,6 +686,9 @@ class _AllocationMode:
 
     @property
     def train_backend(self) -> str | None:
+        # [FUNCTION DOC]
+        # Deprecated property: backend of the single training allocation, None if none,
+        # AttributeError if several.
         """Backward compatible: returns backend for single training allocation."""
         train_allocs = self._get_training_allocations()
         if len(train_allocs) == 0:
@@ -576,6 +702,9 @@ class _AllocationMode:
 
     @property
     def gen_instance_size(self) -> int:
+        # [FUNCTION DOC]
+        # Deprecated property: tp_size * pp_size (GPUs per server instance) of the
+        # single inference allocation; AttributeError if none or several.
         """Backward compatible: returns instance size for single inference allocation."""
         inf_allocs = self._get_inference_allocations()
         if len(inf_allocs) == 0:
@@ -641,6 +770,9 @@ ALLOCATION_GRAMMAR = """
 
 @dataclass
 class ParallelDimension:
+    # [CLASS DOC]
+    # HELPER: Parser intermediate holding one dimension letter (d/t/p/c/e) and its size;
+    # str gives e.g. "d4".
     """Single parallelism dimension with type and size.
 
     Used internally by the grammar parser to represent individual
@@ -651,11 +783,15 @@ class ParallelDimension:
     size: int  # Parallelism degree
 
     def __str__(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns type letter followed by size.
         return f"{self.type_}{self.size}"
 
 
 @dataclass
 class InferenceParallelism:
+    # [CLASS DOC]
+    # Legacy dataclass pairing an inference backend name with a ParallelStrategy.
     """Backward Compatible: Inference parallelism configuration with backend and validation.
 
     Represents the parallelization strategy for inference workloads,
@@ -667,6 +803,9 @@ class InferenceParallelism:
     strategy: ParallelStrategy
 
     def __str__(self):
+        # [FUNCTION DOC]
+        # Returns "backend:dims" listing d, t, p sizes that differ from 1 (or "d1" if
+        # none).
         dims = []
         if self.strategy.data_parallel_size != 1:
             dims.append(f"d{self.strategy.data_parallel_size}")
@@ -680,13 +819,23 @@ class InferenceParallelism:
 
 
 class _ParallelStrategyTransformer(Transformer):
+    # [CLASS DOC]
+    # HELPER: Lark Transformer turning the allocation parse tree into ModelAllocation
+    # objects or lists of them. Methods are named after grammar rules/terminals and
+    # receive child results as items. Tracks seen_names to enforce unique component
+    # names within one parse.
     """Lark transformer to convert parse tree to lists of ModelAllocation objects."""
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Initializes the base Transformer and an empty seen_names set.
         super().__init__()
         self.seen_names = set()
 
     def _validate_name(self, name: str | None):
+        # [FUNCTION DOC]
+        # HELPER: Raises AllocationValidationError if a non-None name was already seen,
+        # else records it.
         """Validate and track component names for uniqueness."""
         if name is not None:
             if name in self.seen_names:
@@ -700,6 +849,9 @@ class _ParallelStrategyTransformer(Transformer):
         strategy: ParallelStrategy,
         scheduling: SchedulingStrategy,
     ) -> ModelAllocation:
+        # [FUNCTION DOC]
+        # HELPER: Validates name uniqueness and constructs a ModelAllocation (which may
+        # raise for invalid fsdp strategies).
         """Build ModelAllocation with validation."""
         self._validate_name(name)
         return ModelAllocation(
@@ -710,12 +862,20 @@ class _ParallelStrategyTransformer(Transformer):
         )
 
     def start(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns the single child result.
         return items[0]
 
     def expression(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns the single child result.
         return items[0]
 
     def disaggregate_chain(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Flattens child allocations/lists into one list; with 3 or more
+        # allocations every one must be named (AllocationValidationError otherwise).
+        # Returns the list.
         """Handle multi-component disaggregation: comp1 + comp2 + comp3..."""
         all_allocations = []
         for item in items:
@@ -736,12 +896,24 @@ class _ParallelStrategyTransformer(Transformer):
         return all_allocations
 
     def component(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns the single child result.
         return items[0]
 
     def single_allocation(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns the single child result.
         return items[0]
 
     def colocate_expr(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Builds a colocation group: the first allocation is the anchor
+        # (separation scheduling); each later one must be named
+        # (AllocationValidationError), gets colocation scheduling targeting the anchor
+        # name, and must have the same parallel world_size as the anchor. Returns the
+        # list.
+        # KNOWN ISSUE: The anchor itself may be unnamed, producing colocation targets of
+        # None.
         """Handle colocation: comp1 | comp2 | comp3..."""
         allocations = []
         anchor_name = None
@@ -780,9 +952,14 @@ class _ParallelStrategyTransformer(Transformer):
         return allocations
 
     def inf_para(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns the single child result.
         return items[0]
 
     def modern_inf_para(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Builds an inference ModelAllocation from backend, optional [name] and
+        # d/t/p dims with separation scheduling.
         backend = str(items[0])
         name = None
         dim_start_idx = 1
@@ -813,6 +990,9 @@ class _ParallelStrategyTransformer(Transformer):
         )
 
     def train_para(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Passes through the train alternative's result; a bare ParallelStrategy
+        # (hybrid MoE syntax without backend) raises AllocationValidationError.
         """Pass through result from one of the train_* alternatives."""
         result = items[0]
 
@@ -828,6 +1008,9 @@ class _ParallelStrategyTransformer(Transformer):
         return result
 
     def train_backend_with_name(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Builds a named training ModelAllocation from backend and d/t/p/c/e
+        # dims with separation scheduling.
         """Handle: TRAIN_BACKEND ( NAME ) : common_dim+"""
         backend = str(items[0])
         name = str(items[1])
@@ -855,6 +1038,9 @@ class _ParallelStrategyTransformer(Transformer):
         )
 
     def train_backend_name_hybrid(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Builds a named training ModelAllocation from backend and a hybrid MoE
+        # ParallelStrategy.
         """Handle: TRAIN_BACKEND [ NAME ] : hybrid_moe_syntax"""
         backend = str(items[0])
         name = str(items[1])
@@ -868,6 +1054,9 @@ class _ParallelStrategyTransformer(Transformer):
         )
 
     def train_backend_hybrid(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Builds an unnamed training ModelAllocation from backend and a hybrid
+        # MoE ParallelStrategy.
         """Handle: TRAIN_BACKEND : hybrid_moe_syntax"""
         backend = str(items[0])
         strategy = items[1]  # ParallelStrategy from hybrid_moe_syntax
@@ -880,6 +1069,9 @@ class _ParallelStrategyTransformer(Transformer):
         )
 
     def train_backend_only(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Builds an unnamed training ModelAllocation from backend and d/t/p/c/e
+        # dims.
         """Handle: TRAIN_BACKEND : common_dim+"""
         backend = str(items[0])
         dims = items[1:]
@@ -906,6 +1098,8 @@ class _ParallelStrategyTransformer(Transformer):
         )
 
     def train_name_only(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Always raises AllocationValidationError (backend prefix required).
         """Handle: ( NAME ) : common_dim+"""
         raise AllocationValidationError(
             "Backend must be explicitly specified. "
@@ -915,6 +1109,8 @@ class _ParallelStrategyTransformer(Transformer):
         )
 
     def train_dims_only(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Always raises AllocationValidationError (backend prefix required).
         """Handle: common_dim+"""
         raise AllocationValidationError(
             "Backend must be explicitly specified. "
@@ -924,37 +1120,61 @@ class _ParallelStrategyTransformer(Transformer):
         )
 
     def common_dim(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns a ParallelDimension from the dim letter and size.
         dim_type = str(items[0])
         size = int(items[1])
         return ParallelDimension(type_=dim_type, size=size)
 
     def attn_dim(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns a ParallelDimension from the dim letter and size.
         dim_type = str(items[0])
         size = int(items[1])
         return ParallelDimension(type_=dim_type, size=size)
 
     def ffn_dim(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns a ParallelDimension from the dim letter and size.
         dim_type = str(items[0])
         size = int(items[1])
         return ParallelDimension(type_=dim_type, size=size)
 
     def inf_dim(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns a ParallelDimension from the dim letter and size.
         dim_type = str(items[0])
         size = int(items[1])
         return ParallelDimension(type_=dim_type, size=size)
 
     def expert_dim(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns a ParallelDimension; no grammar rule named expert_dim exists,
+        # so it is unused.
         dim_type = str(items[0])
         size = int(items[1])
         return ParallelDimension(type_=dim_type, size=size)
 
     def attn_para(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns the dims list; unused by the current grammar.
         return items  # Return list of dimensions
 
     def expert_para(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns the dims list; unused by the current grammar.
         return items  # Return list of dimensions
 
     def hybrid_train_para(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Combines attention dims (d/t/p/c, default 1) and FFN dims into one
+        # ParallelStrategy. Expert pp inherits attention pp if omitted and must equal it
+        # otherwise (AllocationValidationError). Expert tp/ep default 1; expert dp, if
+        # omitted, is attention world size divided by ep*etp*pp
+        # (AllocationValidationError if not divisible). Raises
+        # InvalidAllocationModeError if attention and expert world sizes differ. Returns
+        # a ParallelStrategy with attention sizes plus expert_parallel_size and
+        # expert_tensor_parallel_size (expert dp is implied, not stored).
         attn_dims = items[0]  # List of dimensions for attention modules
         expert_dims = items[1]  # List of dimensions for expert modules
 
@@ -1054,48 +1274,76 @@ class _ParallelStrategyTransformer(Transformer):
         return strategy  # Return ParallelStrategy, will be wrapped by train_para
 
     def hybrid_moe_syntax(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Forwards the attention and FFN dim lists to hybrid_train_para.
         # items should be [attn_section_result, ffn_section_result]
         attn_dims = items[0]
         ffn_dims = items[1]
         return self.hybrid_train_para([attn_dims, ffn_dims])
 
     def attn_section(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns the list of attention dims.
         # items will be the attn_dim+ results (ignoring "attn" and ":" literals)
         return items
 
     def ffn_section(self, items):
+        # [FUNCTION DOC]
+        # HELPER: Returns the list of FFN dims.
         # items will be the ffn_dim+ results (ignoring "ffn" and ":" literals)
         return items
 
     def DIM_TYPE(self, token):
+        # [FUNCTION DOC]
+        # HELPER: Terminal callback converting the token to str.
         return str(token)
 
     def ATTN_DIM_TYPE(self, token):
+        # [FUNCTION DOC]
+        # HELPER: Terminal callback converting the token to str.
         return str(token)
 
     def FFN_DIM_TYPE(self, token):
+        # [FUNCTION DOC]
+        # HELPER: Terminal callback converting the token to str.
         return str(token)
 
     def EXPERT_DIM_TYPE(self, token):
+        # [FUNCTION DOC]
+        # HELPER: Terminal callback converting the token to str; no such terminal exists
+        # in the grammar.
         return str(token)
 
     def INF_DIM_TYPE(self, token):
+        # [FUNCTION DOC]
+        # HELPER: Terminal callback converting the token to str.
         return str(token)
 
     def INFER_BACKEND(self, token):
+        # [FUNCTION DOC]
+        # HELPER: Terminal callback converting the token to str.
         return str(token)
 
     def TRAIN_BACKEND(self, token):
+        # [FUNCTION DOC]
+        # HELPER: Terminal callback converting the token to str.
         return str(token)
 
     def NUMBER(self, token):
+        # [FUNCTION DOC]
+        # HELPER: Terminal callback converting the token to int.
         return int(token)
 
     def NAME(self, token):
+        # [FUNCTION DOC]
+        # HELPER: Terminal callback converting the token to str.
         return str(token)
 
 
 class _LLMParallelParser:
+    # [CLASS DOC]
+    # HELPER: Wraps a Lark Earley parser (explicit ambiguity) over ALLOCATION_GRAMMAR
+    # and the transformer, normalizing errors.
     """Internal LLM parallel strategy parser using Lark grammar.
 
     This parser handles the modern allocation mode syntax with explicit
@@ -1105,9 +1353,18 @@ class _LLMParallelParser:
     """
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # HELPER: Builds the Lark parser from ALLOCATION_GRAMMAR.
         self.parser = Lark(ALLOCATION_GRAMMAR, parser="earley", ambiguity="explicit")
 
     def parse(self, expression: str):
+        # [FUNCTION DOC]
+        # HELPER: Parses expression and transforms it with a fresh
+        # _ParallelStrategyTransformer, returning a ModelAllocation or list. Validation
+        # errors are re-raised directly; when wrapped by Lark (VisitError) they are
+        # recovered by scanning the formatted traceback text for the exception name and
+        # re-raised with the extracted message. Any other failure becomes ValueError
+        # with syntax hints.
         try:
             tree = self.parser.parse(expression)
             transformer = _ParallelStrategyTransformer()
@@ -1148,6 +1405,9 @@ Hints:
             raise ValueError(f"Parsing error: {e}\n{err_hint}")
 
     def _convert_to_allocation_mode(self, result):
+        # [FUNCTION DOC]
+        # HELPER: Wraps a list result or single ModelAllocation into _AllocationMode;
+        # ValueError for other types.
         """Convert parsed result to _AllocationMode object.
 
         Args:
@@ -1180,6 +1440,9 @@ Hints:
 
 
 def __getattr__(name):
+    # [FUNCTION DOC]
+    # HELPER: Module-level hook raising an AttributeError with migration guidance for
+    # the removed name AllocationMode, and a standard AttributeError for anything else.
     if name == "AllocationMode":
         raise AttributeError(
             "AllocationMode has been removed. Use ModelAllocation with per-engine "

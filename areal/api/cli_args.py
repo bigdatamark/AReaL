@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Central configuration schema for AReaL. Defines the dataclasses parsed from YAML/CLI
+# via Hydra+OmegaConf: generation hyperparameters, normalization and micro-batch specs,
+# optimizer and backend engine configs (FSDP, Archon, Megatron, FP8), scheduling specs,
+# train/inference engine configs, PPO/DPO/SFT/RW experiment configs, rejection sampling,
+# agent, logging/tracing/recovery, cluster and dataset configs; plus SGLang/vLLM server
+# command builders and load_expr_config to build a typed config from argv. Each field's
+# metadata help string feeds generated CLI docs; many dataclasses validate in
+# __post_init__. Import side effect: installs uvloop as the asyncio event loop policy.
+# Uses the "CLIArgs" logger.
 # SPDX-License-Identifier: Apache-2.0
 
 import argparse
@@ -41,6 +51,11 @@ ConfigT = TypeVar("ConfigT")
 
 @dataclass
 class NormConfig:
+    # [CLASS DOC]
+    # Dataclass for reward/advantage normalization: mean_level and std_level ("batch",
+    # "group" or None to skip), mean_leave1out (leave-one-out mean), std_unbiased
+    # (default True), eps added to the std denominator, and group_size for group-level
+    # statistics.
     """Configuration for reward/advantage normalization."""
 
     mean_level: str | None = field(
@@ -78,6 +93,9 @@ class NormConfig:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError if mean_level or std_level is not batch/group/None, or if
+        # group normalization is requested with group_size < 1.
         """Validate normalization configuration."""
         valid_levels = {"batch", "group", None}
         if self.mean_level not in valid_levels:
@@ -98,6 +116,12 @@ class NormConfig:
 
 @dataclass
 class MicroBatchSpec:
+    # [CLASS DOC]
+    # Dataclass describing how a batch is split into micro-batches: n_mbs (count, or
+    # minimum when max_tokens_per_mb is set), granularity (adjacent sequences kept
+    # together in groups of this size), max_tokens_per_mb token budget, n_mbs_divisor
+    # (final count made divisible by it), and packing_algorithm ("ffd" first-fit-
+    # decreasing or "kk" Karmarkar-Karp).
     """Specification for splitting micro-batches during training."""
 
     n_mbs: int | None = field(
@@ -139,6 +163,8 @@ class MicroBatchSpec:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError if packing_algorithm is not in PACKING_ALGORITHMS.
         """Validate packing algorithm configuration."""
         if self.packing_algorithm not in PACKING_ALGORITHMS:
             raise ValueError(
@@ -148,6 +174,10 @@ class MicroBatchSpec:
 
     @classmethod
     def new(cls, mb_spec: "MicroBatchSpec", **kwargs):
+        # [FUNCTION DOC]
+        # Classmethod: copies the five fields of mb_spec, overrides them with kwargs and
+        # returns a new instance (works with OmegaConf-backed inputs). Unknown kwargs
+        # raise TypeError from the constructor.
         """Create new spec with updated fields while maintaining Omegaconf compatibility."""
         fields = dict(
             n_mbs=mb_spec.n_mbs,
@@ -162,6 +192,15 @@ class MicroBatchSpec:
 
 @dataclass
 class GenerationHyperparameters:
+    # [CLASS DOC]
+    # Dataclass of sampling parameters for rollout requests: n_samples, max/min new
+    # tokens, max_tokens (prompt + generation cap), greedy, top_p, top_k, temperature,
+    # stop_token_ids, ignore_eos, skip_special_tokens, stop strings, frequency_penalty,
+    # optional per-request seed, lora_name, vLLM use_beam_search, plus workflow-level
+    # flags reward_normalization (per-prompt normalization across n_samples) and
+    # drop_incomplete_group (discard groups with a failed sample). Class sets
+    # _OPENAI_UNSUPPORTED_ARGS and _WORKFLOW_ONLY_ARGS control conversion to OpenAI
+    # client kwargs.
     """Controls text generation behavior for rollout."""
 
     n_samples: int = field(
@@ -267,11 +306,19 @@ class GenerationHyperparameters:
     # NOTE: to add new parameters, please correctly handle them in the `to_openai_args_dict` method.
 
     def new(self, **kwargs):
+        # [FUNCTION DOC]
+        # Returns a new instance from asdict(self) updated with kwargs (deep-copies list
+        # fields).
         args = asdict(self)
         args.update(kwargs)
         return GenerationHyperparameters(**args)
 
     def new_with_stop_and_pad_token_ids(self, tokenizer: "PreTrainedTokenizerFast"):
+        # [FUNCTION DOC]
+        # Returns a copy whose stop_token_ids additionally contain the tokenizer's pad
+        # and eos ids (appended if absent, in that order).
+        # KNOWN ISSUE: If the tokenizer has no pad or eos id, None is appended to
+        # stop_token_ids.
         """Create a new generation hyperparameters with stop and pad token ids added."""
         new_stop_token_ids = self.stop_token_ids.copy()
         if tokenizer.pad_token_id not in new_stop_token_ids:
@@ -283,6 +330,8 @@ class GenerationHyperparameters:
     def to_openai_completions_args_dict(
         self, exclude_args: list[str] | None = None
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Shortcut for to_openai_args_dict with api_format "completions".
         return self.to_openai_args_dict(
             exclude_args=exclude_args, api_format="completions"
         )
@@ -290,6 +339,8 @@ class GenerationHyperparameters:
     def to_openai_responses_args_dict(
         self, exclude_args: list[str] | None = None
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Shortcut for to_openai_args_dict with api_format "responses".
         return self.to_openai_args_dict(
             exclude_args=exclude_args, api_format="responses"
         )
@@ -297,6 +348,8 @@ class GenerationHyperparameters:
     def to_openai_agents_model_settings_dict(
         self, exclude_args: list[str] | None = None
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Shortcut for to_openai_args_dict with api_format "openai-agents".
         return self.to_openai_args_dict(
             exclude_args=exclude_args, api_format="openai-agents"
         )
@@ -323,6 +376,14 @@ class GenerationHyperparameters:
     def to_openai_args_dict(
         self, exclude_args: list[str] | None = None, api_format: str = "completions"
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Converts fields to OpenAI-client keyword arguments. Skips workflow-only flags
+        # silently; skips the union of exclude_args and the unsupported set, logging a
+        # warning when a skipped field differs from its dataclass default. Renames
+        # n_samples to n and max_new_tokens to max_completion_tokens (completions),
+        # max_output_tokens (responses) or max_tokens (openai-agents); other names pass
+        # through. Raises ValueError for unknown api_format; warns if a renamed key
+        # collides. Returns the dict.
         """Convert the generation hyperparameters to a dictionary of arguments for OpenAI client."""
         final_exclude_args = set(exclude_args) if exclude_args is not None else set()
         final_exclude_args.update(self._OPENAI_UNSUPPORTED_ARGS)
@@ -375,6 +436,13 @@ class GenerationHyperparameters:
 
 @dataclass
 class OptimizerConfig:
+    # [CLASS DOC]
+    # Dataclass of optimizer and LR schedule settings: type (adam, sgd, adam_bf16), lr,
+    # weight_decay, Adam betas/eps, min_lr_ratio, lr_scheduler_type
+    # (linear/cosine/constant), warmup via warmup_steps (absolute, takes precedence) or
+    # warmup_steps_proportion (default DEFAULT_WARMUP_STEPS_PROPORTION=0.001), mixed-
+    # precision loss-scale parameters (initial, min, window, hysteresis) and
+    # gradient_clipping norm.
     """Configuration for model optimization during training."""
 
     DEFAULT_WARMUP_STEPS_PROPORTION: ClassVar[float] = 0.001
@@ -456,6 +524,10 @@ class OptimizerConfig:
     )
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Emits a UserWarning when warmup_steps is set and warmup_steps_proportion
+        # differs from the default, since warmup_steps wins. No range validation is done
+        # here.
         if (
             self.warmup_steps is not None
             and self.warmup_steps_proportion != self.DEFAULT_WARMUP_STEPS_PROPORTION
@@ -470,6 +542,9 @@ class OptimizerConfig:
 
 @dataclass
 class FSDPWrapPolicy:
+    # [CLASS DOC]
+    # Dataclass listing transformer layer class names for FSDP to wrap; None means the
+    # transformers-defined decoder layers.
     """Policy configuration for FSDP model layer wrapping. None defaults to wrapping transformer decoder layers defined by transformers."""
 
     transformer_layer_cls_to_wrap: list[str] | None = field(
@@ -480,6 +555,13 @@ class FSDPWrapPolicy:
 
 @dataclass
 class FSDPEngineConfig:
+    # [CLASS DOC]
+    # Dataclass of FSDP2 backend options: wrap_policy, offload_params (CPU offload),
+    # memory_efficient_load (CPU init with rank-0 load and broadcast after sharding;
+    # VLMs load per rank), per_layer_optim_step (GPU Adam step streaming CPU-resident
+    # optimizer states layer by layer) with optim_step_prefetch_layers, and
+    # shard_vision_across_sp (split vision encoder work across sequence-parallel ranks
+    # when cp > 1).
     """Configuration for Fully Sharded Data Parallel (FSDP) training backend."""
 
     wrap_policy: FSDPWrapPolicy | None = field(
@@ -515,6 +597,8 @@ class FSDPEngineConfig:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError if optim_step_prefetch_layers is negative.
         if self.optim_step_prefetch_layers < 0:
             raise ValueError(
                 f"optim_step_prefetch_layers must be >= 0, got {self.optim_step_prefetch_layers}"
@@ -531,6 +615,11 @@ class FSDPEngineConfig:
 
 @dataclass
 class ArchonFP8Config:
+    # [CLASS DOC]
+    # Dataclass for Archon FP8 training: mode ("disabled" or "blockwise" 128x128 e4m3
+    # matmuls on Hopper), exclude_modules (FQN substrings of Linear layers kept in BF16,
+    # default output/router/score), include_experts (FP8 MoE experts), use_triton
+    # (Triton GEMM; required when enabled).
     """Archon FP8 training configuration."""
 
     mode: str = field(
@@ -585,9 +674,14 @@ class ArchonFP8Config:
 
     @property
     def enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: True unless mode is "disabled".
         return self.mode != "disabled"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError for a mode other than disabled/blockwise, or when FP8 is
+        # enabled with use_triton False.
         valid_modes = {"disabled", "blockwise"}
         if self.mode not in valid_modes:
             raise ValueError(
@@ -604,6 +698,14 @@ class ArchonFP8Config:
 
 @dataclass
 class ArchonEngineConfig:
+    # [CLASS DOC]
+    # Dataclass of Archon (native torch parallel) backend options: attention type
+    # (varlen/sdpa/tree), param offload, torch.compile, activation checkpointing (mode
+    # none/full/selective/memory_budget, selective option, memory budget, RNG
+    # preservation, debug), pipeline schedule and stage layout (layers per stage, fewer
+    # layers in first/last stage), FSDP reshard_after_forward policy
+    # (default/always/never), fp8_config, deterministic algorithms, and MoE router dtype
+    # ("fp32" or None).
     """Configuration for Archon Engine training backend."""
 
     # Attention backend
@@ -748,6 +850,10 @@ class ArchonEngineConfig:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError if pp_layers_per_stage < 1, either stage-less-layers value
+        # is negative, reshard_after_forward_policy is not default/always/never, or
+        # moe_router_dtype is not "fp32"/None.
         if self.pp_layers_per_stage is not None and self.pp_layers_per_stage < 1:
             raise ValueError(
                 f"pp_layers_per_stage must be >= 1, got {self.pp_layers_per_stage}"
@@ -779,6 +885,10 @@ class ArchonEngineConfig:
 # These configurations are used by Megatron Bridge to build Megatron models.
 @dataclass
 class DistributedDataParallelConfig:
+    # [CLASS DOC]
+    # Dataclass mirroring Megatron DDP options (fp32 grad reduction, overlap of grad
+    # reduce / param gather, distributed optimizer, NaN checks, bucket size, averaging
+    # in collective, FP8 param gather). Passed through to Megatron.
     """Configuration for Megatron's DistributedDataParallel.
     Refer to Megatron-LM documentation for details.
     """
@@ -796,6 +906,12 @@ class DistributedDataParallelConfig:
 
 @dataclass
 class FP8EngineConfig:
+    # [CLASS DOC]
+    # Dataclass of Megatron/TransformerEngine FP8 settings: mode (e4m3 or hybrid),
+    # scaling recipe (tensorwise/delayed/mxfp8/blockwise), FP8 params, scaling margin
+    # and amax history/algorithm, wgrad precision, FP8 attention variants, TP-only amax
+    # reduction, BF16 first/last layers with counts, and direct_convert for TE<->PyTorch
+    # FP8 conversion during weight sync/save.
     """Configuration for FP8 (8-bit floating point) training.
 
     This configuration encapsulates all FP8-related parameters and can be reused
@@ -901,6 +1017,16 @@ class FP8EngineConfig:
 
 @dataclass
 class MegatronEngineConfig:
+    # [CLASS DOC]
+    # Dataclass of Megatron-LM backend options: DDP wrapping and nested
+    # DistributedDataParallelConfig, FSDP variants, virtual pipeline size, precision-
+    # aware optimizer dtypes, async checkpoint saving, deterministic algorithms,
+    # activation recomputation settings, MoE options (router dtype/fusion, token
+    # dispatcher, DeepEP, shared-expert overlap, aux-loss-free bias rate, z-loss), AReaL
+    # chunked-logits LM head options (enable_chunked_logits, entropy_requires_grad,
+    # lm_head_loss_chunk_size, FP32 lm head), fused cross entropy, optional
+    # FP8EngineConfig, bridge selection (mbridge/megatron-bridge) and bridge save/update
+    # options, grad-buffer CPU backup skip and MTP head retention.
     """Configuration for Megatron-LM training framework.
     Refer to Megatron-LM documentation for implementation details.
     """
@@ -1105,6 +1231,10 @@ class MegatronEngineConfig:
     )
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Raises ValueError if lm_head_loss_chunk_size is negative, or is positive while
+        # enable_chunked_logits is False, entropy_requires_grad is True, or enable_mtp
+        # is True.
         if self.lm_head_loss_chunk_size < 0:
             raise ValueError(
                 "lm_head_loss_chunk_size must be non-negative, got "
@@ -1123,12 +1253,19 @@ class MegatronEngineConfig:
 
 
 class SchedulingStrategyType(str, Enum):
+    # [CLASS DOC]
+    # String enum of scheduling strategies: separation (own resources) and colocation
+    # (share another role's resources). Compares equal to plain strings.
     separation = "separation"
     colocation = "colocation"
 
 
 @dataclass
 class SchedulingStrategy:
+    # [CLASS DOC]
+    # Dataclass: type ("separation" or "colocation"), target role to colocate with, and
+    # fork (with colocation, spawn a separate process on the target's node/GPUs instead
+    # of sharing its process).
     type: str = field(
         default="separation",
         metadata={"choices": ["separation", "colocation"]},
@@ -1148,6 +1285,12 @@ class SchedulingStrategy:
 
 @dataclass
 class SchedulingSpec:
+    # [CLASS DOC]
+    # Dataclass of per-task resource and launch settings: cpu and mem (GB) per GPU, gpu
+    # count, port_count, container image, task_type (worker/engine), env_vars, cmd
+    # (default AReaL RPC server), Slurm options (srun args, extra bash commands,
+    # container type apptainer/none, mount, nodelist, reservation, exclusive, exclude)
+    # and deprecated ray_placement_strategy.
     cpu: int = field(
         default=8, metadata={"help": "Number of CPU cores required per GPU"}
     )
@@ -1234,6 +1377,8 @@ class SchedulingSpec:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Emits a DeprecationWarning if ray_placement_strategy is set (it is ignored).
         """Validate scheduling spec configuration."""
         if self.ray_placement_strategy is not None:
             warnings.warn(
@@ -1246,6 +1391,16 @@ class SchedulingSpec:
 
 @dataclass
 class TrainEngineConfig:
+    # [CLASS DOC]
+    # Core dataclass for a training engine role: experiment/trial names (required), HF
+    # model path, attention implementation and HF kernels, init_from_scratch, is_critic,
+    # temperature used for logprobs, logprobs_chunk_size, micro-batch spec and padding,
+    # dropout/gradient checkpointing, compute/grad-reduce/optimizer-storage dtypes,
+    # optional OptimizerConfig (None = no training), weight update mode (disk/xccl/awex)
+    # with delta-update options, nested fsdp/archon/megatron configs, offload, LoRA
+    # settings, tree training, scheduling_spec (1 or 2 SchedulingSpecs: worker with
+    # embedded engine, or worker + engine), backend string (required, e.g. "fsdp:d4"),
+    # controller version (v1/v2) with gateway settings, and scheduling_strategy.
     """Core configuration for model training, including optimization and backend settings."""
 
     experiment_name: str = MISSING
@@ -1456,6 +1611,13 @@ class TrainEngineConfig:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Validates and normalizes: raises ValueError if logprobs_chunk_size <= 0,
+        # scheduling_spec length is not 1 or 2, attn_impl is invalid,
+        # fsdp.memory_efficient_load is combined with init_from_scratch, or _version is
+        # not v1/v2. Canonicalizes dtype aliases (fp32/bf16/fp16 for dtype; fp32/bf16
+        # for optimizer_dtype) in place, then raises ValueError if optimizer_dtype is
+        # not float32/bfloat16 or dtype not float32/bfloat16/float16.
         """Validate scheduling_spec length and config combinations."""
         if self.logprobs_chunk_size <= 0:
             raise ValueError(
@@ -1503,6 +1665,12 @@ class TrainEngineConfig:
 
 @dataclass
 class RejectionSamplingConfig:
+    # [CLASS DOC]
+    # Dataclass for filtering stale/off-policy samples in decoupled PPO by divergence
+    # between proximal and behavior policies: level (token or sequence), action (mask:
+    # zero loss_mask; clamp: truncate the importance weight), metric (ratio, kl_k1,
+    # kl_k2, kl_k3), agg for sequence level (sum/mean/max; log-space for ratio), upper
+    # bound and optional lower bound.
     """Unified configuration for sample filtering based on policy divergence.
 
     Filters tokens/sequences where the divergence between proximal policy
@@ -1600,6 +1768,12 @@ class RejectionSamplingConfig:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Validates: raises ValueError for unknown level/action/metric/agg, lower >
+        # upper, ratio metric with upper <= 1 or non-positive lower, kl_k2/kl_k3 with
+        # upper <= 0, or clamp with a non-ratio metric. Sets lower to 0.0 for clamp when
+        # unset (mutation). Warns (UserWarning) when level is token and agg is not mean,
+        # since agg is ignored then.
         """Validate configuration."""
         import warnings
 
@@ -1670,6 +1844,16 @@ class RejectionSamplingConfig:
 
 @dataclass
 class PPOActorConfig(TrainEngineConfig):
+    # [CLASS DOC]
+    # TrainEngineConfig subclass with PPO/GRPO actor hyperparameters: minibatches per
+    # update, clipping (eps_clip, decoupled eps_clip_higher, dual clip c_clip), M2PO
+    # threshold, reward processing (NormConfig, scaling, bias, clip, DAPO overlong
+    # penalty, masking truncated samples), discount and GAE lambda (float or dotted path
+    # to a per-sample function with kwargs) with token- or turn-level timesteps,
+    # advantage normalization, KL coefficient and estimator, SAPO and CISPO alternative
+    # surrogates, logprob recomputation, decoupled loss with rejection sampling and
+    # proximal-logp method, importance sampling level (token/sequence), agent stats
+    # logging and max_new_tokens.
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
     # Core PPO/GRPO Parameters
@@ -1859,6 +2043,10 @@ class PPOActorConfig(TrainEngineConfig):
     )
 
     def should_compute_prox_logp(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns True if a forward pass for proximal logprobs is needed: with decoupled
+        # loss when the configured ProxLogpMethod does not skip the forward pass;
+        # without decoupled loss when recompute_logprob is set.
         """Determine if forward pass is needed for proximal log-probabilities.
 
         Returns:
@@ -1872,6 +2060,18 @@ class PPOActorConfig(TrainEngineConfig):
         )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Validates and adjusts: gae_lambda must be a non-bool number or a non-empty
+        # string (ValueError); gae_timestep_unit must be token/turn. Warns (UserWarning)
+        # when reward_norm (dataclass or dict) uses group mean with group_size 1. If
+        # prox_logp_method is reuse_train_logp with more than one minibatch, logs a
+        # warning and forces ppo_n_minibatches to 1. Raises ValueError if delta weight
+        # updates are enabled with ppo_n_minibatches != 1. Logs warnings when
+        # rejection_sampling is set without decoupled loss, or decoupled loss is used
+        # without rejection_sampling. SAPO requires positive temperatures and no
+        # decoupled loss; CISPO excludes SAPO, needs positive eps_clip_higher and token-
+        # level importance sampling (ValueError otherwise). Finally runs
+        # TrainEngineConfig validation.
         """Validate PPO actor configuration."""
         if isinstance(self.gae_lambda, bool) or not isinstance(
             self.gae_lambda, int | float | str
@@ -1988,6 +2188,9 @@ class PPOActorConfig(TrainEngineConfig):
 
 @dataclass
 class PPOCriticConfig(TrainEngineConfig):
+    # [CLASS DOC]
+    # TrainEngineConfig subclass for the PPO value model: ppo_n_minibatches, value-loss
+    # eps_clip and mask_no_eos_with_zero.
     """Configuration for PPO critic model, a subclass of a TrainEngine."""
 
     ppo_n_minibatches: int = field(
@@ -2005,6 +2208,11 @@ class PPOCriticConfig(TrainEngineConfig):
 
 
 def get_py_cmd(module: str, args: dict[str, Any]):
+    # [FUNCTION DOC]
+    # HELPER: Builds an argv list "python3 -m module" plus flags from args: keys become
+    # --kebab-case; None, False, empty string and empty list are skipped; True adds a
+    # bare flag; lists add the flag followed by each element as a string; other values
+    # add flag and str(value). Returns the list.
     # convert to flags
     cmd = ["python3", "-m", module]
     for k, v in args.items():
@@ -2024,6 +2232,12 @@ def get_py_cmd(module: str, args: dict[str, Any]):
 
 @dataclass
 class vLLMConfig:
+    # [CLASS DOC]
+    # Dataclass of vLLM server options (model, seed, eager mode, dtype, executor
+    # backend, batch/block sizes, CPU offload, context length, chunked prefill / prefix
+    # caching switches, GPU memory fraction, AReaL worker extension class, sleep mode,
+    # log level, GDN prefill backend for hybrid models, LoRA options). Fields map
+    # directly to CLI flags of AReaL's vLLM server.
     """Configuration for vLLM runtime. Refer to:
     https://docs.vllm.ai/en/stable/api/index.html for detailed documentation.
     """
@@ -2088,6 +2302,12 @@ class vLLMConfig:
         n_nodes: int = 1,
         node_rank: int = 0,
     ):
+        # [FUNCTION DOC]
+        # Static. Converts vllm_config to a dict and prepends tokenizer=model,
+        # load_format auto, trust_remote_code, tensor/pipeline parallel sizes; adds
+        # host/port if given. For multi-node (n_nodes > 1) adds nnodes, node_rank,
+        # master_addr/master_port parsed from dist_init_addr, and headless for non-zero
+        # node ranks. Returns the args dict.
         args: dict = conf_as_dict(vllm_config)
         args = dict(
             # Model and tokenizer
@@ -2118,6 +2338,9 @@ class vLLMConfig:
 
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
+        # [FUNCTION DOC]
+        # Static. Returns the argv list launching
+        # areal.engine.vllm_ext.areal_vllm_server with args.
         return get_py_cmd("areal.engine.vllm_ext.areal_vllm_server", args)
 
     @staticmethod
@@ -2131,6 +2354,8 @@ class vLLMConfig:
         n_nodes: int = 1,
         node_rank: int = 0,
     ):
+        # [FUNCTION DOC]
+        # Static. build_args followed by build_cmd_from_args; returns the argv list.
         args = vLLMConfig.build_args(
             vllm_config=vllm_config,
             tp_size=tp_size,
@@ -2151,6 +2376,12 @@ _SGLANG_DETERMINISTIC_ATTENTION_BACKENDS = frozenset({"flashinfer", "fa3", "trit
 
 @dataclass
 class SGLangConfig:
+    # [CLASS DOC]
+    # Dataclass of SGLang server options (model path, seed, CUDA graph and radix cache
+    # switches, compile, attention/sampling backends, deterministic inference,
+    # multimodal, context length, memory fraction, scheduling and prefill limits,
+    # dtype/KV cache dtype, dp/ep sizes, LoRA options, logging/metrics, multithreaded
+    # weight load, routed-experts return). Fields map to SGLang CLI flags.
     """Configuration for SGLang runtime. Refer to:
     https://github.com/sgl-project/sglang for detailed documentation.
     """
@@ -2236,6 +2467,9 @@ class SGLangConfig:
         node_rank: int = 0,
         pp_size: int = 1,
     ):
+        # [FUNCTION DOC]
+        # Static. build_args with the same parameters followed by build_cmd_from_args;
+        # returns the argv list.
         args = SGLangConfig.build_args(
             sglang_config=sglang_config,
             tp_size=tp_size,
@@ -2252,6 +2486,9 @@ class SGLangConfig:
 
     @staticmethod
     def build_cmd_from_args(args: dict[str, Any]):
+        # [FUNCTION DOC]
+        # Static. Returns the argv list launching
+        # areal.v2.inference_service.sglang.launch_server with args.
         return get_py_cmd("areal.v2.inference_service.sglang.launch_server", args)
 
     @staticmethod
@@ -2266,6 +2503,17 @@ class SGLangConfig:
         node_rank: int = 0,
         pp_size: int = 1,
     ):
+        # [FUNCTION DOC]
+        # Static. Warns if deterministic inference is enabled with an attention backend
+        # outside _SGLANG_DETERMINISTIC_ATTENTION_BACKENDS. Converts the config to a
+        # dict; if enable_multithread_load, adds a compact JSON
+        # model_loader_extra_config and always drops the enable_multithread_load key.
+        # Prepends tokenizer path, tokenizer_mode auto, trust_remote_code, is_embedding
+        # False, tp_size, base_gpu_id, nnodes, node_rank and dist_init_addr; adds
+        # pp_size if > 1 and host/port if given. Raises RuntimeError if installed sglang
+        # is older than 0.5.10.post1. Returns the dict.
+        # KNOWN ISSUE: The "Map all-linear to all" comment does not correspond to any
+        # code; the version check runs only after the args are built.
         attention_backend = sglang_config.attention_backend
         if (
             sglang_config.enable_deterministic_inference
@@ -2319,6 +2567,14 @@ class SGLangConfig:
 
 @dataclass
 class AgentConfig:
+    # [CLASS DOC]
+    # Dataclass for agent workflows and the agent-service controller: agent_cls_path
+    # (AgentRunnable import path), admin_api_key, scheduling_spec (exactly one, for
+    # guard workers), proxy mode (inline/subproc/online), tool-call and reasoning
+    # parsers, chat template type (hf/concat), engine max tokens, turn reward discount,
+    # export style (individual/concat), Anthropic message preprocessors, custom prefix
+    # matcher, subprocess pool size, retry-orphan dropping, session timeout and reward-
+    # finish timeout.
     """Configuration for agent workflows and the experimental agent service controller.
 
     Consolidates proxy settings (mode, parsers, export) with agent-service
@@ -2459,6 +2715,12 @@ class AgentConfig:
     )
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Raises ValueError if agent_cls_path is empty, scheduling_spec does not have
+        # exactly one entry, admin_api_key is empty/whitespace, or
+        # set_reward_finish_timeout is negative.
+        # KNOWN ISSUE: agent_cls_path defaults to "" so constructing AgentConfig with
+        # defaults always fails.
         if not self.agent_cls_path:
             raise ValueError("agent_cls_path must be a non-empty import path")
         if len(self.scheduling_spec) != 1:
@@ -2476,6 +2738,16 @@ class AgentConfig:
 
 @dataclass
 class InferenceEngineConfig:
+    # [CLASS DOC]
+    # Dataclass for rollout/inference clients and controllers:
+    # experiment/trial/fileroot, concurrency and queue limits, consumer_batch_size,
+    # max_head_offpolicyness (max weight-version lag accepted), tracing, deterministic
+    # sampling and serialized group samples, trajectory format checks, tokenizer path
+    # and trajectory dumping, timeouts (setup, workers ready, request) and retries,
+    # pause grace period, scheduling_spec (1 or 2) and strategy, backend string
+    # (required, e.g. "sglang:d4"), LoRA name/flag, nested AgentConfig, routed-experts
+    # return, controller version (v1/v2) and inference-service gateway settings (model
+    # name, routing strategy, poll interval, admin key, external api_url/provider key).
     """Configuration for inference servers, including offpolicyness control."""
 
     experiment_name: str | None = None
@@ -2664,6 +2936,11 @@ class InferenceEngineConfig:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError if scheduling_spec length is not 1 or 2, _version is not
+        # v1/v2, or admin_api_key is empty/whitespace. Logs warnings when
+        # deterministic_sampling is combined with max_head_offpolicyness > 0, and when
+        # using v2 with a non-default agent.admin_api_key (ignored by v2).
         """Validate scheduling_spec length."""
         if len(self.scheduling_spec) not in (1, 2):
             raise ValueError(
@@ -2696,6 +2973,9 @@ class InferenceEngineConfig:
 
 @dataclass
 class _Timer:
+    # [CLASS DOC]
+    # HELPER: Base dataclass for periodic triggers: experiment/trial/fileroot plus
+    # freq_epochs, freq_steps and freq_secs (each None disables that trigger).
     experiment_name: str = MISSING
     trial_name: str = MISSING
     fileroot: str = MISSING
@@ -2721,6 +3001,8 @@ class _Timer:
 
 @dataclass
 class EvaluatorConfig(_Timer):
+    # [CLASS DOC]
+    # _Timer subclass controlling evaluation frequency, plus eval_before_train.
     """Configuration for model evaluation scheduling and timing."""
 
     eval_before_train: bool = field(
@@ -2733,6 +3015,9 @@ class EvaluatorConfig(_Timer):
 
 @dataclass
 class SaverConfig(_Timer):
+    # [CLASS DOC]
+    # _Timer subclass controlling checkpoint frequency, plus HF save mode (auto: async
+    # for Archon else sync; sync; async).
     """Configuration for model checkpoint saving scheduling and timing."""
 
     mode: str = field(
@@ -2751,6 +3036,8 @@ class SaverConfig(_Timer):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError if mode is not auto/sync/async.
         valid_modes = {"auto", "sync", "async"}
         if self.mode not in valid_modes:
             raise ValueError(f"Invalid mode '{self.mode}'. Valid: {valid_modes}")
@@ -2758,6 +3045,10 @@ class SaverConfig(_Timer):
 
 @dataclass
 class RecoverConfig(_Timer):
+    # [CLASS DOC]
+    # _Timer subclass for recovery checkpoints: mode (on/auto enable recovery,
+    # off/disabled disable), launcher retries, and no_save_optim / no_load_optim to skip
+    # optimizer state.
     """Configuration for experiment recovery and fault tolerance."""
 
     mode: str = field(
@@ -2793,6 +3084,9 @@ class RecoverConfig(_Timer):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError if mode is not on/off/auto/disabled (noting removed
+        # fault/resume modes).
         valid_modes = {"on", "off", "auto", "disabled"}
         if self.mode not in valid_modes:
             raise ValueError(
@@ -2804,6 +3098,10 @@ class RecoverConfig(_Timer):
 
 @dataclass
 class WandBConfig:
+    # [CLASS DOC]
+    # Dataclass of Weights & Biases settings: mode (online/offline/disabled/shared),
+    # base URL, API key, entity, project, run name, job type, group, notes, tags, config
+    # and id_suffix.
     """Configuration for Weights & Biases experiment tracking."""
 
     mode: str = field(
@@ -2826,6 +3124,8 @@ class WandBConfig:
     id_suffix: str | None = "train"
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError for an invalid mode.
         """Validate WandB configuration."""
         valid_modes = ("online", "offline", "disabled", "shared")
         if self.mode not in valid_modes:
@@ -2836,6 +3136,9 @@ class WandBConfig:
 
 @dataclass
 class SwanlabConfig:
+    # [CLASS DOC]
+    # Dataclass of SwanLab settings: project, name, config, logdir, mode
+    # (cloud/local/disabled/offline) and api_key.
     """Configuration for SwanLab experiment tracking and monitoring."""
 
     project: str | None = None
@@ -2853,6 +3156,9 @@ class SwanlabConfig:
     api_key: str | None = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError for an invalid mode; fills api_key from the SWANLAB_API_KEY
+        # environment variable when unset.
         """Validate SwanLab configuration."""
         valid_modes = ("cloud", "local", "disabled", "offline")
         if self.mode not in valid_modes:
@@ -2865,6 +3171,8 @@ class SwanlabConfig:
 
 @dataclass
 class TensorBoardConfig:
+    # [CLASS DOC]
+    # Dataclass holding the TensorBoard log path (None disables).
     """Configuration for TensorBoard logging and visualization."""
 
     path: str | None = None
@@ -2872,6 +3180,9 @@ class TensorBoardConfig:
 
 @dataclass
 class TrackioConfig:
+    # [CLASS DOC]
+    # Dataclass of Trackio (Hugging Face local-first tracker) settings: mode
+    # (disabled/online/local), project, name and optional HF Space id.
     """Configuration for Trackio experiment tracking (Hugging Face).
 
     Trackio is a lightweight, local-first experiment tracking library
@@ -2892,6 +3203,8 @@ class TrackioConfig:
     When set, metrics are also pushed to the specified Hugging Face Space."""
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError for an invalid mode.
         """Validate Trackio configuration."""
         valid_modes = {"disabled", "online", "local"}
         if self.mode not in valid_modes:
@@ -2902,6 +3215,9 @@ class TrackioConfig:
 
 @dataclass
 class StatsLoggerConfig:
+    # [CLASS DOC]
+    # Dataclass grouping experiment identifiers with the WandB, SwanLab, TensorBoard and
+    # Trackio backend configs.
     """Configuration for experiment statistics logging and tracking services."""
 
     experiment_name: str = MISSING
@@ -2927,6 +3243,9 @@ class StatsLoggerConfig:
 
 @dataclass
 class SessionTracerConfig:
+    # [CLASS DOC]
+    # Dataclass for per-session lifecycle tracing: enabled flag (records to
+    # sessions.jsonl) and flush_threshold (values <= 0 treated as 1 by consumers).
     """Configuration for per-session lifecycle tracing."""
 
     enabled: bool = field(
@@ -2951,6 +3270,9 @@ class SessionTracerConfig:
 
 @dataclass
 class MemoryProfilerConfig:
+    # [CLASS DOC]
+    # Dataclass for CUDA memory snapshots: profile_steps (global steps to capture,
+    # default 0 and 1) and max_entries of the memory history buffer.
     """CUDA memory snapshot profiling configuration.
 
     Attributes:
@@ -2970,6 +3292,10 @@ class MemoryProfilerConfig:
 
 @dataclass
 class PerfTracerConfig:
+    # [CLASS DOC]
+    # Dataclass for the performance tracer: identifiers, enabled flag, save_interval
+    # (flush every N saves; <= 0 treated as 1), profile_steps for detailed traces, and
+    # optional SessionTracerConfig.
     """Configuration for perf tracer emission."""
 
     experiment_name: str = MISSING
@@ -3009,6 +3335,9 @@ class PerfTracerConfig:
 
 @dataclass
 class NameResolveConfig:
+    # [CLASS DOC]
+    # Dataclass for the name-resolution KV store: type (nfs, etcd3, ray), NFS record
+    # root, etcd3 address and Ray actor name.
     """Configuration for distributed name resolution and service discovery."""
 
     type: str = field(
@@ -3035,6 +3364,9 @@ class NameResolveConfig:
 
 @dataclass
 class ClusterSpecConfig:
+    # [CLASS DOC]
+    # Dataclass describing the cluster: name_resolve config, cluster name, shared
+    # fileroot, number of nodes and physical GPUs per node.
     """Configuration for cluster specification and distributed computing setup."""
 
     name_resolve: NameResolveConfig = field(
@@ -3065,6 +3397,10 @@ class ClusterSpecConfig:
 
 @dataclass
 class SchedulerConfig:
+    # [CLASS DOC]
+    # Experimental dataclass for single-controller scheduling: scheduler type, endpoint,
+    # deploy mode, function-call service domain and reward config, reward model path and
+    # service URL.
     """Configuration for worker scheduling. Used in the single-controller mode. Experimental."""
 
     type: str | None = field(default=None)
@@ -3078,6 +3414,12 @@ class SchedulerConfig:
 
 @dataclass
 class _DatasetConfig:
+    # [CLASS DOC]
+    # Base dataclass for dataset loading: split, path and type (required; e.g. sft/rl),
+    # batch_size, shuffle, pin_memory, dataloader num_workers, num_dataset_workers for
+    # the remote data service, drop_last, max_length filter, dataset_kwargs forwarded to
+    # get_custom_dataset, optional scheduling_spec (enables a remote data service) and
+    # setup_timeout.
     """Configuration for dataset loading and preprocessing."""
 
     split: str = field(
@@ -3152,11 +3494,16 @@ class _DatasetConfig:
 
 @dataclass
 class TrainDatasetConfig(_DatasetConfig):
+    # [CLASS DOC]
+    # Training dataset config; identical to _DatasetConfig.
     """Configuration for training dataset loading and preprocessing."""
 
 
 @dataclass
 class ValidDatasetConfig(_DatasetConfig):
+    # [CLASS DOC]
+    # Validation dataset config with defaults split "test", shuffle False and drop_last
+    # False.
     """Configuration for validation dataset loading and preprocessing.
 
     It has different default values with `TrainDatasetConfig`.
@@ -3177,6 +3524,13 @@ class ValidDatasetConfig(_DatasetConfig):
 
 @dataclass
 class BaseExperimentConfig:
+    # [CLASS DOC]
+    # Base dataclass for all experiments: experiment/trial names (required), cluster
+    # spec, deprecated allocation_mode string, seed, enable_offload
+    # (torch_memory_saver), training length limits (epochs, steps, samples), tokenizer
+    # path, train/valid dataset configs, saver/evaluator/stats logger/recover configs,
+    # optional perf tracer and memory profiler, sglang/vllm server configs, scheduler
+    # config and post_exit_hook shell command.
     """Base configuration class for all experiment types with common settings."""
 
     # NOTE: we need this unified config class because different experiments
@@ -3264,6 +3618,8 @@ class BaseExperimentConfig:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Raises ValueError if total_train_epochs <= 0.
         """Validate training configuration."""
         if self.total_train_epochs <= 0:
             raise ValueError(
@@ -3273,6 +3629,9 @@ class BaseExperimentConfig:
 
 @dataclass
 class SFTConfig(BaseExperimentConfig):
+    # [CLASS DOC]
+    # Experiment config for supervised fine-tuning with a single actor
+    # TrainEngineConfig.
     """Configuration for Supervised Fine-Tuning (SFT) experiments."""
 
     actor: TrainEngineConfig = field(default_factory=TrainEngineConfig)
@@ -3280,11 +3639,16 @@ class SFTConfig(BaseExperimentConfig):
 
 @dataclass
 class RWConfig(BaseExperimentConfig):
+    # [CLASS DOC]
+    # Experiment config for reward-model training with an actor TrainEngineConfig that
+    # must be a critic.
     """Configuration for Reward Model (RW) training experiments."""
 
     actor: TrainEngineConfig = field(default_factory=TrainEngineConfig)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs base validation, then raises ValueError unless actor.is_critic is True.
         super().__post_init__()
         if not getattr(self.actor, "is_critic", False):
             raise ValueError(
@@ -3295,6 +3659,9 @@ class RWConfig(BaseExperimentConfig):
 
 @dataclass
 class DPOEngineConfig(TrainEngineConfig):
+    # [CLASS DOC]
+    # TrainEngineConfig subclass adding DPO beta (default 0.1) and loss_type ("sigmoid"
+    # original DPO or "ipo" with per-token length normalization).
     """Engine configuration for DPO training, extending TrainEngineConfig with DPO-specific fields."""
 
     beta: float = field(
@@ -3313,6 +3680,9 @@ class DPOEngineConfig(TrainEngineConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs TrainEngineConfig validation, then raises ValueError for an unsupported
+        # loss_type.
         super().__post_init__()
         _valid = {"sigmoid", "ipo"}
         if self.loss_type not in _valid:
@@ -3324,6 +3694,8 @@ class DPOEngineConfig(TrainEngineConfig):
 
 @dataclass
 class DPOConfig(BaseExperimentConfig):
+    # [CLASS DOC]
+    # Experiment config for DPO with actor and reference DPOEngineConfigs.
     """Configuration for Direct Preference Optimization (DPO) experiments."""
 
     actor: DPOEngineConfig = field(default_factory=DPOEngineConfig)
@@ -3331,6 +3703,8 @@ class DPOConfig(BaseExperimentConfig):
     ref: DPOEngineConfig = field(default_factory=DPOEngineConfig)
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Runs base validation, then raises ValueError if actor.is_critic is True.
         super().__post_init__()
         if getattr(self.actor, "is_critic", False):
             raise ValueError(
@@ -3341,6 +3715,11 @@ class DPOConfig(BaseExperimentConfig):
 
 @dataclass
 class TeacherConfig:
+    # [CLASS DOC]
+    # Dataclass for an on-policy distillation teacher: engine_type ("rollout" uses an
+    # InferenceEngineConfig teacher, "train" the legacy PPOActorConfig path), the two
+    # optional engine configs, model path, offload flag, and loss weights for the RL
+    # term (rl_loss_weight) and the distillation term (distill_loss_weight).
     engine_type: str = field(
         default="rollout",
         metadata={
@@ -3377,6 +3756,9 @@ class TeacherConfig:
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Warns (UserWarning) when both rollout and train are configured; raises
+        # ValueError if the config matching engine_type is missing.
         if self.rollout is not None and self.train is not None:
             warnings.warn(
                 "Both teacher.rollout and teacher.train are configured; "
@@ -3395,6 +3777,10 @@ class TeacherConfig:
 
 @dataclass
 class PPOConfig(BaseExperimentConfig):
+    # [CLASS DOC]
+    # Experiment config for PPO-style RL: rollout gconfig and optional eval_gconfig,
+    # rollout InferenceEngineConfig, actor PPOActorConfig, optional ref, critic and
+    # teacher configs, and dynamic_bs (variable-size batches of accepted samples).
     """Configuration for Proximal Policy Optimization (PPO) reinforcement learning experiments."""
 
     gconfig: GenerationHyperparameters = field(
@@ -3431,6 +3817,13 @@ class PPOConfig(BaseExperimentConfig):
     )
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Defaults eval_gconfig to a copy of gconfig. With
+        # rollout.deterministic_sampling, raises ValueError if either generation config
+        # has n_samples > 1 and a fixed seed. Raises ValueError if both
+        # gconfig.reward_normalization and actor.reward_norm are set. If rollout uses
+        # LoRA without a lora_name, copies gconfig.lora_name into it (mutation). Then
+        # runs base validation.
         """Validate the eval generation config."""
         if self.eval_gconfig is None:
             self.eval_gconfig = self.gconfig.new()
@@ -3466,12 +3859,20 @@ class PPOConfig(BaseExperimentConfig):
 
 @dataclass
 class GRPOConfig(PPOConfig):
+    # [CLASS DOC]
+    # Backward-compatible alias of PPOConfig with no changes.
     """A dummy place holder of GRPO config for backward compatibility."""
 
     pass
 
 
 def parse_cli_args(argv: list[str]):
+    # [FUNCTION DOC]
+    # Parses argv with argparse requiring --config (drops a leading *.py script path;
+    # other unknown args are kept as Hydra overrides). Asserts the config file exists,
+    # resets any initialized global Hydra, initializes Hydra with the config directory
+    # expressed relative to this module's directory, and composes the YAML (name without
+    # .yaml) with the overrides. Returns (DictConfig, absolute config Path).
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config", help="Path to the main configuration file", required=True
@@ -3514,6 +3915,11 @@ _LEGACY_MIGRATION_MESSAGE = (
 
 
 def _migrate_legacy_rejection_sampling(cfg: DictConfig) -> DictConfig:
+    # [FUNCTION DOC]
+    # HELPER: Checks the actor and teacher sections of cfg for removed keys
+    # behave_imp_weight_cap / behave_imp_weight_mode and raises ValueError with a
+    # migration guide if found; otherwise returns cfg unchanged. Despite the name, it
+    # does not migrate anything.
     """Intercept removed behave_imp_weight_* keys and raise actionable error."""
     # Walk top-level and known nested actor/teacher configs for legacy keys.
     sections_to_check = ["actor", "teacher"]
@@ -3532,6 +3938,10 @@ def _migrate_legacy_rejection_sampling(cfg: DictConfig) -> DictConfig:
 
 
 def to_structured_cfg(cfg, config_cls):
+    # [FUNCTION DOC]
+    # Checks for legacy keys, then merges cfg onto OmegaConf.structured(config_cls) so
+    # omitted fields get dataclass defaults and types are enforced. Returns the merged
+    # DictConfig.
     # Intercept legacy config keys before merge to give actionable error.
     _migrate_legacy_rejection_sampling(cfg)
     # Merge with the default configuration.
@@ -3542,6 +3952,12 @@ def to_structured_cfg(cfg, config_cls):
 
 
 def load_expr_config(argv: list[str], config_cls: type[ConfigT]) -> tuple[ConfigT, str]:
+    # [FUNCTION DOC]
+    # Full config loading: parse CLI/YAML, merge into config_cls structure, convert to
+    # the dataclass object (asserting its type, which also runs __post_init__
+    # validation), reconfigure name_resolve from cfg.cluster, and on RANK 0 (env var)
+    # save config.yaml to the StatsLogger log path. Returns (config object, config file
+    # path string).
     cfg, config_file = parse_cli_args(argv)
     cfg = to_structured_cfg(cfg, config_cls=config_cls)
     cfg = OmegaConf.to_object(cfg)
@@ -3560,12 +3976,18 @@ def load_expr_config(argv: list[str], config_cls: type[ConfigT]) -> tuple[Config
 
 
 def conf_as_dict(cfg):
+    # [FUNCTION DOC]
+    # HELPER: Returns a plain dict from an OmegaConf DictConfig (resolved) or a
+    # dataclass instance (asdict).
     if isinstance(cfg, (OmegaConf, DictConfig)):
         return OmegaConf.to_container(cfg, resolve=True)
     return asdict(cfg)
 
 
 def save_config(cfg, log_dir):
+    # [FUNCTION DOC]
+    # HELPER: Creates log_dir and writes the dataclass cfg as block-style YAML
+    # (insertion order) to log_dir/config.yaml.
     os.makedirs(log_dir, exist_ok=True)
     config_save_path = os.path.join(log_dir, "config.yaml")
     with open(config_save_path, "w") as f:

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# CLEVR-Count-70K vision counting dataset loaders for SFT and RL. Images are downscaled
+# to at most 336*336 pixels and JPEG-encoded. When torch.distributed is initialized,
+# rank 0 preprocesses first with multiprocessing (up to DATASET_NUM_PROC=16 workers) to
+# populate the HF cache, a barrier follows, then every rank reruns preprocessing
+# (hitting the cache). Uses the "CLEVR70KDataset" logger.
 # SPDX-License-Identifier: Apache-2.0
 
 import math
@@ -20,6 +26,12 @@ def convert_image(
     image: dict[str, Any] | ImageObject | str,
     max_pixels: int | None,
 ) -> ImageObject:
+    # [FUNCTION DOC]
+    # HELPER: If max_pixels is given and the image has more pixels, resizes it by
+    # sqrt(max_pixels / area) keeping aspect ratio. Converts to RGB if needed and
+    # returns JPEG-encoded bytes.
+    # KNOWN ISSUE: Annotated to accept dict/str and return an Image, but it requires a
+    # PIL image and returns bytes.
     if max_pixels is not None and (image.width * image.height) > max_pixels:
         resize_factor = math.sqrt(max_pixels / (image.width * image.height))
         width, height = (
@@ -41,6 +53,11 @@ def get_clevr_count_70k_sft_dataset(
     processor,
     max_length: int | None = None,
 ):
+    # [FUNCTION DOC]
+    # Builds the SFT dataset via the nested _do_preprocess using the distributed
+    # rank-0-first caching scheme described in the module doc (logs a warning to put
+    # HF_HOME on shared storage). Returns a Dataset with input_ids, mm_token_type_ids,
+    # multi_modal_input and loss_mask.
     """
     "clevr_count_70k": {
         "image_key": "images",
@@ -56,11 +73,24 @@ def get_clevr_count_70k_sft_dataset(
         max_length: int | None = None,
         num_proc: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Loads the split; maps each example to substitute the model image token
+        # for "<image>", remove "different", convert images and build seq = problem +
+        # answer + eos; then runs the processor to produce input_ids, mm_token_type_ids,
+        # multi_modal_input (pixel_values, optional image_grid_thw) and a loss_mask of 1
+        # over the trailing len(tokenized answer) tokens. Drops raw columns and
+        # optionally filters by max_length. Returns the Dataset.
+        # KNOWN ISSUE: The num_proc argument is ignored and overwritten with
+        # min(cpu_count, 16), so multiprocessing is used even in the non-distributed
+        # path that intends num_proc=None. Loss mask ignores the trailing eos token so
+        # the mask is shifted by one.
         dataset = load_dataset(path=path, split=split)
 
         tokenizer = processor.tokenizer
 
         def process_example(example):
+            # [FUNCTION DOC]
+            # HELPER: Per-example text and image preprocessing building the seq field.
             # Add query_id column
             images = example["images"]
             image_processor_type = (
@@ -96,6 +126,9 @@ def get_clevr_count_70k_sft_dataset(
         )
 
         def _process(example):
+            # [FUNCTION DOC]
+            # HELPER: Runs the multimodal processor on one example and adds token ids,
+            # multimodal inputs and loss mask.
             text = example["seq"]
             processed_input = processor(
                 text=[text],
@@ -156,6 +189,10 @@ def get_clevr_count_70k_rl_dataset(
     processor,
     max_length: int | None = None,
 ):
+    # [FUNCTION DOC]
+    # Builds the RL dataset via the nested _do_preprocess with the same rank-0-first
+    # caching scheme as the SFT loader. Returns a Dataset with messages (chat-template-
+    # rendered prompt string) and images.
     def _do_preprocess(
         path: str,
         split: str,
@@ -163,9 +200,19 @@ def get_clevr_count_70k_rl_dataset(
         max_length: int | None = None,
         num_proc: int | None = None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Loads the split and maps each sample (with num_proc) to a system
+        # prompt asking to count items and answer as a number in [ ], plus a user turn
+        # with the image token substituted and "different" removed, rendered with the
+        # tokenizer chat template and a generation prompt; images are converted to JPEG
+        # bytes. Removes problem and optionally filters by processor token count
+        # including image tokens. Returns the Dataset.
         dataset = load_dataset(path=path, split=split)
 
         def process(sample):
+            # [FUNCTION DOC]
+            # HELPER: Builds the rendered messages string and processed images for one
+            # sample.
             processed_images = [
                 convert_image(image, 336 * 336) for image in sample["images"]
             ]
@@ -207,6 +254,9 @@ def get_clevr_count_70k_rl_dataset(
         if max_length is not None:
 
             def filter_length(sample):
+                # [FUNCTION DOC]
+                # HELPER: True if the processor's input_ids length for the prompt and
+                # images is <= max_length.
                 # Process the sample to get the total token count including image tokens
                 processed_input = processor(
                     text=[sample["messages"]],

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Workflow contracts. Defines the RolloutWorkflow abstract base (async arun_episode
+# producing a training trajectory from an inference engine), the deprecated
+# AgentWorkflow base for agent-SDK style workflows (async run returning rewards), and
+# the WorkflowLike type alias accepted across the stack (a workflow instance, class,
+# import-path string, or any object with a compatible async run method). Engine/OpenAI
+# types are imported only under TYPE_CHECKING.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations  # noqa
@@ -12,10 +19,19 @@ if TYPE_CHECKING:
 
 
 class RolloutWorkflow(ABC):
+    # [CLASS DOC]
+    # Abstract base for rollout workflows. Subclasses implement arun_episode, which
+    # drives one episode against an InferenceEngine and returns the trajectory used for
+    # training.
     @abstractmethod
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None | dict[str, InteractionWithTokenLogpReward]:
+        # [FUNCTION DOC]
+        # Abstract coroutine. Inputs: engine (InferenceEngine for generation), data (one
+        # dataset item dict). Returns a trajectory dict (tensor batch), a dict mapping
+        # completion IDs to InteractionWithTokenLogpReward, or None to reject the
+        # trajectory. Base implementation raises NotImplementedError.
         """Run a single episode of the workflow.
 
         Note
@@ -40,6 +56,10 @@ class RolloutWorkflow(ABC):
 
 
 class _DeprecatedAgentWorkflowMeta(ABCMeta):
+    # [CLASS DOC]
+    # HELPER: ABCMeta subclass whose __call__ emits a DeprecationWarning whenever a
+    # class using it (i.e. AgentWorkflow subclasses) is instantiated, regardless of
+    # whether __init__ calls super.
     """Metaclass that ensures deprecation warning triggers on any subclass instantiation.
 
     This approach guarantees the warning fires even if subclasses forget to call
@@ -48,6 +68,9 @@ class _DeprecatedAgentWorkflowMeta(ABCMeta):
     """
 
     def __call__(cls, *args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Emits a DeprecationWarning (stacklevel 2) naming the class, then
+        # delegates to normal instance construction and returns the instance.
         import warnings
 
         warnings.warn(
@@ -61,6 +84,9 @@ class _DeprecatedAgentWorkflowMeta(ABCMeta):
 
 
 class AgentWorkflow(ABC, metaclass=_DeprecatedAgentWorkflowMeta):
+    # [CLASS DOC]
+    # Deprecated abstract base for agent workflows; instantiation warns via its
+    # metaclass. Any class with a compatible async run method can be used instead.
     """Base class for agent-based workflows (DEPRECATED).
 
     .. deprecated:: 1.0.0
@@ -77,6 +103,11 @@ class AgentWorkflow(ABC, metaclass=_DeprecatedAgentWorkflowMeta):
     async def run(
         self, data: dict[str, Any], **extra_kwargs: Any
     ) -> dict[str, float] | float:
+        # [FUNCTION DOC]
+        # Abstract coroutine. Inputs: data (input item dict) plus extra_kwargs supplied
+        # by AReaL (base_url of the OpenAI-compatible proxy, http_client
+        # httpx.AsyncClient, session api_key). Returns a float reward or dict of rewards
+        # keyed by response ID. Base raises NotImplementedError.
         """Run an agent with any SDK, e.g., OpenAI SDK.
 
         `data` contains the input data for the agent, which may

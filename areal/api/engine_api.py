@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Engine contracts. TrainEngine is the abstract interface implemented by
+# FSDP/Megatron/Archon training backends (process groups, train/eval/forward over
+# batches, optimizer and LR steps, weight sync to inference, checkpointing, offload,
+# stats). InferenceEngine is the interface for SGLang/vLLM-style rollout clients
+# (generation, weight updates, async workflow submission/wait, batch preparation with
+# staleness control, pause/resume). Base methods are abstract or raise
+# NotImplementedError; a few are no-op hooks or thin conveniences.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -30,8 +38,15 @@ if TYPE_CHECKING:
 
 
 class TrainEngine(abc.ABC):
+    # [CLASS DOC]
+    # Abstract training engine. Lifecycle: create_process_group, then initialize, then
+    # train/eval batches; exposes data-parallel and model-parallel groups, weight
+    # versioning, save/load and weight push to a connected InferenceEngine.
     @abc.abstractmethod
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
+        # [FUNCTION DOC]
+        # Abstract. Creates the torch.distributed groups (DP, model-parallel, CPU)
+        # according to parallel_strategy (None means implementation default).
         """Initialize PyTorch distributed communication groups.
 
         Parameters
@@ -43,6 +58,9 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def initialize(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Abstract. Loads the model/optimizer and sets up distributed training; must
+        # follow create_process_group. Arguments are implementation-specific.
         """Initialize environments for distributed training and load models.
 
         This method should be called after `create_process_group`.
@@ -59,6 +77,8 @@ class TrainEngine(abc.ABC):
     @property
     @abc.abstractmethod
     def data_parallel_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Abstract property: the data-parallel ProcessGroup.
         """Get the data parallel communication group of this engine.
 
         Returns
@@ -71,6 +91,8 @@ class TrainEngine(abc.ABC):
     @property
     @abc.abstractmethod
     def data_parallel_rank(self) -> int:
+        # [FUNCTION DOC]
+        # Abstract property: this process's rank within the DP group.
         """Get the rank of the current process in the data parallel group.
 
         Returns
@@ -83,6 +105,8 @@ class TrainEngine(abc.ABC):
     @property
     @abc.abstractmethod
     def data_parallel_world_size(self) -> int:
+        # [FUNCTION DOC]
+        # Abstract property: size of the DP group.
         """Get the world size of the data parallel group.
 
         Returns
@@ -94,6 +118,9 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def current_data_parallel_head(self) -> int:
+        # [FUNCTION DOC]
+        # Abstract. Returns the global rank acting as head (representative) of this
+        # process's DP slot within its model-parallel group.
         """Get the current data parallel head rank.
 
         Returns
@@ -105,6 +132,9 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def is_data_parallel_head(self) -> bool:
+        # [FUNCTION DOC]
+        # Abstract. True if this rank is the head of its model-parallel group (the one
+        # that owns I/O for its DP slot).
         """Check if the current rank is the data parallel head of the current engine.
 
         Returns
@@ -117,6 +147,9 @@ class TrainEngine(abc.ABC):
     @property
     @abc.abstractmethod
     def context_and_model_parallel_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Abstract property: ProcessGroup spanning context and model (tp/pp) parallel
+        # ranks of the same DP slot.
         """Get the context and model parallel communication group of this engine.
 
         Returns
@@ -129,6 +162,8 @@ class TrainEngine(abc.ABC):
     @property
     @abc.abstractmethod
     def cpu_group(self) -> dist.ProcessGroup:
+        # [FUNCTION DOC]
+        # Abstract property: a CPU (gloo) ProcessGroup for host-side collectives.
         """Get the CPU communication group of this engine.
 
         Returns
@@ -139,11 +174,15 @@ class TrainEngine(abc.ABC):
         raise NotImplementedError()
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Hook to release models and GPU memory; the base implementation does nothing.
         """Destroy the engine and release GPU memory of models."""
 
     @property
     @abc.abstractmethod
     def initialized(self) -> bool:
+        # [FUNCTION DOC]
+        # Abstract property: True once initialize succeeded.
         """Check if the engine has been initialized.
 
         Returns
@@ -155,6 +194,9 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def train(self, mode: bool = True):
+        # [FUNCTION DOC]
+        # Abstract. Switches the model to training mode (mode True) or eval mode
+        # (False).
         """Set the engine to training mode.
 
         Parameters
@@ -165,6 +207,8 @@ class TrainEngine(abc.ABC):
         raise NotImplementedError()
 
     def eval(self):
+        # [FUNCTION DOC]
+        # Convenience: calls train(False) and returns its result.
         """Set the engine to evaluation mode.
 
         This is a convenience method that calls `self.train(False)`.
@@ -173,6 +217,9 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def update_weights(self, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Abstract. Blocking push of current weights to the inference engine as
+        # described by meta (disk or xccl).
         """Update weights to the inference engine in a blocking manner.
 
         Parameters
@@ -184,6 +231,9 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def connect_engine(self, engine: InferenceEngine, meta: WeightUpdateMeta):
+        # [FUNCTION DOC]
+        # Abstract. Attaches an InferenceEngine for online training, using meta to set
+        # up the weight-update channel.
         """Connect to an inference engine for online training.
 
         Parameters
@@ -203,6 +253,11 @@ class TrainEngine(abc.ABC):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Abstract. Synchronous rollout forwarded to the connected inference engine with
+        # distributed data handling: runs workflow on each data item (group_size times,
+        # optional reward normalization and dropping incomplete groups) and returns
+        # accepted trajectories. Intended for offline collection/debugging.
         """Submit a batch of requests and wait for results.
 
         This method does not support asynchronous rollout and should be used for offline
@@ -242,6 +297,13 @@ class TrainEngine(abc.ABC):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Abstract. Pulls items from dataloader and produces one training batch of
+        # accepted trajectories via the connected inference engine, with optional
+        # should_accept_fn filtering (callable or import path), grouping, dynamic batch
+        # size, reward normalization and incomplete-group dropping.
+        # KNOWN ISSUE: Docstring says it returns dict[str, Any] while the annotation is
+        # a list of trajectory dicts.
         """Prepare a batch of data for training from a dataloader.
 
         Parameters
@@ -271,6 +333,8 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def set_version(self, version: int):
+        # [FUNCTION DOC]
+        # Abstract. Sets the engine's current weight version counter.
         """Set the current weight version in the training engine.
 
         Parameters
@@ -282,6 +346,8 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Abstract. Returns the current weight version.
         """Get the current weight version in the training engine.
 
         Returns
@@ -293,6 +359,8 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def save(self, meta: SaveLoadMeta):
+        # [FUNCTION DOC]
+        # Abstract. Saves weights (and optimizer state if meta.with_optim) per meta.
         """Save model weights and optimizer states for later use.
 
         Parameters
@@ -304,6 +372,8 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def load(self, meta: SaveLoadMeta):
+        # [FUNCTION DOC]
+        # Abstract. Loads weights (and optimizer state if requested) per meta.
         """Load model weights and optimizer states from a file.
 
         Parameters
@@ -315,11 +385,16 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def optimizer_zero_grad(self):
+        # [FUNCTION DOC]
+        # Abstract. Zeroes gradients.
         """Zero out all gradients in the optimizer."""
         raise NotImplementedError()
 
     @abc.abstractmethod
     def optimizer_step(self):
+        # [FUNCTION DOC]
+        # Abstract. Performs one optimizer step (with clipping) and returns stats
+        # including update_successful, grad_norm and lr.
         """Perform a single optimization step.
 
         Returns
@@ -331,10 +406,14 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def lr_scheduler_step(self):
+        # [FUNCTION DOC]
+        # Abstract. Advances the LR scheduler one step.
         """Advance the learning rate scheduler by one step."""
         raise NotImplementedError()
 
     def step_lr_scheduler(self):
+        # [FUNCTION DOC]
+        # Alias that calls lr_scheduler_step.
         """This is an alias for `lr_scheduler_step()`."""
         return self.lr_scheduler_step()
 
@@ -347,6 +426,11 @@ class TrainEngine(abc.ABC):
         ],
         forward_only: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Abstract. Runs each micro-batch of mb_list through the model;
+        # process_output_fn receives logits and the micro-batch inputs and returns a
+        # loss (backward is called on it unless None or forward_only). Results can be
+        # gathered through closures. Returns None.
         """Process micro-batches through forward and optionally backward pass.
 
         Parameters
@@ -370,6 +454,12 @@ class TrainEngine(abc.ABC):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Abstract. One training update: splits input (trajectory list or pre-batched
+        # dict) into packed micro-batches, computes loss_fn per micro-batch (actor:
+        # logprobs, entropy, inputs; critic: values, inputs), weights each by
+        # loss_weight_fn for global normalization, backpropagates and steps the
+        # optimizer. Returns scalar stats (lr, grad norm, ...).
         """Update the model with a batch of data and a loss function.
 
         Note
@@ -409,6 +499,10 @@ class TrainEngine(abc.ABC):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
     ) -> torch.Tensor | None:
+        # [FUNCTION DOC]
+        # Abstract, gradient-free. Same inputs as train_batch but only computes the
+        # weighted loss; returns a scalar loss tensor or None, with stats recorded via
+        # stats_tracker.
         """Evaluate the model using the forward pass and loss function.
 
         Note
@@ -448,6 +542,11 @@ class TrainEngine(abc.ABC):
         output_seqlens: list[int] | None = None,
         aggregate_fn: Callable[[list[torch.Tensor]], torch.Tensor] = torch.cat,
     ) -> torch.Tensor | list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Abstract, gradient-free. Runs forward on input (list or dict), producing
+        # logprobs (actor) or values (critic), trimmed to output_seqlens (default: input
+        # lengths) and combined with aggregate_fn (default concatenation). Returns a
+        # batched tensor for dict input or a per-trajectory tensor list for list input.
         """Run the forward pass or inference on the model.
 
         Note
@@ -484,10 +583,15 @@ class TrainEngine(abc.ABC):
         output_seqlens: list[int] | None = None,
         aggregate_fn: Callable[[list[torch.Tensor]], torch.Tensor] = torch.cat,
     ) -> torch.Tensor | list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Gradient-free alias that delegates to forward_batch with the same arguments.
         return self.forward_batch(input_, output_seqlens, aggregate_fn)
 
     @abc.abstractmethod
     def export_stats(self) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Abstract. Returns scalar stats recorded in this process, all-reduced over DP
+        # and broadcast from the last pipeline stage.
         """Export the statistics recorded in this engine process.
 
         Note
@@ -504,23 +608,38 @@ class TrainEngine(abc.ABC):
 
     @abc.abstractmethod
     def onload(self) -> None:
+        # [FUNCTION DOC]
+        # Abstract. Moves offloaded model/optimizer state back to the device.
         raise NotImplementedError()
 
     @abc.abstractmethod
     def offload(self) -> None:
+        # [FUNCTION DOC]
+        # Abstract. Moves model/optimizer state off the device to free GPU memory.
         raise NotImplementedError()
 
     @abc.abstractmethod
     def get_device_stats(self) -> DeviceRuntimeInfo:
+        # [FUNCTION DOC]
+        # Abstract. Returns a DeviceRuntimeInfo memory snapshot.
         raise NotImplementedError()
 
     def start_memory_profile(self, max_entries: int = 100000) -> None:
+        # [FUNCTION DOC]
+        # Hook to begin recording a device memory history (up to max_entries); no-op in
+        # the base.
         pass
 
     def stop_memory_profile(self, snapshot_dir: str) -> None:
+        # [FUNCTION DOC]
+        # Hook to stop memory recording and dump a snapshot into snapshot_dir; no-op in
+        # the base.
         pass
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Hook to flush performance-tracer data for step (force ignores internal
+        # conditions); no-op in the base.
         """Save performance tracer data.
 
         Parameters
@@ -534,6 +653,9 @@ class TrainEngine(abc.ABC):
     def config_perf_tracer(
         self, config: PerfTracerConfig, rank: int, role: str
     ) -> None:
+        # [FUNCTION DOC]
+        # Hook to configure the performance tracer for this process's rank and role; no-
+        # op in the base.
         """Configure performance tracer.
 
         Parameters
@@ -549,7 +671,13 @@ class TrainEngine(abc.ABC):
 
 
 class InferenceEngine(abc.ABC):
+    # [CLASS DOC]
+    # Interface for inference/rollout engines. All methods raise NotImplementedError
+    # (initialized is abstract) except the perf-tracer hooks, which are no-ops.
     def initialize(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Sets up the engine (client connection to remote servers or a local LLM engine)
+        # and starts its background rollout thread. Base raises NotImplementedError.
         """Initialize environments and launch the background thread for asynchronous distributed inference.
 
         For remote inference engines, this serves as a client and connects to the inference servers.
@@ -565,12 +693,16 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Shuts down the engine and frees GPU memory. Base raises NotImplementedError.
         """Destroy the engine and release GPU memory for the local inference engine."""
         raise NotImplementedError()
 
     @property
     @abc.abstractmethod
     def initialized(self) -> bool:
+        # [FUNCTION DOC]
+        # Abstract property: True once initialize succeeded.
         """Check if the engine has been initialized.
 
         Returns
@@ -582,10 +714,17 @@ class InferenceEngine(abc.ABC):
 
     @property
     def workflow_executor(self) -> WorkflowExecutor:
+        # [FUNCTION DOC]
+        # Property returning the WorkflowExecutor that runs rollout workflows. Base
+        # raises NotImplementedError.
         """Get the workflow executor of the inference engine."""
         raise NotImplementedError()
 
     def launch_server(self, server_args: dict[str, Any]) -> LocalInfServerInfo:
+        # [FUNCTION DOC]
+        # Launches a local inference server subprocess with server_args (CLI options)
+        # and returns LocalInfServerInfo (host, port, process). Used in single-
+        # controller mode or standalone scripts. Base raises NotImplementedError.
         """Launch a local inference server via subprocess and return its connection info.
 
         By default, an `InferenceEngine` instance acts as a client that connects to an existing
@@ -618,10 +757,15 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def teardown_server(self):
+        # [FUNCTION DOC]
+        # Stops the server started by launch_server. Base raises NotImplementedError.
         """Teardown the inference server launched by `launch_server`."""
         raise NotImplementedError()
 
     async def agenerate(self, req: ModelRequest) -> ModelResponse:
+        # [FUNCTION DOC]
+        # Coroutine: generates a ModelResponse for one ModelRequest. Base raises
+        # NotImplementedError.
         """Asynchronously generate a response for the given request.
 
         Parameters
@@ -639,6 +783,10 @@ class InferenceEngine(abc.ABC):
     def init_weights_update_group(
         self, meta: WeightUpdateMeta, rank_ids: list[int] | None = None
     ) -> Future[None]:
+        # [FUNCTION DOC]
+        # Sets up the collective group used for distributed weight updates (rank_ids per
+        # server, default server order). Returns a Future completing when done. Base
+        # raises NotImplementedError.
         """Initialize the weight update process group for distributed weight updates.
 
         This method should be called before performing any weight updates to ensure
@@ -670,6 +818,9 @@ class InferenceEngine(abc.ABC):
     def update_weights_from_distributed(
         self, meta: WeightUpdateMeta, param_specs: list[ParamSpec]
     ) -> Future[None]:
+        # [FUNCTION DOC]
+        # Non-blocking weight update via collective broadcast for the listed
+        # param_specs. Returns a Future. Base raises NotImplementedError.
         """Update weights in the inference engine in a non-blocking manner.
 
         Parameters
@@ -687,6 +838,9 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def update_weights_from_disk(self, meta: WeightUpdateMeta) -> Future[None]:
+        # [FUNCTION DOC]
+        # Non-blocking reload of weights from meta.path. Returns a Future. Base raises
+        # NotImplementedError.
         """Update weights in the inference engine from disk in a non-blocking manner.
 
         Parameters
@@ -702,6 +856,9 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def set_version(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # Sets the weight version stamped on generated tokens. Base raises
+        # NotImplementedError.
         """Set the current weight version in the inference engine.
 
         Parameters
@@ -712,6 +869,8 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the current weight version. Base raises NotImplementedError.
         """Get the current weight version in the inference engine.
 
         Returns
@@ -722,6 +881,9 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def compute_logp(self, data: list[dict[str, Any]]) -> list[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Scores sequences and returns per-item token log-prob tensors (e.g. for teacher
+        # distillation). Base raises NotImplementedError naming the concrete class.
         """Compute token log-probabilities for teacher distillation.
 
         Implementations support this as an inference-side scoring API.
@@ -742,6 +904,12 @@ class InferenceEngine(abc.ABC):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> int:
+        # [FUNCTION DOC]
+        # Enqueues one rollout of workflow (instance, class, import path or agent
+        # object; kwargs used to construct non-instances) on data, optionally run
+        # group_size times with acceptance filter, explicit task_id, eval flag, reward
+        # normalization and incomplete-group dropping. Returns the task id immediately.
+        # Base raises NotImplementedError.
         """Submit a request to the inference engine and return immediately.
 
         Should be used together with subsequent `wait`.
@@ -784,6 +952,10 @@ class InferenceEngine(abc.ABC):
     def wait(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> list[dict[str, Any] | None]:
+        # [FUNCTION DOC]
+        # Blocks until count accepted trajectories are available or timeout passes
+        # (TimeoutError if raise_timeout, else empty list). Returns the trajectory list.
+        # Base raises NotImplementedError.
         """Wait for a specified number of requests to complete, with a timeout.
 
         Should be used together with preceding `submit`.
@@ -813,6 +985,11 @@ class InferenceEngine(abc.ABC):
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
+        # [FUNCTION DOC]
+        # Blocks for a specific submitted task id; returns its trajectory or None
+        # (rejected, or timeout with raise_timeout False). Raises ValueError for
+        # unknown/consumed ids and TimeoutError on timeout. Base raises
+        # NotImplementedError.
         """Wait for a specific task to complete by task_id.
 
         Parameters
@@ -847,6 +1024,10 @@ class InferenceEngine(abc.ABC):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Synchronously submits every data item and waits for all results, returning
+        # accepted trajectories. For offline use/debugging. Base raises
+        # NotImplementedError.
         """Submit a batch of requests to the inference engine and wait for the results.
 
         This method does not support asynchronous rollout and should be used for offline
@@ -894,6 +1075,11 @@ class InferenceEngine(abc.ABC):
         reward_normalization: bool = False,
         drop_incomplete_group: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Continuously submits from dataloader with staleness control and returns once a
+        # full batch of accepted trajectories is ready (dynamic_bs stops when
+        # accepted+rejected reaches batch size). The generator and its arguments are
+        # cached from the first call. Base raises NotImplementedError.
         """Asynchronously submit and wait until a full batch is ready with controlled staleness.
 
         See `workflow_api.py` for concrete implementation.
@@ -947,6 +1133,9 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def pause_generation(self):
+        # [FUNCTION DOC]
+        # Pauses in-flight generation on servers (used during weight updates). Base
+        # raises NotImplementedError.
         """Pause the generation of inference engine.
 
         Used during updating weights from distributed or disk.
@@ -954,10 +1143,16 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def continue_generation(self):
+        # [FUNCTION DOC]
+        # Resumes generation paused by pause_generation. Base raises
+        # NotImplementedError.
         """Continue the generation of inference engine."""
         raise NotImplementedError()
 
     def pause(self):
+        # [FUNCTION DOC]
+        # Stops submitting new rollout requests (e.g. during evaluation). Base raises
+        # NotImplementedError.
         """Pause request submission for async rollout.
 
         Used during evaluation to prevent data over-generation.
@@ -965,14 +1160,21 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def resume(self):
+        # [FUNCTION DOC]
+        # Resumes rollout request submission. Base raises NotImplementedError.
         """Resume request submission for async rollout."""
         raise NotImplementedError()
 
     def offload(self):
+        # [FUNCTION DOC]
+        # Moves the model off GPU. Base raises NotImplementedError.
         """Offload model from GPU to CPU for inference engine."""
         raise NotImplementedError()
 
     def onload(self, tags: list[str] | None = None):
+        # [FUNCTION DOC]
+        # Moves the model (or the components named in tags; None = all) back to GPU.
+        # Base raises NotImplementedError.
         """Onload model from CPU to GPU for inference engine.
 
         Parameters
@@ -983,6 +1185,9 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def export_stats(self) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Returns scalar workflow statistics recorded in this process for controller-
+        # side reduction. Base raises NotImplementedError.
         """Export the statistics recorded during workflow execution in the process.
 
         Workflow should only record scalar metrics like "rewards".
@@ -1000,6 +1205,8 @@ class InferenceEngine(abc.ABC):
         raise NotImplementedError()
 
     def save_perf_tracer(self, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Hook to flush performance-tracer data; no-op in the base.
         """Save performance tracer data.
 
         Parameters
@@ -1013,6 +1220,8 @@ class InferenceEngine(abc.ABC):
     def config_perf_tracer(
         self, config: PerfTracerConfig, rank: int, role: str
     ) -> None:
+        # [FUNCTION DOC]
+        # Hook to configure the performance tracer for rank and role; no-op in the base.
         """Configure performance tracer.
 
         Parameters
