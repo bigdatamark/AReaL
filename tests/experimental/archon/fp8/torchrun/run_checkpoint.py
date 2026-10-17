@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# torchrun worker script for the FP8 checkpoint end-to-end test. Each rank initializes
+# NCCL, builds an ArchonLMEngine with blockwise FP8 enabled on a pure data-parallel
+# mesh, loads an FP8 HF checkpoint, runs a deterministic forward, sanity-checks logits,
+# optionally compares against a BF16 checkpoint, and rank 0 writes the result via
+# write_result to --output.
 from __future__ import annotations
 
 import argparse
@@ -26,6 +32,12 @@ def _create_engine_config(
     world_size: int,
     enable_fp8: bool,
 ) -> TrainEngineConfig:
+    # [FUNCTION DOC]
+    # HELPER: Builds a TrainEngineConfig for inference-only use. Inputs: model_path,
+    # world_size (encoded into backend "archon:d{world_size}"), enable_fp8 (when True
+    # sets ArchonEngineConfig fp8_config mode "blockwise", else default
+    # ArchonEngineConfig). Uses one micro-batch, no optimizer, fixed experiment/trial
+    # names. Returns the config.
     archon_config = (
         ArchonEngineConfig(fp8_config=FP8Config(mode="blockwise"))
         if enable_fp8
@@ -43,6 +55,12 @@ def _create_engine_config(
 
 
 def _run_forward(engine: ArchonLMEngine) -> tuple[torch.Tensor, int, int, int]:
+    # [FUNCTION DOC]
+    # HELPER: Runs a no-grad eval forward on engine.model with a seeded (42) packed
+    # batch of 2 sequences of length 32: token ids uniform in [100, vocab-100) shaped
+    # [1, 64], positions 0..63 (not reset per sequence), int32 cu_seqlens [0,32,64],
+    # max_seqlen 32. Returns (logits, batch_size, seq_len, vocab_size). Sets model to
+    # eval mode as a side effect.
     torch.manual_seed(42)
     batch_size, seq_len = 2, 32
     vocab_size = engine.model_config.vocab_size
@@ -71,6 +89,18 @@ def test_fp8_load_and_forward(
     bf16_model_path: str,
     output: str | None = None,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Main check run on every rank. Creates and initializes the FP8 engine
+    # (DP=world_size, dummy FinetuneSpec), runs the forward and asserts logits are
+    # finite, max logit above 15 and self cross-entropy against greedy argmax labels
+    # below 5. Destroys the FP8 engine; if bf16_model_path is given, builds a BF16
+    # engine, runs the same forward and asserts mean relative difference below 0.5. Any
+    # exception is caught, printed and marks failure. Always destroys remaining engines
+    # and barriers. Rank 0 writes the result to output if given. Returns the local
+    # success flag.
+    # KNOWN ISSUE: Success is evaluated per rank but only rank 0 writes the result, so a
+    # failure on another rank is not reflected in the output file (the process exit code
+    # still reports it only if an exception propagates, which it does not here).
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
@@ -164,6 +194,12 @@ def test_fp8_load_and_forward(
 
 
 def main():
+    # [FUNCTION DOC]
+    # Entry point: parses --fp8_model_path (required), --bf16_model_path, --output;
+    # initializes the NCCL process group, sets the CUDA device to the global rank
+    # (assumes single node), runs test_fp8_load_and_forward, barriers and prints the
+    # overall status. On unexpected exceptions prints the traceback, rank 0 writes a
+    # failure result, and re-raises. Always destroys the process group.
     parser = argparse.ArgumentParser()
     parser.add_argument("--fp8_model_path", type=str, required=True)
     parser.add_argument("--bf16_model_path", type=str, default=None)

@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Single-GPU forward tests for the Archon Qwen2 model (MODEL_PATHS["qwen2"]): packed-
+# sequence (cu_seqlens) forward versus HuggingFace run per sequence, packed-logit
+# sanity, precision statistics on random and GSM8K inputs, and torchrun-launched engine
+# tests (Archon FSDP forward, Archon vs FSDP engine logits). Loads real checkpoints via
+# tests.experimental.archon.utils helpers; tests that call setup_environment destroy any
+# default process group afterwards. Module skipped without CUDA.
+# KNOWN ISSUE: The module docstring says all tests are marked slow, but only the two
+# torchrun tests are; it also refers to test_distributed.py, which is now split into
+# test_distributed_dp/tp/cp/ep/pp.py.
 """Forward pass tests for Archon Engine (single GPU).
 
 These tests verify:
@@ -44,6 +54,13 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_archon_forward_matches_hf():
+    # [FUNCTION DOC]
+    # Builds a packed batch of 2 sequences of length 32, constructs positions that
+    # restart at 0 per sequence, runs Archon once on the packed input and HF on each
+    # sequence separately (concatenated). Asserts logits max diff below 3.0 and mean
+    # diff below 0.2, matching top-1 and at least 4 of top-5 at the first position, and
+    # max per-token logprob diff below 0.6 on the first sequence. Destroys the process
+    # group if initialized.
     """Verify Archon forward matches HuggingFace for packed sequences.
 
     This test creates packed input with cu_seqlens, runs Archon forward,
@@ -145,6 +162,10 @@ def test_archon_forward_matches_hf():
 
 
 def test_archon_packed_sequence_logits():
+    # [FUNCTION DOC]
+    # Seeds RNG, packs three random sequences of lengths 10, 15, 7 (int32 cu_seqlens,
+    # positions None) and asserts Archon logits have shape [1, 32, vocab], contain no
+    # NaN/Inf and have std above 0.1. Destroys the process group if initialized.
     """Verify Archon packed sequence (SDPA) produces correct logits.
 
     This test creates a packed batch with cu_seqlens and verifies that:
@@ -200,6 +221,9 @@ def test_archon_packed_sequence_logits():
 
 
 class TestArchonHFPrecision:
+    # [CLASS DOC]
+    # Archon vs HF precision statistics with class-level thresholds: max logits diff
+    # 3.0, top-1 match rate at least 0.85, mean logprob diff below 0.2.
     """Archon vs HuggingFace precision comparison tests.
 
     These tests verify that Archon and HuggingFace models produce
@@ -214,6 +238,10 @@ class TestArchonHFPrecision:
 
     @pytest.fixture(autouse=True)
     def setup(self):
+        # [FUNCTION DOC]
+        # HELPER: Autouse fixture: calls setup_environment, stores model_path (qwen2),
+        # bfloat16 dtype and the platform device on self, yields, then destroys the
+        # default process group if initialized.
         """Set up test environment."""
         setup_environment()
         self.model_path = MODEL_PATHS["qwen2"]
@@ -224,6 +252,12 @@ class TestArchonHFPrecision:
             dist.destroy_process_group()
 
     def test_precision_random_input(self):
+        # [FUNCTION DOC]
+        # Packs 3 random sequences of length 32, runs Archon packed with per-sequence
+        # positions and HF per sequence, prints compare_outputs stats, asserts max diff
+        # below threshold and per-position top-1 agreement rate at least 85%.
+        # KNOWN ISSUE: vocab_size is hard-coded to 151936 rather than read from the
+        # model config.
         """Test Archon vs HF precision with random packed input."""
         hf_model = load_hf_model(self.model_path, dtype=self.dtype)
         archon_model, _ = load_archon_model(self.model_path, dtype=self.dtype)
@@ -298,6 +332,15 @@ class TestArchonHFPrecision:
         )
 
     def test_precision_gsm8k(self):
+        # [FUNCTION DOC]
+        # Loads 10 GSM8K samples; for each, runs Archon (single sequence cu_seqlens) and
+        # HF on the prompt ids, accumulates max diffs, per-position top-1 matches, and,
+        # when the full ids extend beyond the prompt, logprob diffs for answer tokens
+        # predicted within the prompt window. Prints averages and asserts top-1 rate at
+        # least 85% and average logprob diff below 0.2.
+        # KNOWN ISSUE: Only prompt_ids are fed to the models, so the answer-token
+        # logprob slice usually covers just the last prompt position (num_pred is at
+        # most 1); the answer logprob check is therefore very weak.
         """Test Archon vs HF precision with real GSM8K data."""
         hf_model = load_hf_model(self.model_path, dtype=self.dtype)
         archon_model, _ = load_archon_model(self.model_path, dtype=self.dtype)
@@ -380,6 +423,11 @@ class TestArchonHFPrecision:
         )
 
     def test_logits_exact_match(self):
+        # [FUNCTION DOC]
+        # For one GSM8K prompt compares the last-position logits: prints max/mean diff
+        # and decoded top-10 tokens from both models; asserts top-1 matches and top-10
+        # overlap is at least 9.
+        # KNOWN ISSUE: Despite the name, it does not require exact logits equality.
         """Verify logits and top-k predictions match."""
         hf_model = load_hf_model(self.model_path, dtype=self.dtype)
         archon_model, _ = load_archon_model(self.model_path, dtype=self.dtype)
@@ -446,6 +494,9 @@ class TestArchonHFPrecision:
 
 @pytest.mark.slow
 def test_archon_fsdp_forward_1gpu():
+    # [FUNCTION DOC]
+    # Slow. Skips without a device; runs run_forward.py via run_torchrun_test with 1
+    # process.
     """Test Archon Engine forward with FSDP on 1 GPU."""
     if current_platform.device_count() < 1:
         pytest.skip("This test requires at least 1 GPU")
@@ -457,6 +508,9 @@ def test_archon_fsdp_forward_1gpu():
 
 @pytest.mark.slow
 def test_archon_vs_fsdp_engine_logits():
+    # [FUNCTION DOC]
+    # Slow. Skips without a device; runs run_vs_fsdp.py (Archon vs FSDP engine logits
+    # comparison) via run_torchrun_test with 1 process.
     """Test Archon vs FSDP engine logits comparison."""
     if current_platform.device_count() < 1:
         pytest.skip("This test requires at least 1 GPU")

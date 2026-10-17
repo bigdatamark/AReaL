@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Multi-GPU test for Archon data parallelism (FSDP): runs the run_forward.py torchrun
+# worker via the shared run_torchrun_test helper. Module skipped without CUDA.
 """Data Parallelism (DP/FSDP) tests for Archon Engine.
 
 Run tests:
@@ -19,6 +22,9 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_forward_dp_2gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 2 devices; runs run_forward.py with 2
+    # processes and relies on the helper to fail on errors.
     """Test Archon Engine forward_batch with Data Parallelism (2 GPUs)."""
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")

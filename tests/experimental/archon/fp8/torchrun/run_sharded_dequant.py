@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# torchrun worker validating that dequant_fp8_state_dict on FSDP-style Shard(0) DTensors
+# gives the same result as single-device weight_dequant_cpu, including mixed BF16
+# DTensors and shard boundaries that split a 128-row scale block. Run with 2 or 4 GPUs;
+# rank 0 writes "Passed" or "Failed" to --output.
 """Sharded FP8 dequantization correctness tests.
 
 Validates that ``dequant_fp8_state_dict`` produces identical results whether
@@ -34,6 +39,13 @@ from areal.experimental.models.archon.fp8_checkpoint import (
 # Test 1: Basic sharded dequant matches full dequant
 # ---------------------------------------------------------------------------
 def test_sharded_dequant_matches_full():
+    # [FUNCTION DOC]
+    # Builds a seeded 512x256 FP8 weight with random 4x2 scales in [0.5,1.5), computes
+    # the CPU reference, distributes the weight as Shard(0) over a 1-D cuda mesh,
+    # dequantizes to BF16 and asserts the result is a DTensor with (Shard(0),)
+    # placement, global shape [512,256], BF16 dtype, scale key removed, and (on rank 0)
+    # its gathered full tensor matches the reference within 1e-3. full_tensor is a
+    # collective called on all ranks.
     """2-GPU sharded dequant produces the same result as single-device full dequant.
 
     Setup:
@@ -91,6 +103,10 @@ def test_sharded_dequant_matches_full():
 # Test 2: Mixed FP8 + BF16 DTensors in the same state dict
 # ---------------------------------------------------------------------------
 def test_mixed_fp8_and_bf16_dtensors():
+    # [FUNCTION DOC]
+    # State dict with a Shard(0) FP8 256x128 weight plus ones scale and a Shard(0) BF16
+    # norm DTensor. Asserts the FP8 entry becomes a BF16 DTensor and the norm entry is
+    # the identical, untouched object.
     """Non-FP8 DTensors (norms, embeddings) pass through untouched.
 
     Verifies that dequant only touches FP8 keys and leaves BF16 DTensors
@@ -134,6 +150,11 @@ def test_mixed_fp8_and_bf16_dtensors():
 # Test 3: Non-128-aligned shard boundary (block boundary crosses shard)
 # ---------------------------------------------------------------------------
 def test_non_aligned_shard_boundary():
+    # [FUNCTION DOC]
+    # 384x256 weight with 3x2 scales: with 2 ranks the shard start row 192 is not
+    # 128-aligned, so a scale block straddles shards. Asserts the result is a DTensor of
+    # global shape [384,256] and that rank 0's gathered tensor matches the CPU reference
+    # within 1e-3.
     """Shard boundary not aligned to block_size=128.
 
     M=384, R=2 → local_M=192, start_rows=[0, 192].
@@ -181,6 +202,10 @@ def test_non_aligned_shard_boundary():
 # Test 4: Multiple scale patterns (different scales per block)
 # ---------------------------------------------------------------------------
 def test_multi_block_scale_correctness():
+    # [FUNCTION DOC]
+    # All-ones 256x256 FP8 weight with distinct per-block scales 1,2,3,4: asserts on
+    # rank 0 that the gathered dequantized tensor exactly equals the CPU reference,
+    # catching scale indexing errors.
     """Each 128×128 block has a distinct scale — verify per-block correctness.
 
     Uses ones as FP8 data so expected output = scale_inv value per block.
@@ -225,6 +250,14 @@ ALL_TESTS = [
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --output, initializes NCCL, sets the CUDA device to the rank, runs every
+    # function in ALL_TESTS catching and printing exceptions while counting
+    # passes/failures, barriers, prints a summary, and on rank 0 writes "Passed" (no
+    # local failures) or "Failed" to the output file. Destroys the process group.
+    # KNOWN ISSUE: Failure counts are local; rank 0 writes "Passed" even if a test
+    # failed only on another rank. Also an exception in one test on one rank may leave
+    # other ranks blocked in collectives (full_tensor) and hang.
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()

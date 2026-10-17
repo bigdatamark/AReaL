@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Single-GPU HF parity test for the Archon qwen3_5 model (dense hybrid attention: full
+# and linear attention layers) with per-op diagnostics. Loads a truncated HF model
+# (first PARTIAL_LAYERS=4 layers, flash_attention_2, bfloat16) and an Archon model built
+# from the same partial config via the model spec registry, converts weights with the
+# spec's state-dict adapter, captures per-op activations through forward hooks, prints
+# per-op diff/cosine statistics and layer kinds, and asserts final-logit parity on a
+# random length-32 sequence. Requires transformers >= 5.2.0 (importorskip at import
+# time). Module skipped without CUDA.
 from __future__ import annotations
 
 import gc
@@ -25,6 +34,9 @@ SEQ_LEN = 32
 
 
 def _cos_sim(a: torch.Tensor, b: torch.Tensor) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Flattens both tensors to float, truncates to the shorter length, and
+    # returns cosine similarity as a Python float (1.0 when empty). GPU sync via item.
     a_f = a.float().reshape(-1)
     b_f = b.float().reshape(-1)
     n = min(a_f.numel(), b_f.numel())
@@ -38,11 +50,24 @@ def _cos_sim(a: torch.Tensor, b: torch.Tensor) -> float:
 def _capture_hf(
     hf_model: Any, n_layers: int
 ) -> tuple[dict[str, torch.Tensor], list[Any]]:
+    # [FUNCTION DOC]
+    # HELPER: Registers forward hooks on the HF causal LM: embed_tokens ("emb"); for
+    # each of the first n_layers input_layernorm ("layer{i}_attn_norm"), self_attn
+    # and/or linear_attn when present (both write "layer{i}_attn"),
+    # post_attention_layernorm ("layer{i}_ffn_norm"), mlp ("layer{i}_ffn"), the layer
+    # ("layer{i}_out"); and the final norm. Hooks store detached clones of tensor
+    # outputs or of the first element of tuple outputs. Returns (outputs dict, handles).
     out: dict[str, torch.Tensor] = {}
     handles: list[Any] = []
 
     def _mk(name: str):
+        # [FUNCTION DOC]
+        # HELPER: Returns a forward hook closure that records outputs under the given
+        # name.
         def _hook(module: torch.nn.Module, args: tuple[Any, ...], value: Any) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Hook body: stores a detached clone of a tensor output, or of
+            # value[0] for a non-empty tuple; ignores other types.
             if isinstance(value, torch.Tensor):
                 out[name] = value.detach().clone()
             elif (
@@ -81,11 +106,23 @@ def _capture_hf(
 def _capture_archon(
     archon_model: Any, n_layers: int, layer_types: list[str] | None
 ) -> tuple[dict[str, torch.Tensor], list[Any]]:
+    # [FUNCTION DOC]
+    # HELPER: Registers the matching hooks on the Archon model: tok_embeddings, then per
+    # layer (layers keyed by string index) attention_norm, the attention module for
+    # "full_attention" layers (layer type from layer_types, defaulting to full attention
+    # when None) or linear_attn otherwise, ffn_norm, feed_forward if present, the layer
+    # itself, and the final norm, using the same key names as _capture_hf. Returns
+    # (outputs dict, handles).
     out: dict[str, torch.Tensor] = {}
     handles: list[Any] = []
 
     def _mk(name: str):
+        # [FUNCTION DOC]
+        # HELPER: Returns a forward hook closure that records outputs under the given
+        # name.
         def _hook(module: torch.nn.Module, args: tuple[Any, ...], value: Any) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Hook body identical to the HF version.
             if isinstance(value, torch.Tensor):
                 out[name] = value.detach().clone()
             elif (
@@ -122,6 +159,21 @@ def _capture_archon(
 
 @pytest.mark.slow
 def test_hf_parity_qwen3_5() -> None:
+    # [FUNCTION DOC]
+    # Slow. Calls setup_environment; skips if the model path for "qwen3_5" is not
+    # configured. Loads the full config (using text_config for vocab size when present)
+    # and a partial copy whose num_hidden_layers is reduced to min(4, original) (on
+    # text_config when present). Seeds RNG and draws input ids in [100, vocab-100) with
+    # a single cu_seqlens segment. Loads the HF model with the partial config, installs
+    # HF hooks, snapshots its state dict to CPU, skips if the model type is unsupported,
+    # builds the Archon model on device from the spec's args, converts weights via the
+    # adapter and loads them non-strictly but asserts there are no missing or unexpected
+    # keys, casts to bfloat16, calls init_buffers on the device, installs Archon hooks,
+    # and runs both models under no_grad. Removes hooks, prints per-key max/mean diff
+    # and cosine (flattening and truncating on shape mismatch), the layer-output cosine
+    # trend and per-layer kinds, then asserts logits max diff below 6.0, mean diff below
+    # 0.5, cosine above 0.95. Frees models, empties the CUDA cache and destroys the
+    # process group if initialized.
     setup_environment()
 
     model_path = DENSE_MODEL_PATHS.get(MODEL_KEY)

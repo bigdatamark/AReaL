@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Distributed test for sharded (DTensor) FP8 dequantization: launches torchrun with the
+# run_sharded_dequant.py worker on 2 or 4 GPUs and checks the worker wrote "Passed".
+# Skipped when CUDA is unavailable.
 import subprocess
 
 import pytest
@@ -15,6 +19,11 @@ def _run_torchrun_test(
     n_gpus: int,
     output_file: str,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Runs torchrun on one node with n_gpus processes, a free master port, and
+    # --output=output_file. Captures and prints stdout/stderr, fails the test on non-
+    # zero exit code or if the output file does not contain exactly "Passed". Spawns GPU
+    # processes and reads the output file.
     port = find_free_ports(1)[0]
     cmd = [
         "torchrun",
@@ -49,7 +58,11 @@ def _run_torchrun_test(
 
 
 class TestShardedDequant:
+    # [CLASS DOC]
+    # Runs the sharded dequant worker at different world sizes.
     def test_sharded_dequant_2gpu(self, tmp_path):
+        # [FUNCTION DOC]
+        # Skips with fewer than 2 GPUs; otherwise runs the worker with 2 processes.
         n_gpus = torch.cuda.device_count()
         if n_gpus < 2:
             pytest.skip("Need at least 2 GPUs")
@@ -60,6 +73,8 @@ class TestShardedDequant:
         )
 
     def test_sharded_dequant_4gpu(self, tmp_path):
+        # [FUNCTION DOC]
+        # Skips with fewer than 4 GPUs; otherwise runs the worker with 4 processes.
         n_gpus = torch.cuda.device_count()
         if n_gpus < 4:
             pytest.skip("Need at least 4 GPUs")

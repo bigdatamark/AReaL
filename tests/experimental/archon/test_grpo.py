@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Single-GPU GRPO pipeline comparison tests between the Archon engine and the FSDP
+# engine (both held by a module-scoped DualEngineFixture loading the same model): raw
+# logits, logprobs/entropy and importance ratios, gradient flow, optimizer-step weight
+# deltas, plus standalone checks of grpo_loss_fn determinism, edge cases and sensitivity
+# to advantages. Module skipped without CUDA.
 """GRPO training tests for Archon Engine.
 
 These tests compare Archon vs FSDP engine at each stage of the GRPO pipeline
@@ -31,6 +37,9 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def engines():
+    # [FUNCTION DOC]
+    # Module-scoped fixture: creates a DualEngineFixture, calls setup (initializes both
+    # engines on GPU), yields it to tests, then calls teardown.
     """Fixture to provide initialized engines."""
     fixture = DualEngineFixture()
     fixture.setup()
@@ -44,9 +53,20 @@ def engines():
 
 
 class TestLogitsComparison:
+    # [CLASS DOC]
+    # Compares forward outputs of Archon and FSDP engines on the same GRPO batch. Each
+    # test builds a batch with create_grpo_batch, moves tensors to device, prepares
+    # micro-batch lists via each engine's private _prepare_mb_list / _prepare_mb_inputs,
+    # takes the first micro-batch, and runs Archon's model with input_ids, position_ids,
+    # cu_seqlens and int max_seqlen and FSDP's HF model with its kwargs, squeezing a
+    # leading batch dim of 1.
     """Test suite for comparing logits and logprobs between Archon and FSDP."""
 
     def test_logits_numerical_precision(self, engines: DualEngineFixture):
+        # [FUNCTION DOC]
+        # Eval mode, no grad, batch 4 x 128. Truncates both logits to the original
+        # unpadded token count and asserts compare_tensors max diff below 4.0 and mean
+        # diff below 0.2; prints the metrics.
         """Compare raw logits with stricter tolerances for RL training.
 
         The existing test allows max_diff < 2.0, but for RL training we need
@@ -118,6 +138,15 @@ class TestLogitsComparison:
         )
 
     def test_logprobs_consistency(self, engines: DualEngineFixture):
+        # [FUNCTION DOC]
+        # Same forward, then computes per-token logprobs and entropy with
+        # gather_logprobs_entropy (temperature 1, no TP group) using labels obtained by
+        # rolling the flattened input ids left by one. Prints logprob, entropy and
+        # importance-ratio metrics (exp of logprob difference vs 1) and asserts logprob
+        # max diff below 1.5 and max abs ratio deviation below 1.1.
+        # KNOWN ISSUE: Rolling the whole packed flattened sequence makes the last token
+        # of each sequence predict the first token of the next (and the final one wraps
+        # to the start); harmless for a both-sides comparison but not true labels.
         """Test that gather_logprobs_entropy produces consistent results."""
         batch = create_grpo_batch(
             model_path=engines.model_path, batch_size=4, max_seq_len=128
@@ -205,6 +234,11 @@ class TestLogitsComparison:
         )
 
     def test_logprobs_gradient_flow(self, engines: DualEngineFixture):
+        # [FUNCTION DOC]
+        # Train mode, batch 2 x 64: backprops the sum of logits on both engines,
+        # computes and prints global gradient norms (with per-parameter .item() syncs),
+        # asserts no NaN/Inf gradients on either side, then zeroes gradients via
+        # optimizer_zero_grad.
         """Verify gradients flow correctly through logprobs computation."""
         batch = create_grpo_batch(
             model_path=engines.model_path, batch_size=2, max_seq_len=64
@@ -304,9 +338,17 @@ class TestLogitsComparison:
 
 
 class TestLossAdvantageCalculation:
+    # [CLASS DOC]
+    # Pure grpo_loss_fn tests on random device tensors (no engines).
     """Test suite for comparing loss and advantage computation."""
 
     def test_grpo_loss_fn_consistency(self):
+        # [FUNCTION DOC]
+        # Seeded random logprobs, slightly perturbed old logprobs used as both behavior
+        # and proximal logprobs, random advantages, loss mask with the first 10 tokens
+        # off, random non-negative entropy. Calls grpo_loss_fn twice on cloned inputs
+        # (eps_clip 0.2, token-level importance sampling, recompute prox method, no SAPO
+        # / decoupled loss) and asserts identical results.
         """Test GRPO loss function produces consistent results for identical inputs."""
         device = torch.device(current_platform.device_type)
         torch.manual_seed(42)
@@ -374,6 +416,10 @@ class TestLossAdvantageCalculation:
         )
 
     def test_ppo_loss_edge_cases(self):
+        # [FUNCTION DOC]
+        # Runs grpo_loss_fn for scenarios: all-zero advantages, +10 advantages, -10
+        # advantages, and an all-false loss mask; asserts the loss is finite for each,
+        # printing results and re-raising any exception.
         """Test PPO loss with edge cases that might reveal numerical instabilities."""
         device = torch.device(current_platform.device_type)
 
@@ -455,9 +501,20 @@ class TestLossAdvantageCalculation:
 
 
 class TestGradientUpdates:
+    # [CLASS DOC]
+    # Compares parameter updates of the two engines.
     """Test suite for comparing gradient computation and updates."""
 
     def test_optimizer_step_weight_delta(self, engines: DualEngineFixture):
+        # [FUNCTION DOC]
+        # Snapshots all parameters, runs a forward on both engines, backprops the logits
+        # mean, steps each engine's optimizer, and prints the maximum difference between
+        # Archon and FSDP weight deltas over same-named, same-shaped parameters. Then
+        # zeroes gradients and copies the snapshots back into the parameters.
+        # KNOWN ISSUE: Nothing is asserted, so the test cannot fail on mismatch;
+        # parameter names of the two engines generally differ (Archon vs HF naming), so
+        # few or no deltas may be compared; and optimizer state (e.g. Adam moments, step
+        # count) is not restored, leaking into later tests.
         """Compare weight changes after a single optimizer step."""
         batch = create_grpo_batch(
             model_path=engines.model_path, batch_size=2, max_seq_len=64
@@ -565,9 +622,15 @@ class TestGradientUpdates:
 
 
 class TestEndToEndGRPO:
+    # [CLASS DOC]
+    # End-to-end checks of reward-to-loss behavior.
     """Test suite for end-to-end GRPO step comparison."""
 
     def test_reward_signal_propagation(self):
+        # [FUNCTION DOC]
+        # With old logprobs equal to current logprobs (ratio 1), computes grpo_loss_fn
+        # with all advantages +2 and with all -2, prints both, and asserts both are
+        # finite and differ.
         """Verify that reward signals properly influence loss gradients."""
         device = torch.device(current_platform.device_type)
         torch.manual_seed(42)

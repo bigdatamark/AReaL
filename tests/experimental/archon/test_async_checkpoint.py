@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# CPU-only unit tests for SaverConfig.mode validation and AsyncCheckpointManager
+# (areal.utils.async_checkpoint). torch.distributed (dist) and distributed checkpoint
+# (dcp) are patched at module level via the _DIST and _DCP targets, so no process groups
+# are created. Covers SYNC vs ASYNC initialization, save dispatch, staging waits,
+# background consolidation (post_fn) on a sequential executor, error propagation and
+# finalize cleanup.
 """Unit tests for async checkpoint manager and SaverConfig.
 
 These tests do NOT require GPU or distributed environment.
@@ -32,12 +39,18 @@ _DCP = "areal.utils.async_checkpoint.dcp"
 
 
 class TestSaverConfigMode:
+    # [CLASS DOC]
+    # Tests SaverConfig.mode defaults and validation.
     def test_default_is_auto(self):
+        # [FUNCTION DOC]
+        # Asserts mode defaults to "auto".
         config = SaverConfig(experiment_name="test", trial_name="test", fileroot="/tmp")
         assert config.mode == "auto"
 
     @pytest.mark.parametrize("mode", ["auto", "sync", "async"])
     def test_valid_modes(self, mode):
+        # [FUNCTION DOC]
+        # Parametrized over auto/sync/async: asserts the value is stored.
         config = SaverConfig(
             experiment_name="test",
             trial_name="test",
@@ -48,6 +61,9 @@ class TestSaverConfigMode:
 
     @pytest.mark.parametrize("mode", ["invalid", "", "ASYNC", "async_pinned_mem"])
     def test_invalid_modes_raise(self, mode):
+        # [FUNCTION DOC]
+        # Parametrized invalid strings (including uppercase "ASYNC" and empty): asserts
+        # ValueError matching "Invalid mode".
         with pytest.raises(ValueError, match="Invalid mode"):
             SaverConfig(
                 experiment_name="test",
@@ -63,18 +79,26 @@ class TestSaverConfigMode:
 
 
 def _make_completed_future(result=None):
+    # [FUNCTION DOC]
+    # HELPER: Returns a concurrent Future already resolved with result (default None).
     f = Future()
     f.set_result(result)
     return f
 
 
 def _make_failed_future(exc=None):
+    # [FUNCTION DOC]
+    # HELPER: Returns a Future already failed with exc (default RuntimeError "test
+    # error").
     f = Future()
     f.set_exception(exc or RuntimeError("test error"))
     return f
 
 
 def _make_async_save_response():
+    # [FUNCTION DOC]
+    # HELPER: Returns a real AsyncSaveResponse whose staging and upload futures are
+    # already completed.
     """Create a real AsyncSaveResponse with completed futures."""
     return AsyncSaveResponse(
         staging_completion=_make_completed_future(),
@@ -83,6 +107,10 @@ def _make_async_save_response():
 
 
 def _make_mgr(mock_dist):
+    # [FUNCTION DOC]
+    # HELPER: Configures the mocked dist so is_initialized returns True and new_group
+    # yields two named mocks (save PG then consolidation PG), then constructs and
+    # returns an ASYNC-mode AsyncCheckpointManager.
     """Create an ASYNC manager with mocked dist."""
     mock_dist.is_initialized.return_value = True
     mock_dist.new_group.side_effect = [
@@ -98,7 +126,11 @@ def _make_mgr(mock_dist):
 
 
 class TestSyncMode:
+    # [CLASS DOC]
+    # Behavior of the manager in SYNC mode.
     def test_sync_init(self):
+        # [FUNCTION DOC]
+        # Asserts SYNC manager is not async and has no PG, consolidation PG or executor.
         with patch(_DIST):
             mgr = AsyncCheckpointManager(AsyncMode.SYNC)
         assert mgr.is_async is False
@@ -109,6 +141,9 @@ class TestSyncMode:
     @patch(_DCP)
     @patch(_DIST)
     def test_save_calls_sync_dcp(self, mock_dist, mock_dcp):
+        # [FUNCTION DOC]
+        # Asserts save forwards the state dict, storage_writer and checkpoint_id to
+        # dcp.save exactly once and never calls dcp.async_save.
         mgr = AsyncCheckpointManager(AsyncMode.SYNC)
         writer = MagicMock()
         mgr.save({"model": {}}, storage_writer=writer, checkpoint_id="/tmp/ckpt")
@@ -121,6 +156,9 @@ class TestSyncMode:
     @patch(_DCP)
     @patch(_DIST)
     def test_save_with_post_fn_runs_inline(self, mock_dist, mock_dcp):
+        # [FUNCTION DOC]
+        # Asserts that in SYNC mode a post_fn callback is called once right after
+        # dcp.save (no background thread).
         """SYNC mode: post_fn runs inline, no deadlock."""
         mgr = AsyncCheckpointManager(AsyncMode.SYNC)
         callback = MagicMock()
@@ -135,8 +173,13 @@ class TestSyncMode:
 
 
 class TestAsyncModeCheckpoint:
+    # [CLASS DOC]
+    # Behavior of the manager in ASYNC mode.
     @patch(_DIST)
     def test_async_init(self, mock_dist):
+        # [FUNCTION DOC]
+        # Asserts two process groups are created and that PG, consolidation PG and
+        # executor are set.
         mgr = _make_mgr(mock_dist)
         assert mgr.is_async is True
         assert mock_dist.new_group.call_count == 2
@@ -147,6 +190,11 @@ class TestAsyncModeCheckpoint:
     @patch(_DCP)
     @patch(_DIST)
     def test_save_uses_process_type_and_stager(self, mock_dist, mock_dcp):
+        # [FUNCTION DOC]
+        # Asserts save uses dcp.async_save (not save), creates a stager, and stores the
+        # response's staging and upload futures.
+        # KNOWN ISSUE: The test name mentions the process async type, but it never
+        # inspects the arguments passed to async_save.
         mgr = _make_mgr(mock_dist)
         response = _make_async_save_response()
         mock_dcp.async_save.return_value = response
@@ -161,6 +209,9 @@ class TestAsyncModeCheckpoint:
 
     @patch(_DIST)
     def test__wait_for_upload_swallows_error(self, mock_dist):
+        # [FUNCTION DOC]
+        # Asserts _wait_for_upload does not raise on a failed upload future and clears
+        # it.
         """Upload errors are logged by bg thread; _wait_for_upload doesn't raise."""
         mgr = _make_mgr(mock_dist)
         mgr._save_future = _make_failed_future()
@@ -168,6 +219,9 @@ class TestAsyncModeCheckpoint:
         assert mgr._save_future is None
 
     def test_save_without_pg_raises(self):
+        # [FUNCTION DOC]
+        # With dist not initialized at construction, asserts a later save raises
+        # RuntimeError mentioning "process group".
         with patch(_DIST) as mock_dist:
             mock_dist.is_initialized.return_value = False
             mgr = AsyncCheckpointManager(AsyncMode.ASYNC)
@@ -176,6 +230,8 @@ class TestAsyncModeCheckpoint:
 
     @patch(_DIST)
     def test_staging_wait(self, mock_dist):
+        # [FUNCTION DOC]
+        # Asserts maybe_wait_for_staging clears a completed staging future.
         mgr = _make_mgr(mock_dist)
         mgr._staging_future = _make_completed_future()
         mgr.maybe_wait_for_staging()
@@ -183,6 +239,8 @@ class TestAsyncModeCheckpoint:
 
     @patch(_DIST)
     def test_staging_error_handled(self, mock_dist):
+        # [FUNCTION DOC]
+        # Asserts maybe_wait_for_staging swallows a failed staging future and clears it.
         mgr = _make_mgr(mock_dist)
         mgr._staging_future = _make_failed_future()
         mgr.maybe_wait_for_staging()  # should not raise
@@ -191,6 +249,9 @@ class TestAsyncModeCheckpoint:
     @patch(_DCP)
     @patch(_DIST)
     def test_finalize_cleans_up(self, mock_dist, mock_dcp):
+        # [FUNCTION DOC]
+        # Asserts finalize closes the stager, drops stager and executor, destroys
+        # exactly both process groups and clears the PG references.
         mock_dist.is_initialized.return_value = True
         save_pg = MagicMock(name="save_pg")
         consolidation_pg = MagicMock(name="consolidation_pg")
@@ -218,14 +279,22 @@ class TestAsyncModeCheckpoint:
 
 
 class TestBackgroundConsolidation:
+    # [CLASS DOC]
+    # Tests that post_fn consolidation runs on the background executor.
     @patch(_DIST)
     def test_post_fn_runs_in_bg_thread(self, mock_dist):
+        # [FUNCTION DOC]
+        # Submits a callback that sets an Event only if run off the main thread; waits
+        # up to 2s and asserts the event was set.
         """Verify callback runs in a different thread."""
         mgr = _make_mgr(mock_dist)
         called_in_bg = threading.Event()
         main_tid = threading.current_thread().ident
 
         def _callback():
+            # [FUNCTION DOC]
+            # HELPER: Sets called_in_bg if the current thread id differs from the main
+            # thread's.
             if threading.current_thread().ident != main_tid:
                 called_in_bg.set()
 
@@ -237,6 +306,9 @@ class TestBackgroundConsolidation:
 
     @patch(_DIST)
     def test_post_fn_runs_even_on_upload_failure(self, mock_dist):
+        # [FUNCTION DOC]
+        # With a failed upload future, asserts the callback still runs once (keeps
+        # collective barriers aligned across ranks).
         """Consolidation runs even when upload fails (has barrier, prevents deadlock)."""
         mgr = _make_mgr(mock_dist)
         callback = MagicMock()
@@ -249,10 +321,15 @@ class TestBackgroundConsolidation:
 
     @patch(_DIST)
     def test_consolidation_failure_propagated(self, mock_dist):
+        # [FUNCTION DOC]
+        # A failing callback: after the bg job finishes, asserts _check_bg_error re-
+        # raises its RuntimeError and clears _bg_future.
         """_check_bg_error() raises when bg done+failed, clears future."""
         mgr = _make_mgr(mock_dist)
 
         def bad_callback():
+            # [FUNCTION DOC]
+            # HELPER: Raises RuntimeError "consolidation error".
             raise RuntimeError("consolidation error")
 
         mgr._save_future = _make_completed_future()
@@ -270,14 +347,21 @@ class TestBackgroundConsolidation:
 
     @patch(_DIST)
     def test_consecutive_consolidations_ordered(self, mock_dist):
+        # [FUNCTION DOC]
+        # Submits two callbacks back to back and, after finalize, asserts they ran in
+        # submission order.
         """Multiple saves produce ordered consolidations via sequential executor."""
         mgr = _make_mgr(mock_dist)
         call_order: list[str] = []
 
         def _c1():
+            # [FUNCTION DOC]
+            # HELPER: Appends "c1" to call_order.
             call_order.append("c1")
 
         def _c2():
+            # [FUNCTION DOC]
+            # HELPER: Appends "c2" to call_order.
             call_order.append("c2")
 
         mgr._save_future = _make_completed_future()
@@ -296,9 +380,14 @@ class TestBackgroundConsolidation:
 
 
 class TestTrainingLoop:
+    # [CLASS DOC]
+    # Lifecycle tests simulating a training loop with periodic saves.
     @patch(_DCP)
     @patch(_DIST)
     def test_full_training_loop_cycle(self, mock_dist, mock_dcp):
+        # [FUNCTION DOC]
+        # Save with callback, wait for staging, sleep 0.1s to simulate training, save
+        # again with a second callback, finalize; asserts both callbacks ran once.
         """Simulate: save -> staging_wait -> train -> save -> finalize."""
         mgr = _make_mgr(mock_dist)
 
@@ -326,6 +415,10 @@ class TestTrainingLoop:
     @patch(_DCP)
     @patch(_DIST)
     def test_upload_failure_does_not_block_next_save(self, mock_dist, mock_dcp):
+        # [FUNCTION DOC]
+        # After a failed upload whose callback still ran, clears bg state via
+        # _check_bg_error and asserts a following save sets a new save future; then
+        # finalizes.
         """Upload failure doesn't prevent next save."""
         mgr = _make_mgr(mock_dist)
 
@@ -349,10 +442,15 @@ class TestTrainingLoop:
 
     @patch(_DIST)
     def test_finalize_propagates_error(self, mock_dist):
+        # [FUNCTION DOC]
+        # A failing final callback: asserts finalize raises it and still clears
+        # executor, stager and both PGs.
         """finalize() must propagate errors from the final bg job."""
         mgr = _make_mgr(mock_dist)
 
         def bad_callback():
+            # [FUNCTION DOC]
+            # HELPER: Raises RuntimeError "final consolidation error".
             raise RuntimeError("final consolidation error")
 
         mgr._save_future = _make_completed_future()
@@ -369,6 +467,10 @@ class TestTrainingLoop:
 
     @patch(_DIST)
     def test_save_catches_bg_error_completed_during_training(self, mock_dist):
+        # [FUNCTION DOC]
+        # Regression: a bg job fails after 50ms while the test sleeps 200ms; asserts the
+        # next save raises that error (from its internal _check_bg_error) and clears
+        # _bg_future. Timing-based.
         """Regression: bg job that fails during training is caught by next save().
 
         1. Submit bg job that fails after short delay
@@ -378,6 +480,8 @@ class TestTrainingLoop:
         mgr = _make_mgr(mock_dist)
 
         def delayed_failure():
+            # [FUNCTION DOC]
+            # HELPER: Sleeps 50ms then raises RuntimeError "bg error during training".
             time.sleep(0.05)
             raise RuntimeError("bg error during training")
 

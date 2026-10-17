@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# End-to-end checkpoint tests for the Archon Qwen3 state-dict adapter and ArchonEngine
+# HF-format save/load. Includes direct adapter tests against real checkpoints (multi-
+# file index parsing, HF storage reader, MoE config, HF->Archon->HF roundtrip) and
+# multi-GPU tests that launch tests/experimental/archon/torchrun/run_checkpoint_tests.py
+# with different --test_type values. Module skipped without CUDA; model paths come from
+# tests.experimental.archon.utils.
 """End-to-end checkpoint tests for State Dict Adapter functionality.
 
 Tests cover:
@@ -43,10 +50,16 @@ pytestmark = pytest.mark.skipif(
 
 
 class TestMultiFileSafetensorsIndex:
+    # [CLASS DOC]
+    # Adapter-level tests reading a real multi-file (sharded) safetensors checkpoint.
     """Tests for multi-file safetensors index loading."""
 
     @pytest.fixture
     def moe_model_path(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture returning the Qwen3-30B-A3B MoE checkpoint path from
+        # MOE_MODEL_PATHS["qwen3_moe"]; skips the test if unconfigured or missing on
+        # disk.
         """Get path to Qwen3-30B-A3B MoE model."""
         path = MOE_MODEL_PATHS.get("qwen3_moe")
         if path is None:
@@ -57,6 +70,9 @@ class TestMultiFileSafetensorsIndex:
 
     @pytest.fixture
     def dense_model_path(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture returning the Qwen3-0.6B dense checkpoint path from
+        # DENSE_MODEL_PATHS["qwen3"]; skips the test if unconfigured or missing on disk.
         """Get path to Qwen3-0.6B dense model."""
         path = DENSE_MODEL_PATHS.get("qwen3")
         if path is None:
@@ -66,6 +82,10 @@ class TestMultiFileSafetensorsIndex:
         return path
 
     def test_load_moe_safetensors_index(self, moe_model_path):
+        # [FUNCTION DOC]
+        # Builds Qwen3StateDictAdapter with hf_assets_path; asserts fqn_to_index_mapping
+        # is non-empty, that every key in the on-disk index weight_map appears in it,
+        # and that shard indices span exactly 1..16. Prints a summary.
         """Test loading multi-file safetensors index from real MoE checkpoint."""
         from transformers import AutoConfig
 
@@ -104,6 +124,9 @@ class TestMultiFileSafetensorsIndex:
         assert max(indices) == 16  # 16 files for Qwen3-30B-A3B
 
     def test_get_hf_storage_reader_moe(self, moe_model_path):
+        # [FUNCTION DOC]
+        # Asserts adapter.get_hf_storage_reader returns a torch DCP
+        # HuggingFaceStorageReader.
         """Test creating HuggingFaceStorageReader for multi-file checkpoint."""
         from torch.distributed.checkpoint import HuggingFaceStorageReader
         from transformers import AutoConfig
@@ -120,6 +143,8 @@ class TestMultiFileSafetensorsIndex:
         print(f"\nCreated HuggingFaceStorageReader for {moe_model_path}")
 
     def test_moe_config_parsing(self, moe_model_path):
+        # [FUNCTION DOC]
+        # Asserts the adapter detects MoE and 128 experts for Qwen3-30B-A3B.
         """Test that MoE config is correctly parsed for expert count."""
         from transformers import AutoConfig
 
@@ -143,6 +168,12 @@ class TestMultiFileSafetensorsIndex:
 def _run_engine_checkpoint_test(
     n_gpus: int, test_type: str, model_path: str, output_file: str
 ):
+    # [FUNCTION DOC]
+    # HELPER: Launches run_checkpoint_tests.py via torchrun on one node with n_gpus
+    # processes, a free port, and args --test_type, --model_path, --output. Uses
+    # check=True so a non-zero exit becomes a pytest failure showing captured
+    # stdout/stderr. Then asserts the output file reads exactly "Passed". Spawns GPU
+    # processes.
     """Run engine checkpoint test with torchrun."""
     port = find_free_ports(1)[0]
     script_path = "tests/experimental/archon/torchrun/run_checkpoint_tests.py"
@@ -173,6 +204,9 @@ def _run_engine_checkpoint_test(
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 class TestEngineCheckpointIntegration:
+    # [CLASS DOC]
+    # Multi-GPU, slow engine-level checkpoint tests; each launches a torchrun scenario
+    # after checking device count via current_platform.
     """End-to-end tests for ArchonEngine checkpoint methods.
 
     These tests require multiple GPUs and use real model checkpoints.
@@ -181,6 +215,9 @@ class TestEngineCheckpointIntegration:
 
     @pytest.fixture
     def dense_model_path(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture returning the Qwen3-0.6B dense checkpoint path from
+        # DENSE_MODEL_PATHS["qwen3"]; skips the test if unconfigured or missing on disk.
         """Get path to Qwen3-0.6B dense model."""
         path = DENSE_MODEL_PATHS.get("qwen3")
         if path is None:
@@ -191,6 +228,10 @@ class TestEngineCheckpointIntegration:
 
     @pytest.fixture
     def moe_model_path(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture returning the Qwen3-30B-A3B MoE checkpoint path from
+        # MOE_MODEL_PATHS["qwen3_moe"]; skips the test if unconfigured or missing on
+        # disk.
         """Get path to Qwen3-30B-A3B MoE model."""
         path = MOE_MODEL_PATHS.get("qwen3_moe")
         if path is None:
@@ -200,6 +241,8 @@ class TestEngineCheckpointIntegration:
         return path
 
     def test_engine_save_hf_dense_2gpu(self, dense_model_path, tmp_path_factory):
+        # [FUNCTION DOC]
+        # Needs 2 GPUs; runs scenario "save_hf_dense" on the dense model.
         """Test ArchonEngine.save() with weight_format="hf" on 2 GPUs."""
         if current_platform.device_count() < 2:
             pytest.skip("This test requires 2 GPUs")
@@ -213,6 +256,8 @@ class TestEngineCheckpointIntegration:
         )
 
     def test_engine_moe_checkpoint_4gpu(self, moe_model_path, tmp_path_factory):
+        # [FUNCTION DOC]
+        # Needs 4 GPUs; runs scenario "moe_checkpoint" (EP=4) on the MoE model.
         """Test MoE checkpoint save/load on 4 GPUs with EP=4."""
         if current_platform.device_count() < 4:
             pytest.skip("This test requires 4 GPUs")
@@ -228,6 +273,9 @@ class TestEngineCheckpointIntegration:
     def test_engine_save_load_forward_match_2gpu(
         self, dense_model_path, tmp_path_factory
     ):
+        # [FUNCTION DOC]
+        # Needs 2 GPUs; runs "save_load_forward_match" (forward, save, load, forward,
+        # compare) on the dense model.
         """Test forward output matches before save and after load (2 GPUs).
 
         This is the most critical test for checkpoint correctness:
@@ -251,6 +299,8 @@ class TestEngineCheckpointIntegration:
     def test_engine_save_load_forward_match_1gpu(
         self, dense_model_path, tmp_path_factory
     ):
+        # [FUNCTION DOC]
+        # Needs 1 GPU; single-process variant of "save_load_forward_match".
         """Test forward output matches before save and after load (1 GPU).
 
         Single GPU version of forward match test for faster CI.
@@ -269,6 +319,10 @@ class TestEngineCheckpointIntegration:
     def test_engine_save_load_forward_match_with_compile_ac(
         self, dense_model_path, tmp_path_factory
     ):
+        # [FUNCTION DOC]
+        # Needs 1 GPU; runs "save_load_forward_match_with_compile_ac", checking that
+        # wrapper prefixes from torch.compile and activation checkpointing do not break
+        # save/load.
         """Test forward match with torch.compile + activation checkpointing.
 
         This test verifies that checkpoint save/load works correctly when the model
@@ -295,6 +349,8 @@ class TestEngineCheckpointIntegration:
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 class TestAsyncCheckpointIntegration:
+    # [CLASS DOC]
+    # Multi-GPU, slow tests that async HF save matches sync save.
     """Tests for async HF checkpoint save with ArchonEngine.
 
     Verifies that async save produces identical output to sync save.
@@ -302,6 +358,9 @@ class TestAsyncCheckpointIntegration:
 
     @pytest.fixture
     def dense_model_path(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture returning the Qwen3-0.6B dense checkpoint path from
+        # DENSE_MODEL_PATHS["qwen3"]; skips the test if unconfigured or missing on disk.
         path = DENSE_MODEL_PATHS.get("qwen3")
         if path is None:
             pytest.skip("Qwen3-0.6B model path not configured")
@@ -310,6 +369,8 @@ class TestAsyncCheckpointIntegration:
         return path
 
     def test_async_save_hf_dense_2gpu(self, dense_model_path, tmp_path_factory):
+        # [FUNCTION DOC]
+        # Needs 2 GPUs; runs scenario "async_save_hf_dense".
         """Test async HF save matches sync save on 2 GPUs."""
         if current_platform.device_count() < 2:
             pytest.skip("This test requires 2 GPUs")
@@ -323,6 +384,8 @@ class TestAsyncCheckpointIntegration:
         )
 
     def test_async_save_hf_dense_1gpu(self, dense_model_path, tmp_path_factory):
+        # [FUNCTION DOC]
+        # Needs 1 GPU; runs scenario "async_save_hf_dense" with one process.
         """Test async HF save matches sync save on 1 GPU."""
         if current_platform.device_count() < 1:
             pytest.skip("This test requires at least 1 GPU")
@@ -342,10 +405,15 @@ class TestAsyncCheckpointIntegration:
 
 
 class TestWeightComparisonAfterConversion:
+    # [CLASS DOC]
+    # Verifies the adapter preserves weight values exactly across conversion.
     """Tests that verify weight values are preserved after conversion."""
 
     @pytest.fixture
     def dense_model_path(self):
+        # [FUNCTION DOC]
+        # HELPER: Fixture returning the Qwen3-0.6B dense checkpoint path from
+        # DENSE_MODEL_PATHS["qwen3"]; skips the test if unconfigured or missing on disk.
         """Get path to Qwen3-0.6B dense model."""
         path = DENSE_MODEL_PATHS.get("qwen3")
         if path is None:
@@ -356,6 +424,14 @@ class TestWeightComparisonAfterConversion:
 
     @pytest.mark.slow
     def test_adapter_roundtrip_preserves_weights(self, dense_model_path):
+        # [FUNCTION DOC]
+        # Slow, CPU-only in practice. Loads the dense checkpoint (single
+        # model.safetensors, or every shard referenced by the index, each loaded once)
+        # into memory, converts HF->Archon->HF with the adapter, and compares each
+        # original key (skipping rotary_emb keys and lm_head.weight when
+        # tie_word_embeddings is set): records missing keys, shape mismatches and value
+        # mismatches beyond 1e-5. Prints up to 10 mismatches and fails if any; otherwise
+        # prints a success summary.
         """Test that adapter roundtrip preserves exact weight values."""
         from safetensors.torch import load_file
         from transformers import AutoConfig

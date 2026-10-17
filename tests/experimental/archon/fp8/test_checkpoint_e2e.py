@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# End-to-end GPU test that loads a real Qwen3-1.7B FP8 checkpoint through Archon by
+# launching the torchrun worker script run_checkpoint.py. Model paths come from env vars
+# AREAL_FP8_MODEL_PATH / AREAL_BF16_MODEL_PATH (with cluster defaults). Whole module is
+# skipped when CUDA is unavailable.
 import os
 import subprocess
 
@@ -24,6 +29,13 @@ def _run_torchrun_test(
     output_file: str,
     extra_args: list[str] | None = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Launches a torchrun job on a single node. Inputs: script path, n_gpus
+    # (nproc_per_node), output_file (passed as --output), optional extra_args appended
+    # to the command. Picks a free master port, runs the subprocess synchronously
+    # capturing output, prints stdout/stderr, and fails the pytest test if the exit code
+    # is non-zero or if the output file content (stripped) is not exactly "Passed". Side
+    # effects: spawns processes, uses GPUs, reads the output file.
     port = find_free_ports(1)[0]
     cmd = [
         "torchrun",
@@ -60,13 +72,26 @@ def _run_torchrun_test(
 
 
 class TestFP8CheckpointE2E:
+    # [CLASS DOC]
+    # End-to-end FP8 checkpoint loading test class; every test auto-skips when the FP8
+    # model directory is absent.
     @pytest.fixture(autouse=True)
     def _check_fp8_model(self):
+        # [FUNCTION DOC]
+        # HELPER: Autouse fixture that skips the test if FP8_MODEL_PATH does not exist
+        # on disk.
         if not os.path.exists(FP8_MODEL_PATH):
             pytest.skip(f"FP8 model not found at {FP8_MODEL_PATH}")
 
     @pytest.mark.ci
     def test_fp8_load_and_forward_dp8(self, tmp_path):
+        # [FUNCTION DOC]
+        # Marked ci. Requires at least 2 GPUs (skips otherwise). Runs run_checkpoint.py
+        # with all visible GPUs, passing --fp8_model_path and, if present,
+        # --bf16_model_path for a logits comparison. Passes when the worker writes
+        # "Passed".
+        # KNOWN ISSUE: The name says dp8 but it uses however many GPUs are visible
+        # (minimum 2), not necessarily 8.
         n_gpus = torch.cuda.device_count()
         if n_gpus < 2:
             pytest.skip("Need at least 2 GPUs")

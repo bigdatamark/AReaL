@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Multi-GPU test for Archon context parallelism (Ulysses): launches the torchrun worker
+# run_cp_forward.py. Module skipped without CUDA.
 """Context Parallelism (CP/Ulysses) tests for Archon Engine.
 
 Run tests:
@@ -18,6 +21,10 @@ pytestmark = pytest.mark.skipif(
 
 
 def _run_cp_test_with_torchrun(n_gpus: int, cp_size: int):
+    # [FUNCTION DOC]
+    # HELPER: Runs torchrun on one node with n_gpus processes, a free master port, and
+    # the run_cp_forward.py script with --cp_size. check=True; a non-zero exit fails the
+    # test showing stderr. No output file is checked; success is the exit code.
     """Run FSDP+CP (Ulysses) Archon forward test."""
     port = find_free_ports(1)[0]
     try:
@@ -42,6 +49,9 @@ def _run_cp_test_with_torchrun(n_gpus: int, cp_size: int):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_cp_forward_2gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 2 devices; runs the CP forward worker with
+    # 2 processes and cp_size 2 (dp 1).
     """Test Archon Engine forward with CP (Ulysses) on 2 GPUs (dp=1, cp=2)."""
     if current_platform.device_count() < 2:
         pytest.skip("This test requires 2 GPUs")

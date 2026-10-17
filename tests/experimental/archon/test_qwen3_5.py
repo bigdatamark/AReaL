@@ -1,3 +1,17 @@
+# [MODULE DOC]
+# Consolidated Archon Qwen3.5 test suite. Foundation tests (CPU):
+# Qwen3_5ModelArgs.from_hf_config for dense, MoE and composite-VLM configs; RMSNorm and
+# gated RMSNorm parity with HF; cu_seqlens_to_seq_idx; partial-RoPE cache and
+# apply_rotary_emb; compute_decay_beta. Module tests (CUDA sm>=9.0 via requires_cuda):
+# fla fused gated norm, GatedDeltaNet (linear attention) and GatedAttention
+# parity/packing/backward against HF transformers modules, causal_conv1d seq_idx
+# isolation. Integration tests: TransformerBlock and Qwen3_5Model forward/backward and
+# full-model gradient parity with HF Qwen3_5ForCausalLM. Requires transformers >= 5.2.0
+# (importorskip) and skips the whole module if the Archon qwen3_5 modules cannot be
+# imported. Defines tolerance tiers (EXACT, TIGHT, KERNEL, RELAXED, E2E and bf16
+# variants) and small mock configs.
+# KNOWN ISSUE: The module docstring lists integration tests #29-#35, but only #29-#32
+# and #34 exist; the E2E tolerance tier is unused.
 """Qwen3.5 Archon test suite merged into one file.
 
 Includes:
@@ -199,6 +213,10 @@ def assert_ratio_close(
     out: torch.Tensor,
     ratio: float,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Asserts that max absolute error between ref and out divided by max
+    # absolute value of ref (clamped to at least 1e-8) is below ratio; the failure
+    # message includes name, ratio, max error and reference max. GPU sync via item.
     """Assert ``max_abs_error / max_abs_ref < ratio``."""
     err = (ref - out).abs().max()
     ref_max = ref.abs().max().clamp(min=1e-8)
@@ -247,15 +265,26 @@ _MOCK_GDN_CFG = SimpleNamespace(
 # Consolidated helpers
 # ---------------------------------------------------------------------------
 def _make_args() -> Qwen3_5ModelArgs:
+    # [FUNCTION DOC]
+    # HELPER: Returns Qwen3_5ModelArgs built from SMALL_GDN_CONFIG (dim 256, 4 layers
+    # with three linear-attention layers then one full-attention layer, 4 query / 2 KV
+    # heads, head_dim 128, linear attention with 4 key and 8 value heads of dim 32).
     """Create small GatedDeltaNet test config."""
     return Qwen3_5ModelArgs(**SMALL_GDN_CONFIG)
 
 
 def _make_hf_gdn_config() -> SimpleNamespace:
+    # [FUNCTION DOC]
+    # HELPER: Returns the shared SimpleNamespace mock config used to build HF
+    # GatedDeltaNet modules with dimensions matching _make_args.
     return _MOCK_GDN_CFG
 
 
 def _copy_module_weights(hf_module, archon_module):
+    # [FUNCTION DOC]
+    # HELPER: Asserts the HF and Archon module state-dict key sets are identical
+    # (reporting extras on each side) and loads the HF state dict into the Archon module
+    # strictly. Mutates archon_module.
     """Copy weights from HF module to Archon module (strict key match)."""
     hf_sd = hf_module.state_dict()
     archon_sd = archon_module.state_dict()
@@ -273,9 +302,16 @@ def _copy_module_weights(hf_module, archon_module):
 
 
 class TestFromHfConfig:
+    # [CLASS DOC]
+    # Tests #1-#4 for Qwen3_5ModelArgs.from_hf_config.
     """Tests 1-4: Qwen3_5ModelArgs.from_hf_config."""
 
     def test_from_hf_config_dense(self):
+        # [FUNCTION DOC]
+        # Maps the dense mock config and asserts every core field (dims, heads, vocab,
+        # head_dim, hidden_dim, eps, rope theta and partial factor, max_seq_len, eos, no
+        # weight tying, no attention bias, 36 layer types with the hybrid pattern,
+        # linear-attention dims) and that MoE is disabled with no moe_args.
         """Test #1: Dense config → verify all fields."""
         cfg = _MOCK_DENSE_CFG
         args = Qwen3_5ModelArgs.from_hf_config(cfg)
@@ -308,6 +344,10 @@ class TestFromHfConfig:
         assert args.moe_args is None
 
     def test_from_hf_config_moe(self):
+        # [FUNCTION DOC]
+        # Maps the MoE mock config and asserts MoE enabled, expert intermediate and
+        # shared-expert sizes, 64 experts, 4 per token, 2 shared experts, and the hybrid
+        # layer types.
         """Test #2: MoE config → verify MoE fields."""
         cfg = _MOCK_MOE_CFG
         args = Qwen3_5ModelArgs.from_hf_config(cfg)
@@ -328,6 +368,9 @@ class TestFromHfConfig:
         assert args.layer_types[3] == "full_attention"
 
     def test_from_hf_config_composite_vlm(self):
+        # [FUNCTION DOC]
+        # A config with only text_config (and model_type) must be unwrapped; asserts
+        # values equal the dense mock.
         """Test #3: Composite VLM config (has text_config) → unwraps correctly."""
         vlm_cfg = _MOCK_COMPOSITE_VLM_CFG
         args = Qwen3_5ModelArgs.from_hf_config(vlm_cfg)
@@ -339,9 +382,14 @@ class TestFromHfConfig:
         assert args.partial_rotary_factor == 0.25
 
     def test_from_hf_config_invalid_layer_types(self):
+        # [FUNCTION DOC]
+        # A config whose layer_types list is shorter than num_hidden_layers must raise
+        # ValueError mentioning "layer_types length".
         """Test #4: layer_types length ≠ n_layers → raise ValueError."""
 
         class BadConfig:
+            # [CLASS DOC]
+            # HELPER: Class-attribute mock config with 4 layers but only 3 layer types.
             hidden_size = 256
             num_hidden_layers = 4
             num_attention_heads = 2
@@ -369,9 +417,15 @@ class TestFromHfConfig:
 
 
 class TestRMSNorm:
+    # [CLASS DOC]
+    # Tests #5-#6: norm parity with HF on CPU.
     """Tests 5-6: RMSNorm parity with HF oracle."""
 
     def test_rmsnorm_matches_hf(self):
+        # [FUNCTION DOC]
+        # Copies Archon weights into the HF Qwen3_5RMSNorm and asserts TIGHT closeness
+        # on random input, both with initial weights and after randomizing them (normal,
+        # std 0.1).
         """Test #5: Qwen3_5RMSNorm matches HF reference."""
         hidden_size = 128
         archon_norm = Qwen3_5RMSNorm(hidden_size, eps=1e-6)
@@ -395,6 +449,9 @@ class TestRMSNorm:
         assert_close(out_archon, out_hf, **TIGHT)
 
     def test_rmsnorm_gated_matches_hf(self):
+        # [FUNCTION DOC]
+        # Same for the gated norm taking (x, gate), using initial weights and then
+        # weights uniform in [0.5, 1.5].
         """Test #6: Qwen3_5RMSNormGated matches HF reference."""
         hidden_size = 128
         archon_norm = Qwen3_5RMSNormGated(hidden_size, eps=1e-6)
@@ -426,9 +483,15 @@ class TestRMSNorm:
 
 
 class TestCuSeqlensToSeqIdx:
+    # [CLASS DOC]
+    # Test #7.
     """Test 7: cu_seqlens_to_seq_idx."""
 
     def test_cu_seqlens_to_seq_idx(self):
+        # [FUNCTION DOC]
+        # Asserts conversion of cumulative boundaries to per-token sequence ids for
+        # [0,3,5,8], a single sequence, and four length-1 sequences (int32 outputs,
+        # exact).
         """Test #7: [0,3,5,8] → [0,0,0,1,1,2,2,2]."""
         cu_seqlens = torch.tensor([0, 3, 5, 8], dtype=torch.int32)
         total_len = 8
@@ -457,9 +520,15 @@ class TestCuSeqlensToSeqIdx:
 
 
 class TestRoPECache:
+    # [CLASS DOC]
+    # Tests #8-#9 for the partial-rotary RoPE cache.
     """Tests 8-9: precompute_rope_cache."""
 
     def test_precompute_rope_cache_partial(self):
+        # [FUNCTION DOC]
+        # head_dim 256 with factor 0.25: asserts cache shape [L, 128] (cos then sin over
+        # rotary_dim 64, each half-frequency set duplicated) and TIGHT equality with a
+        # manual reference computation.
         """Test #8: head_dim=256, factor=0.25 → shape [L, 128], values match.
 
         rotary_dim = int(256 * 0.25) = 64
@@ -492,6 +561,8 @@ class TestRoPECache:
         assert_close(cache, ref_cache, **TIGHT)
 
     def test_rope_factor_1_matches_qwen2(self):
+        # [FUNCTION DOC]
+        # With factor 1.0 asserts the cache exactly equals the Qwen2 RoPE cache.
         """Test #9: partial_rotary_factor=1.0 → exact match with qwen2."""
         head_dim = 128
         max_seq_len = 64
@@ -512,9 +583,18 @@ class TestRoPECache:
 
 
 class TestApplyRotaryEmb:
+    # [CLASS DOC]
+    # Tests #10-#11 for apply_rotary_emb with partial RoPE.
     """Tests 10-11: apply_rotary_emb with partial RoPE."""
 
     def test_apply_rotary_emb_partial(self):
+        # [FUNCTION DOC]
+        # Asserts shapes are preserved, rotary dims change, pass-through dims (beyond
+        # rotary_dim) are bit-exact, the query rotary part equals the rotate-half
+        # formula using the cache's cos/sin, and that passing explicit positions keeps
+        # pass-through dims exact.
+        # KNOWN ISSUE: Despite the "Tests 10-11" label only one test exists here, and it
+        # does not compare against HF as its docstring claims.
         """Test #10: Rotary dims match HF; passthrough dims bit-exact."""
         head_dim = 256
         partial_rotary_factor = 0.25
@@ -568,8 +648,14 @@ class TestApplyRotaryEmb:
 
 @requires_cuda
 class TestFusedVsTorchRMSNormGated:
+    # [CLASS DOC]
+    # Test #12 (CUDA sm90, needs fla): fused vs PyTorch gated norm.
     @pytest.mark.skipif(not FLA_AVAILABLE, reason="fla not available")
     def test_fused_vs_torch_rmsnorm_gated(self):
+        # [FUNCTION DOC]
+        # Shares weights between Qwen3_5RMSNormGated and fla FusedRMSNormGated (silu),
+        # asserts KERNEL-level forward closeness and gradient ratios below 1e-3 for x,
+        # gate and weight after backprop of output sums.
         """Test #12: Forward + backward parity."""
         hidden_size = 128
         torch_norm = Qwen3_5RMSNormGated(hidden_size, eps=1e-6).cuda()
@@ -602,7 +688,14 @@ class TestFusedVsTorchRMSNormGated:
 
 
 class TestDecayBeta:
+    # [CLASS DOC]
+    # Test #13 for compute_decay_beta (CPU, no CUDA marker).
     def test_decay_beta_formulas(self):
+        # [FUNCTION DOC]
+        # Part A: with A_log 1, dt_bias 1, a 0, b 0, asserts beta equals sigmoid(0)=0.5
+        # and g equals minus exp(1) times softplus(1). Part B on random inputs: g
+        # strictly negative, beta in (0,1), larger A_log or larger dt_bias gives larger
+        # magnitude of g.
         """Test #13: Hand-calculated oracle + mathematical properties."""
         # --- Part A: Hand-calculated oracle ---
         A_log = torch.tensor([1.0])  # exp(1.0) = 2.718281828
@@ -657,9 +750,13 @@ class TestDecayBeta:
 
 @requires_cuda
 class TestGatedDeltaNet:
+    # [CLASS DOC]
+    # Tests #14-#19b for the GatedDeltaNet linear-attention module (CUDA sm90).
     """Tests #14-#19b: GatedDeltaNet module (GPU required)."""
 
     def test_gated_deltanet_shapes(self):
+        # [FUNCTION DOC]
+        # Asserts output shape equals input for a length-192 (3 chunks) input.
         """Test #14: Output shape matches input, seq_len=192 (3x chunk_size)."""
         args = _make_args()
         module = GatedDeltaNet(args, layer_idx=0).cuda()
@@ -671,6 +768,9 @@ class TestGatedDeltaNet:
         "dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"]
     )
     def test_gated_deltanet_matches_hf(self, dtype):
+        # [FUNCTION DOC]
+        # Parametrized fp32/bf16: copies HF GatedDeltaNet weights into Archon and
+        # asserts outputs on a length-64 input are close (KERNEL or KERNEL_BF16).
         """Test #15: Archon vs HF — shared weights, same input."""
         args = _make_args()
         hf_config = _make_hf_gdn_config()
@@ -687,6 +787,9 @@ class TestGatedDeltaNet:
         assert_close(out_archon, out_hf, **tol)
 
     def test_gated_deltanet_head_grouping(self):
+        # [FUNCTION DOC]
+        # Asserts the config has 2 value heads per key head and that fp32 outputs match
+        # HF (exercises key-head repetition).
         """Test #16: Verify repeat_interleave when num_k_heads < num_v_heads."""
         args = _make_args()
         # Sanity: config exercises head grouping
@@ -705,6 +808,10 @@ class TestGatedDeltaNet:
         assert_close(out_archon, out_hf, **KERNEL)
 
     def test_gated_deltanet_packing(self):
+        # [FUNCTION DOC]
+        # Runs sequences of length 128 and 96 separately and then packed with int64
+        # cu_seqlens and seq_idx; asserts the packed slices exactly equal the separate
+        # outputs.
         """Test #17: Packed vs unpacked — EXACT self-consistency.
 
         seq_a=128 (2x chunk_size), seq_b=96 (>chunk_size) to exercise
@@ -730,6 +837,9 @@ class TestGatedDeltaNet:
         assert_close(out_packed[:, 128:], out_b, **EXACT)
 
     def test_gated_deltanet_backward_finite(self):
+        # [FUNCTION DOC]
+        # Backprops a packed single-sequence length-192 forward and asserts all
+        # parameter and input gradients exist and are finite.
         """Test #18: All gradients finite after backward, seq_len=192."""
         args = _make_args()
         module = GatedDeltaNet(args, layer_idx=0).cuda()
@@ -749,6 +859,10 @@ class TestGatedDeltaNet:
         "dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"]
     )
     def test_gated_deltanet_backward_parity(self, dtype):
+        # [FUNCTION DOC]
+        # Parametrized fp32/bf16: compares Archon and HF input-gradient ratio (0.008 /
+        # 0.05) and every same-named parameter gradient ratio (0.02 / 0.1) after
+        # backprop of output sums.
         """Test #19: Gradient correctness — Archon vs HF backward."""
         args = _make_args()
         hf_config = _make_hf_gdn_config()
@@ -784,6 +898,12 @@ class TestGatedDeltaNet:
                 )
 
     def test_gated_deltanet_cross_oracle(self):
+        # [FUNCTION DOC]
+        # Skips without fla; compares fla's triton chunk_gated_delta_rule against HF's
+        # pure-PyTorch torch_chunk_gated_delta_rule on random q/k/v, negative g and
+        # sigmoid beta (L2-normalized q/k in kernel), asserting RELAXED closeness.
+        # KNOWN ISSUE: A comment calls the HF fallback an oracle "from conftest", but it
+        # is imported from transformers.
         """Test #19b: fla triton kernel vs HF pure-PyTorch fallback.
 
         Independent oracle — does not share fla triton codepath.
@@ -831,10 +951,17 @@ class TestGatedDeltaNet:
 
 @requires_cuda
 class TestGatedAttention:
+    # [CLASS DOC]
+    # Tests #20-#22 for GatedAttention (full attention with a sigmoid output gate; CUDA
+    # sm90).
     """Tests #20-#22: GatedAttention module (GPU required, flash attention)."""
 
     @staticmethod
     def _make_hf_attn_config():
+        # [FUNCTION DOC]
+        # HELPER: Returns a SimpleNamespace HF attention config matching _make_args
+        # (hidden 256, 4 heads, 2 KV heads, head_dim 128, no bias or dropout, eager
+        # attention).
         return SimpleNamespace(
             hidden_size=256,
             num_attention_heads=4,
@@ -848,6 +975,10 @@ class TestGatedAttention:
 
     @staticmethod
     def _copy_weights_hf_attn_to_archon(hf_mod, archon_mod):
+        # [FUNCTION DOC]
+        # HELPER: Copies q/k/v/o projection weights (q_proj->wq, k_proj->wk, v_proj->wv,
+        # o_proj->wo) and q_norm/k_norm weights from the HF attention into the Archon
+        # module in place.
         """Copy weights from HF Attention oracle to Archon GatedAttention."""
         mapping = {
             "q_proj": "wq",
@@ -863,6 +994,10 @@ class TestGatedAttention:
         archon_mod.k_norm.weight.data.copy_(hf_mod.k_norm.weight.data)
 
     def test_gated_attention_gate_logic(self):
+        # [FUNCTION DOC]
+        # Asserts wq outputs twice n_heads*head_dim (query plus gate per head) and
+        # output shape equals input; then zeroes the gate half of each head's wq rows
+        # and asserts the output changes (gate becomes sigmoid(0)=0.5).
         """Test #20: Verify q_proj 2x split + sigmoid gate."""
         args = _make_args()
         module = GatedAttention(args).cuda().to(torch.bfloat16)
@@ -909,6 +1044,10 @@ class TestGatedAttention:
         )
 
     def test_gated_attention_matches_hf(self):
+        # [FUNCTION DOC]
+        # bf16: shares weights, runs Archon with partial RoPE cache, positions and
+        # cu_seqlens, and HF eager attention with cos/sin sliced from the same cache and
+        # an explicit additive causal mask; asserts RELAXED_BF16 closeness.
         """Test #21: Archon GatedAttention vs HF oracle (shared weights, bf16)."""
         args = _make_args()
         hf_config = self._make_hf_attn_config()
@@ -950,6 +1089,9 @@ class TestGatedAttention:
         assert_close(out_archon, out_hf, **RELAXED_BF16)
 
     def test_gated_attention_backward_finite(self):
+        # [FUNCTION DOC]
+        # Backprops a bf16 forward and asserts all parameter and input gradients exist
+        # and are finite.
         """Test #22: All gradients finite after backward."""
         args = _make_args()
         module = GatedAttention(args).cuda().to(torch.bfloat16)
@@ -982,9 +1124,16 @@ class TestGatedAttention:
 
 @requires_cuda
 class TestConv1dBoundary:
+    # [CLASS DOC]
+    # Tests #23-#23b for causal_conv1d_fn seq_idx handling (skips without causal_conv1d;
+    # CUDA sm90).
     """Tests #23-#23b: causal_conv1d_fn seq_idx boundary behavior."""
 
     def test_causal_conv1d_seq_idx_boundary(self):
+        # [FUNCTION DOC]
+        # Computes the silu causal conv separately on two channel-last sequences (32 and
+        # 24 steps) and on their concatenation with seq_idx 0/1; asserts both packed
+        # slices exactly equal the separate outputs.
         """Test #23: packed vs unpacked via seq_idx isolation."""
         conv1d_fn = pytest.importorskip("causal_conv1d").causal_conv1d_fn
 
@@ -1029,6 +1178,12 @@ class TestConv1dBoundary:
         )
 
     def test_causal_conv1d_seq_idx_padding_zero(self):
+        # [FUNCTION DOC]
+        # Compares a conv with all-zero seq_idx to one where the last 8 steps are marked
+        # sequence 1; asserts the first 24 outputs are identical.
+        # KNOWN ISSUE: The docstring says out-of-range/-1 seq_idx should produce zero
+        # output, but the test only checks that the prefix is unaffected; no zero-output
+        # or -1 case is tested.
         """Test #23b: seq_idx=-1 (or out-of-range) → zero output."""
         conv1d_fn = pytest.importorskip("causal_conv1d").causal_conv1d_fn
 
@@ -1062,6 +1217,10 @@ class TestConv1dBoundary:
 def _make_block_inputs(
     args: Qwen3_5ModelArgs, seq_len: int = 64, device: str = "cuda"
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Builds bf16 TransformerBlock inputs for one sequence of seq_len (default
+    # 64) on device (default cuda): random hidden states, positions, int64 cu_seqlens,
+    # RoPE cache from args, max_seqlen and seq_idx. Returns them as a keyword dict.
     """Create common inputs for TransformerBlock forward."""
     x = torch.randn(1, seq_len, args.dim, device=device, dtype=torch.bfloat16)
     positions = torch.arange(seq_len, device=device).unsqueeze(0)
@@ -1086,6 +1245,9 @@ def _make_block_inputs(
 def _make_model_inputs(
     args: Qwen3_5ModelArgs, seq_len: int = 64, device: str = "cuda"
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Builds Qwen3_5Model inputs: random token ids over the vocab, positions,
+    # int64 cu_seqlens for one sequence and max_seqlen. Returns a keyword dict.
     """Create common inputs for Qwen3_5Model forward."""
     tokens = torch.randint(0, args.vocab_size, (1, seq_len), device=device)
     positions = torch.arange(seq_len, device=device).unsqueeze(0)
@@ -1101,6 +1263,13 @@ def _make_model_inputs(
 def _copy_model_weights(
     hf_model: HFQwen3_5ForCausalLM, archon_model: Qwen3_5Model
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Under no_grad copies all weights from an HF Qwen3_5ForCausalLM into the
+    # Archon model: embeddings, lm head, final norm, and per layer the two norms, the
+    # SwiGLU MLP (gate->w1, up->w3, down->w2), and either full-attention projections
+    # plus q/k norms or linear-attention parameters (in_proj_qkv, in_proj_z, in_proj_a,
+    # in_proj_b, conv1d, out_proj, norm, A_log, dt_bias) depending on the HF layer_type.
+    # Pairs layers by iteration order.
     """Copy weights from real HF Qwen3_5ForCausalLM to Archon model."""
     hf = hf_model.model
     with torch.no_grad():
@@ -1154,6 +1323,10 @@ def _copy_model_weights(
 
 
 def _make_hf_model_config(args: Qwen3_5ModelArgs) -> HFQwen3_5TextConfig:
+    # [FUNCTION DOC]
+    # HELPER: Builds a real HF Qwen3_5TextConfig mirroring the Archon args (vocab, dims,
+    # heads, layer types, linear-attention dims, rope settings) and forces the eager
+    # attention implementation. Returns the config.
     """Create a real HF Qwen3_5TextConfig from Archon args."""
     cfg = HFQwen3_5TextConfig(
         vocab_size=args.vocab_size,
@@ -1190,6 +1363,10 @@ def _make_hf_model_config(args: Qwen3_5ModelArgs) -> HFQwen3_5TextConfig:
 
 @requires_cuda
 def test_block_full_attention_forward():
+    # [FUNCTION DOC]
+    # #29 (CUDA sm90): builds a bf16 TransformerBlock at the first full-attention index,
+    # initializes weights, runs one forward and asserts same shape, finite output,
+    # attention present and linear_attn absent.
     """#29: Single full_attention block forward — shape + isfinite."""
     args = _make_args()
     # Find a full_attention layer index.
@@ -1212,6 +1389,9 @@ def test_block_full_attention_forward():
 
 @requires_cuda
 def test_block_linear_attention_forward():
+    # [FUNCTION DOC]
+    # #30: same for the first linear-attention index; asserts attention absent and
+    # linear_attn present.
     """#30: Single linear_attention block forward — shape + isfinite."""
     args = _make_args()
     # Find a linear_attention layer index.
@@ -1234,6 +1414,10 @@ def test_block_linear_attention_forward():
 
 @requires_cuda
 def test_model_forward_numerical_sanity():
+    # [FUNCTION DOC]
+    # #31: builds and initializes a bf16 Qwen3_5Model (weights and buffers) and asserts
+    # logits shape (1, 64, vocab), finite, non-constant (std above 1e-6) and bounded
+    # (max abs below 1e4); also checks shapes for sequence lengths 32 and 128.
     """#31: Full model forward → output shape, finite, non-constant."""
     args = _make_args()
     seq_len = 64
@@ -1259,6 +1443,9 @@ def test_model_forward_numerical_sanity():
 
 @requires_cuda
 def test_model_backward_grad_norm():
+    # [FUNCTION DOC]
+    # #32: computes float cross-entropy against random targets, backprops and asserts
+    # the total gradient norm (via clip_grad_norm_ with infinite max) is in (0, 1000).
     """#32: Forward → cross_entropy loss → backward → grad norm in (0, 1e3)."""
     args = _make_args()
     seq_len = 64
@@ -1280,6 +1467,13 @@ def test_model_backward_grad_norm():
 
 @requires_cuda
 def test_hybrid_layer_backward_parity():
+    # [FUNCTION DOC]
+    # #34: builds bf16 Archon and HF 4-layer hybrid models, copies HF weights into
+    # Archon, inits buffers, runs both on seeded tokens of length 192 with random
+    # targets, backprops cross-entropy, maps Archon parameter names to HF names, and for
+    # each matched pair with HF grad norm at least 1e-4 asserts relative grad-norm error
+    # below 0.02 (0.05 when the norm is below 0.01) and gradient cosine similarity above
+    # 0.99. Asserts at least one match and warns about unmatched names.
     """#34: Full 4-layer model backward: Archon vs HF.
 
     Shared weights → compare grad norms AND grad direction (cosine similarity)
@@ -1333,6 +1527,16 @@ def test_hybrid_layer_backward_parity():
 
     # Map Archon parameter names to HF names.
     def _archon_to_hf_name(name: str) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Converts an Archon parameter name to its HF counterpart by prefixing
+        # "model." for embeddings, layers and the final norm, and substituting module
+        # names (output->lm_head, attention_norm->input_layernorm,
+        # ffn_norm->post_attention_layernorm, feed_forward w1/w3/w2->mlp gate/up/down,
+        # attention wq/wk/wv/wo/q_norm/k_norm->self_attn equivalents); linear_attn names
+        # are left unchanged.
+        # KNOWN ISSUE: Annotated as possibly returning None, but it always returns a
+        # string; substitutions are plain substring replacements applied to the whole
+        # name.
         """Convert Archon param name to HF param name."""
         if name.startswith("tok_embeddings"):
             name = name.replace("tok_embeddings", "model.embed_tokens")

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Multi-GPU tests for MoE expert parallelism in Archon: EP, ETP (2-D expert weight
+# sharding), EP+TP, EP+CP, TP-only MoE, state-dict updates after an optimizer step, and
+# DTensor checkpoint (to_hf/from_hf) roundtrips. Each test launches
+# tests/experimental/archon/torchrun/run_ep_tests.py with a --test_type and checks its
+# output file. Module skipped without CUDA.
 """Expert Parallelism (EP) and Expert Tensor Parallelism (ETP) tests for Archon Engine.
 
 Tests various MoE parallelism configurations:
@@ -25,6 +31,10 @@ pytestmark = pytest.mark.skipif(
 
 
 def _run_ep_test_with_torchrun(n_gpus: int, test_type: str, output: str):
+    # [FUNCTION DOC]
+    # HELPER: Runs torchrun on one node with n_gpus processes, a free port, and
+    # run_ep_tests.py with --test_type and --output. A non-zero exit fails the test with
+    # captured stderr; afterwards asserts the output file reads exactly "Passed".
     """Run EP/ETP test with torchrun.
 
     Args:
@@ -66,6 +76,10 @@ def _run_ep_test_with_torchrun(n_gpus: int, test_type: str, output: str):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_ep_tp_forward_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 2 devices; runs run_ep_tests.py scenario
+    # "ep_tp_forward" with 2 processes writing to a per-test temp output file. Checks
+    # EP+TP (ep=2, tp=2, etp=1) forward matches a non-EP golden model.
     """Test EP+TP forward numerical correctness (ep=2, tp=2, etp=1) on 2 GPUs.
 
     Verify: EP model output matches non-EP golden model output.
@@ -79,6 +93,11 @@ def test_archon_ep_tp_forward_2gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_ep_tp_weight_sync_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 2 devices; runs run_ep_tests.py scenario
+    # "ep_tp_weight_sync" with 2 processes writing to a per-test temp output file.
+    # Checks EP+TP weight gathering matches originals, is consistent across ranks and
+    # roundtrips.
     """Test EP+TP weight gather and roundtrip (ep=2, tp=2, etp=1) on 2 GPUs.
 
     Verify: Gathered weights match original, cross-rank consistency, roundtrip.
@@ -97,6 +116,10 @@ def test_archon_ep_tp_weight_sync_2gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_ep_only_forward_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 2 devices; runs run_ep_tests.py scenario
+    # "ep_only_forward" with 2 processes writing to a per-test temp output file. Checks
+    # EP-only (ep=2) forward matches the golden model.
     """Test EP only forward (ep=2, tp=1, cp=1) on 2 GPUs.
 
     Verify: EP model output matches non-EP golden model output.
@@ -110,6 +133,10 @@ def test_archon_ep_only_forward_2gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_ep_only_weight_sync_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 2 devices; runs run_ep_tests.py scenario
+    # "ep_only_weight_sync" with 2 processes writing to a per-test temp output file.
+    # Checks EP-only weight gather and roundtrip.
     """Test EP only weight sync (ep=2, tp=1, cp=1) on 2 GPUs.
 
     Verify: Gathered weights match original, cross-rank consistency, roundtrip.
@@ -128,6 +155,10 @@ def test_archon_ep_only_weight_sync_2gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_ep_cp_forward_4gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 4 devices; runs run_ep_tests.py scenario
+    # "ep_cp_forward" with 4 processes writing to a per-test temp output file. Checks
+    # EP+CP (cp=2) forward matches the golden model.
     """Test EP+CP forward (ep=4, tp=1, cp=2) on 4 GPUs.
 
     Verify: EP+CP model output matches non-EP golden model output.
@@ -141,6 +172,10 @@ def test_archon_ep_cp_forward_4gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_ep_cp_weight_sync_4gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 4 devices; runs run_ep_tests.py scenario
+    # "ep_cp_weight_sync" with 4 processes writing to a per-test temp output file.
+    # Checks EP+CP weight gather and roundtrip.
     """Test EP+CP weight sync (ep=4, tp=1, cp=2) on 4 GPUs.
 
     Verify: Gathered weights match original, cross-rank consistency, roundtrip.
@@ -159,6 +194,10 @@ def test_archon_ep_cp_weight_sync_4gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_etp_forward_4gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 4 devices; runs run_ep_tests.py scenario
+    # "etp_forward" with 4 processes writing to a per-test temp output file. Checks ETP
+    # (ep=2, tp=2, etp=2) forward matches the golden model.
     """Test ETP forward numerical correctness (ep=2, tp=2, etp=2) on 4 GPUs.
 
     Tests ExpertTensorParallel with 2D weight sharding [Shard(0), Shard(1/2)].
@@ -173,6 +212,10 @@ def test_archon_etp_forward_4gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_etp_weight_sync_4gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 4 devices; runs run_ep_tests.py scenario
+    # "etp_weight_sync" with 4 processes writing to a per-test temp output file. Checks
+    # ETP weight gather and roundtrip.
     """Test ETP weight gather and roundtrip (ep=2, tp=2, etp=2) on 4 GPUs.
 
     Tests weight gather/roundtrip with ExpertTensorParallel.
@@ -192,6 +235,10 @@ def test_archon_etp_weight_sync_4gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_tp_only_moe_forward_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 2 devices; runs run_ep_tests.py scenario
+    # "tp_only_forward" with 2 processes writing to a per-test temp output file. Checks
+    # TP-only MoE (ep=1, tp=2) forward matches a non-TP golden model.
     """Test TP-only forward for MoE experts (ep=1, tp=2) on 2 GPUs.
 
     Tests TensorParallel class for MoE experts when EP is disabled.
@@ -211,6 +258,11 @@ def test_archon_tp_only_moe_forward_2gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_ep_state_dict_update_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 2 devices; runs run_ep_tests.py scenario
+    # "state_dict_update" with 2 processes writing to a per-test temp output file.
+    # Checks that after forward/backward/optimizer step, gathered EP weights loaded into
+    # a non-EP model reproduce its outputs.
     """Test state dict correctness after optimizer step (ep=2, tp=2) on 2 GPUs.
 
     Verify:
@@ -232,6 +284,11 @@ def test_archon_ep_state_dict_update_2gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_ep_tp_dtensor_checkpoint_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 2 devices; runs run_ep_tests.py scenario
+    # "ep_tp_dtensor_checkpoint" with 2 processes writing to a per-test temp output
+    # file. Checks MoEWeightConverter DTensor split/concatenate via a to_hf/from_hf
+    # roundtrip under EP+TP.
     """Test DTensor checkpoint roundtrip for EP+TP (ep=2, tp=2) on 2 GPUs.
 
     Tests MoEWeightConverter methods:
@@ -249,6 +306,10 @@ def test_archon_ep_tp_dtensor_checkpoint_2gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_ep_only_dtensor_checkpoint_2gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 2 devices; runs run_ep_tests.py scenario
+    # "ep_only_dtensor_checkpoint" with 2 processes writing to a per-test temp output
+    # file. Same DTensor checkpoint roundtrip under EP only.
     """Test DTensor checkpoint roundtrip for EP only (ep=2, tp=1) on 2 GPUs.
 
     Tests MoEWeightConverter methods with EP-only configuration.
@@ -264,6 +325,10 @@ def test_archon_ep_only_dtensor_checkpoint_2gpu(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_archon_etp_dtensor_checkpoint_4gpu(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Multi-GPU, slow. Skips with fewer than 4 devices; runs run_ep_tests.py scenario
+    # "etp_dtensor_checkpoint" with 4 processes writing to a per-test temp output file.
+    # Same DTensor checkpoint roundtrip under ETP (StridedShard plus Shard placements).
     """Test DTensor checkpoint roundtrip for ETP (ep=2, tp=2, etp=2) on 4 GPUs.
 
     Tests MoEWeightConverter methods with ETP configuration

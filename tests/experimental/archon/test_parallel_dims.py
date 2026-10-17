@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Unit tests for ArchonParallelDims configuration logic: dp_shard auto-derivation and
+# world-size validation including pipeline parallelism, the pp/ep/etp/tp enabled flags,
+# EP "borrowing" rules (etp=1 borrows from dp_shard*cp*tp, etp=tp borrows from
+# dp_shard*cp only), and validation errors. Pure-Python tests need no GPU;
+# TestETPMeshDimensions additionally launches the run_parallel_dims.py torchrun worker
+# on multiple GPUs to verify actual device-mesh shapes.
 """Unit tests for ArchonParallelDims ETP (Expert Tensor Parallelism) configuration.
 
 These tests verify the ETP configuration validation and mesh building logic
@@ -18,9 +25,14 @@ from areal.utils.network import find_free_ports
 
 
 class TestPPValidation:
+    # [CLASS DOC]
+    # Pipeline-parallel related validation and derived properties.
     """Test PP (Pipeline Parallelism) constraint validation in ArchonParallelDims."""
 
     def test_dp_shard_auto_calculation_with_pp(self):
+        # [FUNCTION DOC]
+        # Asserts dp_shard is derived as world_size divided by pp*tp*cp for several
+        # combinations (8 GPUs giving 2, 4, 1).
         """Test that dp_shard auto-calculation includes pp."""
         # world_size=8, pp=2, tp=2, cp=1 -> dp_shard = 8 / (2*2*1) = 2
         dims = ArchonParallelDims(pp=2, tp=2, cp=1, world_size=8)
@@ -35,6 +47,9 @@ class TestPPValidation:
         assert dims.dp_shard == 1
 
     def test_world_size_validation_with_pp(self):
+        # [FUNCTION DOC]
+        # Asserts a consistent product is accepted and an inconsistent one raises
+        # ValueError matching "dp_shard ... tp ... cp ... pp must equal world_size".
         """Test that world_size validation includes pp."""
         # Valid: dp_shard * tp * cp * pp = 2 * 2 * 1 * 2 = 8
         dims = ArchonParallelDims(pp=2, dp_shard=2, tp=2, cp=1, world_size=8)
@@ -47,6 +62,8 @@ class TestPPValidation:
             ArchonParallelDims(pp=2, dp_shard=2, tp=2, cp=1, world_size=4)
 
     def test_pp_enabled_flag(self):
+        # [FUNCTION DOC]
+        # Asserts pp_enabled is False for pp=1 and True for pp=2.
         """Test pp_enabled property."""
         # pp=1 -> not enabled
         dims = ArchonParallelDims(pp=1, dp_shard=2, tp=2, cp=1, world_size=4)
@@ -57,6 +74,9 @@ class TestPPValidation:
         assert dims.pp_enabled
 
     def test_context_and_model_parallel_size(self):
+        # [FUNCTION DOC]
+        # Asserts context_and_model_parallel_size equals cp*tp*pp for three
+        # configurations.
         """Test context_and_model_parallel_size property (cp * tp * pp)."""
         # cp=1, tp=2, pp=2 -> 1 * 2 * 2 = 4
         dims = ArchonParallelDims(pp=2, dp_shard=2, tp=2, cp=1, world_size=8)
@@ -72,9 +92,14 @@ class TestPPValidation:
 
 
 class TestPPWithEP:
+    # [CLASS DOC]
+    # PP combined with expert parallelism.
     """Test PP combined with EP configurations."""
 
     def test_pp_with_ep_etp_disabled(self):
+        # [FUNCTION DOC]
+        # pp=2, dp_shard=2, tp=2, ep=4, etp=1 on 8 ranks: asserts pp and ep enabled, etp
+        # disabled.
         """Test PP with EP when etp=1."""
         # pp=2, dp_shard=2, tp=2, cp=1, ep=4, etp=1, world_size=8
         # EP borrows from dp_shard * cp * tp = 2 * 1 * 2 = 4
@@ -86,6 +111,9 @@ class TestPPWithEP:
         assert not dims.etp_enabled
 
     def test_pp_with_ep_etp_enabled(self):
+        # [FUNCTION DOC]
+        # pp=2, dp_shard=4, tp=2, ep=4, etp=2 on 16 ranks: asserts pp, ep and etp
+        # enabled.
         """Test PP with EP when etp=tp."""
         # pp=2, dp_shard=4, tp=2, cp=1, ep=4, etp=2, world_size=16
         # EP borrows from dp_shard * cp = 4 * 1 = 4
@@ -98,9 +126,14 @@ class TestPPWithEP:
 
 
 class TestETPValidation:
+    # [CLASS DOC]
+    # Validation of the etp setting and EP divisibility rules.
     """Test ETP constraint validation in ArchonParallelDims."""
 
     def test_etp_must_be_1_or_tp(self):
+        # [FUNCTION DOC]
+        # Accepts etp=1 and etp=tp (checking etp_enabled accordingly) and asserts etp=2
+        # with tp=4 raises "etp must be 1 or equal to tp".
         """Test that etp must be 1 or equal to tp."""
         # Valid: etp=1 (default)
         dims = ArchonParallelDims(dp_shard=2, tp=2, cp=1, ep=1, etp=1, world_size=4)
@@ -117,6 +150,9 @@ class TestETPValidation:
             ArchonParallelDims(dp_shard=2, tp=4, cp=1, ep=1, etp=2, world_size=8)
 
     def test_etp_1_ep_borrows_dp_cp_tp(self):
+        # [FUNCTION DOC]
+        # Accepts ep=2 with etp=1 and asserts ep=3 raises "ep must be divisible by cp *
+        # tp".
         """Test that when etp=1, EP borrows from dp_shard * cp * tp."""
         # Valid: ep=2, etp=1, ep divides cp*tp=2
         dims = ArchonParallelDims(dp_shard=2, tp=2, cp=1, ep=2, etp=1, world_size=4)
@@ -129,6 +165,10 @@ class TestETPValidation:
             ArchonParallelDims(dp_shard=2, tp=2, cp=1, ep=3, etp=1, world_size=4)
 
     def test_etp_tp_ep_borrows_dp_cp_only(self):
+        # [FUNCTION DOC]
+        # Accepts ep=2 with etp=tp=2; asserts ep=3 with cp=2 raises "ep must be
+        # divisible by cp" and ep=3 with dp_shard*cp=2 raises "dp_shard * cp must be
+        # divisible by ep".
         """Test that when etp=tp, EP borrows from dp_shard * cp only (not tp)."""
         # Valid: ep=2, etp=2, ep divides dp_shard*cp=2
         dims = ArchonParallelDims(dp_shard=2, tp=2, cp=1, ep=2, etp=2, world_size=4)
@@ -146,9 +186,13 @@ class TestETPValidation:
 
 
 class TestETPMeshConfiguration:
+    # [CLASS DOC]
+    # Enabled-flag combinations for EP/TP/ETP layouts.
     """Test ETP mesh dimension configurations."""
 
     def test_ep_only_no_etp(self):
+        # [FUNCTION DOC]
+        # ep=2, tp=1: asserts ep enabled, etp and tp disabled.
         """Test EP only configuration (etp=1)."""
         # dp_shard=2, tp=1, cp=1, ep=2, etp=1 (2 GPUs)
         dims = ArchonParallelDims(dp_shard=2, tp=1, cp=1, ep=2, etp=1, world_size=2)
@@ -157,6 +201,8 @@ class TestETPMeshConfiguration:
         assert not dims.tp_enabled
 
     def test_ep_tp_no_etp(self):
+        # [FUNCTION DOC]
+        # ep=2, tp=2, etp=1: asserts ep and tp enabled, etp disabled.
         """Test EP+TP configuration with etp=1 (TP borrowed by EP)."""
         # dp_shard=1, tp=2, cp=1, ep=2, etp=1 (2 GPUs)
         # EP borrows from dp_shard * cp * tp = 1 * 1 * 2 = 2
@@ -166,6 +212,8 @@ class TestETPMeshConfiguration:
         assert not dims.etp_enabled  # etp=1, so ETP is not enabled
 
     def test_ep_tp_with_etp(self):
+        # [FUNCTION DOC]
+        # ep=2, tp=2, etp=2: asserts all three enabled.
         """Test EP+TP configuration with etp=tp (ExpertTensorParallel)."""
         # dp_shard=2, tp=2, cp=1, ep=2, etp=2 (4 GPUs)
         # EP borrows from dp_shard * cp = 2 * 1 = 2
@@ -175,6 +223,8 @@ class TestETPMeshConfiguration:
         assert dims.etp_enabled
 
     def test_tp_only_no_ep(self):
+        # [FUNCTION DOC]
+        # tp=2, ep=1: asserts only tp enabled.
         """Test TP only configuration (ep=1)."""
         # dp_shard=1, tp=2, cp=1, ep=1, etp=1 (2 GPUs)
         dims = ArchonParallelDims(dp_shard=1, tp=2, cp=1, ep=1, etp=1, world_size=2)
@@ -184,6 +234,11 @@ class TestETPMeshConfiguration:
 
 
 class TestETPStrategySelection:
+    # [CLASS DOC]
+    # Documents the expert-parallel strategy table (Replicate, TensorParallel,
+    # ExpertParallel, ExpertTensorParallel) by checking the flags that drive selection.
+    # KNOWN ISSUE: Only the enabled flags are asserted; no strategy object is actually
+    # selected or inspected, so the tests duplicate TestETPMeshConfiguration.
     """Test that correct strategy would be selected based on EP/TP/ETP config.
 
     Strategy Selection Table:
@@ -197,6 +252,8 @@ class TestETPStrategySelection:
     """
 
     def test_strategy_none_replicate(self):
+        # [FUNCTION DOC]
+        # EP=1, TP=1: asserts all flags disabled.
         """EP=1, TP=1: No parallelism, weights replicated."""
         dims = ArchonParallelDims(dp_shard=2, tp=1, cp=1, ep=1, etp=1, world_size=2)
         assert not dims.ep_enabled
@@ -204,6 +261,8 @@ class TestETPStrategySelection:
         assert not dims.etp_enabled
 
     def test_strategy_tensor_parallel(self):
+        # [FUNCTION DOC]
+        # EP=1, TP=2: asserts only tp enabled.
         """EP=1, TP>1: TensorParallel for experts."""
         dims = ArchonParallelDims(dp_shard=1, tp=2, cp=1, ep=1, etp=1, world_size=2)
         assert not dims.ep_enabled
@@ -211,6 +270,8 @@ class TestETPStrategySelection:
         assert not dims.etp_enabled
 
     def test_strategy_expert_parallel_ep_only(self):
+        # [FUNCTION DOC]
+        # EP=2, TP=1: asserts only ep enabled.
         """EP>1, TP=1: ExpertParallel only."""
         dims = ArchonParallelDims(dp_shard=2, tp=1, cp=1, ep=2, etp=1, world_size=2)
         assert dims.ep_enabled
@@ -218,6 +279,8 @@ class TestETPStrategySelection:
         assert not dims.etp_enabled
 
     def test_strategy_expert_parallel_ep_tp_borrowed(self):
+        # [FUNCTION DOC]
+        # EP=2, TP=2, etp=1: asserts ep and tp enabled, etp disabled.
         """EP>1, TP>1, etp=1: ExpertParallel (TP borrowed by EP)."""
         dims = ArchonParallelDims(dp_shard=1, tp=2, cp=1, ep=2, etp=1, world_size=2)
         assert dims.ep_enabled
@@ -225,6 +288,8 @@ class TestETPStrategySelection:
         assert not dims.etp_enabled  # TP is borrowed, not used for experts
 
     def test_strategy_expert_tensor_parallel(self):
+        # [FUNCTION DOC]
+        # EP=2, TP=2, etp=2: asserts all enabled.
         """EP>1, TP>1, etp=tp: ExpertTensorParallel (2D sharding)."""
         dims = ArchonParallelDims(dp_shard=2, tp=2, cp=1, ep=2, etp=2, world_size=4)
         assert dims.ep_enabled
@@ -233,15 +298,21 @@ class TestETPStrategySelection:
 
 
 class TestETPWorldSizeCalculation:
+    # [CLASS DOC]
+    # World-size products for representative layouts.
     """Test world size calculations with ETP configurations."""
 
     def test_world_size_ep_etp_4gpu(self):
+        # [FUNCTION DOC]
+        # Asserts dp_shard*tp*cp equals 4 for d2t2 with ep=2, etp=2.
         """Test 4 GPU configuration with EP+ETP."""
         # archon:(attn:d2t2|ffn:e2t2) -> 4 GPUs
         dims = ArchonParallelDims(dp_shard=2, tp=2, cp=1, ep=2, etp=2, world_size=4)
         assert dims.dp_shard * dims.tp * dims.cp == 4
 
     def test_world_size_ep_no_etp_4gpu(self):
+        # [FUNCTION DOC]
+        # Asserts the product is 4 and ep=4, etp=1 are stored for d2t2.
         """Test 4 GPU configuration with EP only (etp=1)."""
         # archon:(attn:d2t2|ffn:e4t1) -> 4 GPUs
         # EP borrows from dp_shard * cp * tp = 2 * 1 * 2 = 4
@@ -251,6 +322,10 @@ class TestETPWorldSizeCalculation:
         assert dims.etp == 1
 
     def test_world_size_ep_etp_8gpu(self):
+        # [FUNCTION DOC]
+        # Asserts the product is 8 and ep=4, etp=2 for dp_shard=4, tp=2.
+        # KNOWN ISSUE: The inline comment labels this layout "attn:d2t2" although
+        # dp_shard is 4.
         """Test 8 GPU configuration with EP+ETP."""
         # archon:(attn:d2t2|ffn:e4t2) -> 8 GPUs
         # EP borrows from dp_shard * cp = 4 * 1 = 4, ep=4
@@ -261,6 +336,9 @@ class TestETPWorldSizeCalculation:
 
 
 class TestETPMeshDimensions:
+    # [CLASS DOC]
+    # Multi-GPU checks that the built device meshes have the expected dimensionality
+    # (ep_tp mesh 2-D when etp=tp, absent when etp=1, pp dimension present).
     """Test that ep_tp mesh is correctly 2D after flattening.
 
     This tests the fix for the ValueError:
@@ -272,6 +350,10 @@ class TestETPMeshDimensions:
 
     @staticmethod
     def _run_parallel_dims_test(n_gpus: int, test_type: str, output: str):
+        # [FUNCTION DOC]
+        # HELPER: Static method that runs run_parallel_dims.py via torchrun on one node
+        # with n_gpus processes, a free port, --test_type and --output; fails the test
+        # with stderr on non-zero exit and asserts the output file reads "Passed".
         """Run parallel dims test with torchrun."""
         port = find_free_ports(1)[0]
         try:
@@ -301,6 +383,9 @@ class TestETPMeshDimensions:
     @pytest.mark.multi_gpu
     @pytest.mark.slow
     def test_ep_mesh_when_etp_disabled_2gpu(self, tmp_path_factory):
+        # [FUNCTION DOC]
+        # CUDA, multi-GPU, slow; skips below 2 devices. Runs scenario "ep_mesh" (ep mesh
+        # 1-D, ep_tp mesh None).
         """Test that ep mesh is 1D and ep_tp mesh is None when etp=1 (2 GPU)."""
         if current_platform.device_count() < 2:
             pytest.skip("This test requires 2 GPUs")
@@ -311,6 +396,9 @@ class TestETPMeshDimensions:
     @pytest.mark.multi_gpu
     @pytest.mark.slow
     def test_etp_mesh_is_2d_4gpu(self, tmp_path_factory):
+        # [FUNCTION DOC]
+        # CUDA, multi-GPU, slow; skips below 4 devices. Runs scenario "etp_mesh" (ep_tp
+        # mesh is 2-D [ep, tp]).
         """Test that ep_tp mesh is 2D with dimensions [ep, tp] when etp=tp (4 GPU)."""
         if current_platform.device_count() < 4:
             pytest.skip("This test requires 4 GPUs")
@@ -321,6 +409,9 @@ class TestETPMeshDimensions:
     @pytest.mark.multi_gpu
     @pytest.mark.slow
     def test_pp_mesh_4gpu(self, tmp_path_factory):
+        # [FUNCTION DOC]
+        # CUDA, multi-GPU, slow; skips below 4 devices. Runs scenario "pp_mesh" (pp
+        # dimension included in the mesh).
         """Test that PP mesh dimension is correctly included (4 GPU)."""
         if current_platform.device_count() < 4:
             pytest.skip("This test requires 4 GPUs")

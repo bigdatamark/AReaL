@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Multi-GPU pipeline-parallel tests for Archon: manual P2P 1F1B forward/backward at PP=2
+# and PP=4, PP gradient parity with non-PP, schedule-API tests (ZBVZeroBubble,
+# InterleavedZeroBubble), PP combined with TP/DP/EP, and PP DCP checkpointing. Each test
+# launches a torchrun worker script and checks a result file. Module skipped without
+# CUDA.
 """Pipeline Parallelism (PP) distributed tests for Archon Engine.
 
 These tests require multiple GPUs and use torchrun for distributed execution.
@@ -54,6 +60,14 @@ def _run_pp_test_with_torchrun(
     extra_args: list[str] | None = None,
     timeout: int = 300,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Creates a named temp file (delete=False) as the result file, runs torchrun
+    # on one node with n_gpus processes, a free port, the script, --output=<temp file>
+    # and extra_args, with check=True and a timeout (default 300s). Fails the test if
+    # the result file is not "Passed", if the process exits non-zero (with
+    # stderr/stdout), or on timeout.
+    # KNOWN ISSUE: The temporary result file is never removed. Also the docstring says
+    # it raises pytest.fail, which is a function that raises a Failed exception.
     """Run a PP test script with torchrun.
 
     Args:
@@ -115,6 +129,10 @@ def _run_pp_test_with_torchrun(
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_pp_forward_2gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 2 devices; runs run_pp_tests.py with 2 processes
+    # and args: --test_type=forward_p2p --pp_size=2. Slow. Checks PP output matches the
+    # non-PP golden model with manual activation passing.
     """Test PP forward pass with 2 GPUs (pp=2) via manual P2P.
 
     Validates that PP model output matches golden (non-PP) model output
@@ -133,6 +151,10 @@ def test_pp_forward_2gpu():
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_pp_backward_2gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 2 devices; runs run_pp_tests.py with 2 processes
+    # and args: --test_type=backward_p2p --pp_size=2. Slow. Checks gradients flow
+    # through all stages with manual gradient passing.
     """Test PP backward pass with 2 GPUs (pp=2) via manual P2P.
 
     Validates that gradients flow correctly through all PP stages
@@ -150,6 +172,10 @@ def test_pp_backward_2gpu():
 
 @pytest.mark.multi_gpu
 def test_pp_gradient_correctness_2gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 2 devices; runs run_pp_gradient_verify.py with 2
+    # processes and args: --n_microbatches=2 --seq_len=64, timeout 120s. Not marked
+    # slow. Checks PP step() gradients equal non-PP manual forward/backward.
     """Test PP gradient correctness with 2 GPUs (pp=2).
 
     Validates that PP step() API produces identical gradients to
@@ -180,6 +206,11 @@ def test_pp_gradient_correctness_2gpu():
 @pytest.mark.slow
 @pytest.mark.parametrize("test_type", ["forward_schedule", "backward_schedule"])
 def test_pp_zbv_2gpu(test_type: str):
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 2 devices; runs run_pp_tests.py with 2 processes
+    # and args: --test_type from the parametrization (forward_schedule or
+    # backward_schedule), --pp_size=2, --pp_schedule=ZBVZeroBubble. Slow. Uses
+    # schedule.eval()/step() with V-style stage assignment.
     """Test ZBVZeroBubble forward/backward pass with 2 GPUs (pp=2) via schedule API.
 
     Validates that PP model with ZBVZeroBubble schedule produces correct output
@@ -204,6 +235,10 @@ def test_pp_zbv_2gpu(test_type: str):
 @pytest.mark.slow
 @pytest.mark.parametrize("test_type", ["forward_schedule", "backward_schedule"])
 def test_pp_izb_4gpu(test_type: str):
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 4 devices; runs run_pp_tests.py with 4 processes
+    # and args: parametrized --test_type, --pp_size=4,
+    # --pp_schedule=InterleavedZeroBubble. Slow. Uses loop-style stage assignment.
     """Test InterleavedZeroBubble forward/backward pass with 4 GPUs (pp=4) via schedule API.
 
     Validates that PP model with InterleavedZeroBubble (ZB1P) schedule produces
@@ -232,6 +267,9 @@ def test_pp_izb_4gpu(test_type: str):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_pp_forward_4gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 4 devices; runs run_pp_tests.py with 4 processes
+    # and args: --test_type=forward_p2p --pp_size=4. Slow. Four-stage forward parity.
     """Test PP forward pass with 4 GPUs (pp=4) via manual P2P.
 
     Validates PP with more stages (4 stages instead of 2) using
@@ -250,6 +288,9 @@ def test_pp_forward_4gpu():
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_pp_backward_4gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 4 devices; runs run_pp_tests.py with 4 processes
+    # and args: --test_type=backward_p2p --pp_size=4. Slow. Four-stage gradient flow.
     """Test PP backward pass with 4 GPUs (pp=4) via manual P2P.
 
     Validates gradient flow with more stages using manual gradient
@@ -273,6 +314,9 @@ def test_pp_backward_4gpu():
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_pp_tp_forward_4gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 4 devices; runs run_pp_combinations.py with 4
+    # processes and args: --test_type=pp_tp. Slow. PP=2 with TP=2.
     """Test PP+TP combination with 4 GPUs (pp=2, tp=2).
 
     Validates that PP works correctly when combined with Tensor Parallelism.
@@ -290,6 +334,9 @@ def test_pp_tp_forward_4gpu():
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_pp_dp_forward_4gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 4 devices; runs run_pp_combinations.py with 4
+    # processes and args: --test_type=pp_dp. Slow. PP=2 with dp_shard=2.
     """Test PP+DP combination with 4 GPUs (pp=2, dp_shard=2).
 
     Validates that PP works correctly when combined with Data Parallelism.
@@ -307,6 +354,9 @@ def test_pp_dp_forward_4gpu():
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_pp_ep_forward_4gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 4 devices; runs run_pp_combinations.py with 4
+    # processes and args: --test_type=pp_ep. Slow. PP=2 with EP=2 on a MoE model.
     """Test PP+EP combination with 4 GPUs (pp=2, ep=2).
 
     Validates that PP works correctly when combined with Expert Parallelism.
@@ -330,6 +380,10 @@ def test_pp_ep_forward_4gpu():
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_pp_dcp_checkpoint_2gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 2 devices; runs run_checkpoint_tests.py with 2
+    # processes and args: --test_type=pp_dcp_checkpoint --pp_size=2. Slow. DCP weight
+    # save/load under PP.
     """Test PP checkpoint save/load using DCP format with 2 GPUs.
 
     Validates that PP model weights can be saved and loaded correctly.
@@ -347,6 +401,10 @@ def test_pp_dcp_checkpoint_2gpu():
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_pp_dcp_with_optim_2gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 2 devices; runs run_checkpoint_tests.py with 2
+    # processes and args: --test_type=pp_dcp_with_optim --pp_size=2. Slow. DCP save/load
+    # including optimizer state.
     """Test PP checkpoint with optimizer state using DCP format with 2 GPUs.
 
     Validates that optimizer state is correctly saved and loaded with PP.
@@ -364,6 +422,10 @@ def test_pp_dcp_with_optim_2gpu():
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_pp_forward_match_2gpu():
+    # [FUNCTION DOC]
+    # Multi-GPU. Skips with fewer than 2 devices; runs run_checkpoint_tests.py with 2
+    # processes and args: --test_type=pp_forward_match --pp_size=2. Slow. Forward output
+    # identical before save and after load.
     """Test forward output matches after PP checkpoint save/load with 2 GPUs.
 
     Validates that model behavior is preserved after checkpoint save/load.

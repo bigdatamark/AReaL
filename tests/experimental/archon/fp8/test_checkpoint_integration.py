@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Integration tests chaining the FP8 checkpoint helpers: _detect_fp8_checkpoint,
+# _prepare_fp8_state_dict (swap BF16 placeholders for FP8 weights plus float32 scale_inv
+# tensors) and dequant_fp8_state_dict (convert back to a target dtype and drop scale
+# keys). CPU only, uses tmp_path.
 import json
 from unittest.mock import patch
 
@@ -11,7 +16,15 @@ from areal.experimental.models.archon.fp8_checkpoint import (
 
 
 class TestFP8CheckpointFlow:
+    # [CLASS DOC]
+    # Covers the full prepare-then-dequant flow for index-based and single-file
+    # checkpoints, BF16 passthrough, and the no-index case.
     def test_full_flow_fp8_to_bf16(self, tmp_path):
+        # [FUNCTION DOC]
+        # Writes an index listing a weight and its scale_inv; prepares a BF16 [256,512]
+        # state dict and asserts the weight became FP8 and the scale key was added; then
+        # fills real FP8 zeros and ones scales and dequantizes, asserting the weight is
+        # BF16 and the scale key removed.
         weight_key = "model.layers.0.q_proj.weight"
         scale_key = "model.layers.0.q_proj.weight_scale_inv"
         index = {
@@ -35,6 +48,10 @@ class TestFP8CheckpointFlow:
         assert scale_key not in sd
 
     def test_full_flow_single_file_fp8_to_bf16(self, tmp_path):
+        # [FUNCTION DOC]
+        # Same flow using a single model.safetensors (no index): saves FP8 weight and
+        # [2,4] scale, asserts detection is True, prepares placeholders, substitutes the
+        # saved tensors, dequantizes to BF16 and checks dtype and scale-key removal.
         from safetensors.torch import save_file
 
         weight_key = "model.layers.0.q_proj.weight"
@@ -61,6 +78,10 @@ class TestFP8CheckpointFlow:
         assert scale_key not in sd
 
     def test_bf16_checkpoint_passthrough(self, tmp_path):
+        # [FUNCTION DOC]
+        # Index with no scale keys: asserts detection is False and that
+        # dequant_fp8_state_dict returns the very same dict object with BF16 weights
+        # unchanged.
         index = {
             "weight_map": {
                 "model.layers.0.q_proj.weight": "model-00001.safetensors",
@@ -77,6 +98,13 @@ class TestFP8CheckpointFlow:
         assert result["model.layers.0.q_proj.weight"].dtype == torch.bfloat16
 
     def test_no_index_file_prepare_not_called(self, tmp_path):
+        # [FUNCTION DOC]
+        # Patches the module-level _prepare_fp8_state_dict with a mock, calls detection
+        # on an empty directory, and asserts it returns False and the mock was never
+        # called.
+        # KNOWN ISSUE: The test only calls detection directly, which never invokes
+        # prepare anyway, so the assertion on the mock is trivially satisfied and does
+        # not exercise any loader gating logic.
         with patch(
             "areal.experimental.models.archon.fp8_checkpoint._prepare_fp8_state_dict"
         ) as mock_prepare:

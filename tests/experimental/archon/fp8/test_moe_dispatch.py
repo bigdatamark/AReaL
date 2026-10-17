@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# GPU unit tests for _run_experts_fp8_for_loop, the per-expert FP8 SwiGLU MoE compute
+# path: BF16 parity, empty / uneven / non-aligned / tiny token splits, non-power-of-2
+# expert counts, zeroed global padding rows and backward gradients. Skipped without CUDA
+# SM90+, torchao FP8, or the function itself.
 """MoE FP8 dispatch unit tests.
 
 Covers _run_experts_fp8_for_loop: BF16 parity, edge cases (empty experts,
@@ -52,6 +57,13 @@ pytestmark = [
 
 
 def _run_bf16_for_loop(w1, w2, w3, x, num_tokens_per_expert):
+    # [FUNCTION DOC]
+    # HELPER: BF16 reference implementation. Inputs: w1, w3 [E, hidden, dim], w2 [E,
+    # dim, hidden], x [T, dim] sorted by expert, num_tokens_per_expert (1-D tensor,
+    # converted to a list, so a GPU tensor would sync). Splits the first sum(counts)
+    # rows by expert, computes silu(x w1^T) times (x w3^T) then times w2^T per expert
+    # (empty experts give an empty [0, dim] block), concatenates, and appends zero rows
+    # for any trailing padding rows of x beyond the total count. Returns [T, dim].
     num_tokens_per_expert_list = num_tokens_per_expert.tolist()
     total_tokens = sum(num_tokens_per_expert_list)
 
@@ -81,7 +93,12 @@ def _run_bf16_for_loop(w1, w2, w3, x, num_tokens_per_expert):
 
 
 class TestMoEFP8Dispatch:
+    # [CLASS DOC]
+    # Test cases for the FP8 grouped-expert for-loop dispatch.
     def test_fp8_matches_bf16_baseline(self):
+        # [FUNCTION DOC]
+        # 4 experts, 128 tokens each: asserts same shape, cosine similarity above 0.99
+        # and assert_close within rtol 0.1 / atol 0.3 versus the BF16 reference.
         num_experts, dim, hidden_dim = 4, 256, 512
         w1, w2, w3 = make_expert_weights(num_experts, dim, hidden_dim)
         x = torch.randn(512, dim, device="cuda", dtype=torch.bfloat16)
@@ -99,6 +116,8 @@ class TestMoEFP8Dispatch:
         torch.testing.assert_close(out_fp8, out_bf16, rtol=0.1, atol=0.3)
 
     def test_empty_expert_handling(self):
+        # [FUNCTION DOC]
+        # Counts [128,256,0,0]: asserts output shape (384,256).
         w1, w2, w3 = make_expert_weights(4, 256, 512)
         x = torch.randn(384, 256, device="cuda", dtype=torch.bfloat16)
         num_tokens = torch.tensor([128, 256, 0, 0])
@@ -107,6 +126,8 @@ class TestMoEFP8Dispatch:
         assert out.shape == (384, 256)
 
     def test_all_experts_empty_except_one(self):
+        # [FUNCTION DOC]
+        # Counts [0,0,256,0]: asserts output shape (256,256).
         w1, w2, w3 = make_expert_weights(4, 256, 512)
         x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
         num_tokens = torch.tensor([0, 0, 256, 0])
@@ -115,6 +136,8 @@ class TestMoEFP8Dispatch:
         assert out.shape == (256, 256)
 
     def test_non_aligned_token_count(self):
+        # [FUNCTION DOC]
+        # Counts [150,150] (not 128 multiples): asserts shape (300,256).
         w1, w2, w3 = make_expert_weights(2, 256, 512)
         x = torch.randn(300, 256, device="cuda", dtype=torch.bfloat16)
         num_tokens = torch.tensor([150, 150])
@@ -123,6 +146,8 @@ class TestMoEFP8Dispatch:
         assert out.shape == (300, 256)
 
     def test_very_small_token_count(self):
+        # [FUNCTION DOC]
+        # Counts [3,7], below one block: asserts shape (10,256).
         w1, w2, w3 = make_expert_weights(2, 256, 512)
         x = torch.randn(10, 256, device="cuda", dtype=torch.bfloat16)
         num_tokens = torch.tensor([3, 7])
@@ -131,6 +156,8 @@ class TestMoEFP8Dispatch:
         assert out.shape == (10, 256)
 
     def test_highly_uneven_distribution(self):
+        # [FUNCTION DOC]
+        # Counts [500,12]: asserts shape (512,256).
         w1, w2, w3 = make_expert_weights(2, 256, 512)
         x = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16)
         num_tokens = torch.tensor([500, 12])
@@ -139,6 +166,8 @@ class TestMoEFP8Dispatch:
         assert out.shape == (512, 256)
 
     def test_single_expert(self):
+        # [FUNCTION DOC]
+        # One expert with 256 tokens: asserts shape (256,256).
         w1, w2, w3 = make_expert_weights(1, 256, 512)
         x = torch.randn(256, 256, device="cuda", dtype=torch.bfloat16)
         num_tokens = torch.tensor([256])
@@ -147,6 +176,8 @@ class TestMoEFP8Dispatch:
         assert out.shape == (256, 256)
 
     def test_non_power_of_2_experts(self):
+        # [FUNCTION DOC]
+        # 3 experts of 128 tokens: asserts shape (384,256).
         w1, w2, w3 = make_expert_weights(3, 256, 512)
         x = torch.randn(384, 256, device="cuda", dtype=torch.bfloat16)
         num_tokens = torch.tensor([128, 128, 128])
@@ -155,6 +186,9 @@ class TestMoEFP8Dispatch:
         assert out.shape == (384, 256)
 
     def test_global_padding(self):
+        # [FUNCTION DOC]
+        # x has 512 rows but counts sum to 256: asserts shape (512,256) and that the
+        # trailing 256 rows are exactly zero.
         w1, w2, w3 = make_expert_weights(2, 256, 512)
         x = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16)
         num_tokens = torch.tensor([128, 128])
@@ -169,6 +203,9 @@ class TestMoEFP8Dispatch:
         )
 
     def test_backward_pass(self):
+        # [FUNCTION DOC]
+        # Enables grads on w1, w2, w3 and x, backprops the output sum and asserts all
+        # four received gradients (presence only).
         w1, w2, w3 = make_expert_weights(2, 256, 512)
         w1.requires_grad_(True)
         w2.requires_grad_(True)

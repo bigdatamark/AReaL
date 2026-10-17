@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Deep diagnostic parity tests between HuggingFace and Archon for the Qwen3-30B-A3B MoE
+# model, targeting MoE-specific divergence sources (router inputs, grouped_mm vs for-
+# loop experts, score-before vs score-after experts, per-layer drift, simulated
+# importance weights, config mapping). A module-scoped fixture loads only
+# NUM_LAYERS_SUBSET=6 layers of each model once and captures activations. Skipped
+# without CUDA and unless env var AREAL_RUN_DEEP_MOE_PARITY is "1"; all tests are slow
+# and print extensive diagnostics.
 """MoE HF parity tests: verify Archon MoE internals match HuggingFace.
 
 Targets MoE-specific divergence sources between Archon and HuggingFace
@@ -69,6 +77,9 @@ SEQ_LEN = 32
 
 
 def _is_moe_layer_idx(layer_id: int, decoder_sparse_step: int) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: Returns True when (layer_id+1) is a multiple of decoder_sparse_step
+    # (Archon convention), False for non-positive steps.
     """Check if a layer index is an MoE layer (mirrors Archon convention)."""
     if decoder_sparse_step <= 0:
         return False
@@ -82,6 +93,24 @@ def _is_moe_layer_idx(layer_id: int, decoder_sparse_step: int) -> bool:
 
 @pytest.fixture(scope="module")
 def moe_model_outputs() -> Generator[dict[str, Any], None, None]:
+    # [FUNCTION DOC]
+    # Module-scoped generator fixture. Calls setup_environment; reads the full config
+    # (for metadata and decoder_sparse_step) and a partial config truncated to 6 layers;
+    # seeds 42 and draws a length-32 random input in [100, vocab-100) with single-
+    # segment cu_seqlens; finds the first MoE layer index. Phase 1: loads the partial HF
+    # model (bf16, flash_attention_2), hooks embedding, per-layer attn norm/attn/ffn
+    # norm/mlp/layer outputs and the final norm, plus a hook on the first MoE layer's
+    # gate capturing its input; runs a no-grad forward, removes hooks, copies the state
+    # dict to CPU and frees the HF model and CUDA cache. Phase 2: skips if unsupported,
+    # builds the Archon model from the model spec, converts and loads the state dict
+    # non-strictly, casts to bf16, init_buffers, installs matching hooks (moe module if
+    # present else feed_forward) and a router hook capturing input, top scores, selected
+    # indices and per-expert token counts; runs forward, removes hooks and frees the
+    # model. Yields a dict with input_ids, cu_seqlens, seq_len, full config,
+    # decoder_sparse_step, both logits, both per-layer output dicts and both router
+    # dicts; on teardown destroys the process group if initialized.
+    # KNOWN ISSUE: load_state_dict uses strict=False without checking missing/unexpected
+    # keys, which could mask adapter bugs.
     """Load HF and Archon MoE models, run forward, capture activations.
 
     Optimised for speed:
@@ -148,11 +177,16 @@ def moe_model_outputs() -> Generator[dict[str, Any], None, None]:
     hf_router_data: dict[str, torch.Tensor] = {}
 
     def _make_hf_hook(name: str):
+        # [FUNCTION DOC]
+        # HELPER: Returns a forward hook storing a detached clone of a tensor output (or
+        # the first element of a non-empty tuple) into hf_layer_outputs under name.
         def hook(
             module: torch.nn.Module,
             input: tuple[torch.Tensor, ...],
             output: Any,
         ) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Hook body for HF activations.
             if isinstance(output, torch.Tensor):
                 hf_layer_outputs[name] = output.detach().clone()
             elif isinstance(output, tuple) and len(output) > 0:
@@ -195,6 +229,9 @@ def moe_model_outputs() -> Generator[dict[str, Any], None, None]:
             input: tuple[torch.Tensor, ...],
             output: Any,
         ) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Forward hook on the HF MoE gate that stores a detached clone of
+            # its input as hf_router_data["input"].
             hf_router_data["input"] = input[0].detach().clone()
 
         hf_moe_layer = hf_model.model.layers[moe_layer_idx].mlp
@@ -249,11 +286,15 @@ def moe_model_outputs() -> Generator[dict[str, Any], None, None]:
     archon_router_data: dict[str, torch.Tensor] = {}
 
     def _make_archon_hook(name: str):
+        # [FUNCTION DOC]
+        # HELPER: Same as _make_hf_hook but writes into archon_layer_outputs.
         def hook(
             module: torch.nn.Module,
             input: tuple[torch.Tensor, ...],
             output: Any,
         ) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Hook body for Archon activations.
             if isinstance(output, torch.Tensor):
                 archon_layer_outputs[name] = output.detach().clone()
             elif isinstance(output, tuple) and len(output) > 0:
@@ -304,6 +345,10 @@ def moe_model_outputs() -> Generator[dict[str, Any], None, None]:
             input: tuple[torch.Tensor, ...],
             output: tuple[torch.Tensor, ...],
         ) -> None:
+            # [FUNCTION DOC]
+            # HELPER: Forward hook on the Archon router storing detached clones of its
+            # input and of the output triple (top scores, selected expert indices,
+            # tokens per expert).
             archon_router_data["input"] = input[0].detach().clone()
             archon_router_data["top_scores"] = output[0].detach().clone()
             archon_router_data["selected_indices"] = output[1].detach().clone()
@@ -352,10 +397,20 @@ def moe_model_outputs() -> Generator[dict[str, Any], None, None]:
 
 
 class TestMoEInternals:
+    # [CLASS DOC]
+    # Level-2 diagnostics on MoE internals.
     """Tests targeting MoE-specific divergence sources."""
 
     @pytest.mark.slow
     def test_level2_router_scores(self, moe_model_outputs: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # Asserts both router hooks fired, prints max/mean diff between HF and Archon
+        # router inputs (flattened to tokens x hidden), expert count/top_k from config
+        # and Archon per-expert token allocation stats, and asserts the input max diff
+        # is below 50.
+        # KNOWN ISSUE: The docstring claims top-k indices and scores are compared, but
+        # HF router outputs are never captured, so only router inputs are checked (with
+        # a very loose bound).
         """Compare HF vs Archon router expert selection and scores.
 
         Uses router data captured by the module fixture (no extra model loads).
@@ -410,6 +465,13 @@ class TestMoEInternals:
 
     @pytest.mark.slow
     def test_level2_grouped_mm_vs_loop(self) -> None:
+        # [FUNCTION DOC]
+        # Builds random bf16 expert weights (8 experts, dim 256, hidden 512) and 256
+        # routed tokens split evenly across experts (remainder on the last), runs
+        # _run_experts_for_loop and _run_experts_grouped_mm under no_grad and asserts
+        # exactly zero max difference.
+        # KNOWN ISSUE: Requiring bitwise equality between a CUTLASS grouped GEMM and
+        # per-expert matmuls may be fragile across GPUs/kernels.
         """Compare _run_experts_grouped_mm (bf16) vs _run_experts_for_loop (reference).
 
         Both functions receive bf16 input (the only dtype used in practice).
@@ -465,6 +527,11 @@ class TestMoEInternals:
 
     @pytest.mark.slow
     def test_level2_score_before_vs_after_experts(self) -> None:
+        # [FUNCTION DOC]
+        # Builds two MoE modules sized from the real config (softmax, route norm)
+        # differing only in score_before_experts, shares weights, casts to bf16,
+        # init_buffers, runs both on the same random input and prints max/mean/relative
+        # differences; asserts max diff below 50. Frees modules and CUDA cache.
         """Quantify effect of score_before_experts=True vs False.
 
         For SwiGLU, score*f(x) ≠ f(score*x). This test runs a single MoE
@@ -539,6 +606,9 @@ class TestMoEInternals:
 
     @pytest.mark.slow
     def test_level2_moe_layer_output(self, moe_model_outputs: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # Compares captured "layer1_out" (first MoE layer) with compare_tensors (atol
+        # 1.0, rtol 0.1), prints metrics, asserts shape match and max diff below 10.
         """Compare full MoE layer output between HF and Archon.
 
         Uses layer 1 (first MoE layer with decoder_sparse_step=2).
@@ -572,6 +642,11 @@ class TestMoEInternals:
 
     @pytest.mark.slow
     def test_level2_dense_ffn_output(self, moe_model_outputs: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # Control: compares "layer0_out" (dense) with atol 0.1, rtol 0.01, prints
+        # metrics, asserts shape match and max diff below 10.
+        # KNOWN ISSUE: The comment says dense layers should be much closer than MoE
+        # layers, but the same max-diff bound of 10 is used.
         """Compare dense FFN layer output as control (layer 0 is dense).
 
         Should show minimal divergence compared to MoE layers.
@@ -610,12 +685,19 @@ class TestMoEInternals:
 
 
 class TestImpWeight:
+    # [CLASS DOC]
+    # Level-5 importance-weight simulation and divergence attribution.
     """Importance weight simulation and divergence attribution."""
 
     @pytest.mark.slow
     def test_level5_simulated_imp_weight(
         self, moe_model_outputs: dict[str, Any]
     ) -> None:
+        # [FUNCTION DOC]
+        # Computes next-token logprobs of the input under both models, importance
+        # weights exp(archon - hf) per token, prints mean/median/min/max/std and
+        # fractions below several thresholds plus an interpretation, and asserts the
+        # mean weight lies in (0.1, 10).
         """DIRECTLY SIMULATE behave_imp_weight.
 
         Computes exp(archon_logprobs - hf_logprobs) per token, then averages.
@@ -682,6 +764,14 @@ class TestImpWeight:
     def test_level5_logprob_per_layer_attribution(
         self, moe_model_outputs: dict[str, Any]
     ) -> None:
+        # [FUNCTION DOC]
+        # For each captured layer output with matching shapes computes the mean absolute
+        # HF/Archon difference and its increase over the previous layer, buckets
+        # increases into MoE vs dense layers, prints a table and share of total drift,
+        # and asserts at least two layers were analyzed.
+        # KNOWN ISSUE: Percentages are computed from signed deltas, so negative deltas
+        # can make shares misleading; when total is not positive an empty line is
+        # printed instead.
         """Attribute logprob divergence to MoE vs dense layers.
 
         For each layer, compute the hidden state divergence and correlate
@@ -774,10 +864,20 @@ class TestImpWeight:
 
 
 class TestMoEConfigValidation:
+    # [CLASS DOC]
+    # Config mapping checks against the real HF config.
     """Validate MoE config mapping from HF to Archon."""
 
     @pytest.mark.slow
     def test_moe_config_matches_hf(self) -> None:
+        # [FUNCTION DOC]
+        # Loads the HF config, maps it with MoEArgs.from_hf_config, prints HF vs Archon
+        # values, asserts num_experts, top_k and route_norm match and score_func is
+        # softmax; prints warnings if score_before_experts or use_grouped_mm are set.
+        # Then maps with Qwen3ModelArgs.from_hf_config and asserts MoE enabled, matching
+        # decoder_sparse_step, non-None moe_args and moe_inter_dim equal to
+        # moe_intermediate_size. Does not need a GPU itself but is under the module
+        # skip.
         """Validate MoEArgs.from_hf_config() correctly maps all fields.
 
         Checks num_experts, top_k, score_func, route_norm,
