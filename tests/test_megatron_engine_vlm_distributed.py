@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# GPU integration tests for the Megatron VLM path (Qwen2.5-VL, Qwen3-VL, Qwen3-VL-MoE).
+# Every test launches tests/torchrun/run_megatron_engine_vlm_distributed.py via torchrun
+# so the pytest process allocates no GPU memory; the worker writes "Passed", "OOM" or an
+# error to an output file. Model selection is via the VLM_MODEL_PATH env var (paths from
+# areal.utils.testing_utils); _VLM_MODELS parametrizes scenarios over the models (MoE
+# needs 8 GPUs). Skipped when CUDA is unavailable.
 # SPDX-License-Identifier: Apache-2.0
 
 """Distributed integration tests for the Megatron VLM path.
@@ -42,6 +49,18 @@ def _run_vlm_test(
     timeout: int = 1800,
     env_overrides: dict[str, str] | None = None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Runs one VLM worker scenario. Inputs: test_type, output_path, backend
+    # allocation string (default single-rank megatron:d1p1t1), nproc (defaults to the
+    # allocation's parallel world size), extra CLI args, timeout seconds (default 1800)
+    # and env_overrides. Copies os.environ, sets CUDA_VISIBLE_DEVICES to 0..nproc-1,
+    # applies overrides, picks a free port, and runs torchrun with --backend,
+    # --test_type, --output plus extras, streaming output to stdout. On non-zero exit:
+    # skips if the output file says "OOM", else pytest.fail with the exit code; on
+    # timeout: pytest.fail. Otherwise reads the output file, skips on "OOM", and asserts
+    # it equals "Passed".
+    # KNOWN ISSUE: Overwrites CUDA_VISIBLE_DEVICES with 0..nproc-1, ignoring any device
+    # restriction set by the caller (unless passed via env_overrides).
     """Launch a VLM integration test via torchrun subprocess.
 
     ``nproc`` is inferred from ``ModelAllocation.from_str(backend).parallel.world_size``
@@ -134,6 +153,9 @@ _VLM_MODELS = [
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize("model_env", _VLM_MODELS)
 def test_engine_initializes(model_env, tmp_path_factory):
+    # [FUNCTION DOC]
+    # Per model: worker "init" scenario checks the engine detects the vision model and
+    # loads its processor.
     """Verify VLM engine detects vision model and loads processor."""
     output = str(tmp_path_factory.mktemp("vlm_test") / "init.out")
     _run_vlm_test("init", output, env_overrides=model_env)
@@ -144,6 +166,8 @@ def test_engine_initializes(model_env, tmp_path_factory):
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize("model_env", _VLM_MODELS)
 def test_simple_forward(model_env, tmp_path_factory):
+    # [FUNCTION DOC]
+    # Per model: worker "forward" scenario runs a forward pass on VLM inputs.
     """Verify forward pass with VLM inputs completes."""
     output = str(tmp_path_factory.mktemp("vlm_test") / "forward.out")
     _run_vlm_test("forward", output, env_overrides=model_env)
@@ -156,6 +180,10 @@ def test_simple_forward(model_env, tmp_path_factory):
     "backend", ["megatron:d1p1t1", "megatron:d1p1t2"], ids=["tp1", "tp2"]
 )
 def test_qwen3_vl_model_thd_matches_bshd(backend, tmp_path_factory):
+    # [FUNCTION DOC]
+    # Parametrized over TP1 and TP2 (skips if too few GPUs): Qwen3-VL via megatron-
+    # bridge must give matching logprobs for model-owned THD (packed) and BSHD (padded)
+    # inputs, text-only and image-text.
     """Model-owned THD must preserve text-only and image-text logprobs."""
     required_gpus = ModelAllocation.from_str(backend).parallel.world_size
     if torch.cuda.device_count() < required_gpus:
@@ -177,6 +205,9 @@ def test_qwen3_vl_model_thd_matches_bshd(backend, tmp_path_factory):
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize("model_env", _VLM_MODELS)
 def test_hf_save_load_weights(model_env, tmp_path_factory):
+    # [FUNCTION DOC]
+    # Per model: worker "save_load" scenario saves HF weights and processor into a temp
+    # save_dir and reloads them, verifying weights are preserved.
     """Verify save/load preserves VLM weights and saves processor."""
     save_dir = str(tmp_path_factory.mktemp("vlm_save"))
     output = str(tmp_path_factory.mktemp("vlm_test") / "save_load.out")
@@ -194,6 +225,8 @@ def test_hf_save_load_weights(model_env, tmp_path_factory):
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 @pytest.mark.parametrize("model_env", _VLM_MODELS)
 def test_train_tensor_parallel(model_env, tmp_path_factory):
+    # [FUNCTION DOC]
+    # Per model, needs 2 GPUs: worker "train" scenario under TP=2.
     """VLM training with TP=2 to avoid single-device OOM."""
     if torch.cuda.device_count() < 2:
         pytest.skip("VLM TP training requires at least 2 GPUs")
@@ -216,6 +249,9 @@ def test_train_tensor_parallel(model_env, tmp_path_factory):
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 def test_qwen3vl_moe_expert_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3-VL-MoE forward smoke with legacy mbridge under attention DP2 TP4 / FFN DP2
+    # EP4; needs 8 GPUs.
     """Legacy mbridge forward smoke under ``(attn:d2t4|ffn:d2e4)``."""
     if torch.cuda.device_count() < 8:
         pytest.skip("Qwen3-VL-MoE expert parallel requires 8 GPUs to run")
@@ -234,6 +270,10 @@ def test_qwen3vl_moe_expert_parallel(tmp_path_factory):
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 def test_qwen3vl_moe_model_thd_expert_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Same allocation as the legacy MoE smoke but using megatron-bridge with
+    # AREAL_TEST_EXPECT_MODEL_THD=1 so the worker asserts the model-owned THD path is
+    # used; needs 8 GPUs.
     """Model-owned THD smoke for Qwen3-VL-MoE under ``(attn:d2t4|ffn:d2e4)``.
 
     Allocation: attn DP=2 TP=4 (8 GPUs); ffn DP=2 EP=4 (8 GPUs). World sizes
@@ -262,6 +302,9 @@ def test_qwen3vl_moe_model_thd_expert_parallel(tmp_path_factory):
 @pytest.mark.slow
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 def test_qwen3vl_moe_dcp_save_load(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3-VL-MoE DCP save/load round trip under attention DP2 TP4 / FFN TP2 EP4; needs
+    # 8 GPUs.
     """DCP save/load round-trip for Qwen3-VL-MoE under ``(attn:d2p1t4|ffn:d1p1t2e4)``.
 
     Allocation: attn DP=2 PP=1 TP=4 (8 GPUs); ffn DP=1 PP=1 TP=2 EP=4 (8 GPUs).

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Multi-GPU (4 device) end-to-end tests comparing KK and FFD sequence packing for
+# trajectory redistribution. Each test spawns torchrun (via python -m
+# torch.distributed.run) on tests/torchrun/run_kk_vs_ffd.py, which writes per-rank
+# pickled metric dicts (rank_<r>.pkl) into an output directory; the tests load and
+# assert on those. Skipped unless current_platform reports at least 4 devices.
 """End-to-end test: KK vs FFD sequence packing with 4 GPUs.
 
 Launches a torchrun worker (run_kk_vs_ffd.py) that simulates trajectory
@@ -40,6 +46,16 @@ WORKER_SCRIPT = os.path.join(os.path.dirname(__file__), "torchrun", "run_kk_vs_f
     current_platform.device_count() < 4, reason="This test requires 4 GPUs"
 )
 def test_kk_vs_ffd_e2e(tmp_path, world_size, n_seqs, seed):
+    # [FUNCTION DOC]
+    # Parametrized over (n_seqs, seed) in {(200,42),(500,123),(1000,7)} with world_size
+    # 4. Runs torchrun with the worker script, output_dir under tmp_path, n_seqs and
+    # seed, on fixed master port 29501 with CUDA_VISIBLE_DEVICES set to 0..world_size-1
+    # and a 120 s timeout. Asserts rc 0, loads rank_0.pkl, checks world_size/n_seqs
+    # fields, prints a spread/loads summary to stdout, and asserts kk_spread <=
+    # 1.05*ffd_spread+50 and kk_max_load <= 1.05*ffd_max_load+50.
+    # KNOWN ISSUE: Hardcoded master port 29501 can collide with other jobs or with
+    # parallel test runs; subprocess.TimeoutExpired propagates as an error rather than a
+    # clean failure.
     """End-to-end test: KK produces more balanced redistribution than FFD.
 
     This test:
@@ -126,6 +142,12 @@ def test_kk_vs_ffd_e2e(tmp_path, world_size, n_seqs, seed):
     current_platform.device_count() < 4, reason="This test requires 4 GPUs"
 )
 def test_kk_consistent_across_ranks(tmp_path):
+    # [FUNCTION DOC]
+    # Runs the worker with 4 ranks (n_seqs 200, seed 42, port 29502,
+    # CUDA_VISIBLE_DEVICES 0,1,2,3), loads every rank's pickle and asserts each rank
+    # reports the same ffd_spread, kk_spread, ffd_loads and kk_loads as rank 0.
+    # KNOWN ISSUE: Hardcoded master port 29502 and device list may collide or ignore the
+    # caller's visible-device configuration.
     """Verify all ranks agree on the same KK vs FFD metrics.
 
     Since redistribution is a global operation, all ranks should compute

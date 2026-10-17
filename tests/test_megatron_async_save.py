@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# CPU-only unit tests for MegatronCheckpointManager's async-save logic in
+# areal/engine/megatron_utils/checkpointer.py. The checkpointer module is loaded from
+# disk under stubbed megatron/areal parent modules; AsyncCallsQueue,
+# save/load_dist_checkpointing, torch.distributed rank/barrier and CUDA cache calls are
+# patched. Also tests the module helpers
+# _inspect_retained_payload/_release_retained_payload (freeing tensor payloads retained
+# by an async request while keeping finalize closures working) and the
+# _UnsupportedMCoreAsyncLayout guard.
 """Unit tests for the Megatron checkpoint manager's async-save state machine.
 
 These tests do NOT exercise real Megatron dist_checkpointing or distributed
@@ -27,6 +36,19 @@ import pytest
 
 
 def _import_checkpointer():
+    # [FUNCTION DOC]
+    # HELPER: Returns the cached checkpointer module from sys.modules if present.
+    # Otherwise installs empty stub modules (setdefault) for
+    # megatron.core.dist_checkpointing.* and areal parent packages, fills required
+    # attributes with MagicMocks (mpu, tensor_parallel, ShardedObject, default load/save
+    # strategies, AsyncCallsQueue/AsyncRequest, fully-parallel wrappers,
+    # current_platform with no device, getLogger, a stub stats_tracker with a MagicMock
+    # scalar), then loads the real checkpointer.py via importlib spec under its dotted
+    # name, registers it in sys.modules and returns it.
+    # KNOWN ISSUE: Permanently inserts stub "areal", "areal.utils" etc. modules into
+    # sys.modules if they were not yet imported, which can break later tests in the same
+    # process; and if the module is already cached the stats_tracker mock is not
+    # installed (hence the skipped metric tests).
     """Import the checkpointer module without triggering the full areal package."""
     if "areal.engine.megatron_utils.checkpointer" in sys.modules:
         return sys.modules["areal.engine.megatron_utils.checkpointer"]
@@ -101,6 +123,12 @@ def _import_checkpointer():
 
 @pytest.fixture
 def patched_checkpointer():
+    # [FUNCTION DOC]
+    # Fixture: imports the module, builds a MagicMock queue (0 unfinalized calls,
+    # finalize returns [], schedule returns 0), patches get_rank to 0 and
+    # AsyncCallsQueue to return that queue, constructs a manager with async_save=True
+    # and MagicMock model/optimizer, and yields (module, manager, queue) with patches
+    # active.
     mod = _import_checkpointer()
 
     queue = MagicMock()
@@ -122,6 +150,9 @@ def patched_checkpointer():
 
 
 def test_async_disabled_creates_no_queue():
+    # [FUNCTION DOC]
+    # With async_save=False the manager creates no queue (_async_queue None), and
+    # _reap_finished_async_saves, wait_async_saves and close are safe no-ops.
     mod = _import_checkpointer()
     with patch("torch.distributed.get_rank", return_value=0):
         m = mod.MegatronCheckpointManager(
@@ -137,6 +168,10 @@ def test_async_disabled_creates_no_queue():
 
 
 def test_save_schedules_async_request(patched_checkpointer, tmp_path):
+    # [FUNCTION DOC]
+    # save_checkpoint with async enabled calls save_dist_checkpointing once with
+    # async_save=True, inspects the returned request's retained payload, schedules the
+    # request on the queue, and releases the inspected tensor lists.
     mod, manager, queue = patched_checkpointer
     fake_request = object()
     tensor_lists = [[]]
@@ -163,6 +198,9 @@ def test_save_schedules_async_request(patched_checkpointer, tmp_path):
 
 
 def test_save_reaps_before_scheduling_next(patched_checkpointer, tmp_path):
+    # [FUNCTION DOC]
+    # Two consecutive saves each call maybe_finalize_async_calls non-blocking (2 calls,
+    # blocking False) and schedule 2 requests.
     mod, manager, queue = patched_checkpointer
 
     with (
@@ -182,6 +220,10 @@ def test_save_reaps_before_scheduling_next(patched_checkpointer, tmp_path):
 
 
 def test_load_blocks_on_pending_saves(patched_checkpointer, tmp_path):
+    # [FUNCTION DOC]
+    # With one pending save, load_checkpoint first calls
+    # maybe_finalize_async_calls(blocking=True). The load itself is expected to fail
+    # (AssertionError or KeyError) because mocked load returns an empty dict.
     mod, manager, queue = patched_checkpointer
     queue.get_num_unfinalized_calls.return_value = 1
 
@@ -197,6 +239,8 @@ def test_load_blocks_on_pending_saves(patched_checkpointer, tmp_path):
 
 
 def test_close_is_idempotent(patched_checkpointer):
+    # [FUNCTION DOC]
+    # Calling close twice does not raise and leaves _async_queue None.
     _, manager, queue = patched_checkpointer
     queue.get_num_unfinalized_calls.return_value = 0
 
@@ -214,6 +258,9 @@ def test_close_is_idempotent(patched_checkpointer):
     "areal.utils.stats_tracker.scalar) is skipped. Tracked in a follow-up issue."
 )
 def test_async_save_reports_queue_depth_only(patched_checkpointer, tmp_path):
+    # [FUNCTION DOC]
+    # (Skipped: module caching breaks stats mock isolation.) Two async saves report only
+    # the "ckpt/async_save_queue_depth" metric key via stats_tracker.scalar.
     """async_save emits ckpt/async_save_queue_depth on schedule and no other metric.
 
     Successful finalize is observable as queue_depth returning to 0; a failing
@@ -255,6 +302,9 @@ def test_async_save_reports_queue_depth_only(patched_checkpointer, tmp_path):
     "areal.utils.stats_tracker.scalar) is skipped. Tracked in a follow-up issue."
 )
 def test_sync_save_emits_no_async_metrics(patched_checkpointer, tmp_path):
+    # [FUNCTION DOC]
+    # (Skipped for the same reason.) A synchronous save (async disabled) emits no
+    # stats_tracker.scalar calls.
     """Sync save path stays metric-free; trainer-side `timeperf/save` is sufficient."""
     mod, manager, _ = patched_checkpointer
     manager.async_save = False
@@ -274,6 +324,10 @@ def test_sync_save_emits_no_async_metrics(patched_checkpointer, tmp_path):
 
 
 def test_generate_state_dict_requests_dp_reshardable_sharding(patched_checkpointer):
+    # [FUNCTION DOC]
+    # generate_state_dict with only the optimizer requests the optimizer's
+    # sharded_state_dict with metadata distrib_optim_sharding_type "dp_reshardable" and
+    # is_loading False, and the result has an "optimizer" key.
     _, manager, _ = patched_checkpointer
 
     with patch("torch.distributed.barrier"):
@@ -290,6 +344,10 @@ def test_generate_state_dict_requests_dp_reshardable_sharding(patched_checkpoint
 def test_load_checkpoint_builds_optimizer_template_with_is_loading(
     patched_checkpointer, tmp_path
 ):
+    # [FUNCTION DOC]
+    # load_checkpoint (optimizer only) builds the optimizer template with is_loading
+    # True and dp_reshardable metadata, then calls optimizer.load_state_dict with the
+    # loaded {"step": 1}.
     mod, manager, _ = patched_checkpointer
 
     with (
@@ -313,13 +371,21 @@ def test_load_checkpoint_builds_optimizer_template_with_is_loading(
 
 
 class _FakeRequest:
+    # [CLASS DOC]
+    # HELPER: Minimal stand-in for a megatron AsyncRequest with async_fn_args,
+    # preload_fn and finalize_fns.
     def __init__(self, args, preload_fn, finalize_fns):
+        # [FUNCTION DOC]
+        # HELPER: Stores the three attributes.
         self.async_fn_args = args
         self.preload_fn = preload_fn
         self.finalize_fns = finalize_fns
 
 
 def _request_with_pending_payload(buckets, finalize_fns=None):
+    # [FUNCTION DOC]
+    # HELPER: Builds a _FakeRequest whose args are (0, buckets, "results_queue"), whose
+    # preload_fn returns buckets, and whose finalize_fns default to a single no-op.
     return _FakeRequest(
         args=(0, buckets, "results_queue"),
         preload_fn=lambda: buckets,
@@ -328,9 +394,17 @@ def _request_with_pending_payload(buckets, finalize_fns=None):
 
 
 def test_release_retained_payload_clears_tensor_data_and_preserves_finalize():
+    # [FUNCTION DOC]
+    # Builds a write bucket holding a bytes item list and a tensor item list (with a
+    # weakly referenced payload object), inspects the request, deletes the strong ref
+    # and releases: asserts the tensor is garbage-collected, the bucket list object is
+    # unchanged but its tensor list is emptied, request args/preload/finalize are
+    # intact, and the finalize closure still sees the bytes items.
     mod = _import_checkpointer()
 
     class Payload:
+        # [CLASS DOC]
+        # HELPER: Empty class used as a weak-referenceable fake tensor.
         pass
 
     tensor = Payload()
@@ -347,6 +421,9 @@ def test_release_retained_payload_clears_tensor_data_and_preserves_finalize():
     buckets = writer.write_buckets
 
     def finalize_fn():
+        # [FUNCTION DOC]
+        # HELPER: Finalize closure returning the bucket count and the first bucket's
+        # bytes item list.
         return len(writer.write_buckets), writer.write_buckets[0][2][0]
 
     request = _request_with_pending_payload(buckets, [finalize_fn])
@@ -368,6 +445,10 @@ def test_release_retained_payload_clears_tensor_data_and_preserves_finalize():
 def test_save_unknown_payload_layout_fails_before_scheduling(
     patched_checkpointer, tmp_path
 ):
+    # [FUNCTION DOC]
+    # With an unrecognized bucket layout and megatron-core version patched to 0.18.0,
+    # save_checkpoint raises _UnsupportedMCoreAsyncLayout mentioning the version and
+    # write_buckets[0], never schedules the request, and leaves buckets untouched.
     mod, manager, queue = patched_checkpointer
     buckets = ["opaque-bucket"]
     request = _request_with_pending_payload(buckets)

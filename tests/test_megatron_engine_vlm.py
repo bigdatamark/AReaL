@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# CPU-only unit tests for Megatron VLM support: unwrap_to_gpt_model, vision-tensor
+# extraction and sequence-layout preparation in
+# areal.engine.megatron_utils.packed_context_parallel (wrapper THD, padded BSHD, model-
+# owned THD), packed_context_parallel_forward argument construction (mpu functions
+# monkeypatched), AReaL chunked LM-head helper functions in
+# areal.engine.megatron_engine, vision model detection helpers, mcore-to-HF parameter-
+# name converters for Qwen2.5-VL, Qwen3-VL and Qwen3-VL-MoE, and remove_padding for VLM
+# vocab tensors. Imports are done inside each test; requires megatron.core installed but
+# no GPU.
 """CPU-only unit tests for Megatron engine VLM (Vision-Language Model) support.
 
 Distributed integration tests live in
@@ -13,9 +23,14 @@ import torch
 
 
 class TestUnwrapToGptModel:
+    # [CLASS DOC]
+    # Tests unwrap_to_gpt_model, which strips DDP-style .module wrappers and VLM
+    # .language_model attributes until reaching a GPTModel.
     """Test unwrap_to_gpt_model with VLM model structures."""
 
     def test_plain_gpt_model_unwraps(self):
+        # [FUNCTION DOC]
+        # A GPTModel-classed mock is returned unchanged.
         """Plain GPTModel (no wrapping) should return itself."""
         from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -27,6 +42,8 @@ class TestUnwrapToGptModel:
         assert result is mock_gpt
 
     def test_ddp_wrapped_gpt_model_unwraps(self):
+        # [FUNCTION DOC]
+        # A wrapper whose .module is the GPTModel unwraps to it.
         """GPTModel wrapped in DDP (via .module) should unwrap correctly."""
         from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -41,6 +58,9 @@ class TestUnwrapToGptModel:
         assert result is mock_gpt
 
     def test_vlm_model_with_language_model_unwraps(self):
+        # [FUNCTION DOC]
+        # A VLM-like object without .module but with .language_model unwraps to the
+        # language model.
         """VLM model (e.g. Qwen2_5VLModel) with .language_model attribute unwraps."""
         from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -59,6 +79,8 @@ class TestUnwrapToGptModel:
         assert result is mock_gpt
 
     def test_ddp_wrapped_vlm_model_unwraps(self):
+        # [FUNCTION DOC]
+        # A wrapper around a VLM unwraps through both .module and .language_model.
         """VLM model wrapped in DDP should unwrap to language_model."""
         from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -80,6 +102,9 @@ class TestUnwrapToGptModel:
         assert result is mock_gpt
 
     def test_unsupported_model_raises_type_error(self):
+        # [FUNCTION DOC]
+        # An object with neither GPTModel type, .module nor .language_model raises
+        # TypeError ("could not be unwrapped").
         """Model with neither GPTModel nor .language_model should raise TypeError."""
         from areal.models.mcore.registry import unwrap_to_gpt_model
 
@@ -93,9 +118,16 @@ class TestUnwrapToGptModel:
 
 
 class TestExtractVisionFromMultiModal:
+    # [CLASS DOC]
+    # Tests extract_vision_from_multi_modal(mb, padded_mb): pops multi_modal_input from
+    # both dicts and concatenates per-sample pixel_values, image_grid_thw and
+    # video_grid_thw onto padded_mb only.
     """Test _extract_vision_from_multi_modal helper."""
 
     def test_extracts_pixel_values_and_grid(self):
+        # [FUNCTION DOC]
+        # Two samples (10 and 5 patches): padded_mb gets 15 pixel rows and 2 grids; mb
+        # gets no vision keys; multi_modal_input removed from both.
         """Vision tensors should land on padded_mb only, not duplicated on mb."""
         from areal.engine.megatron_utils.packed_context_parallel import (
             extract_vision_from_multi_modal,
@@ -128,6 +160,8 @@ class TestExtractVisionFromMultiModal:
         assert "multi_modal_input" not in padded_mb
 
     def test_handles_video_grid_thw(self):
+        # [FUNCTION DOC]
+        # video_grid_thw is extracted onto padded_mb and absent from mb.
         """Should extract video_grid_thw onto padded_mb."""
         from areal.engine.megatron_utils.packed_context_parallel import (
             extract_vision_from_multi_modal,
@@ -150,6 +184,8 @@ class TestExtractVisionFromMultiModal:
         assert "video_grid_thw" not in mb
 
     def test_no_multi_modal_input_is_noop(self):
+        # [FUNCTION DOC]
+        # Without multi_modal_input nothing is added.
         """Should do nothing if multi_modal_input not in dict."""
         from areal.engine.megatron_utils.packed_context_parallel import (
             extract_vision_from_multi_modal,
@@ -164,6 +200,9 @@ class TestExtractVisionFromMultiModal:
         assert "image_grid_thw" not in mb
 
     def test_empty_multi_modal_input_is_noop(self):
+        # [FUNCTION DOC]
+        # A multi_modal_input of empty dicts adds no vision keys but is still popped
+        # from both dicts.
         """Should not add keys if multi_modal_input items have no vision data,
         but should still pop multi_modal_input itself."""
         from areal.engine.megatron_utils.packed_context_parallel import (
@@ -181,6 +220,9 @@ class TestExtractVisionFromMultiModal:
         assert "multi_modal_input" not in padded_mb
 
     def test_falls_back_to_padded_mb(self):
+        # [FUNCTION DOC]
+        # When only padded_mb has multi_modal_input, its pixel_values are still
+        # concatenated onto padded_mb and the key removed.
         """When mb lacks multi_modal_input but padded_mb has it, the fallback
         branch should still concatenate vision tensors onto padded_mb."""
         from areal.engine.megatron_utils.packed_context_parallel import (
@@ -203,7 +245,15 @@ class TestExtractVisionFromMultiModal:
 
 
 class TestPackedContextParallelForward:
+    # [CLASS DOC]
+    # Tests sequence-layout preparation, packed_context_parallel_forward kwargs, and
+    # AReaL LM-head helper functions from megatron_engine.
     def test_wrapper_thd_padding_keeps_sequence_offsets_tp_aligned(self):
+        # [FUNCTION DOC]
+        # pad_packed_tensor_dict with pad_to_length 16 and seq_align_to 4 on two
+        # sequences (3 and 2 tokens) yields per-sequence lengths [4, 4, 248], all
+        # multiples of 4 (sequence offsets stay TP-aligned; the trailing pad sequence
+        # absorbs the remainder).
         from areal.utils.data import pad_packed_tensor_dict
 
         padded, _, _, _ = pad_packed_tensor_dict(
@@ -231,6 +281,11 @@ class TestPackedContextParallelForward:
     def test_sequence_layout_controls_batch_padding(
         self, sequence_packing_mode, expected_cu_seqlens, expected_bshd_shape
     ):
+        # [FUNCTION DOC]
+        # Parametrized over sequence packing modes for one 14010-token sequence:
+        # wrapper_thd pads by appending a pad sequence (cu_seqlens [0, 14010, 14080]);
+        # padded and model_thd keep cu_seqlens [0, 14010] and reconstruct to a (1,
+        # 14010) BSHD batch via _reconstruct_padded_2d.
         from areal.api.cli_args import MicroBatchSpec
         from areal.engine.core.model import SequencePackingMode
         from areal.engine.megatron_utils.packed_context_parallel import (
@@ -274,6 +329,9 @@ class TestPackedContextParallelForward:
         assert reconstructed.shape == expected_bshd_shape
 
     def test_bshd_pad_to_maximum_preserves_legacy_packed_axis_behavior(self):
+        # [FUNCTION DOC]
+        # PADDED mode with pad_to_maximum True and max_tokens_per_mb 14080 still appends
+        # the legacy pad segment (cu_seqlens [0, 14010, 14080]).
         from areal.api.cli_args import MicroBatchSpec
         from areal.engine.core.model import SequencePackingMode
         from areal.engine.megatron_utils.packed_context_parallel import (
@@ -314,6 +372,11 @@ class TestPackedContextParallelForward:
     def test_padded_vlm_preserves_model_specific_mask_semantics(
         self, monkeypatch, use_padded_seq, expected_mask
     ):
+        # [FUNCTION DOC]
+        # Vision model forward with padded BSHD: input_ids are reshaped to
+        # [[10,11,12],[20,21,0]], position_ids and packed_seq_params are None,
+        # attention_mask is None unless use_padded_seq (then a boolean valid-token
+        # mask), and output is repacked to 5 tokens x 4.
         from areal.engine.megatron_utils import packed_context_parallel
 
         model = MagicMock(return_value=torch.ones(2, 3, 4))
@@ -345,6 +408,10 @@ class TestPackedContextParallelForward:
         assert output.shape == (5, 4)
 
     def test_model_thd_passes_padded_inputs_and_packed_metadata(self, monkeypatch):
+        # [FUNCTION DOC]
+        # use_model_packed_seq: model receives padded input_ids, a boolean attention
+        # mask, no position_ids, and THD packed_seq_params with cu_seqlens_q [0, 3, 5];
+        # output repacked to 5 x 3.
         from areal.engine.megatron_utils import packed_context_parallel
 
         model = MagicMock(return_value=torch.ones(1, 5, 3))
@@ -382,15 +449,27 @@ class TestPackedContextParallelForward:
         assert output.shape == (5, 3)
 
     def test_hidden_state_mode_bypasses_post_process_and_restores_model(self):
+        # [FUNCTION DOC]
+        # With return_hidden_states True, the model's post_process flag is False during
+        # forward and restored to True afterwards; the raw hidden-state shape (2, 1, 3)
+        # is returned.
         from areal.engine.megatron_utils import packed_context_parallel
 
         class HiddenModel(torch.nn.Module):
+            # [CLASS DOC]
+            # HELPER: Tiny module recording the post_process value seen at forward time
+            # and returning ones(2, 1, 3).
             def __init__(self):
+                # [FUNCTION DOC]
+                # HELPER: Sets post_process and seen_post_process to True.
                 super().__init__()
                 self.post_process = True
                 self.seen_post_process = True
 
             def forward(self, **_kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Records post_process into seen_post_process and returns
+                # ones(2, 1, 3); kwargs ignored.
                 self.seen_post_process = self.post_process
                 return torch.ones(2, 1, 3)
 
@@ -406,6 +485,10 @@ class TestPackedContextParallelForward:
         assert model.post_process is True
 
     def test_padded_lm_head_labels_and_outputs_preserve_sequence_order(self):
+        # [FUNCTION DOC]
+        # _padded_lm_head_labels builds [S, B] next-token labels from packed ids
+        # (shifted within each sequence, pad 0); _repack_padded_lm_head_output flattens
+        # an [S, B] output, drops the pad slot and restores sequence-major packed order.
         from areal.engine.megatron_engine import (
             _padded_lm_head_labels,
             _repack_padded_lm_head_output,
@@ -426,6 +509,9 @@ class TestPackedContextParallelForward:
         assert repacked.tolist() == [100, 101, 102, 200, 201]
 
     def test_repack_padded_lm_head_output_rejects_wrong_token_count(self):
+        # [FUNCTION DOC]
+        # _repack_padded_lm_head_output raises ValueError when the token count does not
+        # match the BSHD layout.
         from areal.engine.megatron_engine import _repack_padded_lm_head_output
 
         with pytest.raises(ValueError, match="does not match the BSHD token layout"):
@@ -454,6 +540,10 @@ class TestPackedContextParallelForward:
         model_dtype,
         expected,
     ):
+        # [FUNCTION DOC]
+        # Parametrized: _float16_wrapper_fp32_output returns False for chunked logits
+        # with bf16/fp16 models, and None (no override) for fp32 models or when chunked
+        # logits are disabled.
         from areal.engine.megatron_engine import _float16_wrapper_fp32_output
 
         assert (
@@ -495,6 +585,10 @@ class TestPackedContextParallelForward:
         cross_entropy_loss_fusion,
         expected,
     ):
+        # [FUNCTION DOC]
+        # Parametrized: _mbridge_precision_args returns a kwargs dict that includes
+        # enable_fp32_lm_head only when chunked logits are disabled and fp32 head
+        # requested, and cross_entropy_loss_fusion only when enabled.
         from areal.engine.megatron_engine import _mbridge_precision_args
 
         assert (
@@ -521,6 +615,9 @@ class TestPackedContextParallelForward:
         entropy_requires_grad,
         expected,
     ):
+        # [FUNCTION DOC]
+        # Parametrized: _reuse_chunked_logits_storage is True only when chunked logits
+        # are enabled and entropy does not require grad.
         from areal.engine.megatron_engine import _reuse_chunked_logits_storage
 
         assert (
@@ -555,6 +652,10 @@ class TestPackedContextParallelForward:
         entropy_requires_grad,
         warns,
     ):
+        # [FUNCTION DOC]
+        # Parametrized: the warning about non-differentiable entropy is logged once only
+        # on global rank 0, for actors (not critics), with chunked logits enabled and
+        # entropy not requiring grad.
         from areal.engine.megatron_engine import (
             _warn_if_areal_lm_head_entropy_is_nondifferentiable,
         )
@@ -595,6 +696,9 @@ class TestPackedContextParallelForward:
         npu_available,
         error_match,
     ):
+        # [FUNCTION DOC]
+        # Parametrized: _validate_areal_lm_head_compatibility raises NotImplementedError
+        # for chunked logits combined with tree training or NPU, and passes otherwise.
         from areal.engine.megatron_engine import (
             _validate_areal_lm_head_compatibility,
         )
@@ -616,6 +720,9 @@ class TestPackedContextParallelForward:
 
     @pytest.mark.parametrize("fp32_output", [False, True])
     def test_forwards_explicit_fp32_output(self, monkeypatch, fp32_output):
+        # [FUNCTION DOC]
+        # Parametrized: an explicit fp32_output value is forwarded unchanged to the
+        # model call.
         from areal.engine.megatron_utils import packed_context_parallel
 
         model = MagicMock(return_value=torch.ones(1, 2, 3))
@@ -639,6 +746,8 @@ class TestPackedContextParallelForward:
         assert model.call_args.kwargs["fp32_output"] is fp32_output
 
     def test_omits_unspecified_fp32_output(self, monkeypatch):
+        # [FUNCTION DOC]
+        # When fp32_output is not given, the kwarg is omitted from the model call.
         from areal.engine.megatron_utils import packed_context_parallel
 
         model = MagicMock(return_value=torch.ones(1, 2, 3))
@@ -662,6 +771,9 @@ class TestPackedContextParallelForward:
 
 
 class TestPrepareMbListRebindCallerSafety:
+    # [CLASS DOC]
+    # Pins the contract that multimodal payload keys are dropped by rebinding
+    # mb_list.data to a filtered copy rather than mutating the caller's dict in place.
     """Verify _prepare_mb_list rebinds mb_list.data to a filtered copy so the
     caller's input dict survives across repeated forward() calls.
 
@@ -675,6 +787,14 @@ class TestPrepareMbListRebindCallerSafety:
     """
 
     def test_rebind_does_not_mutate_caller_input(self):
+        # [FUNCTION DOC]
+        # Builds an input dict with multimodal keys, wraps it in a MicroBatchList
+        # (asserting data aliases it), rebinds data to a copy filtered by
+        # _is_multi_modal_payload_key, and asserts the caller's keys are unchanged while
+        # the new data lacks multimodal keys but keeps input_ids.
+        # KNOWN ISSUE: The test performs the rebinding itself instead of calling the
+        # engine's _prepare_mb_list, so a regression in the engine code would not be
+        # caught.
         from areal.engine.megatron_utils.packed_context_parallel import (
             _is_multi_modal_payload_key,
         )
@@ -715,24 +835,36 @@ class TestPrepareMbListRebindCallerSafety:
 
 
 class TestVisionModelDetection:
+    # [CLASS DOC]
+    # Tests is_valid_vision_model and the Qwen3-VL family helpers on model_type strings.
     """Test is_valid_vision_model detection."""
 
     def test_qwen2_5_vl_detected(self):
+        # [FUNCTION DOC]
+        # "qwen2_5_vl" is a vision model.
         from areal.engine.core.model import is_valid_vision_model
 
         assert is_valid_vision_model("qwen2_5_vl") is True
 
     def test_qwen2_vl_detected(self):
+        # [FUNCTION DOC]
+        # "qwen2_vl" is a vision model.
         from areal.engine.core.model import is_valid_vision_model
 
         assert is_valid_vision_model("qwen2_vl") is True
 
     def test_qwen3_vl_detected(self):
+        # [FUNCTION DOC]
+        # "qwen3_vl" is a vision model.
         from areal.engine.core.model import is_valid_vision_model
 
         assert is_valid_vision_model("qwen3_vl") is True
 
     def test_qwen3_vl_moe_detected(self):
+        # [FUNCTION DOC]
+        # "qwen3_vl_moe" is a vision model and a Qwen3-VL-MoE; the family helper
+        # is_qwen3_vl_model accepts both dense and MoE while the MoE helper rejects
+        # "qwen3_vl".
         from areal.engine.core.model import (
             is_qwen3_vl_model,
             is_qwen3_vl_moe_model,
@@ -747,21 +879,31 @@ class TestVisionModelDetection:
         assert is_qwen3_vl_moe_model("qwen3_vl") is False
 
     def test_qwen3_not_detected(self):
+        # [FUNCTION DOC]
+        # "qwen3" is not a vision model.
         from areal.engine.core.model import is_valid_vision_model
 
         assert is_valid_vision_model("qwen3") is False
 
     def test_text_model_not_detected(self):
+        # [FUNCTION DOC]
+        # "llama" is not a vision model.
         from areal.engine.core.model import is_valid_vision_model
 
         assert is_valid_vision_model("llama") is False
 
 
 class TestConvertQwen25VLToHF:
+    # [CLASS DOC]
+    # Tests mcore-to-HF parameter conversion for Qwen2.5-VL (convert_qwen2_5_vl_to_hf
+    # and convert_to_hf dispatch), returning lists of (hf_name, tensor).
     """Test mcore→HF weight name conversion for Qwen2.5-VL."""
 
     @pytest.fixture()
     def tf_config(self):
+        # [FUNCTION DOC]
+        # Fixture: MagicMock TransformerConfig with Qwen2.5-VL-3B text dims (hidden
+        # 2048, 16 heads, 2 query groups, kv_channels 128).
         """Mock TransformerConfig with Qwen2.5-VL-3B values."""
         cfg = MagicMock()
         cfg.hidden_size = 2048
@@ -772,6 +914,9 @@ class TestConvertQwen25VLToHF:
 
     @pytest.fixture()
     def hf_config(self):
+        # [FUNCTION DOC]
+        # Fixture: MagicMock HF config with vision_config num_heads 16 and hidden_size
+        # 1280.
         """Mock HF config with vision_config for Qwen2.5-VL-3B."""
         cfg = MagicMock()
         cfg.vision_config.num_heads = 16
@@ -781,6 +926,9 @@ class TestConvertQwen25VLToHF:
     # --- Registry dispatch ---
 
     def test_registry_dispatches_qwen2_5_vl_before_qwen2(self, tf_config, hf_config):
+        # [FUNCTION DOC]
+        # convert_to_hf with "qwen2_5_vl" routes to the VLM converter (vision final
+        # layernorm maps to visual.merger.ln_q.weight) rather than the qwen2 converter.
         """convert_to_hf with model_name='qwen2_5_vl' must use the VLM converter."""
         from areal.engine.megatron_utils.megatron import convert_to_hf
 
@@ -797,6 +945,9 @@ class TestConvertQwen25VLToHF:
     # --- Language model delegation ---
 
     def test_language_model_embedding_delegates(self, tf_config):
+        # [FUNCTION DOC]
+        # Language embedding is delegated to the qwen2 converter: one entry named
+        # model.embed_tokens.weight.
         """language_model.embedding should strip prefix and delegate to qwen2."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -810,6 +961,8 @@ class TestConvertQwen25VLToHF:
         assert result[0][0] == "model.embed_tokens.weight"
 
     def test_language_model_output_layer_delegates(self, tf_config):
+        # [FUNCTION DOC]
+        # Language output_layer maps to lm_head.weight.
         """language_model.output_layer should map to lm_head."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -822,6 +975,8 @@ class TestConvertQwen25VLToHF:
         assert result[0][0] == "lm_head.weight"
 
     def test_language_model_decoder_layer_qkv_delegates(self, tf_config):
+        # [FUNCTION DOC]
+        # Language fused QKV for layer 5 splits into q_proj, k_proj and v_proj names.
         """language_model decoder QKV should split into q/k/v projections."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -840,6 +995,8 @@ class TestConvertQwen25VLToHF:
         assert "model.layers.5.self_attn.v_proj.weight" in names
 
     def test_language_model_mlp_fc1_splits_gate_up(self, tf_config):
+        # [FUNCTION DOC]
+        # Language MLP linear_fc1 splits into gate_proj and up_proj.
         """language_model MLP fc1 should split into gate_proj and up_proj."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -856,6 +1013,9 @@ class TestConvertQwen25VLToHF:
     # --- Vision model direct mappings ---
 
     def test_vision_patch_embed(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision patch_embed maps 1:1 to visual.patch_embed.proj.weight with the same
+        # tensor.
         """vision_model.patch_embed maps to visual.patch_embed."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -868,6 +1028,8 @@ class TestConvertQwen25VLToHF:
         assert result == [("visual.patch_embed.proj.weight", param)]
 
     def test_vision_merger_ln(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision final layernorm maps to visual.merger.ln_q.weight.
         """vision final layernorm maps to visual.merger.ln_q."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -880,6 +1042,8 @@ class TestConvertQwen25VLToHF:
         assert result[0][0] == "visual.merger.ln_q.weight"
 
     def test_vision_merger_mlp(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision projection encoder linear_fc1 maps to visual.merger.mlp.0.weight.
         """vision projection MLP maps to visual.merger.mlp."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -894,6 +1058,9 @@ class TestConvertQwen25VLToHF:
     # --- Vision model per-layer params ---
 
     def test_vision_layer_attn_qkv(self, tf_config, hf_config):
+        # [FUNCTION DOC]
+        # Vision layer QKV maps to visual.blocks.7.attn.qkv.weight with the same shape
+        # (rows reordered using hf_config head counts).
         """Vision attention QKV maps to visual.blocks.<idx>.attn.qkv with reordering."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -908,6 +1075,8 @@ class TestConvertQwen25VLToHF:
         assert result[0][1].shape == param.shape  # same shape, different ordering
 
     def test_vision_layer_attn_proj(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision attention linear_proj maps to visual.blocks.3.attn.proj.weight.
         """Vision attention proj maps to visual.blocks.<idx>.attn.proj."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -920,6 +1089,8 @@ class TestConvertQwen25VLToHF:
         assert result[0][0] == "visual.blocks.3.attn.proj.weight"
 
     def test_vision_layer_norm1(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision QKV layer_norm_weight maps to visual.blocks.0.norm1.weight.
         """Vision input layernorm maps to visual.blocks.<idx>.norm1."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -932,6 +1103,9 @@ class TestConvertQwen25VLToHF:
         assert result[0][0] == "visual.blocks.0.norm1.weight"
 
     def test_vision_layer_mlp_fc1_splits_gate_up(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision MLP linear_fc1 splits into gate_proj and up_proj (gated MLP in
+        # Qwen2.5-VL).
         """Vision MLP fc1 splits into gate_proj and up_proj."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -946,6 +1120,8 @@ class TestConvertQwen25VLToHF:
         assert "visual.blocks.2.mlp.up_proj.weight" in names
 
     def test_vision_layer_mlp_fc2(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision MLP linear_fc2 maps to mlp.down_proj.
         """Vision MLP fc2 maps to visual.blocks.<idx>.mlp.down_proj."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -958,6 +1134,8 @@ class TestConvertQwen25VLToHF:
         assert result[0][0] == "visual.blocks.10.mlp.down_proj.weight"
 
     def test_vision_layer_norm2(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision MLP fc1 layer_norm_weight maps to norm2.weight.
         """Vision post-attention layernorm maps to visual.blocks.<idx>.norm2."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -972,6 +1150,8 @@ class TestConvertQwen25VLToHF:
     # --- Error handling ---
 
     def test_unknown_param_raises_value_error(self, tf_config):
+        # [FUNCTION DOC]
+        # Unknown name raises ValueError ("Unknown parameter name").
         """Unknown parameter name should raise ValueError."""
         from areal.engine.megatron_utils.megatron import convert_qwen2_5_vl_to_hf
 
@@ -984,10 +1164,16 @@ class TestConvertQwen25VLToHF:
 
 
 class TestConvertQwen3VLToHF:
+    # [CLASS DOC]
+    # Tests mcore-to-HF conversion for dense Qwen3-VL (convert_qwen3_vl_to_hf), whose HF
+    # names use model.language_model.* and model.visual.* prefixes.
     """Test mcore→HF weight name conversion for Qwen3-VL (dense)."""
 
     @pytest.fixture()
     def tf_config(self):
+        # [FUNCTION DOC]
+        # Fixture: MagicMock TransformerConfig with Qwen3-VL-2B text dims (hidden 2048,
+        # 16 heads, 8 query groups, kv_channels 128).
         """Mock TransformerConfig matching Qwen/Qwen3-VL-2B-Instruct text_config:
         hidden=2048, attn_heads=16, kv_heads=8, head_dim=128.
         """
@@ -1000,6 +1186,8 @@ class TestConvertQwen3VLToHF:
 
     @pytest.fixture()
     def hf_config(self):
+        # [FUNCTION DOC]
+        # Fixture: MagicMock HF config with vision num_heads 16 and hidden_size 1024.
         """Mock HF config matching Qwen/Qwen3-VL-2B-Instruct vision_config:
         hidden=1024, num_heads=16 (head_dim=64).
         """
@@ -1011,6 +1199,9 @@ class TestConvertQwen3VLToHF:
     # --- Registry dispatch ---
 
     def test_registry_dispatches_qwen3_vl_before_qwen3(self, tf_config, hf_config):
+        # [FUNCTION DOC]
+        # convert_to_hf with "qwen3_vl" uses the VLM converter (merger patch_norm maps
+        # to model.visual.merger.norm.weight) instead of falling through to qwen3.
         """convert_to_hf with model_name='qwen3_vl' must use the VLM converter,
         not fall through to qwen3 (substring match order)."""
         from areal.engine.megatron_utils.megatron import convert_to_hf
@@ -1028,6 +1219,9 @@ class TestConvertQwen3VLToHF:
     # --- Language model (Qwen3-VL has model.language_model.* prefix) ---
 
     def test_language_model_embedding_uses_language_model_prefix(self, tf_config):
+        # [FUNCTION DOC]
+        # Embedding maps to model.language_model.embed_tokens.weight with the same
+        # tensor.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(151936, 2048)
@@ -1039,6 +1233,8 @@ class TestConvertQwen3VLToHF:
         assert result == [("model.language_model.embed_tokens.weight", param)]
 
     def test_language_model_final_norm(self, tf_config):
+        # [FUNCTION DOC]
+        # Final layernorm maps to model.language_model.norm.weight.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(2048)
@@ -1050,6 +1246,8 @@ class TestConvertQwen3VLToHF:
         assert result == [("model.language_model.norm.weight", param)]
 
     def test_language_model_output_layer(self, tf_config):
+        # [FUNCTION DOC]
+        # Output layer maps to lm_head.weight.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(151936, 2048)
@@ -1061,6 +1259,8 @@ class TestConvertQwen3VLToHF:
         assert result == [("lm_head.weight", param)]
 
     def test_language_model_qkv_split(self, tf_config):
+        # [FUNCTION DOC]
+        # Fused QKV weight splits into q/k/v_proj under model.language_model.layers.5.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         # value_num_per_group = 16/8 = 2, head_dim = 128
@@ -1078,6 +1278,8 @@ class TestConvertQwen3VLToHF:
         assert "model.language_model.layers.5.self_attn.v_proj.weight" in names
 
     def test_language_model_qkv_bias_split(self, tf_config):
+        # [FUNCTION DOC]
+        # Fused QKV bias splits into q/k/v_proj biases.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         qkv_dim = tf_config.num_query_groups * (2 + 1 + 1) * tf_config.kv_channels
@@ -1093,6 +1295,8 @@ class TestConvertQwen3VLToHF:
         assert "model.language_model.layers.0.self_attn.v_proj.bias" in names
 
     def test_language_model_q_norm(self, tf_config):
+        # [FUNCTION DOC]
+        # q_layernorm maps to self_attn.q_norm.weight.
         """Qwen3-specific q_layernorm → self_attn.q_norm."""
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
@@ -1107,6 +1311,8 @@ class TestConvertQwen3VLToHF:
         ]
 
     def test_language_model_k_norm(self, tf_config):
+        # [FUNCTION DOC]
+        # k_layernorm maps to self_attn.k_norm.weight.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(128)
@@ -1120,6 +1326,8 @@ class TestConvertQwen3VLToHF:
         ]
 
     def test_language_model_o_proj(self, tf_config):
+        # [FUNCTION DOC]
+        # linear_proj maps to self_attn.o_proj.weight.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(2048, 2048)
@@ -1133,6 +1341,8 @@ class TestConvertQwen3VLToHF:
         ]
 
     def test_language_model_input_layernorm(self, tf_config):
+        # [FUNCTION DOC]
+        # QKV layer_norm_weight maps to input_layernorm.weight.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(2048)
@@ -1146,6 +1356,8 @@ class TestConvertQwen3VLToHF:
         ]
 
     def test_language_model_post_attention_layernorm(self, tf_config):
+        # [FUNCTION DOC]
+        # MLP fc1 layer_norm_weight maps to post_attention_layernorm.weight.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(2048)
@@ -1159,6 +1371,8 @@ class TestConvertQwen3VLToHF:
         ]
 
     def test_language_model_mlp_fc1_splits_gate_up(self, tf_config):
+        # [FUNCTION DOC]
+        # Language MLP fc1 splits into gate_proj and up_proj.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(12288, 2048)
@@ -1172,6 +1386,8 @@ class TestConvertQwen3VLToHF:
         assert "model.language_model.layers.0.mlp.up_proj.weight" in names
 
     def test_language_model_mlp_fc2(self, tf_config):
+        # [FUNCTION DOC]
+        # Language MLP fc2 maps to mlp.down_proj.weight.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(2048, 6144)
@@ -1185,6 +1401,8 @@ class TestConvertQwen3VLToHF:
     # --- Vision model: direct mappings (model.visual.* prefix) ---
 
     def test_vision_patch_embed_weight(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision patch_embed weight maps to model.visual.patch_embed.proj.weight.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(1024, 3, 2, 16, 16)
@@ -1196,6 +1414,8 @@ class TestConvertQwen3VLToHF:
         assert result == [("model.visual.patch_embed.proj.weight", param)]
 
     def test_vision_patch_embed_bias(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision patch_embed bias maps to model.visual.patch_embed.proj.bias.
         """Qwen3-VL adds patch_embed bias (Qwen2.5-VL was bias=False)."""
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
@@ -1208,6 +1428,8 @@ class TestConvertQwen3VLToHF:
         assert result == [("model.visual.patch_embed.proj.bias", param)]
 
     def test_vision_pos_embed(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision pos_embed maps to model.visual.pos_embed.weight.
         """Qwen3-VL has pos_embed (new vs Qwen2.5-VL)."""
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
@@ -1220,6 +1442,8 @@ class TestConvertQwen3VLToHF:
         assert result == [("model.visual.pos_embed.weight", param)]
 
     def test_vision_merger_patch_norm(self, tf_config):
+        # [FUNCTION DOC]
+        # Merger patch_norm weight/bias map to model.visual.merger.norm.weight/bias.
         """merger.patch_norm.{weight,bias} → merger.norm.{weight,bias}."""
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
@@ -1233,6 +1457,8 @@ class TestConvertQwen3VLToHF:
             assert result == [(f"model.visual.merger.norm.{kind}", param)]
 
     def test_vision_merger_linear_fc1_fc2(self, tf_config):
+        # [FUNCTION DOC]
+        # Merger linear_fc1/linear_fc2 weight/bias map 1:1 under model.visual.merger.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         for fc in ("linear_fc1", "linear_fc2"):
@@ -1250,6 +1476,9 @@ class TestConvertQwen3VLToHF:
     # --- Vision model: per-layer params ---
 
     def test_vision_block_qkv_weight_reordered(self, tf_config, hf_config):
+        # [FUNCTION DOC]
+        # Vision block QKV weight maps to model.visual.blocks.7.attn.qkv.weight, shape
+        # preserved (reordered).
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         # 3 * hidden_vision = 3 * 1024 = 3072
@@ -1264,6 +1493,8 @@ class TestConvertQwen3VLToHF:
         assert result[0][1].shape == param.shape
 
     def test_vision_block_qkv_bias_reordered(self, tf_config, hf_config):
+        # [FUNCTION DOC]
+        # Vision block QKV bias maps to attn.qkv.bias, shape preserved.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(3072)
@@ -1277,6 +1508,9 @@ class TestConvertQwen3VLToHF:
         assert result[0][1].shape == param.shape
 
     def test_vision_block_qkv_requires_hf_config(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision QKV conversion without hf_config raises ValueError mentioning
+        # vision_config.num_heads.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         param = torch.randn(3072, 1024)
@@ -1288,6 +1522,8 @@ class TestConvertQwen3VLToHF:
             )
 
     def test_vision_block_attn_proj(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision attention linear_proj weight/bias map to attn.proj.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         for kind, shape in (("weight", (1024, 1024)), ("bias", (1024,))):
@@ -1300,6 +1536,8 @@ class TestConvertQwen3VLToHF:
             assert result == [(f"model.visual.blocks.3.attn.proj.{kind}", param)]
 
     def test_vision_block_norm1_weight_and_bias(self, tf_config):
+        # [FUNCTION DOC]
+        # QKV layer_norm weight/bias map to norm1 weight/bias.
         """Qwen3-VL adds norm1.bias (Qwen2.5-VL was weight-only)."""
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
@@ -1313,6 +1551,8 @@ class TestConvertQwen3VLToHF:
             assert result == [(f"model.visual.blocks.0.norm1.{kind}", param)]
 
     def test_vision_block_norm2_weight_and_bias(self, tf_config):
+        # [FUNCTION DOC]
+        # MLP fc1 layer_norm weight/bias map to norm2 weight/bias.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         for kind in ("weight", "bias"):
@@ -1325,6 +1565,9 @@ class TestConvertQwen3VLToHF:
             assert result == [(f"model.visual.blocks.1.norm2.{kind}", param)]
 
     def test_vision_block_mlp_is_NOT_gated(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision MLP fc1 weight/bias map 1:1 to mlp.linear_fc1 (not split; the Qwen3-VL
+        # vision MLP is not gated).
         """Regression guard: Qwen3-VL vision MLP is NOT gated.
 
         linear_fc1 must map 1:1 (no chunk into gate_proj/up_proj).
@@ -1341,6 +1584,8 @@ class TestConvertQwen3VLToHF:
             assert result == [(f"model.visual.blocks.2.mlp.linear_fc1.{kind}", param)]
 
     def test_vision_block_mlp_fc2(self, tf_config):
+        # [FUNCTION DOC]
+        # Vision MLP fc2 weight/bias map 1:1 to mlp.linear_fc2.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         for kind, shape in (("weight", (1024, 4096)), ("bias", (1024,))):
@@ -1356,6 +1601,9 @@ class TestConvertQwen3VLToHF:
 
     @pytest.mark.parametrize("idx", [0, 1, 2])
     def test_deepstack_merger_norm(self, tf_config, idx):
+        # [FUNCTION DOC]
+        # Parametrized idx 0-2: deepstack merger patch_norm weight/bias map to
+        # deepstack_merger_list.idx.norm.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         for kind in ("weight", "bias"):
@@ -1371,6 +1619,8 @@ class TestConvertQwen3VLToHF:
 
     @pytest.mark.parametrize("idx", [0, 1, 2])
     def test_deepstack_merger_linear_fc(self, tf_config, idx):
+        # [FUNCTION DOC]
+        # Parametrized idx 0-2: deepstack merger linear_fc1/fc2 weight/bias map 1:1.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         for fc in ("linear_fc1", "linear_fc2"):
@@ -1388,6 +1638,9 @@ class TestConvertQwen3VLToHF:
     # --- Error handling ---
 
     def test_unknown_lang_param_raises(self, tf_config):
+        # [FUNCTION DOC]
+        # Unknown language-model param raises ValueError ("Unknown Qwen3-VL language-
+        # model").
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         with pytest.raises(ValueError, match="Unknown Qwen3-VL language-model"):
@@ -1398,6 +1651,8 @@ class TestConvertQwen3VLToHF:
             )
 
     def test_unknown_param_raises(self, tf_config):
+        # [FUNCTION DOC]
+        # Unknown top-level param raises ValueError ("Unknown Qwen3-VL parameter").
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_to_hf
 
         with pytest.raises(ValueError, match="Unknown Qwen3-VL parameter"):
@@ -1409,6 +1664,9 @@ class TestConvertQwen3VLToHF:
 
 
 class TestConvertQwen3VLMoEToHF:
+    # [CLASS DOC]
+    # Tests convert_qwen3_vl_moe_to_hf: MoE experts, router and pre-MLP layernorm,
+    # registry ordering against dense, and shared attention/vision paths.
     """Test mcore→HF weight name conversion for Qwen3-VL-MoE.
 
     Qwen3-VL-MoE shares vision tower + language attention with dense
@@ -1419,6 +1677,9 @@ class TestConvertQwen3VLMoEToHF:
 
     @pytest.fixture()
     def tf_config(self):
+        # [FUNCTION DOC]
+        # Fixture: MagicMock TransformerConfig with Qwen3-VL-30B-A3B text dims (hidden
+        # 2048, 32 heads, 4 query groups, kv_channels 128).
         """Mock TransformerConfig matching Qwen/Qwen3-VL-30B-A3B-Instruct text_config:
         hidden=2048, attn_heads=32, kv_heads=4, head_dim=128.
         """
@@ -1431,6 +1692,8 @@ class TestConvertQwen3VLMoEToHF:
 
     @pytest.fixture()
     def hf_config(self):
+        # [FUNCTION DOC]
+        # Fixture: MagicMock HF config with vision num_heads 16 and hidden_size 1152.
         """Mock HF config matching Qwen/Qwen3-VL-30B-A3B-Instruct vision_config."""
         cfg = MagicMock()
         cfg.vision_config.num_heads = 16
@@ -1442,6 +1705,9 @@ class TestConvertQwen3VLMoEToHF:
     def test_registry_dispatches_qwen3_vl_moe_before_qwen3_vl(
         self, tf_config, hf_config
     ):
+        # [FUNCTION DOC]
+        # convert_to_hf with "qwen3_vl_moe" routes to the MoE converter: per-expert fc1
+        # "weight5" splits into experts.5 gate_proj and up_proj.
         """``qwen3_vl_moe`` model_name must dispatch to the MoE converter, not
         fall through to ``qwen3_vl`` / ``qwen3_moe`` / ``qwen3`` (substring match
         order). MoE-specific names like ``mlp.experts.linear_fc1.weight0`` would
@@ -1462,6 +1728,9 @@ class TestConvertQwen3VLMoEToHF:
         assert "model.language_model.layers.0.mlp.experts.5.up_proj.weight" in names
 
     def test_registry_dense_still_routes_to_dense(self, tf_config, hf_config):
+        # [FUNCTION DOC]
+        # convert_to_hf with "qwen3_vl" still routes to the dense converter (fc1 splits
+        # into gate/up).
         """Sanity: ``qwen3_vl`` model_name still dispatches to dense converter
         even after MoE entry is inserted. Dense MLP fc1 must chunk gate/up.
         """
@@ -1482,6 +1751,8 @@ class TestConvertQwen3VLMoEToHF:
     # --- Shared global / attention paths (regression guards on factoring) ---
 
     def test_lm_global_embedding_shared_with_dense(self, tf_config):
+        # [FUNCTION DOC]
+        # Embedding conversion matches the dense path.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
         param = torch.randn(151936, 2048)
@@ -1493,6 +1764,8 @@ class TestConvertQwen3VLMoEToHF:
         assert result == [("model.language_model.embed_tokens.weight", param)]
 
     def test_lm_attention_qkv_split_shared_with_dense(self, tf_config):
+        # [FUNCTION DOC]
+        # QKV split for layer 4 matches the dense path.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
         # value_num_per_group = 32/4 = 8, head_dim = 128
@@ -1509,6 +1782,8 @@ class TestConvertQwen3VLMoEToHF:
         assert "model.language_model.layers.4.self_attn.v_proj.weight" in names
 
     def test_lm_attention_q_norm_shared_with_dense(self, tf_config):
+        # [FUNCTION DOC]
+        # q_layernorm conversion matches the dense path.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
         param = torch.randn(128)
@@ -1524,6 +1799,9 @@ class TestConvertQwen3VLMoEToHF:
     # --- MoE-specific: experts, router, pre_mlp_layernorm ---
 
     def test_expert_fc1_chunks_gate_up_per_expert(self, tf_config):
+        # [FUNCTION DOC]
+        # Expert fc1 "weight12" splits into exactly two tensors: experts.12 gate_proj
+        # and up_proj.
         """Per-expert ``linear_fc1.weight{idx}`` chunks into gate_proj and
         up_proj at the per-expert HF path.
         """
@@ -1541,6 +1819,8 @@ class TestConvertQwen3VLMoEToHF:
         assert "model.language_model.layers.3.mlp.experts.12.up_proj.weight" in names
 
     def test_expert_fc2_passthrough_per_expert(self, tf_config):
+        # [FUNCTION DOC]
+        # Expert fc2 "weight12" maps 1:1 to experts.12.down_proj.weight.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
         param = torch.randn(2048, 768)
@@ -1554,6 +1834,8 @@ class TestConvertQwen3VLMoEToHF:
         ]
 
     def test_router_renamed_to_mlp_gate(self, tf_config):
+        # [FUNCTION DOC]
+        # mlp.router.weight maps to mlp.gate.weight.
         """``mlp.router.weight`` → HF ``mlp.gate.weight`` (NOT ``mlp.router.weight``)."""
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
@@ -1566,6 +1848,8 @@ class TestConvertQwen3VLMoEToHF:
         assert result == [("model.language_model.layers.0.mlp.gate.weight", param)]
 
     def test_pre_mlp_layernorm_renamed_to_post_attention(self, tf_config):
+        # [FUNCTION DOC]
+        # pre_mlp_layernorm.weight maps to post_attention_layernorm.weight.
         """``pre_mlp_layernorm.weight`` → HF ``post_attention_layernorm.weight``."""
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
@@ -1580,6 +1864,9 @@ class TestConvertQwen3VLMoEToHF:
         ]
 
     def test_dense_mlp_fallback_for_mixed_sparse_step(self, tf_config):
+        # [FUNCTION DOC]
+        # Dense MLP fallback in the MoE converter: fc1 splits gate/up, fc1
+        # layer_norm_weight maps to post_attention_layernorm, fc2 maps to down_proj.
         """Layers left non-sparse by ``decoder_sparse_step > 1`` keep the dense
         MLP path. Qwen3-VL-30B-A3B-Instruct uses ``decoder_sparse_step=1`` so
         these branches are dead for that checkpoint, but they must exist for
@@ -1623,6 +1910,9 @@ class TestConvertQwen3VLMoEToHF:
     # --- Vision tower (delegates to shared helper) ---
 
     def test_vision_block_qkv_reordered_via_shared_helper(self, tf_config, hf_config):
+        # [FUNCTION DOC]
+        # Vision QKV goes through the shared helper: name
+        # model.visual.blocks.7.attn.qkv.weight, shape preserved.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
         # 3 * hidden_vision = 3 * 1152 = 3456
@@ -1637,6 +1927,8 @@ class TestConvertQwen3VLMoEToHF:
         assert result[0][1].shape == param.shape
 
     def test_deepstack_merger_via_shared_helper(self, tf_config):
+        # [FUNCTION DOC]
+        # Deepstack merger patch_norm goes through the shared helper.
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
         param = torch.randn(1152)
@@ -1650,6 +1942,9 @@ class TestConvertQwen3VLMoEToHF:
     # --- Error handling ---
 
     def test_unknown_lang_param_raises(self, tf_config):
+        # [FUNCTION DOC]
+        # Unknown language-model param raises ValueError ("Unknown Qwen3-VL-MoE
+        # language-model").
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
         with pytest.raises(ValueError, match="Unknown Qwen3-VL-MoE language-model"):
@@ -1660,6 +1955,9 @@ class TestConvertQwen3VLMoEToHF:
             )
 
     def test_unknown_expert_kind_raises(self, tf_config):
+        # [FUNCTION DOC]
+        # Unknown expert kind (linear_fc99) raises ValueError ("Unknown Qwen3-VL-MoE
+        # expert").
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
         with pytest.raises(ValueError, match="Unknown Qwen3-VL-MoE expert"):
@@ -1670,6 +1968,9 @@ class TestConvertQwen3VLMoEToHF:
             )
 
     def test_unknown_top_level_param_raises(self, tf_config):
+        # [FUNCTION DOC]
+        # Unknown top-level name raises via the shared vision helper ("Unknown Qwen3-VL
+        # parameter").
         """Non-LM, non-vision names should raise via the shared vision helper."""
         from areal.engine.megatron_utils.megatron import convert_qwen3_vl_moe_to_hf
 
@@ -1682,9 +1983,14 @@ class TestConvertQwen3VLMoEToHF:
 
 
 class TestRemovePaddingVLM:
+    # [CLASS DOC]
+    # Tests remove_padding(name, tensor, vocab_size) for VLM language_model-prefixed
+    # vocab tensors.
     """Test remove_padding handles VLM language_model prefixed params."""
 
     def test_vlm_embedding_padding_removed(self):
+        # [FUNCTION DOC]
+        # A padded language_model embedding is trimmed to vocab_size rows.
         """VLM language_model embedding should be trimmed to vocab_size."""
         from areal.engine.megatron_utils.megatron import remove_padding
 
@@ -1698,6 +2004,8 @@ class TestRemovePaddingVLM:
         assert result.shape[0] == vocab_size
 
     def test_vlm_output_layer_padding_removed(self):
+        # [FUNCTION DOC]
+        # A padded language_model output_layer is trimmed to vocab_size rows.
         """VLM language_model output_layer should be trimmed to vocab_size."""
         from areal.engine.megatron_utils.megatron import remove_padding
 
@@ -1711,6 +2019,8 @@ class TestRemovePaddingVLM:
         assert result.shape[0] == vocab_size
 
     def test_non_embedding_param_unchanged(self):
+        # [FUNCTION DOC]
+        # A non-vocab parameter is returned as the same object.
         """Non-embedding params should pass through unchanged."""
         from areal.engine.megatron_utils.megatron import remove_padding
 

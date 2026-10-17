@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Unit/integration tests for LocalScheduler (areal.infra.scheduler.local), which
+# launches RPC-server worker subprocesses on the local host, allocates GPUs round-robin
+# and free ports, waits for /health readiness, supports colocation (reuse or /fork of a
+# target role's workers), forwards engine creation/method calls over HTTP (requests
+# sync, aiohttp async) with 503 retry/backoff, and tears down process trees. Most tests
+# mock subprocess.Popen, find_free_ports, gethostip and HTTP clients; the fork tests
+# start real RPC servers. The whole module is skipped by default via pytestmark (flaky
+# on GCP CI) and must be run manually. Also tests kill_process_tree from
+# areal.infra.utils.proc.
 import asyncio
 import os
 import sys
@@ -43,6 +53,10 @@ pytestmark = pytest.mark.skip(
 
 @pytest.fixture
 def scheduler(tmp_path):
+    # [FUNCTION DOC]
+    # Fixture: creates fileroot and name_resolve dirs under tmp_path and returns a
+    # LocalScheduler with gpu_devices [0], log_dir tmp_path, experiment "test_exp",
+    # trial "test_trial".
     """Create a LocalScheduler instance with default configuration."""
     fileroot = tmp_path / "fileroot"
     fileroot.mkdir()
@@ -60,6 +74,8 @@ def scheduler(tmp_path):
 
 @pytest.fixture
 def multi_gpu_scheduler(tmp_path):
+    # [FUNCTION DOC]
+    # Fixture: same as scheduler but with gpu_devices [0, 1, 2].
     """Create a LocalScheduler instance with multiple GPUs."""
     fileroot = tmp_path / "fileroot"
     fileroot.mkdir()
@@ -77,12 +93,20 @@ def multi_gpu_scheduler(tmp_path):
 
 @pytest.fixture(autouse=True)
 def mock_kill_process_tree():
+    # [FUNCTION DOC]
+    # Autouse fixture: patches areal.infra.scheduler.local.kill_process_tree for every
+    # test so scheduler cleanup/__del__ never signals the fake PIDs of mocked processes;
+    # yields the mock for tests to configure.
     """Automatically mock kill_process_tree to prevent LocalScheduler.__del__ from killing fake PIDs."""
     with patch("areal.infra.scheduler.local.kill_process_tree") as mock_kill:
         yield mock_kill
 
 
 def create_mock_process(pid=1234, is_alive=True, exit_code=None):
+    # [FUNCTION DOC]
+    # HELPER: Builds a Mock standing in for subprocess.Popen with given pid. poll()
+    # returns None when is_alive, else exit_code; returncode is set to exit_code only
+    # when not alive. Returns the Mock.
     """Create a mock subprocess.Popen process.
 
     Args:
@@ -102,6 +126,12 @@ def create_mock_process(pid=1234, is_alive=True, exit_code=None):
 
 
 def create_scheduler(tmp_path, gpu_devices=None, **kwargs):
+    # [FUNCTION DOC]
+    # HELPER: Creates fileroot/name_resolve dirs (exist_ok) under tmp_path and returns a
+    # LocalScheduler with default kwargs (gpu_devices defaults to [0], log_dir,
+    # experiment/trial names, fileroot, nfs_record_root) overridden by **kwargs.
+    # KNOWN ISSUE: Uses "gpu_devices or [0]", so an explicit empty list is silently
+    # replaced by [0].
     """Create a LocalScheduler instance with proper directory setup.
 
     Args:
@@ -138,6 +168,11 @@ def create_worker_info(
     log_file="/tmp/test.log",
     process=None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Builds a WorkerInfo with a Worker (id, ip, worker_ports default ["8000"],
+    # empty engine_ports), a process (default mock alive process from
+    # create_mock_process), role, gpu_devices (default [0]), created_at now, and
+    # log_file (default /tmp/test.log). Returns the WorkerInfo.
     """Create a WorkerInfo instance with sensible defaults.
 
     Args:
@@ -170,6 +205,9 @@ def create_worker_info(
 
 
 def create_mock_http_response(status_code=200, json_data=None):
+    # [FUNCTION DOC]
+    # HELPER: Returns a Mock HTTP response with status_code and, if json_data is given,
+    # json() returning it.
     """Create a mock HTTP response.
 
     Args:
@@ -187,9 +225,16 @@ def create_mock_http_response(status_code=200, json_data=None):
 
 
 class TestLocalSchedulerInitialization:
+    # [CLASS DOC]
+    # Tests constructor state: GPU list, log dir creation, timeouts and empty internal
+    # bookkeeping.
     """Test LocalScheduler initialization and GPU detection."""
 
     def test_init_with_explicit_gpu_devices(self, tmp_path):
+        # [FUNCTION DOC]
+        # Explicit gpu_devices [0,1,2], startup_timeout 60 and health_check_interval 2
+        # are stored; gpu counter 0, no allocated ports or workers; log_dir equals
+        # tmp_path.
         """Should initialize with explicitly provided GPU devices."""
         scheduler = create_scheduler(
             tmp_path,
@@ -208,6 +253,10 @@ class TestLocalSchedulerInitialization:
         assert tmp_path.exists()
 
     def test_init_without_gpu_devices_uses_cuda_visible_devices(self, tmp_path):
+        # [FUNCTION DOC]
+        # Without gpu_devices, the scheduler parses the platform's device control env
+        # var: patches current_platform to use CUDA_VISIBLE_DEVICES and sets it to
+        # "0,1,3"; expects gpu_devices [0, 1, 3].
         """Should detect GPUs from CUDA_VISIBLE_DEVICES environment variable."""
         # We need to patch the current_platform module-level attribute used in local.py
         # by patching the import in the local module directly
@@ -236,6 +285,9 @@ class TestLocalSchedulerInitialization:
             assert scheduler.gpu_devices == [0, 1, 3]
 
     def test_init_creates_log_directory(self, tmp_path):
+        # [FUNCTION DOC]
+        # A nested non-existent log_dir is created by the constructor and stored as a
+        # Path.
         """Should create log directory if it doesn't exist."""
         log_dir = tmp_path / "nested" / "log" / "dir"
         assert not log_dir.exists()
@@ -247,9 +299,14 @@ class TestLocalSchedulerInitialization:
 
 
 class TestGPUAllocation:
+    # [CLASS DOC]
+    # Tests _allocate_gpus round-robin and _get_colocated_gpus lookup.
     """Test GPU allocation strategies."""
 
     def test_allocate_gpus_round_robin(self, tmp_path):
+        # [FUNCTION DOC]
+        # With 3 GPUs, successive allocations of 2, 3, 1 return [0,1], [2,0,1], [2]
+        # (counter wraps).
         """Should allocate GPUs in round-robin fashion."""
         scheduler = create_scheduler(tmp_path, gpu_devices=[0, 1, 2])
 
@@ -266,6 +323,9 @@ class TestGPUAllocation:
         assert gpus3 == [2]
 
     def test_allocate_gpus_exceeds_available(self, tmp_path):
+        # [FUNCTION DOC]
+        # Requesting 3 GPUs with only 2 raises GPUAllocationError with "Requested 3 GPUs
+        # but only 2 available".
         """Should raise GPUAllocationError when requesting more GPUs than available."""
         scheduler = create_scheduler(tmp_path, gpu_devices=[0, 1])
 
@@ -275,6 +335,8 @@ class TestGPUAllocation:
         assert "Requested 3 GPUs but only 2 available" in str(exc_info.value)
 
     def test_allocate_gpus_single_gpu_multiple_times(self, scheduler):
+        # [FUNCTION DOC]
+        # With one GPU, five single-GPU allocations all return [0] (sharing allowed).
         """Should allow multiple workers to share a single GPU via round-robin."""
         # Multiple allocations should all get GPU 0
         for _ in range(5):
@@ -282,6 +344,9 @@ class TestGPUAllocation:
             assert gpus == [0]
 
     def test_get_colocated_gpus_success(self, multi_gpu_scheduler):
+        # [FUNCTION DOC]
+        # _get_colocated_gpus(role, idx) returns the gpu_devices of the target role's
+        # idx-th worker.
         """Should return GPU devices from target worker for colocation."""
         # Create mock workers for target role
         worker1 = create_worker_info(
@@ -300,6 +365,8 @@ class TestGPUAllocation:
         assert gpus == [2]
 
     def test_get_colocated_gpus_role_not_found(self, scheduler):
+        # [FUNCTION DOC]
+        # Unknown target role raises WorkerNotFoundError mentioning role not found.
         """Should raise WorkerNotFoundError when target role doesn't exist."""
         with pytest.raises(WorkerNotFoundError) as exc_info:
             scheduler._get_colocated_gpus("nonexistent", 0)
@@ -309,6 +376,9 @@ class TestGPUAllocation:
         )
 
     def test_get_colocated_gpus_worker_index_out_of_range(self, scheduler):
+        # [FUNCTION DOC]
+        # Index beyond the target role's worker count raises ValueError ("only 1 workers
+        # exist").
         """Should raise ValueError when worker index is out of range."""
         # Create only one worker for target role
         worker = create_worker_info(worker_id="actor/0", role="actor", gpu_devices=[0])
@@ -321,9 +391,16 @@ class TestGPUAllocation:
 
 
 class TestPortAllocation:
+    # [CLASS DOC]
+    # Tests _allocate_ports, which calls find_free_ports excluding already-allocated
+    # ports and records results in _allocated_ports, wrapping failures in
+    # PortAllocationError.
     """Test port allocation and tracking."""
 
     def test_allocate_ports_success(self, tmp_path):
+        # [FUNCTION DOC]
+        # One allocation returns the mocked ports, records them, and passes an empty
+        # exclude set.
         """Should allocate requested number of free ports."""
         with patch("areal.infra.scheduler.local.find_free_ports") as mock_find_ports:
             mock_find_ports.return_value = [8000, 8001, 8002]
@@ -336,6 +413,9 @@ class TestPortAllocation:
             mock_find_ports.assert_called_once_with(3, exclude_ports=set())
 
     def test_allocate_ports_excludes_already_allocated(self, tmp_path):
+        # [FUNCTION DOC]
+        # Second allocation passes the first allocation's ports as exclude_ports and the
+        # set accumulates all four.
         """Should exclude already allocated ports from search."""
         with patch("areal.infra.scheduler.local.find_free_ports") as mock_find_ports:
             mock_find_ports.side_effect = [
@@ -360,6 +440,9 @@ class TestPortAllocation:
             assert calls[1] == call(2, exclude_ports={8000, 8001})
 
     def test_allocate_ports_failure(self, tmp_path):
+        # [FUNCTION DOC]
+        # A ValueError from find_free_ports is re-raised as PortAllocationError carrying
+        # the message.
         """Should raise PortAllocationError when port allocation fails."""
         with patch("areal.infra.scheduler.local.find_free_ports") as mock_find_ports:
             mock_find_ports.side_effect = ValueError("No free ports available")
@@ -373,6 +456,11 @@ class TestPortAllocation:
 
 
 class TestWorkerCreation:
+    # [CLASS DOC]
+    # Tests create_workers(job): spec resolution, command/env construction, colocation,
+    # validation errors, immediate-exit detection, port-conflict retry and cleanup on
+    # failure. _configure_worker is patched out where workers would otherwise be
+    # contacted.
     """Test worker creation with various configurations."""
 
     @patch("areal.infra.scheduler.local.gethostip")
@@ -381,6 +469,11 @@ class TestWorkerCreation:
     def test_create_workers_with_default_spec(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # Job with replicas 2 and no tasks: returns ["rollout/0", "rollout/1"],
+        # registers 2 workers and calls Popen twice; then deletes all workers.
+        # KNOWN ISSUE: Docstring claims the default spec is "1 GPU, 2 ports" but the
+        # test never verifies GPU or port counts.
         """Should create workers with default spec (1 GPU, 2 ports) when no specs provided."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.side_effect = [[8000, 8001], [8002, 8003]]
@@ -416,6 +509,9 @@ class TestWorkerCreation:
     def test_create_workers_with_single_spec_for_all(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # A single SchedulingSpec (gpu 2, port_count 3) is applied to all 3 replicas:
+        # each worker gets 3 ports, Popen called 3 times.
         """Should use single spec for all workers when specs length is 1."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.side_effect = [[8000, 8001, 8002]] * 3
@@ -463,6 +559,9 @@ class TestWorkerCreation:
     def test_create_workers_with_per_worker_specs(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # Two specs for two replicas are applied per worker (port_count 1 and 2
+        # respectively).
         """Should use individual specs when specs length equals replicas."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.side_effect = [[8000], [8001, 8002]]
@@ -514,6 +613,9 @@ class TestWorkerCreation:
     def test_create_workers_with_custom_command(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # A custom cmd is launched as a shell string (shell=True) containing
+        # "my_custom_server.py --port 8000".
         """Should use custom command from spec when provided."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.return_value = [8000, 8001]
@@ -563,6 +665,10 @@ class TestWorkerCreation:
     def test_create_workers_with_environment_variables(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # Spec env_vars and the device control variable (CUDA_VISIBLE_DEVICES=0) are
+        # embedded as assignments in the shell command string passed to Popen with
+        # shell=True.
         """Should merge environment variables from spec into worker environment."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.return_value = [8000, 8001]
@@ -620,6 +726,10 @@ class TestWorkerCreation:
     def test_create_workers_with_colocate_strategy(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # Creates 2 actor workers, then a critic job with colocation strategy targeting
+        # "actor" and fork=False: returns the same worker IDs as actor, spawns no new
+        # processes, and records critic -> actor in _colocated_roles.
         """Should reuse existing workers from target role when colocate strategy is used."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.return_value = [8000, 8001]
@@ -688,6 +798,9 @@ class TestWorkerCreation:
         scheduler.delete_workers(None)
 
     def test_create_workers_duplicate_role_error(self, tmp_path):
+        # [FUNCTION DOC]
+        # Creating the same role twice raises WorkerCreationError ("Worker group already
+        # exists") with worker_key "test".
         """Should raise WorkerCreationError when attempting to create workers for existing role."""
         scheduler = create_scheduler(tmp_path)
 
@@ -718,6 +831,8 @@ class TestWorkerCreation:
             scheduler.delete_workers(None)
 
     def test_create_workers_zero_replicas_error(self, tmp_path):
+        # [FUNCTION DOC]
+        # replicas=0 raises WorkerCreationError ("replicas must be greater than 0").
         """Should raise WorkerCreationError when replicas is 0."""
         scheduler = create_scheduler(tmp_path)
 
@@ -729,6 +844,9 @@ class TestWorkerCreation:
         assert "replicas must be greater than 0" in str(exc_info.value)
 
     def test_create_workers_invalid_specs_length(self, tmp_path):
+        # [FUNCTION DOC]
+        # 2 task specs for 3 replicas raises WorkerCreationError about schedulings
+        # length.
         """Should raise WorkerCreationError when tasks length is invalid."""
         scheduler = create_scheduler(tmp_path, gpu_devices=[0, 1])
 
@@ -760,6 +878,10 @@ class TestWorkerCreation:
     def test_create_workers_subprocess_fails_immediately(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # A process whose poll() immediately returns 1 makes create_workers raise
+        # WorkerCreationError ("exited immediately with code 1") after a single Popen
+        # (no retry for non-port errors); _read_log_tail is patched.
         """Should raise WorkerCreationError when subprocess exits immediately."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.return_value = [8000, 8001]
@@ -794,6 +916,10 @@ class TestWorkerCreation:
     def test_create_workers_retries_immediate_port_conflict(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # First process exits immediately with a log tail indicating "Address already in
+        # use": the scheduler retries with newly allocated ports, ending with ports
+        # ["8002","8003"], 2 Popen calls, and only the new ports recorded as allocated.
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.side_effect = [[8000, 8001], [8002, 8003]]
 
@@ -829,6 +955,10 @@ class TestWorkerCreation:
     def test_create_workers_cleanup_on_partial_failure(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # find_free_ports fails for the second replica: WorkerCreationError ("Resource
+        # allocation failed") is raised and _cleanup_workers is called for the already-
+        # started worker.
         """Should clean up successfully created workers when a later worker fails."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.side_effect = [
@@ -855,6 +985,9 @@ class TestWorkerCreation:
             assert "Resource allocation failed" in str(exc_info.value)
 
     def test_create_workers_colocate_strategy_missing_target(self, tmp_path):
+        # [FUNCTION DOC]
+        # Colocation strategy with empty target raises WorkerCreationError ("Colocation
+        # strategy requires target").
         """Should raise WorkerCreationError when colocation strategy is missing target role."""
         scheduler = create_scheduler(tmp_path)
 
@@ -882,9 +1015,14 @@ class TestWorkerCreation:
 
 
 class TestGetWorkers:
+    # [CLASS DOC]
+    # Tests get_workers(role, timeout), which polls _is_worker_ready for every worker
+    # until all are ready, raising on timeout or process death.
     """Test getting workers and waiting for readiness."""
 
     def test_get_workers_role_not_found(self, scheduler):
+        # [FUNCTION DOC]
+        # Unknown role raises WorkerNotFoundError with worker_id "nonexistent".
         """Should raise WorkerNotFoundError when role doesn't exist."""
         with pytest.raises(WorkerNotFoundError) as exc_info:
             scheduler.get_workers("nonexistent")
@@ -893,6 +1031,9 @@ class TestGetWorkers:
 
     @patch("areal.infra.scheduler.local.time.sleep")
     def test_get_workers_success(self, mock_sleep, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # With _is_worker_ready always True, returns the two Worker objects in order
+        # (sleep patched).
         """Should return workers when all are ready."""
         # Create mock workers
         worker1 = create_worker_info(
@@ -914,6 +1055,9 @@ class TestGetWorkers:
     @patch("areal.infra.scheduler.local.time.time")
     @patch("areal.infra.scheduler.local.time.sleep")
     def test_get_workers_timeout(self, mock_sleep, mock_time, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # time.time patched to advance 1 s per call and readiness always False: raises
+        # WorkerTimeoutError with worker_key "test" and timeout 5.0.
         """Should raise WorkerTimeoutError when timeout is exceeded."""
         # Mock time progression - provide enough values
         mock_time.side_effect = [0.0] + [i for i in range(1, 20)]
@@ -932,6 +1076,9 @@ class TestGetWorkers:
             assert exc_info.value.timeout == 5.0
 
     def test_get_workers_process_died(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Process poll returns None then 1 while never ready: raises WorkerFailedError
+        # with worker_id "test/0" and exit_code 1.
         """Should raise WorkerFailedError when worker process dies during readiness check."""
         log_file = tmp_path / "test.log"
         log_file.write_text("Error: Connection refused\n")
@@ -953,6 +1100,9 @@ class TestGetWorkers:
 
     @patch("areal.infra.scheduler.local.time.sleep")
     def test_get_workers_gradual_readiness(self, mock_sleep, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Readiness sequence True, False, True, True: get_workers keeps polling until
+        # both are ready and returns 2 workers.
         """Should wait for all workers to become ready gradually."""
         worker1 = create_worker_info(
             worker_id="test/0", ports=["8000"], log_file=str(tmp_path / "test.log")
@@ -972,6 +1122,9 @@ class TestGetWorkers:
 
 
 class TestWorkerHealthCheck:
+    # [CLASS DOC]
+    # Tests _is_worker_ready (HTTP health GET on the worker's first port) and
+    # _check_worker_health (detects dead processes).
     """Test worker health checking functionality."""
 
     @pytest.mark.parametrize(
@@ -985,6 +1138,8 @@ class TestWorkerHealthCheck:
     def test_is_worker_ready_http_status(
         self, scheduler, tmp_path, status_code, expected
     ):
+        # [FUNCTION DOC]
+        # Parametrized: HTTP 200 means ready, 503 and 500 mean not ready.
         """Should return appropriate result based on HTTP status code."""
         worker_info = create_worker_info(log_file=str(tmp_path / "test.log"))
         mock_response = create_mock_http_response(status_code=status_code)
@@ -993,6 +1148,8 @@ class TestWorkerHealthCheck:
             assert scheduler._is_worker_ready(worker_info) is expected
 
     def test_is_worker_ready_connection_error(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # A requests ConnectionError makes _is_worker_ready return False.
         """Should return False when connection to worker fails."""
         worker_info = create_worker_info(log_file=str(tmp_path / "test.log"))
 
@@ -1004,6 +1161,8 @@ class TestWorkerHealthCheck:
             assert scheduler._is_worker_ready(worker_info) is False
 
     def test_check_worker_health_all_healthy(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # _check_worker_health passes silently when all mock processes are alive.
         """Should pass when all workers are healthy."""
         worker1 = create_worker_info(
             worker_id="test/0", ports=["8000"], log_file=str(tmp_path / "test.log")
@@ -1018,6 +1177,9 @@ class TestWorkerHealthCheck:
         scheduler._check_worker_health("test")
 
     def test_check_worker_health_worker_failed(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # A dead process (exit code 137) makes _check_worker_health raise
+        # WorkerFailedError with that worker id and exit code.
         """Should raise WorkerFailedError when a worker has failed."""
         log_file = tmp_path / "test.log"
         log_file.write_text("Killed by signal\n")
@@ -1034,15 +1196,22 @@ class TestWorkerHealthCheck:
         assert exc_info.value.exit_code == 137
 
     def test_check_worker_health_nonexistent_role(self, scheduler):
+        # [FUNCTION DOC]
+        # _check_worker_health on an unknown role is a no-op.
         """Should silently pass when role doesn't exist."""
         # Should not raise
         scheduler._check_worker_health("nonexistent")
 
 
 class TestDeleteWorkers:
+    # [CLASS DOC]
+    # Tests delete_workers(role or None, reverse_order=False) and _cleanup_workers (kill
+    # process trees, release ports).
     """Test worker deletion and cleanup."""
 
     def test_delete_workers_specific_role(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Deleting "role1" removes only its workers and releases only its port 8000.
         """Should delete workers for specific role."""
         # Create mock workers for multiple roles
         worker1 = create_worker_info(
@@ -1071,6 +1240,8 @@ class TestDeleteWorkers:
         assert 8001 in scheduler._allocated_ports
 
     def test_delete_workers_all_roles(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # delete_workers(None) removes all roles and releases all ports.
         """Should delete all workers when role is None."""
         worker1 = create_worker_info(
             worker_id="role1/0",
@@ -1096,11 +1267,17 @@ class TestDeleteWorkers:
         assert len(scheduler._allocated_ports) == 0
 
     def test_delete_workers_nonexistent_role(self, scheduler):
+        # [FUNCTION DOC]
+        # Deleting an unknown role does not raise (only logs a warning).
         """Should log warning and return when role doesn't exist."""
         # Should not raise
         scheduler.delete_workers("nonexistent")
 
     def test_delete_workers_reverse_order(self, scheduler, tmp_path, monkeypatch):
+        # [FUNCTION DOC]
+        # With 4 workers and reverse_order=True, wraps _cleanup_workers with a spy and
+        # asserts workers are passed in order role1/3..role1/0 and the role is removed
+        # (protects rank-0's TCPStore during teardown).
         """With reverse_order=True, workers are cleaned up in reverse rank order.
 
         This protects rank-0 (owner of the global TCPStore server) from being
@@ -1123,6 +1300,9 @@ class TestDeleteWorkers:
         original_cleanup = scheduler._cleanup_workers
 
         def spy(workers_arg):
+            # [FUNCTION DOC]
+            # HELPER: Spy that records the worker ids it receives in observed_order,
+            # then delegates to the original _cleanup_workers.
             observed_order.extend(w.worker.id for w in workers_arg)
             original_cleanup(workers_arg)
 
@@ -1134,6 +1314,9 @@ class TestDeleteWorkers:
         assert "role1" not in scheduler._workers
 
     def test_cleanup_workers_releases_ports(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # _cleanup_workers releases the worker's ports (8000, 8001) leaving 8002
+        # allocated.
         """Should release allocated ports when cleaning up workers."""
         worker = create_worker_info(
             ports=["8000", "8001"], log_file=str(tmp_path / "test.log")
@@ -1148,6 +1331,9 @@ class TestDeleteWorkers:
     def test_cleanup_workers_handles_errors(
         self, scheduler, tmp_path, mock_kill_process_tree
     ):
+        # [FUNCTION DOC]
+        # Autouse kill_process_tree mock raises on the first worker; _cleanup_workers
+        # must swallow it and continue with the second.
         """Should continue cleanup even if terminating a process fails."""
         worker1 = create_worker_info(
             worker_id="test/0", ports=["8000"], log_file=str(tmp_path / "test.log")
@@ -1164,11 +1350,17 @@ class TestDeleteWorkers:
 
 
 class TestProcessTermination:
+    # [CLASS DOC]
+    # Tests kill_process_tree(pid, timeout, graceful) with psutil.Process and wait_procs
+    # mocked.
     """Test process termination functionality."""
 
     @patch("areal.infra.utils.proc.psutil.Process")
     @patch("areal.infra.utils.proc.psutil.wait_procs")
     def test_kill_process_tree_graceful(self, mock_wait_procs, mock_process_class):
+        # [FUNCTION DOC]
+        # Graceful path: children and parent are terminated once and never killed when
+        # wait_procs reports none alive.
         """Should gracefully terminate process tree."""
         # Mock parent process
         mock_parent = Mock()
@@ -1196,6 +1388,8 @@ class TestProcessTermination:
     @patch("areal.infra.utils.proc.psutil.Process")
     @patch("areal.infra.utils.proc.psutil.wait_procs")
     def test_kill_process_tree_force_kill(self, mock_wait_procs, mock_process_class):
+        # [FUNCTION DOC]
+        # A child still alive after wait_procs is force-killed after terminate.
         """Should force kill processes that don't terminate gracefully."""
         mock_parent = Mock()
         mock_child = Mock()
@@ -1214,6 +1408,8 @@ class TestProcessTermination:
 
     @patch("areal.infra.utils.proc.psutil.Process")
     def test_kill_process_tree_no_such_process(self, mock_process_class):
+        # [FUNCTION DOC]
+        # psutil.NoSuchProcess when looking up the root pid is swallowed.
         """Should handle gracefully when process doesn't exist."""
         mock_process_class.side_effect = psutil.NoSuchProcess(1234)
 
@@ -1222,6 +1418,8 @@ class TestProcessTermination:
 
     @patch("areal.infra.utils.proc.psutil.Process")
     def test_kill_process_tree_handles_child_no_such_process(self, mock_process_class):
+        # [FUNCTION DOC]
+        # NoSuchProcess raised while terminating a child is swallowed.
         """Should handle when child process disappears during termination."""
         mock_parent = Mock()
         mock_child = Mock()
@@ -1235,9 +1433,14 @@ class TestProcessTermination:
 
 
 class TestLogFileHandling:
+    # [CLASS DOC]
+    # Tests _read_log_tail(path, lines=N), which returns the last N lines of a log or an
+    # error message string.
     """Test log file reading and handling."""
 
     def test_read_log_tail_success(self, tmp_path):
+        # [FUNCTION DOC]
+        # 100-line file with lines=10 returns lines 90-99 and not line 89.
         """Should read last N lines from log file."""
         scheduler = create_scheduler(tmp_path)
 
@@ -1253,6 +1456,9 @@ class TestLogFileHandling:
         assert "Line 89" not in tail
 
     def test_read_log_tail_file_not_found(self, tmp_path):
+        # [FUNCTION DOC]
+        # Missing file returns a string containing "Could not read log file" instead of
+        # raising.
         """Should return error message when log file doesn't exist."""
         scheduler = create_scheduler(tmp_path)
 
@@ -1261,6 +1467,8 @@ class TestLogFileHandling:
         assert "Could not read log file" in tail
 
     def test_read_log_tail_fewer_lines_than_requested(self, tmp_path):
+        # [FUNCTION DOC]
+        # Requesting 50 lines from a 3-line file returns all three.
         """Should return all lines when file has fewer lines than requested."""
         scheduler = create_scheduler(tmp_path)
 
@@ -1275,9 +1483,15 @@ class TestLogFileHandling:
 
 
 class TestSetEnv:
+    # [CLASS DOC]
+    # Tests async set_worker_env(worker_id, env), which POSTs env vars to the worker via
+    # aiohttp.
     """Test configuring worker environment variables."""
 
     def test_set_env_success(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # With a mocked aiohttp ClientSession returning status 200, set_worker_env posts
+        # exactly once.
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
 
@@ -1302,6 +1516,8 @@ class TestSetEnv:
             mock_session.post.assert_called_once()
 
     def test_set_env_worker_not_found(self, scheduler):
+        # [FUNCTION DOC]
+        # Unknown worker id raises WorkerNotFoundError.
         with pytest.raises(WorkerNotFoundError):
             asyncio.run(
                 scheduler.set_worker_env("missing/0", {"RANK": "0", "WORLD_SIZE": "1"})
@@ -1309,9 +1525,14 @@ class TestSetEnv:
 
 
 class TestEngineCreation:
+    # [CLASS DOC]
+    # Tests async create_engine(worker_id, engine_import_path, *args, **kwargs), which
+    # POSTs to the worker's RPC server and maps failures to scheduler exceptions.
     """Test engine creation on workers."""
 
     def test_create_engine_success(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # HTTP 200 with JSON {"result": {...}} returns the inner result dict.
         """Should successfully create engine on worker."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1343,6 +1564,8 @@ class TestEngineCreation:
             assert result == {"status": "initialized", "name": "TestEngine"}
 
     def test_create_engine_worker_not_found(self, scheduler):
+        # [FUNCTION DOC]
+        # Unknown worker raises WorkerNotFoundError with that worker_id.
         """Should raise WorkerNotFoundError when worker doesn't exist."""
         with pytest.raises(WorkerNotFoundError) as exc_info:
             asyncio.run(
@@ -1352,6 +1575,8 @@ class TestEngineCreation:
         assert exc_info.value.worker_id == "nonexistent/0"
 
     def test_create_engine_worker_died(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Dead worker process raises WorkerFailedError (exit code 1) before any request.
         """Should raise WorkerFailedError when worker process has died."""
         log_file = tmp_path / "test.log"
         log_file.write_text("Worker crashed\n")
@@ -1367,6 +1592,9 @@ class TestEngineCreation:
         assert exc_info.value.exit_code == 1
 
     def test_create_engine_invalid_engine_type(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Non-string engine argument raises EngineCreationError ("Engine must be a
+        # string import path").
         """Should raise EngineCreationError when engine is not a string."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1377,6 +1605,9 @@ class TestEngineCreation:
         assert "Engine must be a string import path" in str(exc_info.value)
 
     def test_create_engine_import_error(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # HTTP 400 with an import failure message raises EngineImportError mentioning
+        # the engine path.
         """Should raise EngineImportError when engine import fails."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1405,6 +1636,9 @@ class TestEngineCreation:
             assert "nonexistent.Engine" in str(exc_info.value)
 
     def test_create_engine_initialization_error(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # HTTP 500 raises EngineCreationError carrying the error text and status_code
+        # 500.
         """Should raise EngineCreationError when engine initialization fails."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1436,6 +1670,9 @@ class TestEngineCreation:
             assert exc_info.value.status_code == 500
 
     def test_create_engine_connection_error_worker_died(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # aiohttp ClientConnectionError while the process is found dead on re-check
+        # raises WorkerFailedError.
         """Should raise WorkerFailedError when connection fails and worker is dead."""
         log_file = tmp_path / "test.log"
         log_file.write_text("Worker crashed during engine creation\n")
@@ -1468,6 +1705,9 @@ class TestEngineCreation:
             assert exc_info.value.worker_id == "test/0"
 
     def test_create_engine_connection_error_worker_alive(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # ClientConnectionError while the process is alive raises RPCConnectionError
+        # with worker_id, host 127.0.0.1 and port 8000.
         """Should raise RPCConnectionError when connection fails but worker is alive."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1494,6 +1734,9 @@ class TestEngineCreation:
             assert exc_info.value.port == 8000
 
     def test_create_engine_timeout(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # TimeoutError from the session raises EngineCreationError ("Request timed
+        # out").
         """Should raise EngineCreationError when request times out."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1517,9 +1760,14 @@ class TestEngineCreation:
 
 
 class TestEngineMethodCalls:
+    # [CLASS DOC]
+    # Tests call_engine (sync, requests.post with retry on 503 and exponential backoff
+    # via time.sleep) and async_call_engine (aiohttp with asyncio.sleep backoff).
     """Test calling methods on engines (sync and async)."""
 
     def test_call_engine_success(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # HTTP 200 {"result": 42} returns 42.
         """Should successfully call engine method synchronously."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1534,11 +1782,15 @@ class TestEngineMethodCalls:
             assert result == 42
 
     def test_call_engine_worker_not_found(self, scheduler):
+        # [FUNCTION DOC]
+        # Unknown worker raises WorkerNotFoundError.
         """Should raise WorkerNotFoundError when worker doesn't exist."""
         with pytest.raises(WorkerNotFoundError):
             scheduler.call_engine("nonexistent/0", "method")
 
     def test_call_engine_worker_died(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Dead worker raises WorkerFailedError.
         """Should raise WorkerFailedError when worker dies before call."""
         log_file = tmp_path / "test.log"
         log_file.write_text("Worker crashed\n")
@@ -1551,6 +1803,8 @@ class TestEngineMethodCalls:
             scheduler.call_engine("test/0", "method")
 
     def test_call_engine_method_error(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # HTTP 400 with an error message raises EngineCallError containing it.
         """Should raise EngineCallError when method call returns 400/500."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1567,6 +1821,8 @@ class TestEngineMethodCalls:
 
     @patch("areal.infra.scheduler.local.time.sleep")
     def test_call_engine_retry_on_503(self, mock_sleep, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # 503 then 200: returns "success" and sleeps between attempts.
         """Should retry on 503 Service Unavailable."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1589,6 +1845,9 @@ class TestEngineMethodCalls:
 
     @patch("areal.infra.scheduler.local.time.sleep")
     def test_call_engine_max_retries_exhausted(self, mock_sleep, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Always 503 with max_retries 3 raises EngineCallError with attempt 3 and a
+        # retries/unavailable message.
         """Should raise EngineCallError after max retries."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1606,6 +1865,9 @@ class TestEngineMethodCalls:
 
     @patch("areal.infra.scheduler.local.time.sleep")
     def test_call_engine_exponential_backoff(self, mock_sleep, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Always 503 with retry_delay 1.0: the first two sleeps are 1.0 and 2.0
+        # (doubling backoff). EngineCallError is swallowed.
         """Should use exponential backoff for retries."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1626,6 +1888,8 @@ class TestEngineMethodCalls:
         assert sleep_calls[1] == 2.0  # Second retry
 
     def test_async_call_engine_success(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Async call with mocked aiohttp session returning {"result": 42} returns 42.
         """Should successfully call engine method asynchronously."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1653,11 +1917,15 @@ class TestEngineMethodCalls:
             assert result == 42
 
     def test_async_call_engine_worker_not_found(self, scheduler):
+        # [FUNCTION DOC]
+        # Async call on unknown worker raises WorkerNotFoundError.
         """Should raise WorkerNotFoundError when worker doesn't exist (async)."""
         with pytest.raises(WorkerNotFoundError):
             asyncio.run(scheduler.async_call_engine("nonexistent/0", "method"))
 
     def test_async_call_engine_retry_with_backoff(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Async 503 then 200 returns "success" and asyncio.sleep is called (patched).
         """Should retry with exponential backoff in async mode."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1694,9 +1962,13 @@ class TestEngineMethodCalls:
 
 
 class TestFindWorkerById:
+    # [CLASS DOC]
+    # Tests _find_worker_by_id across all roles.
     """Test finding workers by ID."""
 
     def test_find_worker_by_id_success(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Returns the exact WorkerInfo object for "role2/0".
         """Should find worker by ID."""
         worker1 = create_worker_info(
             worker_id="role1/0",
@@ -1720,6 +1992,8 @@ class TestFindWorkerById:
         assert found.worker.id == "role2/0"
 
     def test_find_worker_by_id_not_found(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Returns None for an unknown id.
         """Should return None when worker ID is not found."""
         worker = create_worker_info(
             worker_id="role1/0", role="role1", log_file=str(tmp_path / "role1.log")
@@ -1732,9 +2006,13 @@ class TestFindWorkerById:
 
 
 class TestSchedulerCleanup:
+    # [CLASS DOC]
+    # Tests __del__ cleanup behavior.
     """Test scheduler cleanup and destructor."""
 
     def test_destructor_deletes_all_workers(self, scheduler, tmp_path):
+        # [FUNCTION DOC]
+        # Calling __del__ invokes delete_workers once.
         """Should delete all workers when scheduler is destroyed."""
         worker = create_worker_info(log_file=str(tmp_path / "test.log"))
         scheduler._workers["test"] = [worker]
@@ -1745,6 +2023,8 @@ class TestSchedulerCleanup:
             mock_delete.assert_called_once()
 
     def test_destructor_handles_errors_gracefully(self, scheduler):
+        # [FUNCTION DOC]
+        # Exceptions from delete_workers inside __del__ are swallowed.
         """Should handle errors gracefully in destructor."""
         with patch.object(scheduler, "delete_workers", side_effect=Exception("Error")):
             # Should not raise
@@ -1752,9 +2032,13 @@ class TestSchedulerCleanup:
 
 
 class TestEdgeCases:
+    # [CLASS DOC]
+    # Miscellaneous edge cases for allocation, ids, empty state and paths.
     """Test various edge cases and corner scenarios."""
 
     def test_gpu_counter_wraps_correctly(self, tmp_path):
+        # [FUNCTION DOC]
+        # Ten single-GPU allocations over 2 GPUs alternate 0, 1, 0, 1, ...
         """Should correctly wrap GPU counter for round-robin allocation."""
         scheduler = create_scheduler(tmp_path, gpu_devices=[0, 1])
 
@@ -1765,6 +2049,8 @@ class TestEdgeCases:
             assert gpus == [expected_gpu]
 
     def test_port_allocation_accumulates_correctly(self, tmp_path):
+        # [FUNCTION DOC]
+        # Three port allocations accumulate all seven ports in _allocated_ports.
         """Should correctly accumulate allocated ports over multiple allocations."""
         with patch("areal.infra.scheduler.local.find_free_ports") as mock_find_ports:
             mock_find_ports.side_effect = [
@@ -1795,6 +2081,8 @@ class TestEdgeCases:
     def test_worker_id_format(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # Five replicas of role "worker" get ids "worker/0".."worker/4".
         """Should create worker IDs in correct format (role/index)."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.return_value = [8000, 8001]
@@ -1825,6 +2113,9 @@ class TestEdgeCases:
         scheduler.delete_workers(None)
 
     def test_empty_workers_dict_operations(self, tmp_path):
+        # [FUNCTION DOC]
+        # delete_workers(None), _check_worker_health and _find_worker_by_id work on an
+        # empty scheduler.
         """Should handle operations on empty workers dictionary gracefully."""
         scheduler = create_scheduler(tmp_path)
 
@@ -1838,6 +2129,10 @@ class TestEdgeCases:
         assert scheduler._find_worker_by_id("any/0") is None
 
     def test_concurrent_gpu_allocations(self, tmp_path):
+        # [FUNCTION DOC]
+        # Six single-GPU allocations over 3 GPUs cycle [0,1,2,0,1,2].
+        # KNOWN ISSUE: Despite the name, allocations are sequential; no concurrency
+        # (threads) is exercised.
         """Should handle concurrent GPU allocations correctly."""
         scheduler = create_scheduler(tmp_path, gpu_devices=[0, 1, 2])
 
@@ -1851,6 +2146,8 @@ class TestEdgeCases:
         assert results == [0, 1, 2, 0, 1, 2]
 
     def test_log_directory_with_special_characters(self, tmp_path):
+        # [FUNCTION DOC]
+        # A log_dir containing spaces and special characters is created and stored.
         """Should handle log directory paths with special characters."""
         log_dir = tmp_path / "logs with spaces" / "special-chars_123"
         scheduler = create_scheduler(tmp_path, log_dir=str(log_dir))
@@ -1860,6 +2157,9 @@ class TestEdgeCases:
 
 
 class TestColocationBehavior:
+    # [CLASS DOC]
+    # Tests non-fork colocation: the colocated role maps onto the target role's existing
+    # workers without spawning processes.
     """Test colocation-specific behavior for worker reuse."""
 
     @patch("areal.infra.scheduler.local.gethostip")
@@ -1868,6 +2168,9 @@ class TestColocationBehavior:
     def test_get_workers_for_colocated_role_delegates_to_target(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # get_workers("ref") for a role colocated (fork=False) with "actor" returns the
+        # actor's worker (id "actor/0").
         """Should return target role's workers when getting colocated role workers."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.return_value = [8000, 8001]
@@ -1910,6 +2213,9 @@ class TestColocationBehavior:
     def test_delete_colocated_role_does_not_kill_processes(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # Deleting a non-fork colocated role only removes its _colocated_roles mapping
+        # and never calls _cleanup_workers; the actor workers remain.
         """Should only remove mapping when deleting colocated role, not kill processes."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.return_value = [8000, 8001]
@@ -1962,6 +2268,9 @@ class TestColocationBehavior:
     def test_colocation_replica_mismatch_raises_error(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # Colocating 1 replica onto a 2-replica target raises WorkerCreationError
+        # mentioning replica count.
         """Should raise error when colocated role has different replica count."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.return_value = [8000, 8001]
@@ -2003,6 +2312,8 @@ class TestColocationBehavior:
     def test_colocation_target_not_found_raises_error(
         self, mock_find_ports, mock_popen, mock_gethostip, tmp_path
     ):
+        # [FUNCTION DOC]
+        # Colocating onto a nonexistent target role raises WorkerNotFoundError.
         """Should raise error when colocation target role doesn't exist."""
         mock_gethostip.return_value = "127.0.0.1"
         mock_find_ports.return_value = [8000, 8001]
@@ -2022,6 +2333,10 @@ class TestColocationBehavior:
 
 
 class TestForkColocationBehavior:
+    # [CLASS DOC]
+    # Tests fork colocation using real RPC server subprocesses (python -m
+    # areal.infra.rpc.rpc_server) and its /alloc_ports, /fork and /health HTTP
+    # endpoints. Requires network on localhost and can take tens of seconds.
     """Test fork colocation behavior for spawning new worker processes.
 
     These tests use real subprocesses and RPC servers to verify fork functionality.
@@ -2029,6 +2344,15 @@ class TestForkColocationBehavior:
 
     @pytest.fixture
     def rpc_server_process(self, tmp_path):
+        # [FUNCTION DOC]
+        # Fixture: up to 5 attempts, each picks a free port via a bound socket, launches
+        # an actor RPC server on 127.0.0.1 with fileroot tmp_path, and polls /health for
+        # up to 15 s (aborting the attempt if the process dies, capturing its output).
+        # Raises RuntimeError if all attempts fail. Yields (process, host, port);
+        # afterwards kills the process tree.
+        # KNOWN ISSUE: Launches "python" from PATH rather than sys.executable, which may
+        # pick a different interpreter; the port is freed before the server binds it
+        # (race).
         """Start a real RPC server process for testing.
 
         Returns tuple of (process, host, port).
@@ -2121,6 +2445,13 @@ class TestForkColocationBehavior:
         kill_process_tree(proc.pid, timeout=3, graceful=True)
 
     def test_fork_endpoint_spawns_new_process(self, rpc_server_process):
+        # [FUNCTION DOC]
+        # Allocates a child port via /alloc_ports, POSTs /fork with a raw rpc_server
+        # command for role "ref", expects status "success" with host and pid, asserts
+        # the pid exists, then polls the child's /health for up to 30 s (fails if never
+        # ready).
+        # KNOWN ISSUE: The forked child process is not explicitly killed by the test
+        # (relies on parent tree cleanup).
         """Should spawn a new RPC server process when /fork is called."""
         _, host, port = rpc_server_process
 
@@ -2185,6 +2516,10 @@ class TestForkColocationBehavior:
             pytest.fail("Forked worker did not become ready")
 
     def test_forked_worker_inherits_environment(self, rpc_server_process):
+        # [FUNCTION DOC]
+        # Same fork flow as the spawn test and waits for the child to become healthy.
+        # KNOWN ISSUE: Despite the name and docstring, no environment variable is set or
+        # checked, so inheritance is not actually tested.
         """Forked worker should inherit environment variables from parent."""
         _, host, port = rpc_server_process
 
@@ -2241,6 +2576,12 @@ class TestForkColocationBehavior:
             pytest.fail("Forked worker did not become ready")
 
     def test_create_forked_workers_via_scheduler(self, tmp_path):
+        # [FUNCTION DOC]
+        # Starts a real actor RPC server, registers it manually as WorkerInfo in a
+        # scheduler, then create_workers on a "ref" job with colocation fork=True:
+        # expects ["ref/0"], role tracked in _workers and _colocated_roles, forked
+        # WorkerInfo.process None, and a healthy /health on the forked worker's port.
+        # Deletes all workers and kills the server in finally.
         """LocalScheduler should create forked workers through /fork endpoint."""
         import socket
         import subprocess
@@ -2362,6 +2703,11 @@ class TestForkColocationBehavior:
             kill_process_tree(server_proc.pid, timeout=3, graceful=True)
 
     def test_fork_replica_mismatch_raises_error(self, tmp_path):
+        # [FUNCTION DOC]
+        # Starts two actor RPC servers, registers them, and asserts a 1-replica fork-
+        # colocated "ref" job raises WorkerCreationError mentioning replica count. Kills
+        # servers in finally.
+        # KNOWN ISSUE: Reserves 4 ports but only uses 2.
         """Should raise error when forked role has different replica count."""
         import socket
         import subprocess
@@ -2473,6 +2819,9 @@ class TestForkColocationBehavior:
                 kill_process_tree(proc.pid, timeout=3, graceful=True)
 
     def test_fork_target_not_found_raises_error(self, tmp_path):
+        # [FUNCTION DOC]
+        # Fork colocation onto a nonexistent target raises WorkerNotFoundError (no
+        # servers started).
         """Should raise error when fork target role doesn't exist."""
         scheduler = create_scheduler(tmp_path)
 
@@ -2489,6 +2838,10 @@ class TestForkColocationBehavior:
             scheduler.create_workers(ref_job)
 
     def test_delete_forked_workers_cleans_up_tracking(self, tmp_path):
+        # [FUNCTION DOC]
+        # Starts a real actor server, registers it, creates a fork-colocated "ref" role,
+        # then delete_workers("ref") must remove it from _colocated_roles and _workers
+        # while keeping "actor". Kills the server in finally.
         """Should remove forked role from tracking when deleted."""
         import socket
         import subprocess

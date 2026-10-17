@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Tests for AReaL's Megatron vocab-parallel LM head
+# (areal.models.mcore.vocab_parallel_head) and its configuration: MegatronEngineConfig
+# LM-head flags and validation, actor output-layer replacement wiring in
+# areal.models.mcore.registry, in-place promotion of ColumnParallelLinear to
+# AReaLVocabParallelLMHead, FP32-output/FP32-operand GEMM forward and backward
+# contracts, frozen-weight paths, in-place FP32-to-half packing of dlogits with storage-
+# identity checks, the chunked fused logprob/entropy LM head
+# (_ChunkedVocabParallelLMHead) including main_grad accumulation, and logits reuse
+# through gather_logprobs_entropy. CPU tests need megatron.core; most numerical tests
+# are skipped without CUDA. Single process, tp_group None.
 # SPDX-License-Identifier: Apache-2.0
 
 import gc
@@ -31,17 +42,31 @@ CUDA_AVAILABLE = torch.cuda.is_available()
 
 
 class _ModelWithOutputLayer(torch.nn.Module):
+    # [CLASS DOC]
+    # HELPER: Minimal parent module exposing an output_layer attribute, as
+    # replace_output_layer_with_areal_lm_head expects.
     def __init__(self, output_layer: torch.nn.Module) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Registers the given module as output_layer.
         super().__init__()
         self.output_layer = output_layer
 
 
 class _BF16OutputModule(torch.nn.Module):
+    # [CLASS DOC]
+    # HELPER: Module whose forward returns a bf16 tensor of ones (shape [2]) to probe
+    # Float16Module output casting.
     def forward(self) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Returns ones(2) in bfloat16.
         return torch.ones(2, dtype=torch.bfloat16)
 
 
 def _make_uninitialized_head() -> mcore_layers.ColumnParallelLinear:
+    # [FUNCTION DOC]
+    # HELPER: Builds a ColumnParallelLinear without running its constructor (no parallel
+    # state needed): initializes it as a plain nn.Module, sets an empty 8x4 weight
+    # Parameter and a None bias. Returns the head.
     head = mcore_layers.ColumnParallelLinear.__new__(mcore_layers.ColumnParallelLinear)
     torch.nn.Module.__init__(head)
     head.weight = torch.nn.Parameter(torch.empty(8, 4))
@@ -50,6 +75,11 @@ def _make_uninitialized_head() -> mcore_layers.ColumnParallelLinear:
 
 
 def test_areal_lm_head_config_defaults_and_fp32_help():
+    # [FUNCTION DOC]
+    # MegatronEngineConfig defaults: chunked logits off, entropy_requires_grad off,
+    # lm_head_loss_chunk_size 0, enable_fp32_lm_head off; help metadata mentions
+    # "Defaults to False" for entropy_requires_grad and describes FP32 operands (not
+    # deprecated) for enable_fp32_lm_head.
     config = MegatronEngineConfig()
     config_fields = {field.name: field for field in fields(MegatronEngineConfig)}
 
@@ -66,6 +96,10 @@ def test_areal_lm_head_config_defaults_and_fp32_help():
 
 
 def test_chunked_lm_head_config_validation():
+    # [FUNCTION DOC]
+    # MegatronEngineConfig validation raises ValueError for negative chunk size, chunk
+    # size without chunked logits, chunk size with entropy_requires_grad, and chunked LM
+    # head with enable_mtp; a valid chunked config keeps chunk size 128.
     with pytest.raises(ValueError, match="must be non-negative"):
         MegatronEngineConfig(lm_head_loss_chunk_size=-1)
     with pytest.raises(ValueError, match="requires enable_chunked_logits"):
@@ -101,6 +135,11 @@ def test_chunked_lm_head_config_validation():
 def test_actor_output_layer_replacement_configures_fp32_operands(
     enabled, fp32_operands, monkeypatch
 ):
+    # [FUNCTION DOC]
+    # Parametrized over enabled and fp32_operands with unwrap/replace functions
+    # monkeypatched: _replace_actor_output_layers calls the replacement once on the
+    # unwrapped GPT model with fp32_output True and the given fp32_operands when
+    # enabled, and never otherwise.
     model = object()
     gpt_model = object()
     replacements: list[tuple[object, bool, bool]] = []
@@ -141,6 +180,11 @@ def test_configure_actor_output_layers_supports_all_flag_combinations(
     expected: list[tuple[str, bool]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # [FUNCTION DOC]
+    # Parametrized over flag combinations: _configure_actor_output_layers calls the
+    # chunked replacement (passing enable_fp32_lm_head as fp32_operands) when chunked
+    # logits are enabled, else the fp32 forward patch when enable_fp32_lm_head is set,
+    # else nothing.
     calls: list[tuple[str, bool]] = []
     monkeypatch.setattr(
         mcore_registry,
@@ -173,6 +217,10 @@ def _native_megatron_areal_logits(
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Reference "native" path: Megatron's
+    # linear_with_grad_accumulation_and_async_allreduce in the input dtype (no bias
+    # fusion/async/sequence parallel), then cast to float32. Returns logits tensor.
     """Original MCore BF16 linear followed by AReaL's FP32 output cast."""
     return mcore_layers.linear_with_grad_accumulation_and_async_allreduce(
         input_,
@@ -188,11 +236,16 @@ def _native_megatron_areal_logits(
 
 
 def _relative_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Returns the relative L2 error norm(actual - expected) / norm(expected) as
+    # a Python float (computed in fp32; causes a device sync).
     difference = actual.float() - expected.float()
     return (difference.norm() / expected.float().norm()).item()
 
 
 def _cosine_similarity(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Returns cosine similarity of the flattened fp32 tensors as a Python float.
     return F.cosine_similarity(
         actual.float().flatten(),
         expected.float().flatten(),
@@ -201,6 +254,11 @@ def _cosine_similarity(actual: torch.Tensor, expected: torch.Tensor) -> float:
 
 
 def test_replace_output_layer_preserves_module_parameter_and_state_key():
+    # [FUNCTION DOC]
+    # Replacing the output layer mutates the existing module's class in place: same
+    # module and parameter identities, fp32 flags set, state_dict key preserved, and
+    # existing gradient hooks kept. If megatron.bridge is installed, also asserts the
+    # new class is registered as a "column" module in AutoMapping.
     """Promotion must not invalidate DDP hooks or checkpoint mappings."""
     head = _make_uninitialized_head()
     model = _ModelWithOutputLayer(head)
@@ -233,10 +291,17 @@ def test_fp32_operands_match_reference_and_cast_weight_once(
     dtype: torch.dtype,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # [FUNCTION DOC]
+    # CUDA, parametrized bf16/fp16: linear_with_areal_output with fp32_output and
+    # fp32_operands equals an exact fp32 matmul-plus-bias reference in forward and in
+    # input/weight/bias gradients, and the weight is cast to compute dtype exactly once
+    # (tracked via a wrapped _lm_head_compute_weight), not again in backward.
     cast_calls = 0
     original_compute_weight = lm_head_module._lm_head_compute_weight
 
     def tracking_compute_weight(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Counts calls then delegates to the original _lm_head_compute_weight.
         nonlocal cast_calls
         cast_calls += 1
         return original_compute_weight(*args, **kwargs)
@@ -284,6 +349,9 @@ def test_fp32_operands_match_reference_and_cast_weight_once(
 
 
 def test_fp32_operands_reject_deferred_embedding_wgrad() -> None:
+    # [FUNCTION DOC]
+    # fp32_operands combined with deferred embedding wgrad (grad_output_buffer given)
+    # raises NotImplementedError.
     input_ = torch.randn(3, 1, 4, requires_grad=True)
     weight = torch.randn(8, 4, requires_grad=True)
 
@@ -304,8 +372,16 @@ def test_fp32_operands_reject_deferred_embedding_wgrad() -> None:
 
 
 def test_replace_output_layer_preserves_bridge_subclass_forward():
+    # [FUNCTION DOC]
+    # Promoting a ColumnParallelLinear subclass (as Megatron-Bridge uses) keeps the
+    # subclass's own forward and keeps it in the new class's MRO, with fp32_output
+    # False.
     class BridgeOutputLayer(mcore_layers.ColumnParallelLinear):
+        # [CLASS DOC]
+        # HELPER: Bridge-style subclass whose forward returns a sentinel string.
         def forward(self):
+            # [FUNCTION DOC]
+            # HELPER: Returns "bridge-forward".
             return "bridge-forward"
 
     head = _make_uninitialized_head()
@@ -320,6 +396,9 @@ def test_replace_output_layer_preserves_bridge_subclass_forward():
 
 
 def test_float16_module_default_output_remains_fp32(monkeypatch):
+    # [FUNCTION DOC]
+    # With pipeline-stage helpers monkeypatched to single stage, a bf16 Float16Module
+    # returns fp32 output by default and bf16 when fp32_output=False.
     """The BF16 LM Head mode must retain Megatron's default output cast."""
     from megatron.core.pipeline_parallel import utils as pp_utils
     from megatron.core.transformer import module as module_lib
@@ -353,6 +432,13 @@ def test_lm_head_output_and_gradients_match_reference(
     fp32_output: bool,
     dtype: torch.dtype,
 ):
+    # [FUNCTION DOC]
+    # CUDA, parametrized over output mode and dtype: the promoted head's _forward_impl
+    # matches an exact GEMM (fp32-output mm or native matmul), uses the expected custom
+    # backward node, exposes reusable logits in fp32 mode, and produces input/weight
+    # gradients equal to the low-precision dlogits contract.
+    # KNOWN ISSUE: Both branches of the fp32_output conditional set backward_grad
+    # identically, so the branch is redundant.
     """Both output modes must match their GEMM and Megatron backward contracts."""
     torch.manual_seed(1234)
     device = torch.device("cuda")
@@ -415,6 +501,10 @@ def test_frozen_lm_head_skips_wgrad_and_matches_dgrad(
     gradient_accumulation_fusion: bool,
     fp32_output: bool,
 ):
+    # [FUNCTION DOC]
+    # CUDA: with a weight that does not require grad, the head uses the frozen backward
+    # node, matches the expected forward exactly, computes the correct input gradient,
+    # and leaves weight.grad None (no wgrad).
     torch.manual_seed(4321)
     input_ = torch.randn(
         5, 2, 16, dtype=torch.bfloat16, device="cuda", requires_grad=True
@@ -466,6 +556,10 @@ def test_pack_fp32_to_half_inplace_preserves_values_and_storage(
     target_dtype: torch.dtype,
     shape: tuple[int, int],
 ):
+    # [FUNCTION DOC]
+    # CUDA, parametrized: _pack_fp32_to_half_inplace converts an fp32 tensor to
+    # bf16/fp16 in its own storage (same data_ptr and storage size, version bumped) with
+    # values equal to a normal cast.
     torch.manual_seed(20260720)
     source = torch.randn(shape, dtype=torch.float32, device="cuda")
     expected = source.to(dtype=target_dtype)
@@ -489,6 +583,10 @@ def test_pack_fp32_to_half_inplace_preserves_values_and_storage(
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for storage reuse")
 def test_storage_identity_rejects_recycled_cuda_address():
+    # [FUNCTION DOC]
+    # CUDA: after freeing a tensor and creating a new tensor on its storage at the same
+    # address, _matches_storage against the dead weakref returns False (address reuse is
+    # not identity).
     shape = (1024, 1024)
     source = torch.empty(shape, dtype=torch.float32, device="cuda")
     source_ptr = source.data_ptr()
@@ -514,6 +612,10 @@ def test_direct_fp32_backward_exactly_matches_native_cast_contract(
     use_bias: bool,
     monkeypatch,
 ):
+    # [FUNCTION DOC]
+    # CUDA, with/without bias: linear_with_fp32_output yields bit-identical
+    # input/weight/bias gradients to the native cast path; in-place packing is forbidden
+    # (monkeypatched to fail) because the grad_output is externally owned.
     """Both paths must pass the same BF16 dlogits into MCore backward."""
     monkeypatch.setattr(
         lm_head_module,
@@ -566,6 +668,11 @@ def test_direct_fp32_backward_exactly_matches_native_cast_contract(
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for direct FP32 mm")
 def test_direct_fp32_end_to_end_precision_matches_native_megatron_areal():
+    # [FUNCTION DOC]
+    # CUDA: compares linear_with_fp32_output against the native path on random bf16
+    # data: logits close (rel L2, cosine) and at least as close to an fp32 reference;
+    # per-token and mean cross-entropy close; input and weight grads close within
+    # tolerances.
     """Compare logits, CE, and gradients with the original production path."""
     torch.manual_seed(20260720)
     sequence_length, batch_size, hidden_size, vocab_size = 17, 3, 128, 512
@@ -651,10 +758,19 @@ def test_chunked_lm_head_matches_full_fused_path(
     fp32_operands: bool,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    # [FUNCTION DOC]
+    # CUDA, parametrized over dtype, temperature and fp32_operands:
+    # _ChunkedVocabParallelLMHead (chunk 5, logit scale 0.5) returns logprobs, entropy
+    # and per-token logit min/max/mean/norm matching a full-logits reference via
+    # gather_logprobs_entropy; stats and entropy carry no grad; no full [seq, vocab]
+    # tensor is saved for backward; weight cast happens once; gradients match within
+    # tolerances (bias exact for fp32 operands, rel L2 otherwise).
     compute_weight_calls = 0
     original_compute_weight = lm_head_module._lm_head_compute_weight
 
     def tracking_compute_weight(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Counts calls then delegates to the original _lm_head_compute_weight.
         nonlocal compute_weight_calls
         compute_weight_calls += 1
         return original_compute_weight(*args, **kwargs)
@@ -761,6 +877,11 @@ def test_chunked_lm_head_matches_full_fused_path(
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for chunked LM Head")
 def test_chunked_lm_head_accumulates_fp32_main_grad():
+    # [FUNCTION DOC]
+    # CUDA: with gradient_accumulation_fusion, the chunked head accumulates the weight
+    # gradient into the main_grad captured at forward time (not one swapped in later),
+    # equal to the non-fused reference gradient, sets grad_added_to_main_grad, and
+    # leaves a zero weight.grad.
     torch.manual_seed(20260721)
     base_input = torch.randn(11, 1, 16, dtype=torch.bfloat16, device="cuda")
     base_weight = torch.randn(48, 16, dtype=torch.bfloat16, device="cuda")
@@ -826,6 +947,9 @@ def test_chunked_lm_head_accumulates_fp32_main_grad():
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for chunked LM Head")
 def test_chunked_fp32_lm_head_rejects_non_fp32_main_grad():
+    # [FUNCTION DOC]
+    # CUDA: gradient accumulation fusion with a bf16 main_grad raises RuntimeError
+    # ("require an FP32 main_grad") during backward.
     input_ = torch.randn(
         5, 1, 8, dtype=torch.bfloat16, device="cuda", requires_grad=True
     )
@@ -853,6 +977,11 @@ def test_chunked_fp32_lm_head_rejects_non_fp32_main_grad():
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for direct FP32 mm")
 def test_direct_fp32_lm_head_reuses_logits_through_loss_backward(monkeypatch):
+    # [FUNCTION DOC]
+    # CUDA: fp32 logits from linear_with_fp32_output are their own reusable owner;
+    # gather_logprobs_entropy with reuse_logits matches a reference log-softmax, keeps
+    # the storage, and on backward packs dlogits in place exactly once on the logits
+    # storage; resulting grads match the expected bf16 dlogits contract.
     """The direct GEMM owner must remain reusable by the fused loss autograd node."""
     pack_calls: list[tuple[int, int]] = []
     original_pack = lm_head_module._pack_fp32_to_half_inplace
@@ -862,6 +991,8 @@ def test_direct_fp32_lm_head_reuses_logits_through_loss_backward(monkeypatch):
         target_dtype: torch.dtype,
         seed_elements: int,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Wraps the original packer and records (input ptr, output ptr) pairs.
         packed = original_pack(tensor, target_dtype, seed_elements)
         pack_calls.append((tensor.data_ptr(), packed.data_ptr()))
         return packed
@@ -918,19 +1049,32 @@ def test_direct_fp32_lm_head_reuses_logits_through_loss_backward(monkeypatch):
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for direct FP32 mm")
 def test_direct_fp32_lm_head_does_not_pack_reused_allocator_address(monkeypatch):
+    # [FUNCTION DOC]
+    # CUDA: when logits are freed and the backward gradient may land on a recycled
+    # address, the head must not pack in place (packer patched to fail); the input
+    # gradient equals the expected constant dlogits times weight.
     """A recycled CUDA address is not proof that dlogits owns the logits storage."""
 
     class _ReleaseLogits(torch.autograd.Function):
+        # [CLASS DOC]
+        # HELPER: Autograd function that sums logits in forward (keeping no reference)
+        # and in backward allocates a fresh constant-2 fp32 gradient, recording its
+        # pointer.
         grad_ptr: int | None = None
 
         @staticmethod
         def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+            # [FUNCTION DOC]
+            # HELPER: Saves shape/device on ctx and returns the tensor sum.
             ctx.shape = tensor.shape
             ctx.device = tensor.device
             return tensor.sum()
 
         @staticmethod
         def backward(ctx, grad_output: torch.Tensor) -> tuple[torch.Tensor]:
+            # [FUNCTION DOC]
+            # HELPER: Returns a new tensor full of 2.0 (fp32) with the saved shape and
+            # records its data_ptr.
             del grad_output
             grad = torch.full(ctx.shape, 2.0, dtype=torch.float32, device=ctx.device)
             _ReleaseLogits.grad_ptr = grad.data_ptr()
@@ -970,11 +1114,18 @@ def test_direct_fp32_lm_head_does_not_pack_reused_allocator_address(monkeypatch)
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA is required for direct FP32 mm")
 def test_fused_loss_preserves_public_logits_hook_and_retain_grad(monkeypatch):
+    # [FUNCTION DOC]
+    # CUDA: with retain_grad and a user hook scaling by 0.5 on the logits, the fused
+    # loss path still invokes the hook once with the correct gradient, logits.grad
+    # reflects the scaled grad, input grad uses the hook-modified dlogits, and no in-
+    # place packing occurs.
     """The destructive loss must keep the public LM Head autograd edge."""
     pack_calls = 0
     original_pack = lm_head_module._pack_fp32_to_half_inplace
 
     def tracking_pack(*args, **kwargs):
+        # [FUNCTION DOC]
+        # HELPER: Counts calls then delegates to the original packer.
         nonlocal pack_calls
         pack_calls += 1
         return original_pack(*args, **kwargs)

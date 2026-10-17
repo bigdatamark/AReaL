@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Multi-GPU integration tests for MegatronEngine parallelism (TP, PP, CP, VPP, EP, DP)
+# and checkpointing on Qwen3, Qwen3-MoE, Qwen3.5 (GDN hybrid, via megatron-bridge) and
+# Qwen3.5-MoE. Each test spawns tests/torchrun/run_megatron_engine_distributed.py under
+# torchrun with a model type, allocation string and test type; the worker writes
+# "Passed" to an output file on success. Tests skip when too few devices are present;
+# all are marked slow.
 import subprocess
 import sys
 
@@ -11,6 +18,16 @@ from areal.utils.network import find_free_ports
 def _run_test_with_torchrun(
     model_type: str, alloc_mode: str, test_type: str, output: str, vpp_size: int = 1
 ):
+    # [FUNCTION DOC]
+    # HELPER: Picks a free port, derives the process count from the allocation string's
+    # parallel world size, and runs torchrun (single node, localhost) on the worker
+    # script with --model_type, --backend (alloc_mode), --output, --test_type and
+    # --vpp_size (default 1), streaming its stdout/stderr to the test's stdout. On non-
+    # zero exit calls pytest.fail; otherwise reads the output file and asserts its
+    # stripped content is "Passed". Relative script path assumes repo-root cwd; no
+    # timeout.
+    # KNOWN ISSUE: stderr is redirected to sys.stdout, so CalledProcessError.stderr is
+    # None and the failure message always reports "None".
     port = find_free_ports(1)[0]
     n_gpus = ModelAllocation.from_str(alloc_mode).parallel.world_size
     try:
@@ -43,6 +60,8 @@ def _run_test_with_torchrun(
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_tensor_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3 forward under TP=2 (megatron:d1p1t2); needs 2 devices.
     if current_platform.device_count() < 2:
         pytest.skip("tensor parallel requires 2 GPUs to run")
     output = tmp_path_factory.mktemp("test_output") / "qwen3_tensor_parallel.out"
@@ -54,6 +73,12 @@ def test_qwen3_tensor_parallel(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_grad_norm_mb_invariance(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3 grad_norm must not depend on the number of microbatches (guards the
+    # loss_multiplier fix compensating Megatron's per-microbatch loss division); runs
+    # with DP=2.
+    # KNOWN ISSUE: Unlike sibling tests, it has no device_count check, so it fails
+    # instead of skipping on machines with fewer than 2 GPUs.
     """Regression guard: grad_norm must be invariant to num_microbatches.
 
     Guards the `loss_multiplier` fix in `MegatronEngine.train_batch` that
@@ -76,6 +101,8 @@ def test_qwen3_grad_norm_mb_invariance(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_pipeline_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3 forward under PP=2 (megatron:d1p2t1); needs 2 devices.
     if current_platform.device_count() < 2:
         pytest.skip("pipeline parallel requires 2 GPUs to run")
     output = tmp_path_factory.mktemp("test_output") / "qwen3_pipeline_parallel.out"
@@ -87,6 +114,8 @@ def test_qwen3_pipeline_parallel(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_context_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3 forward under CP=2 (megatron:d1p1t1c2); needs 2 devices.
     if current_platform.device_count() < 2:
         pytest.skip("context parallel requires 2 GPUs to run")
     output = tmp_path_factory.mktemp("test_output") / "qwen3_context_parallel.out"
@@ -98,6 +127,8 @@ def test_qwen3_context_parallel(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_virtual_pipeline_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3 forward under PP=2 with virtual pipeline size 2; needs 2 devices.
     if current_platform.device_count() < 2:
         pytest.skip("virtual pipeline parallel requires 2 GPUs to run")
     output = (
@@ -111,6 +142,9 @@ def test_qwen3_virtual_pipeline_parallel(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3moe_expert_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3-MoE forward with hybrid allocation (attention TP2 CP2, FFN EP4); needs 4
+    # devices.
     if current_platform.device_count() < 4:
         pytest.skip("Qwen3 MoE expert parallel requires 4 GPUs to run")
     output = tmp_path_factory.mktemp("test_output") / "qwen3moe_expert_parallel.out"
@@ -125,6 +159,8 @@ def test_qwen3moe_expert_parallel(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_dcp_save_load(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3 train then DCP save/load round trip under d2p2t2; needs 8 devices.
     if current_platform.device_count() < 8:
         pytest.skip("DCP save load requires 8 GPUs to run")
     output = tmp_path_factory.mktemp("test_output") / "qwen3_save_load.out"
@@ -139,6 +175,9 @@ def test_qwen3_dcp_save_load(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3moe_dcp_save_load(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3-MoE simple DCP save/load under attention TP4 CP2 / FFN TP2 EP4; needs 8
+    # devices.
     if current_platform.device_count() < 8:
         pytest.skip("Qwen3 MoE DCP save load requires 8 GPUs to run")
     output = tmp_path_factory.mktemp("test_output") / "qwen3moe_save_load.out"
@@ -161,6 +200,9 @@ def test_qwen3moe_dcp_save_load(tmp_path_factory):
 
 @pytest.mark.slow
 def test_qwen3_5_single_gpu_forward(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3.5 single-GPU smoke test (engine init + forward via megatron-bridge load
+    # path).
     """Smoke test on a single GPU: engine init + forward pass.
 
     Validates the megatron-bridge load path (including the AReaL-side
@@ -178,6 +220,8 @@ def test_qwen3_5_single_gpu_forward(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_5_tensor_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3.5 forward under TP=2; needs 2 devices.
     if current_platform.device_count() < 2:
         pytest.skip("tensor parallel requires 2 GPUs to run")
     output = tmp_path_factory.mktemp("test_output") / "qwen3_5_tensor_parallel.out"
@@ -189,6 +233,8 @@ def test_qwen3_5_tensor_parallel(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_5_pipeline_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3.5 forward under PP=2; needs 2 devices.
     if current_platform.device_count() < 2:
         pytest.skip("pipeline parallel requires 2 GPUs to run")
     output = tmp_path_factory.mktemp("test_output") / "qwen3_5_pipeline_parallel.out"
@@ -205,6 +251,9 @@ def test_qwen3_5_pipeline_parallel(tmp_path_factory):
     "initial Qwen3.5 support; VPP is an optional scheduling optimization."
 )
 def test_qwen3_5_virtual_pipeline_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # (Skipped: megatron-bridge lacks VPP + tied embeddings support.) Qwen3.5 forward
+    # with PP=2 and VPP=2.
     if current_platform.device_count() < 2:
         pytest.skip("virtual pipeline parallel requires 2 GPUs to run")
     output = (
@@ -228,6 +277,9 @@ def test_qwen3_5_virtual_pipeline_parallel(tmp_path_factory):
     "diff). See run_qwen3_5_35b_megatron.sh for the recommended config."
 )
 def test_qwen3_5_grad_norm_mb_invariance(tmp_path_factory):
+    # [FUNCTION DOC]
+    # (Skipped: padded BSHD mode is not microbatch-invariant.) Qwen3.5 grad_norm
+    # microbatch-invariance check under DP=2.
     """Same regression guard as ``test_qwen3_grad_norm_mb_invariance`` but on
     Qwen3.5. Exercises full backward + optimizer step under DP=2 to verify the
     ``loss_multiplier`` fix still holds for GDN models.
@@ -248,6 +300,9 @@ def test_qwen3_5_grad_norm_mb_invariance(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_5_hf_save_load(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3.5 train, HF safetensors save, zero, load, retrain round trip under TP=2;
+    # needs 2 devices.
     """HF save/load round-trip under TP=2.
 
     Uses _save_model_to_hf / _load_model_from_hf (HF safetensors) instead of
@@ -288,6 +343,9 @@ def test_qwen3_5_hf_save_load(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_5_moe_expert_parallel(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3.5-MoE forward with attention PP2 TP2 and FFN PP2 EP2 on 4 ranks (FSDP cross-
+    # check skipped by the runner).
     """Qwen3.5-MoE megatron forward under PP=2 / TP=2 / EP=2.
 
     The MoE analog of ``test_qwen3moe_expert_parallel``. CP is unavailable for
@@ -312,6 +370,9 @@ def test_qwen3_5_moe_expert_parallel(tmp_path_factory):
 @pytest.mark.multi_gpu
 @pytest.mark.slow
 def test_qwen3_5_moe_hf_save_load(tmp_path_factory):
+    # [FUNCTION DOC]
+    # Qwen3.5-MoE HF save/zero/load/compare round trip (train step skipped by the
+    # runner) on 4 ranks.
     """HF save/load round-trip for Qwen3.5-MoE under PP=2 / TP=2 / EP=2.
 
     Validates the megatron-bridge conversion of MoE expert weights

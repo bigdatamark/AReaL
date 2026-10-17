@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Single-GPU tests for MegatronEngine (areal.engine) on Qwen3-0.6B (local storage path
+# or HF hub id via get_model_path): forward, a training step with LR scheduler step, and
+# HF/DCP weight save-load round trips; plus a CPU unit test of
+# MegatronEngine._mark_duplicated_params. Uses the TestMegatronEngine logger.
 import os
 import time
 from importlib.metadata import version as get_version
@@ -36,6 +41,15 @@ def mock_input(
     max_seqlen=20,
     device=current_platform.device_type,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Module-scoped fixture: builds a random padded batch (batch_size 5, per-row lengths
+    # in [min_seqlen, max_seqlen), token ids in [0, VOCAB_SIZE)) on the platform device.
+    # Builds a boolean attention mask from the lengths and fills padded token positions
+    # with pad id 0. Returns dict with input_ids [batch, max_len] long and
+    # attention_mask [batch, max_len] bool.
+    # KNOWN ISSUE: Docstring says position_ids are returned but only input_ids and
+    # attention_mask are; parameters are pytest-fixture arguments with defaults so they
+    # cannot be overridden per test.
     """Create mock padded input data (same format for huggingface) for testing.
     Returns a dict with input_ids, attention_mask, and position_ids.
     """
@@ -66,11 +80,21 @@ def mock_loss_fn(
     input_data: dict,
     **kwargs,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Dummy loss returning the mean of logprobs; entropy, input_data and kwargs
+    # ignored. Output: scalar tensor.
     """Mock loss function for testing."""
     return torch.mean(logprobs)
 
 
 def test_mark_duplicated_params_clears_tp_metadata_for_replicated_params():
+    # [FUNCTION DOC]
+    # Builds a module with three bias-free Linear layers whose weights are flagged
+    # tensor_model_parallel: a tp_size 1 "duplicated" layer, a tp_size 1 layer whose
+    # name contains "expert", and a tp_size 4 layer. Calls _mark_duplicated_params on a
+    # dummy engine holding [model] and asserts only the non-expert tp_size 1 weight gets
+    # _is_duplicated True and has tensor_model_parallel cleared; the others are
+    # unchanged.
     model = torch.nn.Module()
 
     duplicated_linear = torch.nn.Linear(2, 2, bias=False)
@@ -106,6 +130,15 @@ def test_mark_duplicated_params_clears_tp_metadata_for_replicated_params():
 # Cannot use a "module" scope since process groups can only be initialized once.
 @pytest.fixture
 def engine():
+    # [FUNCTION DOC]
+    # Function-scoped fixture (process groups can only be initialized once per group):
+    # sets single-process torch.distributed env vars (WORLD_SIZE 1, RANK 0, MASTER_PORT
+    # 7777), creates a MegatronEngine from a TrainEngineConfig with default
+    # optimizer/megatron configs, creates process groups for d1p1t1, initializes with a
+    # FinetuneSpec (1 epoch, 128 samples, batch 8), logs model and device stats, yields
+    # it, then destroys it and asserts torch.distributed is no longer initialized.
+    # KNOWN ISSUE: Mutates os.environ permanently and uses a hardcoded master port; the
+    # config backend string is "fsdp:d1" even though a Megatron engine is built.
     logger.info(f"megatron.core version={get_version('megatron.core')}")
     os.environ.update(
         {
@@ -139,12 +172,18 @@ def engine():
 
 
 def test_simple_forward(engine, mock_input):
+    # [FUNCTION DOC]
+    # Runs engine.forward in eval mode on the mock batch and logs the result (smoke
+    # test, no assertions).
     engine.eval()
     result = engine.forward(mock_input)
     logger.info(f"Forward done, result: {result}")
 
 
 def test_simple_train(engine, mock_input):
+    # [FUNCTION DOC]
+    # Runs one train_batch with mock_loss_fn and constant loss weight 1.0, steps the LR
+    # scheduler and logs the result (smoke test, no assertions).
     engine.train()
     train_result = engine.train_batch(
         mock_input,
@@ -157,6 +196,10 @@ def test_simple_train(engine, mock_input):
 
 @torch.no_grad()
 def test_hf_save_load_weights(tmp_path_factory, engine, mock_input):
+    # [FUNCTION DOC]
+    # Under no_grad: forwards, saves weights in HF format (with tokenizer, no optimizer)
+    # to a temp dir, zeroes all parameters, reloads, forwards again and asserts outputs
+    # are allclose to the originals. Logs save/load timings.
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     path = tmp_path_factory.mktemp("hf_engine_test")
     save_load_meta = SaveLoadMeta(
@@ -184,6 +227,9 @@ def test_hf_save_load_weights(tmp_path_factory, engine, mock_input):
 @torch.no_grad()
 @pytest.mark.slow
 def test_dcp_save_load_weights(tmp_path_factory, engine, mock_input):
+    # [FUNCTION DOC]
+    # Slow test: same round trip as the HF test but with DCP format and optimizer state
+    # included.
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     path = tmp_path_factory.mktemp("megatron_engine_dcp_test")
     save_load_meta = SaveLoadMeta(
