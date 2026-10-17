@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Project-wide constants: default distributed group timeout (2h), memory alignment sizes
+# (2 MiB page, 16-byte vector alignment), enums for proximal log-probability computation
+# and approximation methods used by decoupled PPO, and backward-compatible string
+# aliases plus lists of all valid values for config validation.
 # SPDX-License-Identifier: Apache-2.0
 
 import datetime
@@ -34,6 +39,10 @@ DEFAULT_VECTORIZED_ALIGNMENT_BYTES = 16
 
 
 class ProxLogpMethod(str, Enum):
+    # [CLASS DOC]
+    # String enum selecting how proximal-policy logprobs are obtained in decoupled PPO:
+    # recompute via forward pass, log-linear approximation, recompute plus approximation
+    # metrics, or reuse the training forward logprobs.
     """Method for computing proximal policy log-probabilities in decoupled PPO.
 
     Attributes:
@@ -51,11 +60,18 @@ class ProxLogpMethod(str, Enum):
     REUSE_TRAIN_LOGP = "reuse_train_logp"
 
     def skips_forward_pass(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns True for LOGLINEAR and REUSE_TRAIN_LOGP, i.e. methods that avoid a
+        # separate proximal forward pass.
         """Return True if this method skips the forward pass (optimization enabled)."""
         return self in (ProxLogpMethod.LOGLINEAR, ProxLogpMethod.REUSE_TRAIN_LOGP)
 
 
 class ProxApproxMethod(str, Enum):
+    # [CLASS DOC]
+    # String enum of proximal logprob approximation formulas: log-linear interpolation,
+    # linear interpolation in probability space, or using rollout (behavior) logprobs as
+    # is.
     """Approximation method for proximal policy log-probabilities.
 
     Attributes:

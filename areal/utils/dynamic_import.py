@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Dynamic import helper for resolving dotted "module.path.ObjectName" strings to
+# objects.
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
@@ -5,6 +8,11 @@ from typing import Any
 
 
 def import_from_string(module_path: str) -> Any:
+    # [FUNCTION DOC]
+    # Imports module_path's module part and returns its named attribute. Raises
+    # ValueError for empty/non-string input or a path without a dot, ImportError
+    # (wrapped) if the module import fails, AttributeError (wrapped) if the attribute is
+    # missing. Side effect: module import.
     if not module_path or not isinstance(module_path, str):
         raise ValueError(
             f"Invalid module path: {module_path!r}. "

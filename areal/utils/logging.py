@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# AReaL logging setup. Defines the "(AReaL)" header and formats, per-logger color tables
+# (exact names and substring patterns), a colorlog formatter that colors DEBUG/INFO
+# lines by logger name, a dictConfig with stdout handlers and quieted third-party HTTP
+# loggers, getLogger (the project's logger factory), optional file logging for the
+# controller process (main.log plus merged.log), and a helper to push metrics to
+# SwanLab, wandb, Trackio and TensorBoard. Running the module prints a color demo.
 # SPDX-License-Identifier: Apache-2.0
 
 import logging.config
@@ -157,14 +164,22 @@ _loggers_lock = threading.Lock()
 
 
 class StreamingFileHandler(FileHandler):
+    # [CLASS DOC]
+    # FileHandler that flushes after every record so log files stream in real time.
     """FileHandler that flushes after each log message for real-time streaming."""
 
     def emit(self, record):
+        # [FUNCTION DOC]
+        # Emits the record via FileHandler then flushes the stream.
         super().emit(record)
         self.flush()
 
 
 class LoggerColoredFormatter(colorlog.ColoredFormatter):
+    # [CLASS DOC]
+    # colorlog formatter where DEBUG/INFO lines take a color derived from the logger
+    # name (LOGGER_COLORS_EXACT, then LOGGER_PATTERNS, else DEFAULT_LOGGER_COLOR) while
+    # WARNING and above keep level colors. Caches name to color lookups per instance.
     """Custom formatter that colors logs based on logger name for INFO/DEBUG levels.
 
     WARNING, ERROR, and CRITICAL levels keep their standard colors (yellow, red)
@@ -172,10 +187,17 @@ class LoggerColoredFormatter(colorlog.ColoredFormatter):
     """
 
     def __init__(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Forwards all args to ColoredFormatter and creates an empty name-to-color
+        # cache.
         super().__init__(*args, **kwargs)
         self._logger_color_cache: dict[str, str] = {}
 
     def _get_logger_color(self, name: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns the cached color for name, else exact-table color, else the
+        # first pattern contained in the name (prefix or substring), else the default;
+        # caches the result.
         """Get the color for a logger name, using cache for performance."""
         if name in self._logger_color_cache:
             return self._logger_color_cache[name]
@@ -195,6 +217,11 @@ class LoggerColoredFormatter(colorlog.ColoredFormatter):
         return color
 
     def formatMessage(self, record):
+        # [FUNCTION DOC]
+        # Formats a record: takes level escape codes, and for levels below WARNING
+        # replaces "log_color" in a local copy with the logger-name color (no shared
+        # state mutation), then formats through the base logging.Formatter with a
+        # ColoredRecord wrapper and appends a reset code. Returns the string.
         """Thread-safe formatting that uses per-logger colors for DEBUG/INFO."""
         # Get escape codes from parent's method
         escapes = self._escape_code_map(record.levelname)
@@ -349,6 +376,17 @@ def getLogger(
     type_: Literal["plain", "benchmark", "colored", "system"] | None = None,
     level: int = LOGLEVEL,
 ):
+    # [FUNCTION DOC]
+    # Returns a stdlib Logger configured with AReaL handlers. Every call creates a fresh
+    # RootLogger(WARNING) and Manager (to undo third-party, e.g. transformer_engine,
+    # logging changes) and re-applies log_config. name defaults to "plain", type_
+    # (plain, benchmark, colored, system) selects the stdout handler for new names; a
+    # new name is added to the global log_config with the given level and config re-
+    # applied. Registers the logger in _created_loggers and attaches any file handlers
+    # from setup_file_logging (thread-safe). Raises AssertionError on an invalid type_.
+    # KNOWN ISSUE: level and type_ are ignored for names already in log_config, and
+    # replacing the global root/manager on every call orphans loggers obtained earlier
+    # through the stdlib.
     # Fix the logging config automatically set by transformer_engine
     # by reset config everytime getLogger is called.
     root = RootLogger(WARNING)
@@ -400,6 +438,10 @@ _HTTP_LOGGERS = (
 
 
 def suppress_http_loggers() -> None:
+    # [FUNCTION DOC]
+    # Sets every logger in _HTTP_LOGGERS (uvicorn, httpx, aiohttp, werkzeug, urllib3
+    # ...) to WARNING. Intended right before starting a web server that reconfigures
+    # logging.
     """Force all HTTP-related loggers to WARNING.
 
     Call this from service __main__.py right before uvicorn.run() or
@@ -417,6 +459,12 @@ def setup_file_logging(
     filename: str = "main.log",
     level: int = LOGLEVEL,
 ) -> None:
+    # [FUNCTION DOC]
+    # Idempotently (no-op if file handlers already exist) creates log_dir and two
+    # flushing file handlers in append mode: log_dir/filename with the colored
+    # LOG_FORMAT, and log_dir/merged.log with a fixed-width "[main]" prefix. Both use
+    # the given level and per-logger colors. Stores them globally and attaches them to
+    # all loggers created so far; later getLogger calls attach them too.
     """Set up file logging for the controller process.
 
     Adds FileHandlers to all loggers so they write to:
@@ -488,6 +536,11 @@ _LATEST_LOG_STEP = 0
 
 
 def log_swanlab_wandb_tensorboard(data, step=None, summary_writer=None):
+    # [FUNCTION DOC]
+    # Logs a metrics dict at step to SwanLab and Trackio (if installed), wandb (always
+    # imported; ImportError propagates if missing), and TensorBoard via summary_writer
+    # (add_scalar per key) if given. step None reuses the max step seen so far, stored
+    # in the global _LATEST_LOG_STEP.
     # Logs data to SwanLab, wandb, TensorBoard, and Trackio.
 
     global _LATEST_LOG_STEP

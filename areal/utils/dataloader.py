@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Dataloader construction helpers: create_dataloader builds a StatefulDataLoader with a
+# rank-aware sampler, plus an evaluation sampler that does not pad and a prefetch-aware
+# variant for remote RDatasets.
 # SPDX-License-Identifier: Apache-2.0
 
 from collections.abc import Callable
@@ -17,6 +21,15 @@ def create_dataloader(
     dataset_config: _DatasetConfig,
     collate_fn: Callable | None = None,
 ) -> StatefulDataLoader:
+    # [FUNCTION DOC]
+    # Builds a StatefulDataLoader for one DP rank. Inputs: dataset, rank, world_size,
+    # dataset_config (batch_size is global and divided by world_size; shuffle,
+    # drop_last, num_workers), optional collate_fn (default identity, returning the list
+    # of samples). Sampler choice: RDataset + validation config ->
+    # _PrefetchAwareEvalSampler; RDataset -> _PrefetchAwareSampler; validation config ->
+    # EvalDistributedSampler; else DistributedSampler. Sampler drop_last is True for
+    # training and False for validation. Raises ValueError if batch_size is not
+    # divisible by world_size. Lazily imports RDataset.
     """Create a stateful dataloader for a dataset with distributed sampler.
 
     Args:
@@ -63,6 +76,9 @@ def create_dataloader(
 
 
 class EvalDistributedSampler(DistributedSampler):
+    # [CLASS DOC]
+    # DistributedSampler for evaluation that does not pad: every sample is visited
+    # exactly once overall, and ranks may get one fewer sample than others.
     r"""A DistributedSampler specifically designed for evaluation (Validation/Testing).
 
     Unlike the standard :class:`~torch.utils.data.DistributedSampler`, this sampler
@@ -90,6 +106,10 @@ class EvalDistributedSampler(DistributedSampler):
         seed: int = 0,
         drop_last: bool = False,
     ) -> None:
+        # [FUNCTION DOC]
+        # Calls the base constructor, then when drop_last is False sets total_size to
+        # the dataset length (removing padding), and decrements num_samples by one if
+        # this rank's last strided index would fall beyond total_size.
         super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
 
         if not drop_last:
@@ -100,14 +120,26 @@ class EvalDistributedSampler(DistributedSampler):
 
 
 class _PrefetchAwareEvalSampler(EvalDistributedSampler):
+    # [CLASS DOC]
+    # HELPER: Evaluation sampler for remote RDatasets that triggers server-side prefetch
+    # of the indices this rank will iterate.
     def __init__(self, dataset: Any, *args: Any, **kwargs: Any) -> None:
+        # [FUNCTION DOC]
+        # Initializes the eval sampler, keeps a reference to the RDataset and triggers
+        # prefetch.
         super().__init__(dataset, *args, **kwargs)
         self._rdataset = dataset
         self._trigger_prefetch()
 
     def set_epoch(self, epoch: int) -> None:
+        # [FUNCTION DOC]
+        # Sets the epoch (changes shuffle order) and re-triggers prefetch for the new
+        # order.
         super().set_epoch(epoch)
         self._trigger_prefetch()
 
     def _trigger_prefetch(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Materializes this sampler's index list (via the base iterator) and
+        # passes it to the RDataset's _start_prefetch.
         self._rdataset._start_prefetch(list(super().__iter__()))

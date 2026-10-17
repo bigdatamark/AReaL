@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Learning-rate scheduler helpers.
 # SPDX-License-Identifier: Apache-2.0
 
 """Learning-rate scheduler helpers."""
@@ -14,6 +16,10 @@ def get_num_warmup_steps(
     optimizer_config: OptimizerConfig,
     total_train_steps: int,
 ) -> int:
+    # [FUNCTION DOC]
+    # Returns the number of warmup steps: optimizer_config.warmup_steps if set, else
+    # int(warmup_steps_proportion * total_train_steps). Raises ValueError if the chosen
+    # value is negative.
     """Resolve warmup steps, preferring fixed steps over proportions."""
     if optimizer_config.warmup_steps is not None:
         if optimizer_config.warmup_steps < 0:

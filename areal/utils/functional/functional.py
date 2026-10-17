@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Core RL loss and normalization math, independent of engines: masked (optionally
+# distributed) normalization, GSPO sequence-level ratios, rejection sampling of stale
+# off-policy tokens, binary KL, PPO/SAPO/CISPO actor losses, DPO helpers, PPO critic
+# loss and DAPO overlong reward penalty. Inputs are either 2D padded [batch, seq_len] or
+# 1D packed [total_tokens] tensors with cu_seqlens boundaries.
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
@@ -23,6 +29,15 @@ def masked_normalization(
     all_reduce=True,
     reduce_group=None,
 ):
+    # [FUNCTION DOC]
+    # Normalizes x to zero mean / unit std over dim (default all dims), counting only
+    # masked elements when mask is given. Computes in float64 (or float32 if not
+    # high_precision); sums, squared sums and counts are all-reduced over reduce_group
+    # when dist is initialized and all_reduce is True (collective). unbiased applies
+    # Bessel correction; eps is added to std. Returns float32 tensor of x's shape. Runs
+    # under no_grad.
+    # KNOWN ISSUE: masked-out positions are not zeroed in the output; they become (0 -
+    # mean)/std after the mask multiplication, so callers must re-mask.
     dtype = torch.float64 if high_precision else torch.float32
     x = x.to(dtype)
     if dim is None:
@@ -59,6 +74,13 @@ def _compute_sequence_level_ratio_and_advantages(
     loss_mask: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: GSPO. Per sequence, computes the geometric-mean ratio (exp of masked mean
+    # log_ratio) and mean masked advantage, broadcast back to each token and zeroed
+    # where loss_mask is False. 1D input requires cu_seqlens (ValueError otherwise) and
+    # uses scatter_add over a token-to-sequence index; 2D input reduces over dim 1.
+    # Valid counts are clamped to at least 1. Returns (ratio, advantages) with input
+    # shape; gradients flow through log_ratio.
     """Compute sequence-level geometric mean ratios and average advantages per sequence (GSPO).
 
     Args:
@@ -151,6 +173,10 @@ def _compute_sequence_level_ratio_and_advantages(
 
 @dataclass
 class RejectionSamplingResult:
+    # [CLASS DOC]
+    # Dataclass returned by apply_rejection_sampling: updated loss_mask, per-token
+    # behavior importance weight (zeroed outside the mask), and fraction of valid tokens
+    # filtered/clamped (python float).
     """Result of rejection sampling, used by ppo_actor_loss_fn.
 
     Attributes:
@@ -167,6 +193,9 @@ class RejectionSamplingResult:
 def _check_bounds(
     metric: torch.Tensor, config: RejectionSamplingConfig
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Returns a bool tensor, True where metric <= config.upper and, if
+    # config.lower is set, also >= config.lower.
     """Check if metric values are within configured bounds.
 
     Args:
@@ -189,6 +218,20 @@ def apply_rejection_sampling(
     cu_seqlens: torch.Tensor | None,
     config: RejectionSamplingConfig,
 ) -> RejectionSamplingResult:
+    # [FUNCTION DOC]
+    # Filters or truncates tokens by staleness between proximal and behavior policies.
+    # Validates equal shapes and ndim 1 or 2 (ValueError). Computes fp32 log_ratio (non-
+    # finite -> 0) and a metric per config.metric: "ratio" (exp log_ratio),
+    # "kl_k1/k2/k3" (KLEstimator approximations, unclamped), "binary_kl" (max of forward
+    # and reverse Bernoulli KL); unknown -> ValueError. Initial weight is
+    # exp(log_ratio). Token level: mask mode keeps tokens in bounds, clamp mode clamps
+    # weights to [lower or 0, upper]. Sequence level (1D via cu_seqlens, required; or 2D
+    # per row): aggregates per sequence by config.agg (sum, mean, max; ratio metric
+    # aggregated in log space so mean = geometric mean, and the weight becomes the
+    # sequence geometric mean for every token); all-masked sequences count as in-bounds
+    # for max; then mask whole sequences or clamp weights of out-of-bounds sequences.
+    # Finally computes updated mask and filtered/clamped fraction (.item() syncs) and
+    # zeroes weights outside the mask. Returns RejectionSamplingResult.
     """Apply rejection sampling based on divergence between proximal and behavior policy.
 
     Supports two action modes:
@@ -440,6 +483,10 @@ def apply_rejection_sampling(
 def compute_binary_kl_divergence(
     log_p: torch.Tensor, log_q: torch.Tensor, eps: float = 1e-8
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Elementwise KL(P||Q) between Bernoulli distributions whose success probabilities
+    # are exp(log_p) and exp(log_q), clamped to [eps, 1-eps]. Returns a tensor of input
+    # shape.
     """KL(P||Q) for Bernoulli distributions parameterized by log-probabilities.
     Treats each element as a Bernoulli: P = [p, 1-p], Q = [q, 1-q].
     KL(P||Q) = p*log(p/q) + (1-p)*log((1-p)/(1-q))
@@ -462,6 +509,19 @@ def ppo_actor_loss_fn(
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
+    # [FUNCTION DOC]
+    # PPO clipped surrogate actor loss. Optionally applies rejection sampling first
+    # (narrowing loss_mask in mask mode, giving behave_imp_weight). Ratio
+    # pi_theta/pi_proximal is per token (zeroed outside the original mask) or GSPO
+    # sequence-level (also replacing advantages by sequence means). Loss per token is
+    # max(-A*r, -A*clip(r, 1-eps_clip, 1+eps_clip_higher or eps_clip)); with c_clip
+    # (asserted > 1) dual clipping caps it at c_clip*|A|. Multiplies by
+    # behave_imp_weight when rejection sampling is on. Returns (scalar loss = masked sum
+    # over narrowed mask divided by ORIGINAL valid count, stats) where stats has per-
+    # token loss, importance_weight, approx_kl, clip and dual-clip masks (on the
+    # original mask), token counts and masked ratio (one .item() sync), plus
+    # behave_approx_kl, behave_imp_weight, behave_mask and filtered_fraction when
+    # rejection sampling is used. Invalid importance_sampling_level raises ValueError.
     """PPO actor loss function with optional rejection sampling.
 
     The ``rejection_sampling`` parameter replaces the removed
@@ -606,6 +666,15 @@ def sapo_loss_fn(
     importance_sampling_level: str = "token",
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
+    # [FUNCTION DOC]
+    # SAPO loss: replaces clipping with soft sigmoid gates. Ratio is exp(logprobs -
+    # old_logprobs) per token or GSPO sequence-level. Gate is sigmoid(tau*(ratio-1))
+    # scaled by 4/tau, using tau_pos for positive advantages and tau_neg otherwise; per-
+    # token loss is -gate*advantage (advantages detached). Returns (masked sum / valid
+    # count, stats with PPO-compatible keys, all-false clip masks, and sapo_* gate
+    # stats). Raises ValueError for non-positive temperatures or invalid level.
+    # KNOWN ISSUE: the per-token loss is -gate*A with A detached, so the gradient flows
+    # only through the gate (as intended by SAPO); stats "approx_kl" is raw log ratio.
     """SAPO (Soft Adaptive Policy Optimization) loss with asymmetric sigmoid gates.
 
     SAPO replaces PPO clipping with soft sigmoid gates, providing smooth gradients.
@@ -686,6 +755,14 @@ def cispo_loss_fn(
     rejection_sampling: RejectionSamplingConfig | None = None,
     cu_seqlens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
+    # [FUNCTION DOC]
+    # CISPO loss (MiniMax-M1): per-token loss -stopgrad(clip(ratio, 1-eps_clip,
+    # 1+eps_clip_higher)) * advantage * logprobs, with ratio exp(logprobs - proximal)
+    # detached and advantages detached. Optional rejection sampling (needs old_logprobs)
+    # narrows mask and multiplies by behave_imp_weight. Returns (masked sum / original
+    # valid count, stats) with loss, unclipped importance_weight, approx_kl, clip_mask
+    # (ratio left band, valid tokens), zero dual_clip_mask and behave_* stats when
+    # rejection sampling is on. Raises ValueError if eps_clip_higher is None or <= 0.
     """CISPO (Clipped IS-weight Policy Optimization) loss from MiniMax-M1.
 
     PPO/GRPO-style clipping zeroes the gradient of any token whose
@@ -800,6 +877,12 @@ def dpo_pair_logratios(
     loss_mask: torch.Tensor,
     valid_pairs: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Sums masked per-sequence logprobs for policy and reference over a packed batch of
+    # interleaved (chosen, rejected) sequences. Shifts loss_mask left by one (last
+    # element zero) and zeros each sequence's final position; accumulates in float64 via
+    # index_add. Returns (policy_logps, ref_logps, completion_lens) each [K, 2] for the
+    # valid pairs selected by the bool mask valid_pairs. Assumes an even sequence count.
     """Aggregate per-sequence masked logprobs over a packed batch and pair them up.
 
     Sequences are packed and interleaved as ``[chosen_0, rejected_0, chosen_1,
@@ -844,6 +927,10 @@ def dpo_pair_logratios(
 def dpo_preference_loss(
     logits: torch.Tensor, *, beta: float, loss_type: str = "sigmoid"
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Per-pair DPO loss from log-ratio logits: "sigmoid" gives -logsigmoid(beta*logits);
+    # "ipo" gives (logits - 1/(2*beta))^2 (logits must be length-normalized). Computed
+    # in float32. Raises ValueError for other loss types.
     """Per-pair preference loss from DPO log-ratio logits.
 
     For ``"sigmoid"``, ``logits`` is the un-normalized pair delta.
@@ -858,11 +945,15 @@ def dpo_preference_loss(
 
 
 def _huber_loss(x: torch.Tensor, y: torch.Tensor, delta: float):
+    # [FUNCTION DOC]
+    # HELPER: Elementwise Huber loss with threshold delta.
     diff = torch.abs(x - y)
     return torch.where(diff < delta, 0.5 * diff**2, delta * (diff - 0.5 * delta))
 
 
 def _mse_loss(x: torch.Tensor, y: torch.Tensor):
+    # [FUNCTION DOC]
+    # HELPER: Elementwise half squared error.
     return 0.5 * (x - y) ** 2
 
 
@@ -874,6 +965,13 @@ def ppo_critic_loss_fn(
     loss_mask: torch.Tensor | None = None,
     loss_fn_type: str = "mse",
 ) -> tuple[torch.Tensor, dict]:
+    # [FUNCTION DOC]
+    # PPO value loss with value clipping: max(loss(value, target), loss(old +
+    # clamp(value - old, +-eps), target)) using MSE or Huber (delta 10). Asserts all
+    # inputs are float32; clones target if it is an inference tensor;
+    # NotImplementedError for unknown loss type. Returns (masked mean or plain mean,
+    # stats with clip_mask where the clipped loss was larger and per-element loss).
+    # KNOWN ISSUE: with a loss_mask of all zeros the masked mean divides by zero (NaN).
     """Compute PPO critic loss function given padded batch inputs.
 
     There is no shape requirements for the inputs, but they must have the same shape.
@@ -940,6 +1038,12 @@ def reward_overlong_penalty(
     overlong_penalty_factor: float,
     max_response_length: int,
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # DAPO overlong penalty. For each sample, response length = loss_mask row sum; if it
+    # exceeds max_response_length - overlong_tokens, adds a linear penalty
+    # -(excess/overlong_tokens)*overlong_penalty_factor (never positive) to rewards.
+    # Mutates and returns data (rewards tensor modified in place). Python loop over
+    # batch, 2D inputs.
     reward_score = data["rewards"]
     input_ids = data["input_ids"]
     response_lengths = (data["loss_mask"].sum(dim=-1)).long()

@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Hugging Face helpers: version-normalized chat template application, cached tokenizer
+# and processor loading, and download of files referenced by hf:// style URIs.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -21,6 +24,8 @@ def apply_chat_template(
     tokenize: Literal[True] = ...,
     **kwargs: Any,
 ) -> list[int]: ...
+    # [FUNCTION DOC]
+    # Typing overload: with tokenize=True (default) returns token ids list[int].
 
 
 @overload
@@ -31,6 +36,8 @@ def apply_chat_template(
     tokenize: Literal[False],
     **kwargs: Any,
 ) -> str: ...
+    # [FUNCTION DOC]
+    # Typing overload: with tokenize=False returns the rendered prompt string.
 
 
 def apply_chat_template(
@@ -40,6 +47,10 @@ def apply_chat_template(
     tokenize: bool = True,
     **kwargs: Any,
 ) -> list[int] | str:
+    # [FUNCTION DOC]
+    # Calls tokenizer.apply_chat_template(messages, tokenize, **kwargs). When tokenizing
+    # on transformers >= 5.0 (which returns a dict-like), extracts and returns list of
+    # "input_ids"; otherwise returns the raw result (list of ids or string).
     """Apply chat template, normalising transformers >=5.0 dict return to list[int]."""
     result = tokenizer.apply_chat_template(messages, tokenize=tokenize, **kwargs)
     if tokenize and pkg_version.is_version_greater_or_equal("transformers", "5.0"):
@@ -53,6 +64,13 @@ def load_hf_tokenizer(
     fast_tokenizer=True,
     padding_side: str | None = None,
 ) -> transformers.PreTrainedTokenizerFast:
+    # [FUNCTION DOC]
+    # Loads an AutoTokenizer (trust_remote_code, optional padding_side) and sets
+    # pad_token_id to eos_token_id when missing. LRU-cached on arguments (max 8), so
+    # callers share and may mutate the same tokenizer object. Side effect: may download
+    # from the Hub.
+    # KNOWN ISSUE: passes "fast_tokenizer" to from_pretrained, which is not the HF kwarg
+    # ("use_fast"), so the flag is likely ignored.
     kwargs = {}
     if padding_side is not None:
         kwargs["padding_side"] = padding_side
@@ -74,6 +92,10 @@ def load_hf_processor_and_tokenizer(
     fast_tokenizer=True,
     padding_side: str | None = None,
 ) -> tuple[transformers.ProcessorMixin | None, transformers.PreTrainedTokenizerFast]:
+    # [FUNCTION DOC]
+    # Returns (processor or None, tokenizer). Tokenizer via load_hf_tokenizer; processor
+    # via AutoProcessor (trust_remote_code, use_fast). Any processor load exception is
+    # swallowed, logging a warning and returning None. LRU-cached (max 8).
     """Load a tokenizer and processor from Hugging Face."""
     # NOTE: use the raw type annoation will trigger cuda initialization
     tokenizer = load_hf_tokenizer(model_name_or_path, fast_tokenizer, padding_side)
@@ -96,6 +118,10 @@ def load_hf_processor_and_tokenizer(
 def download_from_huggingface(
     repo_id: str, filename: str, revision: str = "main", repo_type: str = "dataset"
 ) -> str:
+    # [FUNCTION DOC]
+    # Downloads one file from a Hub repo via huggingface_hub.hf_hub_download (lazy
+    # import; ImportError with install hint if missing) and returns the local cached
+    # path. Network I/O.
     """
     Download a file from a HuggingFace Hub repository.
     """
@@ -115,6 +141,13 @@ def download_from_huggingface(
 
 
 def load_hf_or_local_file(path: str) -> str:
+    # [FUNCTION DOC]
+    # If path starts with "hf://" or "hf-dataset://", parses
+    # "<org>/<repo>[@revision]/<file>", downloads it (repo_type always "dataset") and
+    # returns the local path; otherwise returns the path string unchanged.
+    # KNOWN ISSUE: "hf://" is documented as a model URI but repo_type is always
+    # "dataset" (the model branch is commented out); the docstring example cache path
+    # also says "models--".
     """
     Load a file from a HuggingFace Hub repository or a local file.
     hf://<org>/<repo>/<filename>

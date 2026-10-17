@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Triton kernels and Python launchers for the destructive (in-place) vocab-parallel
+# logprob/entropy path. All kernels operate on contiguous 2D CUDA FP32 [rows,
+# vocab_shard] tensors with a 2D launch grid (row, column tile of _BLOCK_SIZE=1024). If
+# Triton is not importable, TRITON_AVAILABLE is False, kernels are not defined and
+# launchers raise.
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
@@ -28,6 +34,12 @@ if TRITON_AVAILABLE:
         inv_temperature,
         BLOCK_SIZE: tl.constexpr,
     ):
+        # [FUNCTION DOC]
+        # Triton kernel: for one row and column tile, loads logits, computes shifted =
+        # (logit - row_max) * inv_temperature and exp(shifted), stores the exponentials
+        # in place, and writes the tile's sum of exp and sum of shifted*exp into
+        # partial_sums / partial_weighted_sums at [row, tile] (deterministic, no
+        # atomics).
         row = tl.program_id(axis=0)
         tile = tl.program_id(axis=1)
         cols = tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -56,6 +68,9 @@ if TRITON_AVAILABLE:
         n_cols,
         BLOCK_SIZE: tl.constexpr,
     ):
+        # [FUNCTION DOC]
+        # Triton kernel: divides each element of a row tile in place by that row's
+        # sum_exp, turning exponentials into softmax probabilities.
         row = tl.program_id(axis=0)
         tile = tl.program_id(axis=1)
         cols = tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -78,6 +93,11 @@ if TRITON_AVAILABLE:
         HAS_LOGPROBS_GRAD: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
+        # [FUNCTION DOC]
+        # Triton kernel: overwrites softmax in place with the logprob gradient w.r.t.
+        # logits: (one_hot(target) - p) * grad_logprob * inv_temperature, where the one-
+        # hot term applies only when the local target is >= 0 (label in this shard).
+        # Without HAS_LOGPROBS_GRAD writes zeros.
         row = tl.program_id(axis=0)
         tile = tl.program_id(axis=1)
         cols = tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -110,6 +130,11 @@ if TRITON_AVAILABLE:
         HAS_LOGPROBS_GRAD: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
+        # [FUNCTION DOC]
+        # Triton kernel: like the softmax backward but recomputes probabilities from raw
+        # logits, row_max and sum_exp (exp((x - max)*inv_temperature)/sum_exp), and
+        # additionally scales the stored gradient by logit_scale. Writes in place into
+        # logits.
         row = tl.program_id(axis=0)
         tile = tl.program_id(axis=1)
         cols = tile * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -138,6 +163,9 @@ if TRITON_AVAILABLE:
 
 
 def _check_input(tensor: torch.Tensor) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Validates that Triton is available (RuntimeError) and that tensor is a
+    # CUDA float32 contiguous 2D tensor (ValueError otherwise).
     if not TRITON_AVAILABLE:
         raise RuntimeError("Triton is required for fused vocab-parallel kernels")
     if not tensor.is_cuda or tensor.dtype is not torch.float32:
@@ -153,6 +181,10 @@ def fused_exp_sum_inplace(
     partial_weighted_sums: torch.Tensor,
     inv_temperature: float,
 ) -> None:
+    # [FUNCTION DOC]
+    # Launches _exp_sum_inplace_kernel over (rows, tiles) after validation. Inputs:
+    # logits [R, V] (overwritten with exponentials), row_max [R], partial_sums and
+    # partial_weighted_sums [R, tiles] outputs, inv_temperature. Returns None.
     """Overwrite logits with shifted exponentials and emit deterministic tile sums."""
     _check_input(logits)
     n_rows, n_cols = logits.shape
@@ -176,6 +208,9 @@ def fused_normalize_inplace(
     logits: torch.Tensor,
     sum_exp: torch.Tensor,
 ) -> None:
+    # [FUNCTION DOC]
+    # Launches _normalize_inplace_kernel to divide logits rows (holding exponentials) by
+    # sum_exp [R] in place. Returns None.
     """Overwrite exponentials with normalized softmax probabilities."""
     _check_input(logits)
     n_rows, n_cols = logits.shape
@@ -197,6 +232,10 @@ def fused_softmax_backward_inplace(
     grad_logprobs: torch.Tensor | None,
     inv_temperature: float,
 ) -> None:
+    # [FUNCTION DOC]
+    # Launches _softmax_backward_inplace_kernel turning softmax [R, V] into dlogits in
+    # place given local_targets [R] (-1 if not local) and optional grad_logprobs [R] (a
+    # dummy pointer is passed when None). Returns None.
     """Overwrite softmax with the selected-token logprob gradient."""
     _check_input(softmax)
     n_rows, n_cols = softmax.shape
@@ -225,6 +264,11 @@ def fused_logits_backward_inplace(
     inv_temperature: float,
     logit_scale: float = 1.0,
 ) -> None:
+    # [FUNCTION DOC]
+    # Launches _logits_backward_inplace_kernel turning recomputed logits [R, V] into
+    # dlogits in place from row_max, sum_exp, local_targets, optional grad_logprobs,
+    # inv_temperature and logit_scale. Returns None. (Not used by vocab_parallel.py in
+    # this module set.)
     """Overwrite recomputed logits with selected-token logprob gradients."""
     _check_input(logits)
     n_rows, n_cols = logits.shape
@@ -248,6 +292,11 @@ def fused_logits_backward_inplace(
 
 
 def reusable_vocab_parallel_logits(logits: torch.Tensor) -> torch.Tensor | None:
+    # [FUNCTION DOC]
+    # Returns a tensor safe to overwrite for the in-place path, or None. If logits is a
+    # view, it must be contiguous, start at offset 0, cover all of its contiguous base,
+    # and the base is used instead. The workspace must be CUDA float32 contiguous, not a
+    # leaf (so it is an intermediate autograd result), and Triton must be available.
     """Return logits when they exclusively cover their underlying storage."""
     workspace = logits
     if logits._base is not None:
@@ -273,8 +322,13 @@ def reusable_vocab_parallel_logits(logits: torch.Tensor) -> torch.Tensor | None:
 
 
 def fused_vocab_parallel_available(logits: torch.Tensor) -> bool:
+    # [FUNCTION DOC]
+    # True if reusable_vocab_parallel_logits returns a workspace for logits.
     return reusable_vocab_parallel_logits(logits) is not None
 
 
 def vocab_tile_count(vocab_size: int) -> int:
+    # [FUNCTION DOC]
+    # Returns the number of _BLOCK_SIZE column tiles needed for vocab_size (ceil
+    # division).
     return (vocab_size + _BLOCK_SIZE - 1) // _BLOCK_SIZE

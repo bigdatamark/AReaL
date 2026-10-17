@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Networking helpers: host name/IP discovery, loopback detection, IPv6-aware host:port
+# formatting and parsing, and random free-port discovery by bind probing.
 # SPDX-License-Identifier: Apache-2.0
 
 import random
@@ -6,10 +9,20 @@ from ipaddress import ip_address
 
 
 def gethostname():
+    # [FUNCTION DOC]
+    # Returns socket.gethostname().
     return socket.gethostname()
 
 
 def gethostip(probe_host: str = "8.8.8.8", probe_port: int = 80) -> str:
+    # [FUNCTION DOC]
+    # Returns a non-loopback local IP. First resolves the hostname (any family) and
+    # returns the first non-127.* IPv4 or non-::1 IPv6 address. Otherwise opens a UDP
+    # socket "connected" to probe_host:probe_port (no packets sent) and returns its
+    # local address; if that fails, tries the same over IPv6 to Google DNS. Raises
+    # RuntimeError if IPv6 also errors.
+    # KNOWN ISSUE: if the IPv6 probe succeeds but yields "::1", the function implicitly
+    # returns None instead of raising, contradicting the str return type.
     """
     Find the local IP address for outbound route to `probe_host:probe_port`.
 
@@ -54,6 +67,9 @@ def gethostip(probe_host: str = "8.8.8.8", probe_port: int = 80) -> str:
 
 
 def get_loopback_ip() -> str:
+    # [FUNCTION DOC]
+    # Returns "127.0.0.1" if a TCP socket can bind there, else "::1" if IPv6 is
+    # available and bindable, else raises RuntimeError.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("127.0.0.1", 0))
@@ -71,6 +87,9 @@ def get_loopback_ip() -> str:
 
 
 def format_host_for_url(host: str) -> str:
+    # [FUNCTION DOC]
+    # Wraps bare IPv6 hosts (containing ":") in brackets for URLs; leaves bracketed
+    # hosts and IPv4/hostnames unchanged.
     if host.startswith("[") and host.endswith("]"):
         return host
     if ":" in host:
@@ -79,10 +98,17 @@ def format_host_for_url(host: str) -> str:
 
 
 def format_hostport(host: str, port: int) -> str:
+    # [FUNCTION DOC]
+    # Returns "<host>:<port>" with the host URL-formatted (IPv6 bracketed).
     return f"{format_host_for_url(host)}:{port}"
 
 
 def split_hostport(addr: str) -> tuple[str, int]:
+    # [FUNCTION DOC]
+    # Parses "host:port", "[ipv6]:port" or bare "ipv6:port" into (host, int port).
+    # Bracketed and multi-colon forms require the host (zone id after "%" ignored) to be
+    # a valid IP; raises ValueError otherwise or on malformed brackets. int() errors on
+    # bad ports propagate as ValueError. Hosts are returned without brackets.
     if addr.startswith("["):
         end = addr.find("]")
         if end == -1:
@@ -116,6 +142,11 @@ def find_free_ports(
     port_range: tuple = (10000, 32767),
     exclude_ports: set[int] | None = None,
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # Returns a sorted list of count distinct random ports within port_range (inclusive)
+    # that are not in exclude_ports and pass is_port_free. Raises ValueError if the
+    # range minus in-range exclusions is too small, or if fewer were found within
+    # count*10 attempts. Inherently racy: ports may be taken after the check.
     """
     Find multiple free ports within a specified range.
 
@@ -179,6 +210,9 @@ def find_free_ports(
 
 
 def is_port_free(port: int) -> bool:
+    # [FUNCTION DOC]
+    # Returns True iff the port can be bound on all interfaces for both TCP and UDP
+    # (IPv4); sockets are closed immediately.
     """
     Check if a port is free by attempting to bind to it.
 

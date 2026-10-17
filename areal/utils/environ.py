@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Environment-variable helpers: string lookup with fallback names, boolean parsing with
+# one-time warnings for unrecognized values, mode checks (CI, single-controller vs
+# SPMD), and rank filtering from comma/range env lists. Uses module-level sets to dedupe
+# warnings.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -17,6 +22,9 @@ def get_env_var(
     fallback_names: tuple[str, ...] = (),
     allow_empty: bool = False,
 ) -> str | None:
+    # [FUNCTION DOC]
+    # Returns the first value among name and fallback_names that is set (and non-blank
+    # unless allow_empty), else default. Reads os.environ only.
     """Read an environment variable with ordered fallback names.
 
     Empty values are skipped by default so a legacy name can supply the value.
@@ -40,6 +48,13 @@ def get_bool_env_var(
     falsy_values: tuple[str, ...] = ("false", "0"),
     strip_value: bool = False,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Reads a boolean env var via get_env_var (empty explicit values allowed only when
+    # there are no fallbacks), optionally strips, lowercases, and returns True iff it is
+    # in truthy_values. Unrecognized values log a warning and count as False. Default
+    # "false". Asserts the resolved value is not None (fails if default=None and unset).
+    # KNOWN ISSUE: the warning dedupe set is keyed by the value, not the variable name,
+    # so the same bad value in different variables warns only once.
     """Read a boolean environment variable.
 
     The default accepted values remain backward compatible. Callers that
@@ -68,14 +83,23 @@ def get_bool_env_var(
 
 
 def is_in_ci():
+    # [FUNCTION DOC]
+    # True if env AREAL_IS_IN_CI is truthy.
     return get_bool_env_var("AREAL_IS_IN_CI")
 
 
 def is_single_controller():
+    # [FUNCTION DOC]
+    # True unless env AREAL_SPMD_MODE is truthy (single-controller is the default mode).
     return not get_bool_env_var("AREAL_SPMD_MODE")
 
 
 def rank_in_env_filter(name: str, rank: int) -> bool:
+    # [FUNCTION DOC]
+    # Parses env var name as a rank filter: unset/blank or "all" selects every rank;
+    # otherwise comma-separated ints and inclusive "a-b" ranges. Invalid parts (non-int,
+    # reversed range) are ignored with a once-per-(name, value) warning. Returns whether
+    # rank is selected.
     """Return whether rank is selected by a comma/range env filter.
 
     Empty or unset values mean all ranks. Accepted examples: ``0``, ``0,2``,

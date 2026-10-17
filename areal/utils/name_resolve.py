@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Simple name-resolving service: a distributed key-value store with path-like keys used
+# for service discovery across processes. Defines the abstract NameRecordRepository and
+# backends: in-process memory (tests), NFS/shared filesystem (one ENTRY file per key
+# directory), etcd3 (with TTL leases and native watches) and Ray (a detached actor KV
+# store). Also exposes module-level functions (add, get, wait, ...) bound to a
+# DEFAULT_REPOSITORY (NFS with empty root until reconfigure is called).
 # SPDX-License-Identifier: Apache-2.0
 
 # Implements a simple name resolving service, which can be considered as a distributed key-value dict.
@@ -30,19 +37,32 @@ RAY_NAME_RESOLVE_NAMESPACE = "areal_name_resolve"
 
 
 class ArgumentError(Exception):
+    # [CLASS DOC]
+    # Raised for invalid arguments to name resolve operations (not raised in this
+    # module).
     pass
 
 
 class NameEntryExistsError(Exception):
+    # [CLASS DOC]
+    # Raised when adding an existing key without replace.
     pass
 
 
 class NameEntryNotFoundError(Exception):
+    # [CLASS DOC]
+    # Raised when a requested key does not exist.
     pass
 
 
 class NameRecordRepository:
+    # [CLASS DOC]
+    # Abstract repository interface. Subclasses implement add, delete, clear_subtree,
+    # get, get_subtree, find_subtree and reset; this base provides add_subentry, polling
+    # wait and thread-based watch_names, and calls reset on garbage collection.
     def __del__(self):
+        # [FUNCTION DOC]
+        # Calls reset() on destruction, logging (INFO) and ignoring any exception.
         try:
             self.reset()
         except Exception as e:
@@ -56,6 +76,9 @@ class NameRecordRepository:
         keepalive_ttl=None,
         replace=False,
     ):
+        # [FUNCTION DOC]
+        # Abstract: store value under name, with delete_on_exit, optional keepalive TTL
+        # and replace semantics (see docstring). Always raises NotImplementedError here.
         """Creates a name record in the central repository.
 
         In our semantics, the name record repository is essentially a multimap (i.e. Dict[str, Set[str]]).
@@ -80,6 +103,9 @@ class NameRecordRepository:
         raise NotImplementedError()
 
     def add_subentry(self, name, value, **kwargs):
+        # [FUNCTION DOC]
+        # Adds value under "<normpath(name)>/<8-char uuid>" via add (kwargs forwarded)
+        # and returns the generated sub-key.
         """Adds a sub-entry to the key-root `name`.
 
         The values is retrievable by get_subtree() given that no other
@@ -90,16 +116,22 @@ class NameRecordRepository:
         return sub_name
 
     def delete(self, name):
+        # [FUNCTION DOC]
+        # Abstract delete; raises NotImplementedError.
         """Deletes an existing record."""
         raise NotImplementedError()
 
     def clear_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Abstract prefix delete; raises NotImplementedError.
         """Deletes all records whose names start with the path root name_root;
         specifically, whose name either is `name_root`, or starts with
         `name_root.rstrip("/") + "/"`."""
         raise NotImplementedError()
 
     def get(self, name):
+        # [FUNCTION DOC]
+        # Abstract get; raises NotImplementedError.
         """Returns the value of the key.
 
         Raises NameEntryNotFoundError if not found.
@@ -107,16 +139,24 @@ class NameRecordRepository:
         raise NotImplementedError()
 
     def get_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Abstract prefix value listing; raises NotImplementedError.
         """Returns all values whose names start with the path root name_root;
         specifically, whose name either is `name_root`, or starts with
         `name_root.rstrip("/") + "/"`."""
         raise NotImplementedError()
 
     def find_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Abstract prefix key listing; raises NotImplementedError.
         """Returns all KEYS whose names start with the path root name_root."""
         raise NotImplementedError()
 
     def wait(self, name, timeout=None, poll_frequency=1):
+        # [FUNCTION DOC]
+        # Polls get(name) until it exists and returns its value, sleeping poll_frequency
+        # plus up to 0.1s jitter between tries (no sleep when timeout <= 0). Raises
+        # TimeoutError after timeout seconds; None waits forever.
         """Waits until a name appears.
 
         Raises:
@@ -138,6 +178,8 @@ class NameRecordRepository:
                 )
 
     def reset(self):
+        # [FUNCTION DOC]
+        # Abstract: delete all entries this instance added with delete_on_exit.
         """Deletes all entries added via this repository instance's
         add(delete_on_exit=True)."""
         raise NotImplementedError()
@@ -149,6 +191,12 @@ class NameRecordRepository:
         poll_frequency=15,
         wait_timeout=300,
     ):
+        # [FUNCTION DOC]
+        # Watches names (str or list) and calls call_back once when the LAST remaining
+        # watched key disappears: a queue pre-filled with len-1 tokens is drained by
+        # each deletion and the callback fires on the deletion that finds it empty.
+        # Starts one daemon thread per name running _watch_thread_run. Returns
+        # immediately.
         """Watch a name, execute call_back when key is deleted."""
         if isinstance(names, str):
             names = [names]
@@ -158,6 +206,8 @@ class NameRecordRepository:
             q.put(0)
 
         def wrap_call_back():
+            # [FUNCTION DOC]
+            # HELPER: Consumes one token; when none are left logs and invokes call_back.
             try:
                 q.get_nowait()
             except queue.Empty:
@@ -173,6 +223,10 @@ class NameRecordRepository:
             t.start()
 
     def _watch_thread_run(self, name, call_back, poll_frequency, wait_timeout):
+        # [FUNCTION DOC]
+        # HELPER: Thread body: waits up to wait_timeout for name to appear (TimeoutError
+        # ends the thread silently), then polls every poll_frequency(+jitter) seconds
+        # until get raises NameEntryNotFoundError, then calls call_back once.
         self.wait(name, timeout=wait_timeout, poll_frequency=poll_frequency)
         while True:
             try:
@@ -184,6 +238,9 @@ class NameRecordRepository:
 
 
 class MemoryNameRecordRepository(NameRecordRepository):
+    # [CLASS DOC]
+    # In-process dict-backed repository; for tests only. Keys are normpath-ed. Optional
+    # event printing.
     """Stores all the records in a thread-local memory.
 
     Note that this is most likely for testing purposes:
@@ -191,6 +248,8 @@ class MemoryNameRecordRepository(NameRecordRepository):
     """
 
     def __init__(self, log_events=False):
+        # [FUNCTION DOC]
+        # Initializes the private store dict, the to-delete set and the log_events flag.
         self.__store = {}
         self.__to_delete = set()
         self.__log_events = log_events
@@ -203,6 +262,10 @@ class MemoryNameRecordRepository(NameRecordRepository):
         keepalive_ttl=None,
         replace=False,
     ):
+        # [FUNCTION DOC]
+        # Stores str(value) under normpath(name). Raises ValueError for empty names and
+        # NameEntryExistsError if present and not replace. Records name for deletion on
+        # reset if delete_on_exit. keepalive_ttl is ignored. Prints when log_events.
         if not name:
             raise ValueError(f"Invalid name: {name}")
         name = os.path.normpath(name)
@@ -215,9 +278,16 @@ class MemoryNameRecordRepository(NameRecordRepository):
             self.__to_delete.add(name)
 
     def touch(self, name, value, new_time_to_live):
+        # [FUNCTION DOC]
+        # Not supported; raises NotImplementedError.
         raise NotImplementedError()
 
     def delete(self, name):
+        # [FUNCTION DOC]
+        # Deletes name (not normpath-ed) or raises NameEntryNotFoundError; drops it from
+        # the to-delete set.
+        # KNOWN ISSUE: unlike add/get, the name is not normalized, so non-normalized
+        # names miss.
         if self.__log_events:
             print(f"NameResolve: delete {name}")
         if name not in self.__store:
@@ -227,6 +297,9 @@ class MemoryNameRecordRepository(NameRecordRepository):
         del self.__store[name]
 
     def clear_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Deletes every key equal to normpath(name_root) or under it ("/" clears all),
+        # also removing them from the to-delete set.
         if self.__log_events:
             print(f"NameResolve: clear_subtree {name_root}")
         name_root = os.path.normpath(name_root)
@@ -241,6 +314,8 @@ class MemoryNameRecordRepository(NameRecordRepository):
                 del self.__store[name]
 
     def get(self, name):
+        # [FUNCTION DOC]
+        # Returns the value for normpath(name) or raises NameEntryNotFoundError.
         name = os.path.normpath(name)
         if name not in self.__store:
             raise NameEntryNotFoundError(f"K={name}")
@@ -250,6 +325,9 @@ class MemoryNameRecordRepository(NameRecordRepository):
         return r
 
     def get_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Returns values of keys equal to or under normpath(name_root), in insertion
+        # order.
         if self.__log_events:
             print(f"NameResolve: get_subtree {name_root}")
         name_root = os.path.normpath(name_root)
@@ -264,6 +342,9 @@ class MemoryNameRecordRepository(NameRecordRepository):
         return rs
 
     def find_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Returns sorted keys equal to or under name_root.
+        # KNOWN ISSUE: name_root is not normpath-ed here, unlike get_subtree.
         if self.__log_events:
             print(f"NameResolve: find_subtree {name_root}")
         rs = []
@@ -278,17 +359,30 @@ class MemoryNameRecordRepository(NameRecordRepository):
         return rs
 
     def reset(self):
+        # [FUNCTION DOC]
+        # Removes all to-delete keys from the store and clears the set.
+        # KNOWN ISSUE: pop raises KeyError if such a key was already removed by other
+        # means.
         for name in self.__to_delete:
             self.__store.pop(name)
         self.__to_delete = set()
 
 
 class NfsNameRecordRepository(NameRecordRepository):
+    # [CLASS DOC]
+    # Filesystem-backed repository for a shared (NFS/CPFS) directory: each key maps to
+    # <record_root>/<key>/ENTRY containing the value. Works across nodes sharing the FS.
     def __init__(self, record_root="", **kwargs):
+        # [FUNCTION DOC]
+        # Stores record_root (may be empty until configured) and an empty to-delete set.
+        # Extra kwargs ignored.
         self.__to_delete = set()
         self.record_root = record_root
 
     def __dir_path(self, name):
+        # [FUNCTION DOC]
+        # HELPER: Returns record_root joined with name; raises RuntimeError if
+        # record_root is empty.
         if not self.record_root:
             raise RuntimeError(
                 "The `record_root` of NfsNameRecordRepository is not properly reconfigured."
@@ -296,6 +390,8 @@ class NfsNameRecordRepository(NameRecordRepository):
         return os.path.join(self.record_root, name)
 
     def __file_path(self, name):
+        # [FUNCTION DOC]
+        # HELPER: Returns the ENTRY file path for name.
         return os.path.join(self.__dir_path(name), "ENTRY")
 
     def add(
@@ -306,6 +402,11 @@ class NfsNameRecordRepository(NameRecordRepository):
         keepalive_ttl=None,
         replace=False,
     ):
+        # [FUNCTION DOC]
+        # Writes str(value) atomically (temp file + rename) to the key's ENTRY file,
+        # creating directories (retrying on transient NotADirectory/FileNotFound races).
+        # Raises ValueError for empty names, NameEntryExistsError if the file exists and
+        # not replace. TTL ignored. Tracks for deletion if delete_on_exit.
         if not name:
             raise ValueError("Name cannot be empty")
         name = os.path.normpath(name)
@@ -328,6 +429,9 @@ class NfsNameRecordRepository(NameRecordRepository):
             self.__to_delete.add(name)
 
     def delete(self, name):
+        # [FUNCTION DOC]
+        # Removes the ENTRY file (NameEntryNotFoundError if absent), then removes now-
+        # empty parent directories up to record_root, and untracks the name.
         path = self.__file_path(name)
         if not os.path.isfile(path):
             raise NameEntryNotFoundError(path)
@@ -343,6 +447,9 @@ class NfsNameRecordRepository(NameRecordRepository):
             self.__to_delete.remove(name)
 
     def clear_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Recursively deletes the directory for name_root if it exists, logging either
+        # way.
         dir_path = self.__dir_path(name_root)
         if os.path.isdir(dir_path):
             logger.info("Removing name resolve path: %s", dir_path)
@@ -351,6 +458,10 @@ class NfsNameRecordRepository(NameRecordRepository):
             logger.info("No such name resolve path: %s", dir_path)
 
     def get(self, name):
+        # [FUNCTION DOC]
+        # Reads and returns the stripped ENTRY contents for normpath(name). Raises
+        # NameEntryNotFoundError if missing; retries up to 100 times (5 ms) on ESTALE
+        # (errno 116), then raises RuntimeError; other OSErrors propagate.
         name = os.path.normpath(name)
         path = self.__file_path(name)
         if not os.path.isfile(path):
@@ -368,6 +479,10 @@ class NfsNameRecordRepository(NameRecordRepository):
         raise RuntimeError(f"Failed to read value for {name}")
 
     def get_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Walks the name_root directory and returns values of every directory containing
+        # exactly one file named ENTRY (keys vanishing mid-walk are skipped). Order
+        # follows os.walk.
         dir_path = self.__dir_path(name_root)
         rs = []
         if os.path.isdir(dir_path):
@@ -385,6 +500,8 @@ class NfsNameRecordRepository(NameRecordRepository):
         return rs
 
     def find_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Like get_subtree but returns the sorted keys (paths relative to record_root).
         dir_path = self.__dir_path(name_root)
         rs = []
         if os.path.isdir(dir_path):
@@ -403,6 +520,8 @@ class NfsNameRecordRepository(NameRecordRepository):
         return rs
 
     def reset(self):
+        # [FUNCTION DOC]
+        # Deletes every tracked key, ignoring errors, and clears tracking.
         for name in list(self.__to_delete):
             try:
                 self.delete(name)
@@ -412,6 +531,10 @@ class NfsNameRecordRepository(NameRecordRepository):
 
 
 class Etcd3NameRecordRepository(NameRecordRepository):
+    # [CLASS DOC]
+    # etcd3-backed repository with TTL leases refreshed by a background keepalive thread
+    # and watch_names implemented through etcd watch callbacks. Operations are
+    # serialized by a lock.
     """Implements a name record repository using etcd3 as the backend storage.
 
     This implementation provides distributed key-value storage with support for
@@ -422,12 +545,21 @@ class Etcd3NameRecordRepository(NameRecordRepository):
 
     @dataclasses.dataclass
     class _Entry:
+        # [CLASS DOC]
+        # HELPER: Per-key local record: value, optional lease id, TTL and a
+        # FrequencyControl that fires every TTL/3 seconds for lease refresh.
         value: str
         lease_id: int | None = None
         keepalive_ttl: int | None = None
         keeper: timeutil.FrequencyControl | None = None
 
     def __init__(self, host=None, port=None, user=None, password=None, **kwargs):
+        # [FUNCTION DOC]
+        # Connects an etcd3 client (host/port/user/password as given; no env defaults
+        # despite the docstring), starts the daemon keepalive thread and initializes
+        # tracking structures. Network side effect. Requires the etcd3 package (etcd3 is
+        # None if import failed).
+        # KNOWN ISSUE: docstring claims ETCD_* env defaults that the code does not read.
         """Initialize the etcd3 name record repository.
 
         Args:
@@ -468,6 +600,11 @@ class Etcd3NameRecordRepository(NameRecordRepository):
         logger.debug(f"Connected to etcd3 at {self._host}:{self._port}")
 
     def __del__(self):
+        # [FUNCTION DOC]
+        # Stops and joins the keepalive thread (5 s), resets tracked keys and closes the
+        # client.
+        # KNOWN ISSUE: if __init__ failed early, reset accesses missing attributes and
+        # raises.
         """Clean up resources when the object is deleted."""
         self._keepalive_running = False
         if hasattr(self, "_keepalive_thread"):
@@ -477,6 +614,8 @@ class Etcd3NameRecordRepository(NameRecordRepository):
             self._client.close()
 
     def _create_lease(self, ttl_seconds):
+        # [FUNCTION DOC]
+        # HELPER: Creates an etcd lease with ttl_seconds and returns its id.
         """Create an etcd lease with the specified TTL.
 
         Args:
@@ -496,6 +635,12 @@ class Etcd3NameRecordRepository(NameRecordRepository):
         keepalive_ttl=None,
         replace=False,
     ):
+        # [FUNCTION DOC]
+        # Puts str(value) at normpath(name) under the lock. Without replace, raises
+        # NameEntryExistsError if the key exists (check-then-put, not atomic across
+        # clients). With positive keepalive_ttl, attaches a new lease and always tracks
+        # for deletion; else plain put tracked only if delete_on_exit. Records an _Entry
+        # for keepalive. ValueError on empty name.
         """Add a key-value pair to etcd with optional TTL.
 
         Args:
@@ -548,6 +693,8 @@ class Etcd3NameRecordRepository(NameRecordRepository):
             )
 
     def delete(self, name):
+        # [FUNCTION DOC]
+        # Under the lock deletes name (via _delete_locked) and untracks it.
         """Delete a key from etcd.
 
         Args:
@@ -562,6 +709,9 @@ class Etcd3NameRecordRepository(NameRecordRepository):
                 self._to_delete.remove(name)
 
     def _delete_locked(self, name):
+        # [FUNCTION DOC]
+        # HELPER: Raises NameEntryNotFoundError if the key is absent; otherwise drops
+        # the local entry and deletes it from etcd. Caller holds the lock.
         """Delete a key from etcd with lock already acquired.
 
         Args:
@@ -583,6 +733,10 @@ class Etcd3NameRecordRepository(NameRecordRepository):
         self._client.delete(name)
 
     def clear_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Deletes every key from etcd's prefix query on normpath(name_root), dropping
+        # local entries; logs the count. Note etcd prefix match is raw string prefix (no
+        # "/" boundary).
         """Delete all keys with the given prefix.
 
         Args:
@@ -606,6 +760,9 @@ class Etcd3NameRecordRepository(NameRecordRepository):
             logger.debug(f"Deleted {count} etcd entries under {name_root}")
 
     def get_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Returns the sorted decoded values for keys with raw prefix
+        # normpath(name_root).
         """Get all values with keys having the given prefix.
 
         Args:
@@ -623,6 +780,8 @@ class Etcd3NameRecordRepository(NameRecordRepository):
             return sorted(rs)
 
     def find_subtree(self, name_root):
+        # [FUNCTION DOC]
+        # Returns sorted keys with raw prefix name_root (not normpath-ed).
         """Find all keys with the given prefix.
 
         Args:
@@ -641,6 +800,9 @@ class Etcd3NameRecordRepository(NameRecordRepository):
             return sorted(rs)
 
     def get(self, name):
+        # [FUNCTION DOC]
+        # Returns the decoded value for normpath(name) under the lock or raises
+        # NameEntryNotFoundError.
         """Get the value for a key.
 
         Args:
@@ -657,6 +819,9 @@ class Etcd3NameRecordRepository(NameRecordRepository):
             return self._get_locked(name)
 
     def _get_locked(self, name):
+        # [FUNCTION DOC]
+        # HELPER: Gets and decodes a key; raises NameEntryNotFoundError if absent. Lock
+        # held.
         """Get a value with lock already acquired.
 
         Args:
@@ -674,6 +839,9 @@ class Etcd3NameRecordRepository(NameRecordRepository):
         return value.decode("utf-8")
 
     def reset(self):
+        # [FUNCTION DOC]
+        # Under the lock deletes tracked keys that still have local entries (ignoring
+        # missing ones), clears tracking and logs the count.
         """Delete all keys added via this repository instance."""
         with self._lock:
             if hasattr(self, "_to_delete"):
@@ -689,6 +857,10 @@ class Etcd3NameRecordRepository(NameRecordRepository):
                 logger.info(f"Reset {count} saved etcd entries")
 
     def _keepalive_thread_run(self):
+        # [FUNCTION DOC]
+        # HELPER: Daemon loop: every second, for each entry with a lease whose keeper
+        # fires, refreshes the lease, logging errors. Exits when _keepalive_running is
+        # False.
         """Background thread to keep leases alive."""
         while self._keepalive_running:
             time.sleep(self.KEEPALIVE_POLL_FREQUENCY)
@@ -715,6 +887,11 @@ class Etcd3NameRecordRepository(NameRecordRepository):
         poll_frequency=15,
         wait_timeout=300,
     ):
+        # [FUNCTION DOC]
+        # Same last-key-gone semantics as the base, but for each name waits (blocking,
+        # in the caller thread) until it exists, then registers an etcd watch callback
+        # that triggers on delete events; watch ids are kept in _watch_ids. Returns
+        # after all watches are set.
         """Watch keys and call back when they are deleted.
 
         Args:
@@ -731,6 +908,8 @@ class Etcd3NameRecordRepository(NameRecordRepository):
             q.put(0)
 
         def wrap_call_back():
+            # [FUNCTION DOC]
+            # HELPER: Consumes a token; when none remain logs and calls call_back.
             try:
                 q.get_nowait()
             except queue.Empty:
@@ -753,6 +932,8 @@ class Etcd3NameRecordRepository(NameRecordRepository):
             self._watch_ids.append(watch_id)
 
     def _watch_callback(self, event, callback):
+        # [FUNCTION DOC]
+        # HELPER: Invokes callback once for each DeleteEvent in the etcd watch response.
         """Process watch events and call back on deletion.
 
         Args:
@@ -767,6 +948,9 @@ class Etcd3NameRecordRepository(NameRecordRepository):
                 callback()
 
     def _testonly_drop_cached_entry(self, name):
+        # [FUNCTION DOC]
+        # Test helper: drops a key's local entry (stopping its keepalive) to simulate a
+        # crash.
         """Used by unittest only to simulate the case that the process crashes.
 
         Args:
@@ -780,15 +964,23 @@ class Etcd3NameRecordRepository(NameRecordRepository):
 
 @ray.remote
 class DistributedKVStore:
+    # [CLASS DOC]
+    # Ray actor holding a dict KV store with lazy TTL expiry (expired keys removed on
+    # reads) and integer lease ids. Created as a detached named actor by
+    # RayNameResolveRepository.
     """Ray actor implementing a distributed key-value store with TTL support."""
 
     def __init__(self):
+        # [FUNCTION DOC]
+        # Initializes store, expiry map, lease map and a lease counter.
         self.store = {}
         self.ttl_store = {}  # key -> expiry_time
         self.lease_store = {}  # key -> lease_id
         self.lease_counter = 0
 
     def put(self, key: str, value: str, lease_id: int | None = None):
+        # [FUNCTION DOC]
+        # Stores value; records lease_id if given (no expiry). Returns True.
         """Store a key-value pair with optional lease."""
         self.store[key] = value
         if lease_id is not None:
@@ -796,6 +988,8 @@ class DistributedKVStore:
         return True
 
     def get(self, key: str):
+        # [FUNCTION DOC]
+        # Purges expired keys and returns the value or None.
         """Get value for a key, checking TTL expiry."""
         self._cleanup_expired()
         if key not in self.store:
@@ -803,6 +997,8 @@ class DistributedKVStore:
         return self.store[key]
 
     def delete(self, key: str):
+        # [FUNCTION DOC]
+        # Removes key and its TTL/lease metadata; returns whether it existed.
         """Delete a key and its associated metadata."""
         deleted = key in self.store
         self.store.pop(key, None)
@@ -811,6 +1007,9 @@ class DistributedKVStore:
         return deleted
 
     def get_prefix(self, prefix: str):
+        # [FUNCTION DOC]
+        # Purges expired keys and returns (key, value) pairs whose normalized key equals
+        # the normalized prefix or lies under it.
         """Get all key-value pairs with keys matching the prefix."""
         self._cleanup_expired()
         result = []
@@ -826,6 +1025,9 @@ class DistributedKVStore:
         return result
 
     def delete_prefix(self, prefix: str):
+        # [FUNCTION DOC]
+        # Purges expired keys, deletes all keys equal to or under the prefix, returns
+        # the count.
         """Delete all keys matching the prefix."""
         self._cleanup_expired()
         normalized_prefix = os.path.normpath(prefix)
@@ -843,6 +1045,9 @@ class DistributedKVStore:
         return len(keys_to_delete)
 
     def create_lease(self, ttl_seconds: int):
+        # [FUNCTION DOC]
+        # HELPER: Increments the lease counter and returns (lease_id, now +
+        # ttl_seconds).
         """Create a lease with TTL."""
         self.lease_counter += 1
         lease_id = self.lease_counter
@@ -850,6 +1055,9 @@ class DistributedKVStore:
         return lease_id, expiry_time
 
     def put_with_lease(self, key: str, value: str, ttl_seconds: int):
+        # [FUNCTION DOC]
+        # Stores value with a new lease expiring after ttl_seconds; returns the lease
+        # id.
         """Store key-value with TTL lease."""
         lease_id, expiry_time = self.create_lease(ttl_seconds)
         self.store[key] = value
@@ -858,6 +1066,9 @@ class DistributedKVStore:
         return lease_id
 
     def refresh_lease(self, key: str, ttl_seconds: int):
+        # [FUNCTION DOC]
+        # Extends the key's expiry to now + ttl_seconds if it exists with a lease;
+        # returns success.
         """Refresh the lease for a key."""
         if key in self.store and key in self.lease_store:
             self.ttl_store[key] = time.time() + ttl_seconds
@@ -865,6 +1076,8 @@ class DistributedKVStore:
         return False
 
     def _cleanup_expired(self):
+        # [FUNCTION DOC]
+        # HELPER: Deletes all keys whose expiry time has passed.
         """Remove expired keys."""
         current_time = time.time()
         expired_keys = []
@@ -877,24 +1090,37 @@ class DistributedKVStore:
             self.delete(key)
 
     def get_all_keys(self):
+        # [FUNCTION DOC]
+        # Purges expired keys and returns all keys.
         """Get all keys in the store."""
         self._cleanup_expired()
         return list(self.store.keys())
 
 
 class RayNameResolveRepository:
+    # [CLASS DOC]
+    # Name repository backed by the DistributedKVStore Ray actor (shared via a fixed
+    # namespace and actor name). Mirrors the NameRecordRepository API (duck-typed, not
+    # subclassed), with TTL keepalive thread and polling watches.
     """Ray-based implementation of NameRecordRepository using distributed actors."""
 
     KEEPALIVE_POLL_FREQUENCY = 1
 
     @dataclasses.dataclass
     class _Entry:
+        # [CLASS DOC]
+        # HELPER: Per-key local record (value, lease id, TTL, keepalive FrequencyControl
+        # at TTL/3).
         value: str
         lease_id: int | None = None
         keepalive_ttl: int | None = None
         keeper: timeutil.FrequencyControl | None = None
 
     def __init__(self, actor_name: str = "distributed_kv_store", **kwargs):
+        # [FUNCTION DOC]
+        # Initializes Ray (via initialize_ray), gets or creates the detached named
+        # DistributedKVStore actor in RAY_NAME_RESOLVE_NAMESPACE, and starts the daemon
+        # keepalive thread. Extra kwargs ignored.
         """Initialize Ray-based name record repository.
 
         Args:
@@ -933,6 +1159,8 @@ class RayNameResolveRepository:
         self._to_delete = set()
 
     def __del__(self):
+        # [FUNCTION DOC]
+        # Calls reset(), logging and ignoring exceptions.
         """Clean up resources when the object is deleted."""
         try:
             self.reset()
@@ -949,6 +1177,12 @@ class RayNameResolveRepository:
         keepalive_ttl: int | None = None,
         replace: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Stores str(value) at normpath(name) in the actor (blocking ray.get calls).
+        # Without replace raises NameEntryExistsError if present (non-atomic check).
+        # Positive TTL uses put_with_lease and always tracks for deletion; otherwise
+        # tracks if delete_on_exit. Records a local _Entry for keepalive. ValueError on
+        # empty name.
         """Add a key-value pair to the distributed store.
 
         Args:
@@ -1000,12 +1234,17 @@ class RayNameResolveRepository:
             )
 
     def add_subentry(self, name: str, value: str, **kwargs):
+        # [FUNCTION DOC]
+        # Adds value at "<normpath(name)>/<8-char uuid>" and returns the sub-key.
         """Add a sub-entry to the key-root `name`."""
         sub_name = os.path.join(os.path.normpath(name), str(uuid.uuid4())[:8])
         self.add(sub_name, value, **kwargs)
         return sub_name
 
     def delete(self, name: str):
+        # [FUNCTION DOC]
+        # Under the lock deletes name and untracks it; NameEntryNotFoundError if
+        # missing.
         """Delete a key from the distributed store.
 
         Args:
@@ -1020,6 +1259,9 @@ class RayNameResolveRepository:
                 self._to_delete.remove(name)
 
     def _delete_locked(self, name: str):
+        # [FUNCTION DOC]
+        # HELPER: Raises NameEntryNotFoundError if absent; else drops the local entry
+        # and deletes in the actor. Lock held by caller.
         """Delete a key with lock already acquired."""
         # Check if key exists
         existing_value = ray.get(self._kv_store.get.remote(name))
@@ -1034,6 +1276,9 @@ class RayNameResolveRepository:
         ray.get(self._kv_store.delete.remote(name))
 
     def clear_subtree(self, name_root: str):
+        # [FUNCTION DOC]
+        # Deletes all keys equal to or under normpath(name_root) in the actor and the
+        # matching local entries; logs the count.
         """Delete all keys with the given prefix."""
         with self._lock:
             name_root = os.path.normpath(name_root)
@@ -1054,6 +1299,8 @@ class RayNameResolveRepository:
             logger.debug(f"Deleted {count} entries under {name_root}")
 
     def get(self, name: str):
+        # [FUNCTION DOC]
+        # Returns the value for normpath(name) or raises NameEntryNotFoundError.
         """Get the value for a key.
 
         Args:
@@ -1070,6 +1317,9 @@ class RayNameResolveRepository:
             return self._get_locked(name)
 
     def _get_locked(self, name: str):
+        # [FUNCTION DOC]
+        # HELPER: Fetches from the actor; raises NameEntryNotFoundError on None. Lock
+        # held.
         """Get a value with lock already acquired."""
         value = ray.get(self._kv_store.get.remote(name))
         if value is None:
@@ -1077,6 +1327,8 @@ class RayNameResolveRepository:
         return value
 
     def get_subtree(self, name_root: str):
+        # [FUNCTION DOC]
+        # Returns sorted values for keys equal to or under normpath(name_root).
         """Get all values with keys having the given prefix."""
         with self._lock:
             name_root = os.path.normpath(name_root)
@@ -1085,6 +1337,8 @@ class RayNameResolveRepository:
             return sorted(values)
 
     def find_subtree(self, name_root: str):
+        # [FUNCTION DOC]
+        # Returns sorted keys equal to or under normpath(name_root).
         """Find all keys with the given prefix."""
         with self._lock:
             name_root = os.path.normpath(name_root)
@@ -1093,6 +1347,9 @@ class RayNameResolveRepository:
             return sorted(keys)
 
     def wait(self, name: str, timeout: float | None = None, poll_frequency: float = 1):
+        # [FUNCTION DOC]
+        # Polls get until the key exists and returns its value (same semantics as the
+        # base wait).
         """Wait until a name appears.
 
         Raises:
@@ -1114,6 +1371,11 @@ class RayNameResolveRepository:
                 )
 
     def reset(self):
+        # [FUNCTION DOC]
+        # Stops and joins the keepalive thread, then deletes all tracked keys (ignoring
+        # missing), clearing tracking and local entries.
+        # KNOWN ISSUE: keepalive is permanently stopped after reset, so TTL keys added
+        # later on the same instance are never refreshed and will expire.
         """Delete all keys added via this repository instance."""
         self._keepalive_running = False
         if hasattr(self, "_keepalive_thread"):
@@ -1138,6 +1400,9 @@ class RayNameResolveRepository:
         poll_frequency: float = 15,
         wait_timeout: float = 300,
     ):
+        # [FUNCTION DOC]
+        # Same last-key-gone callback semantics as the base, using one polling daemon
+        # thread per name.
         """Watch keys and call back when they are deleted.
 
         Args:
@@ -1154,6 +1419,8 @@ class RayNameResolveRepository:
             q.put(0)
 
         def wrap_call_back():
+            # [FUNCTION DOC]
+            # HELPER: Consumes a token; when none remain logs and calls call_back.
             try:
                 q.get_nowait()
             except queue.Empty:
@@ -1171,6 +1438,9 @@ class RayNameResolveRepository:
     def _watch_thread_run(
         self, name: str, call_back: Callable, poll_frequency: float, wait_timeout: float
     ):
+        # [FUNCTION DOC]
+        # HELPER: Waits for name to exist, then polls until it disappears and calls
+        # call_back.
         """Background thread to watch a key for deletion."""
         self.wait(name, timeout=wait_timeout, poll_frequency=poll_frequency)
         while True:
@@ -1182,6 +1452,9 @@ class RayNameResolveRepository:
                 break
 
     def _keepalive_thread_run(self):
+        # [FUNCTION DOC]
+        # HELPER: Daemon loop refreshing due leases in the actor every second; logs
+        # failures.
         """Background thread to keep leases alive."""
         while self._keepalive_running:
             time.sleep(self.KEEPALIVE_POLL_FREQUENCY)
@@ -1211,6 +1484,10 @@ class RayNameResolveRepository:
 
 
 def make_repository(args: "NameResolveConfig"):
+    # [FUNCTION DOC]
+    # Builds a repository from NameResolveConfig: "nfs" (creates nfs_record_root),
+    # "etcd3" (parses etcd3_addr host:port) or "ray" (ray_actor_name). Raises
+    # NotImplementedError otherwise.
     if args.type == "nfs":
         repo = NfsNameRecordRepository(args.nfs_record_root)
         os.makedirs(repo.record_root, exist_ok=True)
@@ -1240,6 +1517,10 @@ watch_names = DEFAULT_REPOSITORY.watch_names
 
 
 def reconfigure(config: "NameResolveConfig"):
+    # [FUNCTION DOC]
+    # Replaces the global DEFAULT_REPOSITORY with make_repository(config) and rebinds
+    # all module-level shortcut functions to it. Previous repository is dropped (its
+    # __del__ may reset its tracked keys).
     global DEFAULT_REPOSITORY
     global \
         add, \

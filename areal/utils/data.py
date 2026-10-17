@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Data-layout utilities shared by trainers and engines. Conventions: a "padded" batch is
+# a dict of [B, S, ...] tensors with a bool "attention_mask"; a "packed" batch
+# concatenates valid tokens into [total_tokens, ...] tensors described by int32
+# "cu_seqlens" [B+1] and "max_seqlen"; trajectories travel as list[dict] and are batched
+# with concat_batch. Covers dict/list reshaping, padding/unpadding (adapted from flash-
+# attention), concatenation and splitting of trajectories, micro-batch allocation
+# (balanced packing, synced across ranks), MicroBatchList with per-micro-batch
+# padding/alignment, distributed broadcast/all-gather of nested tensor containers,
+# dataloader cycling, reward/advantage Normalization, KL estimators and dummy eval
+# items.
 # SPDX-License-Identifier: Apache-2.0
 
 # Pad/unpad operations are modified from flash-attention under BSD-3 license.
@@ -25,6 +36,10 @@ logger = logging.getLogger("DataUtils")
 
 
 def get_batch_size(data: dict[str, Any]) -> int:
+    # [FUNCTION DOC]
+    # Infers batch size of a dict: attention_mask dim 0, else len(cu_seqlens) - 1, else
+    # length of a list "multi_modal_input", else dim 0 of the first tensor with ndim >=
+    # 1, else 0 (also 0 for empty dicts).
     if not data:
         return 0
 
@@ -48,17 +63,24 @@ def get_batch_size(data: dict[str, Any]) -> int:
 
 
 def reorder_list(xs: Sequence, indices: list[int]) -> list:
+    # [FUNCTION DOC]
+    # Returns xs permuted by indices. Asserts indices are unique and as many as xs.
     assert len(set(indices)) == len(xs)
     return [xs[i] for i in indices]
 
 
 def dict_map(x: dict, fn: Callable) -> dict:
+    # [FUNCTION DOC]
+    # Returns a new dict applying fn to every value.
     return {k: fn(v) for k, v in x.items()}
 
 
 def dict_of_list2list_of_dict(
     dict_of_lists: dict[str, list[Any]],
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Converts {key: list} into a list of {key: element} dicts. Empty input gives [].
+    # Raises ValueError if the lists differ in length.
     if not dict_of_lists:
         return []
     keys = list(dict_of_lists.keys())
@@ -74,6 +96,9 @@ def dict_of_list2list_of_dict(
 def list_of_dict2dict_of_list(
     list_of_dicts: list[dict[str, Any]],
 ) -> dict[str, list[Any]]:
+    # [FUNCTION DOC]
+    # Converts a list of dicts with identical key sets into {key: list}. Empty input
+    # gives {}. Raises ValueError on key mismatch.
     if not list_of_dicts:
         return {}
     keys = list(list_of_dicts[0].keys())
@@ -86,11 +111,16 @@ def list_of_dict2dict_of_list(
 
 
 def is_multi_modal_key(key: str) -> bool:
+    # [FUNCTION DOC]
+    # True if key starts with "multi_modal_input".
     # Any key matching: multi_modal_input*
     return key.startswith("multi_modal_input")
 
 
 def _get_first_non_multimodal_seq(item: dict[str, Any]) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Returns the first value in item whose key is not multimodal; ValueError if
+    # none.
     """Get the first non-multimodal sequence from a dict item."""
     for key, seq in item.items():
         if not is_multi_modal_key(key):
@@ -99,12 +129,21 @@ def _get_first_non_multimodal_seq(item: dict[str, Any]) -> Any:
 
 
 def _make_attention_mask(seq_len: int, max_len: int) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Returns a list of seq_len ones followed by zeros up to max_len.
     return [1] * seq_len + [0] * (max_len - seq_len)
 
 
 def pad_sequences_to_tensors(
     sequence_list: list[dict[str, Any]], pad_value: float = 0.0
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Pads a list of per-sample dicts of 1D sequences into a batch: every non-multimodal
+    # key is converted to a tensor, right-padded with pad_value to the global max length
+    # and stacked to [B, max_len]; multimodal keys (lists of dicts) have the first
+    # dict's values converted to tensors in place and are list-concatenated. Adds a bool
+    # attention_mask from the length of each item's first non-multimodal sequence. Empty
+    # input gives {}.
     if not sequence_list:
         return {}
     max_length = max(
@@ -148,6 +187,12 @@ def pad_sequences_to_tensors(
 def collate_samples_to_list(
     sequence_list: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Converts raw samples into the canonical per-trajectory list: each non-multimodal
+    # value becomes a [1, seqlen] tensor; multimodal values are wrapped into lists (dict
+    # values converted to tensors in place); an all-True [1, seqlen] attention_mask is
+    # added (from the first non-multimodal value) unless already present. Returns list
+    # of dicts.
     """Convert raw dataset samples into per-sample tensor dicts.
 
     Each sample is converted to a dict of 2-D tensors ``[1, seqlen]``
@@ -183,6 +228,10 @@ def collate_samples_to_list(
 def unpad_input(
     hidden_states, attention_mask
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    # [FUNCTION DOC]
+    # Removes padding: given hidden_states [B, S, ...] and attention_mask [B, S],
+    # returns (valid tokens [nnz, ...], flat indices of valid positions, int32
+    # cu_seqlens [B+1], max sequence length as a Python int via .item()).
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
     max_seqlen_in_batch = seqlens_in_batch.max().item()
@@ -196,12 +245,21 @@ def unpad_input(
 
 
 def pad_input(hidden_states, indices, batch, seqlen):
+    # [FUNCTION DOC]
+    # Inverse of unpad_input: scatters packed hidden_states back to [batch, seqlen, ...]
+    # with zeros at padded positions.
+    # KNOWN ISSUE: the output buffer is allocated as 1D (batch*seqlen) ignoring trailing
+    # dimensions, so it only works for 1D packed inputs, not [nnz, hidden].
     output = hidden_states.new_zeros(batch * seqlen)
     output[indices] = hidden_states
     return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 
 def _pad_cat_dim0(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Concatenates tensors on dim 0; for ndim >= 2, first right-pads dims 1..N-1
+    # to the per-dim maximum with pad_value. Raises ValueError on an empty list or
+    # mismatched ndim.
     """Pad tensors to the same non-batch dims and concatenate along dim 0.
 
     For 0D/1D tensors no padding is needed — they are simply concatenated.
@@ -241,6 +299,12 @@ def _pad_cat_dim0(tensors: list[torch.Tensor], pad_value: float = 0.0) -> torch.
 def concat_padded_tensors(
     tensor_dicts: list[dict[str, Any]], pad_value: float = 0.0
 ) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Merges a list of batched dicts with identical keys (ValueError otherwise): tensors
+    # are padded and concatenated along dim 0 (attention_mask padded with 0), lists
+    # flattened, multimodal keys list-extended (filling missing with batch-size many
+    # empty dicts), and other values taken from the first dict. A single dict is
+    # shallow-copied; empty gives {}.
     """Concatenate and pad tensors from multiple dictionaries.
 
     For each key present in the input dicts:
@@ -301,6 +365,9 @@ def concat_padded_tensors(
 def _unpad_splits(
     splits: list[torch.Tensor], traj_seqlens: list[int] | None
 ) -> list[torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Trims each split's last dim to traj_seqlens[i] when it is longer (ndim >=
+    # 2); modifies and returns the list. No-op when traj_seqlens is None.
     """Trim each split tensor's last dim to its original sequence length."""
     if traj_seqlens is None:
         return splits
@@ -316,6 +383,13 @@ def split_and_unpad_tensor(
     traj_group_sizes: list[int] | int = 1,
     traj_seqlens: list[int] | None = None,
 ) -> Any:
+    # [FUNCTION DOC]
+    # Inverse of concat_padded_tensors. Splits a Tensor or dict result along dim 0 into
+    # n_trajs pieces of traj_group_sizes rows (int means equal sizes) and trims trailing
+    # padding to traj_seqlens; if not given and the dict has a 2D attention_mask,
+    # derives per-group max lengths (only when some padding exists). Dict values whose
+    # dim 0 does not equal the total are deep-copied into every piece. None returns
+    # None; other types are returned unchanged.
     """Inverse of concat_padded_tensors: split batched result into per-trajectory
     list and trim trailing padding. Handles Tensor, dict, and None inputs.
 
@@ -359,6 +433,9 @@ def split_and_unpad_tensor(
 
 @dataclass
 class TrajBatchMeta:
+    # [CLASS DOC]
+    # Dataclass recording how concat_batch merged trajectories: number of trajectories,
+    # rows per trajectory and each trajectory's padded sequence length.
     """Metadata for reversing concat_batch: traj counts, group sizes, seqlens."""
 
     n_trajs: int
@@ -369,6 +446,11 @@ class TrajBatchMeta:
 def concat_batch(
     data: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], "TrajBatchMeta"]:
+    # [FUNCTION DOC]
+    # Concatenates list[dict] trajectories via concat_padded_tensors and returns (batch,
+    # TrajBatchMeta). Group size per trajectory is dim 0 of its first tensor (1 if
+    # none); seqlen is the last dim of its attention_mask (KeyError if missing). Asserts
+    # list of dicts.
     """Concat list[dict] trajectories into a single batched dict with metadata."""
     assert isinstance(data, list) and all(isinstance(d, dict) for d in data), (
         f"Expected list[dict], got {type(data)}"
@@ -394,6 +476,9 @@ def split_batch(
     result: Any,
     meta: TrajBatchMeta,
 ) -> list[Any] | None:
+    # [FUNCTION DOC]
+    # Splits a batched result back into per-trajectory items using meta
+    # (split_and_unpad_tensor).
     """Inverse of concat_batch: split batched result back into per-trajectory list."""
     return split_and_unpad_tensor(
         result, meta.n_trajs, meta.traj_group_sizes, meta.traj_seqlens
@@ -407,6 +492,9 @@ def batched_call(
     unpack: bool = True,
     pass_meta: bool = False,
 ) -> Any:
+    # [FUNCTION DOC]
+    # Concatenates data with concat_batch, calls fn(batched) or fn(batched, meta) when
+    # pass_meta, and returns split_batch(result) when unpack else the raw result.
     """Concatenate per-trajectory dicts into one batch, call *fn*, optionally unpack.
 
     This is the canonical way to bridge the per-trajectory data representation
@@ -439,6 +527,9 @@ def unpack_sequence(
     lens: list[int] | None = None,
     dim: int = 0,
 ):
+    # [FUNCTION DOC]
+    # Splits x along dim into per-sequence pieces using lens or cu_seqlens diffs (moved
+    # to CPU). Returns a tuple of tensors. Raises ValueError if neither is given.
     """Unpack a sequence tensor into a list of tensors based on cumulative sequence lengths."""
     if lens is not None:
         return torch.split(x, lens, dim=dim)
@@ -450,6 +541,11 @@ def unpack_sequence(
 
 
 def allocate_balanced_mbs(mb_spec: MicroBatchSpec, lens: list[int]) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # Groups sequence indices into micro-batches with at most max_tokens_per_mb tokens
+    # each, using the packing algorithm from mb_spec (ffd default or kk), at least n_mbs
+    # groups and a group count divisible by n_mbs_divisor. Returns groups with sorted
+    # indices, sorted lexicographically. Asserts max_tokens_per_mb is set.
     """Allocate sequences into balanced micro-batches using the configured algorithm.
 
     The packing algorithm is determined by ``mb_spec.packing_algorithm``:
@@ -481,6 +577,11 @@ def allocate_balanced_mbs_synced(
     lens: list[int],
     group: dist.ProcessGroup | None = None,
 ) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # Like allocate_balanced_mbs, but if torch.distributed is initialized, all-gathers
+    # the group count over group and, if ranks disagree, recursively retries with n_mbs
+    # set to the maximum so every rank gets the same number of micro-batches
+    # (collective).
     group_indices = allocate_balanced_mbs(mb_spec, lens)
     if not dist.is_initialized():
         return group_indices
@@ -494,6 +595,12 @@ def allocate_balanced_mbs_synced(
 
 
 def pack_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Packs a padded dict into the packed layout: tensors shaped [B, S, ...] become
+    # [total_tokens, ...] holding each row's first len tokens (assumes left-aligned
+    # valid tokens); attention_mask is replaced by int32 cu_seqlens and int max_seqlen;
+    # other values pass through. Asserts a 2D attention_mask. Per-row .item() calls sync
+    # with the device.
     """Pack a dict of tensors of shape [B, S, ...] into [total_length, ...], leaving other keys unchanged.
 
     Args:
@@ -546,6 +653,9 @@ def pack_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def pad_and_stack_tensors_along_first_dim(tensor_list: list[torch.Tensor]):
+    # [FUNCTION DOC]
+    # Right-pads tensors along dim 0 to the max length with zeros and stacks them on a
+    # new dim 0. Raises ValueError if ndims differ.
     max_length = max(tensor.shape[0] for tensor in tensor_list)
     n_dim = tensor_list[0].ndim
     if not all(tensor.ndim == n_dim for tensor in tensor_list):
@@ -564,6 +674,12 @@ def tensor_container_to(
     *args,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Recursively applies .to(*args, **kwargs) to tensors in a tensor, list/tuple
+    # (returned as list) or dict (nested dicts and lists recursed); other values
+    # returned unchanged.
+    # KNOWN ISSUE: tuples nested inside dicts are not recursed into (only dict/list
+    # are).
     """Apply `t.to(*args, **kwargs)` to all tensors in the dictionary.
     Support nested dictionaries.
     """
@@ -588,6 +704,10 @@ def tensor_container_to(
 
 
 class MicroBatchItem(NamedTuple):
+    # [CLASS DOC]
+    # NamedTuple yielded when iterating a MicroBatchList: original micro-batch, padded
+    # micro-batch for the forward pass, batch-level padding length, pre-alignment
+    # cu_seqlens and padded target length.
     """A single micro-batch item from MicroBatchList iteration.
 
     Attributes:
@@ -607,6 +727,11 @@ class MicroBatchItem(NamedTuple):
 
 @dataclass
 class MicroBatchList:
+    # [CLASS DOC]
+    # Dataclass holding a batch split into micro-batches: original data, spec, per-mb
+    # dicts, token count per mb, forward/backward permutation indices (to restore
+    # original order), and after padding: padded mbs, padding lengths, padded-to
+    # lengths, per-sequence alignment lengths and original cu_seqlens.
     data: dict[str, Any]
     mb_spec: MicroBatchSpec
     mbs: list[dict[str, Any]]
@@ -624,6 +749,11 @@ class MicroBatchList:
 
     @property
     def max_seqlen(self) -> int:
+        # [FUNCTION DOC]
+        # Returns (cached) the maximum total packed length (cu_seqlens[-1]) over padded
+        # micro-batches. Raises ValueError if not padded; asserts cu_seqlens exist.
+        # KNOWN ISSUE: despite the name it is the max total token count per micro-batch,
+        # not the max single-sequence length.
         """Return the maximum sequence length across all padded micro-batches."""
         if self.padded_mbs is None:
             raise ValueError("padded_mbs is None. Call pad_mb_list first.")
@@ -635,9 +765,15 @@ class MicroBatchList:
         return self._max_seqlen
 
     def __len__(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the number of micro-batches.
         return len(self.mbs)
 
     def __iter__(self) -> Iterator[MicroBatchItem]:
+        # [FUNCTION DOC]
+        # Yields a MicroBatchItem per micro-batch; raises ValueError if padded_mbs is
+        # None. Uses None for old_cu_seqlens / padded_to_length when those lists are
+        # unset.
         """Iterate over micro-batches, yielding MicroBatchItem named tuples.
 
         Yields:
@@ -666,6 +802,9 @@ class MicroBatchList:
             )
 
     def to(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Returns a new MicroBatchList with data, mbs, padded mbs and old cu_seqlens
+        # moved via .to(*args, **kwargs); other fields shared.
         mbs = [tensor_container_to(mb, *args, **kwargs) for mb in self.mbs]
         data = tensor_container_to(self.data, *args, **kwargs)
         padded_mbs = None
@@ -702,6 +841,15 @@ def split_padded_tensor_dict_into_mb_list(
     mb_spec: MicroBatchSpec,
     group: dist.ProcessGroup | None = None,
 ) -> MicroBatchList:
+    # [FUNCTION DOC]
+    # Splits a padded batch (requires attention_mask; ValueError otherwise) into
+    # balanced micro-batches. Uses DEFAULT_MAX_TOKENS_PER_MB when unset; batch size must
+    # be divisible by mb_spec.granularity (RuntimeError) and granularity-sized row
+    # groups stay together. Token counts per group drive allocate_balanced_mbs_synced
+    # (collective over group). Tensors with B*S elements (and position_ids) are
+    # reordered and sliced per micro-batch; multimodal lists are split by index; other
+    # values are copied into every micro-batch. Returns MicroBatchList with forward and
+    # backward (inverse) index lists and group_lens.
     """Split a padded dict of tensors into micro-batches based on the attention mask.
 
     Args:
@@ -770,6 +918,9 @@ def split_padded_tensor_dict_into_mb_list(
     backward_indices[forward_indices] = np.arange(bs)
 
     def _split(tensor):
+        # [FUNCTION DOC]
+        # HELPER: Reorders the rows of tensor by forward_indices and slices consecutive
+        # chunks of group_n_seqs rows, returning a list of per-micro-batch tensors.
         """Split and pad a tensor based on forward indices and lens."""
         # Unpack the sequence
         unpacked = [tensor[i] for i in range(bs)]
@@ -825,6 +976,18 @@ def pad_packed_tensor_dict(
     pad_value: float = 0.0,
     seq_align_to: int | None = None,
 ) -> tuple[dict[str, Any], int, torch.Tensor, int | None]:
+    # [FUNCTION DOC]
+    # Pads a packed dict. If seq_align_to is set, first pads each sequence to a multiple
+    # of it: per-token tensors (numel == total) are re-laid out with pad_value gaps,
+    # position_ids are regenerated (1D: 0..len-1 per padded sequence; [N, 3] mrope:
+    # original values then 0..pad-1), cu_seqlens/max_seqlen updated; and pad_to_length
+    # is rounded up to a multiple of lcm(seq_align_to, 256), grown if needed to fit.
+    # Then, if pad_to_length is given, appends one synthetic sequence of pad_length
+    # tokens (pad_value; position_ids 0..pad-1) and updates cu_seqlens/max_seqlen.
+    # Returns (data, pad_length, original cu_seqlens clone, aligned total length or
+    # None). Raises ValueError if pad_to_length is less than the total; asserts
+    # cu_seqlens and max_seqlen present. Uses .item() syncs and per-sequence Python
+    # loops.
     """Pad a packed dict of tensors to a specified length.
     This function assumes that the input data contains "cu_seqlens" and "max_seqlen" key,
     and all other tensors of shape [total_length, ] will be padded to `pad_to_length`.
@@ -992,6 +1155,11 @@ def align_mb_list_sequences(
     pad_value: float = 0.0,
     seq_align_to: int = 1,
 ) -> MicroBatchList:
+    # [FUNCTION DOC]
+    # Sets padded_mbs on mb_list by aligning each micro-batch's sequences to
+    # seq_align_to without adding a trailing padding sequence (pad_to_length None).
+    # padding_lengths are 0, padded_to_lengths and align_to_lengths are the aligned
+    # totals. Mutates and returns mb_list.
     """Align real sequences without adding a synthetic padding sequence.
 
     This projection is for model inputs that are reconstructed as BSHD. A
@@ -1028,6 +1196,13 @@ def pad_mb_list(
     batch_align_to: int | None = None,
     seq_align_to: int | None = None,
 ) -> MicroBatchList:
+    # [FUNCTION DOC]
+    # Pads each micro-batch via pad_packed_tensor_dict to max_tokens_per_mb (if
+    # pad_to_maximum and the spec has a real limit; otherwise warns and disables) or to
+    # its token count rounded up to 256 and then to batch_align_to, with optional per-
+    # sequence alignment. Stores padded mbs, padding lengths, target lengths and (when
+    # seq_align_to) original cu_seqlens and aligned lengths on mb_list. Mutates and
+    # returns mb_list.
     """Pad the micro-batch list to the maximum length or to a specific size to:
         1. Reduce memory fragmentation.
         2. Align sequences to an integer multiple of `seq_align_to`
@@ -1092,6 +1267,11 @@ def unpad_logits(
     cu_seqlens: torch.Tensor | None = None,
     old_cu_seqlens: torch.Tensor | None = None,
 ):
+    # [FUNCTION DOC]
+    # Removes padding from model outputs: drops the trailing padding_length rows, then
+    # if old_cu_seqlens is given copies each sequence's first original-length rows from
+    # the aligned layout (cu_seqlens) into a new compact tensor. Returns the unpadded
+    # tensor. .item() calls per sequence.
     # TODO: when using megatron, logits are in fp32,
     # create new logits in bucket to reduce peak memory usage
     # First unpad batch
@@ -1118,6 +1298,10 @@ def unpad_logits(
 
 
 def unsqueeze_packed_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Adds a leading batch dim of 1 to position_ids and all per-token tensors (numel
+    # equals total tokens) except cu_seqlens/max_seqlen. Returns a new dict; asserts
+    # both keys exist.
     assert "cu_seqlens" in data, "Input data must contain 'cu_seqlens' key."
     assert "max_seqlen" in data, "Input data must contain 'max_seqlen' key."
 
@@ -1142,6 +1326,9 @@ def unsqueeze_packed_tensor_dict(data: dict[str, Any]) -> dict[str, Any]:
 def unsqueeze_mb_list(
     mb_list: MicroBatchList,
 ) -> MicroBatchList:
+    # [FUNCTION DOC]
+    # Replaces padded_mbs with unsqueezed versions (unsqueeze_packed_tensor_dict) when
+    # present. Mutates and returns mb_list.
     """Unsqueeze the packed dict of tensors in the micro-batch list."""
     new_padded_mbs = []
     for i, mb in enumerate(mb_list.mbs):
@@ -1152,6 +1339,11 @@ def unsqueeze_mb_list(
 
 
 def amend_position_ids(data: dict) -> dict:
+    # [FUNCTION DOC]
+    # Sets data["position_ids"] to 0..S-1 for each row ([B, S] long on the mask device).
+    # Mutates and returns data; asserts attention_mask present.
+    # KNOWN ISSUE: masked_fill is not in-place and its result is discarded, so padded
+    # positions are not zeroed as apparently intended.
     assert "attention_mask" in data, "Input data must contain 'attention_mask' key."
 
     attn_mask = data["attention_mask"]
@@ -1167,6 +1359,13 @@ def amend_position_ids(data: dict) -> dict:
 
 
 def broadcast_tensor(tensor: torch.Tensor | None, src_rank=0, group=None):
+    # [FUNCTION DOC]
+    # Broadcasts a tensor from global rank src_rank over group: the source sends
+    # metadata (shape, dtype, device type) with broadcast_object_list then the
+    # contiguous tensor; receivers allocate an empty tensor on CPU or the current
+    # accelerator and receive. Returns the tensor on all ranks. Raises RuntimeError if
+    # dist is not initialized and ValueError if the source passes None. Docstring
+    # mentions a nonexistent "device" argument.
     """
     Broadcast a tensor from source rank to all other ranks in the process group.
 
@@ -1231,6 +1430,8 @@ def broadcast_tensor(tensor: torch.Tensor | None, src_rank=0, group=None):
 
 
 def _unpad_unflatten(x, shape):
+    # [FUNCTION DOC]
+    # HELPER: Trims a flat padded tensor to prod(shape) elements and reshapes it.
     assert len(x.shape) == 1
     pad_size = x.numel() - np.prod(shape)
     assert pad_size >= 0, pad_size
@@ -1238,12 +1439,20 @@ def _unpad_unflatten(x, shape):
 
 
 def _flatten_pad_to_max_numel(x, shapes):
+    # [FUNCTION DOC]
+    # HELPER: Flattens x and zero-pads it to the largest numel among shapes.
     pad_size = max(np.prod(shape) for shape in shapes) - x.numel()
     assert pad_size >= 0, pad_size
     return torch.nn.functional.pad(x.view(-1), (0, pad_size), value=0)
 
 
 def all_gather_tensor_container(data, group=None) -> list:
+    # [FUNCTION DOC]
+    # All-gathers a nested container over group and returns one entry per rank: tensors
+    # via shape exchange, flatten/pad to max numel and all_gather; lists (lengths must
+    # match, RuntimeError) become a list of per-element tuples across ranks; dicts (keys
+    # must match, RuntimeError) become a list of per-rank dicts; other objects via
+    # all_gather_object.
     world_size = dist.get_world_size(group)
     if torch.is_tensor(data):
         local_shape = list(data.shape)
@@ -1292,6 +1501,12 @@ def all_gather_tensor_container(data, group=None) -> list:
 
 
 def broadcast_tensor_container(data, src_rank=0, group=None):
+    # [FUNCTION DOC]
+    # Broadcasts a nested container (None, tensor, list, dict or picklable object) from
+    # global rank src_rank: the source first broadcasts a (type, info) header (list
+    # length or dict keys) and recursively sends children; receivers mirror the
+    # structure. Tensors use broadcast_tensor. Returns the reconstructed container on
+    # all ranks. ValueError on an unknown header type.
     if dist.get_rank() != src_rank:
         metadata = [None]
         dist.broadcast_object_list(metadata, src=src_rank, group=group)
@@ -1352,6 +1567,12 @@ def broadcast_tensor_container(data, src_rank=0, group=None):
 def bcast_mb_list(
     mb_list: MicroBatchList | None, src_rank=0, group=None
 ) -> MicroBatchList:
+    # [FUNCTION DOC]
+    # Broadcasts a MicroBatchList from src_rank: data, mbs, padded_mbs and
+    # old_cu_seqlens_list via broadcast_tensor_container, and spec, indices, group_lens
+    # and padding/alignment lists via one broadcast_object_list. Non-source ranks pass
+    # None. Returns a new MicroBatchList (_max_seqlen not transferred). Asserts mb_list
+    # on the source.
     if dist.get_rank() == src_rank:
         assert mb_list is not None
     # bcast tensor container attributes
@@ -1407,6 +1628,9 @@ def bcast_mb_list(
 
 
 def cycle_dataloader(dataloader: StatefulDataLoader, num_cycles: int = -1):
+    # [FUNCTION DOC]
+    # Generator yielding batches from dataloader forever (or num_cycles epochs if > 0),
+    # calling sampler.set_epoch(epoch) before each epoch when supported.
     """Cycle through a dataloader indefinitely."""
     epoch = 0
     while True:
@@ -1419,6 +1643,11 @@ def cycle_dataloader(dataloader: StatefulDataLoader, num_cycles: int = -1):
 
 
 class Normalization:
+    # [CLASS DOC]
+    # Configurable advantage/reward normalization from NormConfig. mean_level and
+    # std_level are each "batch" (all ranks, all-reduced), "group" (per contiguous group
+    # of fixed group_size or explicit variable group_sizes) or none; supports leave-one-
+    # out mean, unbiased std and eps.
     """
     Adaptive normalization with different levels.
 
@@ -1429,6 +1658,9 @@ class Normalization:
     """
 
     def __init__(self, config: NormConfig):
+        # [FUNCTION DOC]
+        # Copies mean_level, mean_leave1out, std_level, std_unbiased, group_size and eps
+        # from config.
         self.mean_level = config.mean_level
         self.mean_leave1out = config.mean_leave1out
         self.std_level = config.std_level
@@ -1439,6 +1671,10 @@ class Normalization:
     def _build_group_slices(
         self, bs: int, group_sizes: list[int] | None
     ) -> list[slice]:
+        # [FUNCTION DOC]
+        # HELPER: Returns contiguous slices for groups: from group_sizes if given (all
+        # positive and summing to bs, else ValueError), otherwise bs // group_size
+        # fixed-size slices (any remainder rows are left uncovered).
         """Build slices for group-level normalization.
 
         When ``group_sizes`` (e.g. ``[8, 7, 8, ...]``) is provided it gives
@@ -1476,6 +1712,15 @@ class Normalization:
         reduce_group=None,
         group_sizes: list[int] | None = None,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Normalizes x [B, ...] under no_grad. Returns x as float unchanged if loss_mask
+        # has no active elements (.item() sync). Computes mean (batch: all-reduced over
+        # reduce_group, group: per slice with singleton LOO groups using themselves,
+        # none: zero), centers and masks x, then std (batch all-reduced, group per slice
+        # with singleton unbiased groups using 1, none: 1 with eps 0) and returns
+        # float32 centered/(std + eps).
+        # KNOWN ISSUE: with fixed group_size not dividing bs, the uncovered tail keeps
+        # mean 0 and std 0, giving x/eps.
         bs = x.size(0)
         eps = self.eps
 
@@ -1585,6 +1830,12 @@ class Normalization:
         all_reduce: bool,
         reduce_group,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Mean over all dims of x (optionally masked), in float64/32, with
+        # optional all-reduce of sums and counts. Leave-one-out returns per-element (sum
+        # - x_i)/(count - 1) (masked positions get the regular mean); zero when count <=
+        # 1. Count 0 returns zero. Returns keepdim tensor (or full-shape for LOO).
+        # .item() syncs.
         """Compute mean only, using masked_normalization internals."""
         dtype = torch.float64 if high_precision else torch.float32
         x = x.to(dtype)
@@ -1643,6 +1894,10 @@ class Normalization:
         all_reduce: bool,
         reduce_group,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Std over all dims of x around the given mean (masked if mask),
+        # optional all-reduce, unbiased (count-1) or biased. Returns ones when the count
+        # is too small. Returns a keepdim tensor.
         """Compute std only, given precomputed mean."""
         dtype = torch.float64 if high_precision else torch.float32
         x = x.to(dtype)
@@ -1677,11 +1932,17 @@ class Normalization:
 
 
 class KLEstimator:
+    # [CLASS DOC]
+    # Callable KL estimator between two log-prob tensors (Schulman's k1, k2, k3) with
+    # optional clamping to [-10, 10].
     """
     KL divergence estimator, supports k1, k2 and k3.
     """
 
     def __init__(self, kl_estimator: str = "k1", apply_clamp: bool = True):
+        # [FUNCTION DOC]
+        # Validates kl_estimator in k1/k2/k3 (ValueError otherwise) and stores it with
+        # apply_clamp.
         self.kl_estimator = kl_estimator
         if kl_estimator not in ["k1", "k2", "k3"]:
             raise ValueError(
@@ -1692,6 +1953,9 @@ class KLEstimator:
     def __call__(
         self, log_probs: torch.Tensor, log_probs_base: torch.Tensor
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Returns the per-element approximate KL of log_probs vs log_probs_base using
+        # the configured estimator.
         return self._compute_approx_kl(
             log_probs, log_probs_base, self.kl_estimator, self.apply_clamp
         )
@@ -1704,6 +1968,12 @@ class KLEstimator:
         kl_estimator: str = "k1",
         apply_clamp: bool = True,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Static estimator: with r = log_probs - log_probs_base in float32, k1 returns
+        # r, k2 returns r^2 / 2, k3 returns exp(-r) - 1 + r; optionally clamps to [-10,
+        # 10].
+        # KNOWN ISSUE: an unknown estimator name (possible when called statically)
+        # raises UnboundLocalError instead of a clear ValueError.
         """
         Compute the approximate KL divergence between two distributions.
         Schulman blog: http://joschu.net/blog/kl-approx.html
@@ -1738,6 +2008,10 @@ class KLEstimator:
 
 
 def make_dummy_eval_item(template: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Builds a placeholder item with the same keys as template: tensors become zeros of
+    # shape [1, 1] with same dtype/device, attention_mask/loss_mask become zeros (bool
+    # if not a tensor), multimodal keys become [{}], other values deep-copied.
     """Create a zero-contribution dummy item matching *template*'s schema.
 
     Every tensor field is replaced with a minimal all-zeros tensor that
@@ -1747,6 +2021,8 @@ def make_dummy_eval_item(template: dict[str, Any]) -> dict[str, Any]:
     """
 
     def _zero_tensor_like(tensor: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # HELPER: Returns a [1, 1] zeros tensor matching tensor's dtype and device.
         return torch.zeros((1, 1), dtype=tensor.dtype, device=tensor.device)
 
     dummy: dict[str, Any] = {}

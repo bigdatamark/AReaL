@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Log-probability and entropy gathering from logits, with optional vocab (tensor)
+# parallelism where each TP rank holds a contiguous vocab shard. Provides chunked (along
+# the first/token dimension) dense implementations (torch.compile'd except on NPU),
+# memory-lean custom autograd Functions for vocab-parallel logprobs and logprobs+entropy
+# that all-reduce small per-token statistics over the TP group, and a destructive in-
+# place CUDA FP32 path backed by Triton kernels (vocab_parallel_kernels). Public API:
+# gather_logprobs and gather_logprobs_entropy.
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
@@ -16,6 +24,9 @@ T = TypeVar("T", torch.Tensor, tuple[torch.Tensor, torch.Tensor])
 def _gather_logprobs(
     logits: torch.Tensor, labels: torch.Tensor, temperature: float = 1.0
 ):
+    # [FUNCTION DOC]
+    # HELPER: Log-softmax of float32 logits / temperature, gathered at labels. Returns
+    # tensor of labels' shape. Compiled with torch.compile unless on NPU.
     log_probs = torch.nn.functional.log_softmax(logits.float() / temperature, dim=-1)
     log_probs_labels = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
     return log_probs_labels
@@ -24,6 +35,9 @@ def _gather_logprobs(
 def _gather_logprobs_entropy(
     logits: torch.Tensor, labels: torch.Tensor, temperature: float = 1.0
 ):
+    # [FUNCTION DOC]
+    # HELPER: Same as _gather_logprobs, also returns entropy -sum(p*log p) of the
+    # tempered distribution. Returns (logprobs, entropy).
     log_probs = torch.nn.functional.log_softmax(logits.float() / temperature, dim=-1)
     entropy = -torch.sum(log_probs.exp() * log_probs, dim=-1)
     log_probs_labels = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
@@ -31,6 +45,8 @@ def _gather_logprobs_entropy(
 
 
 def _should_use_torch_compile() -> bool:
+    # [FUNCTION DOC]
+    # HELPER: True unless an NPU is available (torch.compile disabled on NPU).
     return not is_npu_available
 
 
@@ -45,6 +61,10 @@ def _chunked_apply(
     labels: torch.Tensor,
     chunk_size: int = 1024,
 ) -> T:
+    # [FUNCTION DOC]
+    # HELPER: Applies fn(logits_chunk, labels_chunk) over chunks of chunk_size rows
+    # along dim 0 and concatenates results (elementwise for tuple outputs). Asserts at
+    # least one row. Reduces peak memory of intermediate [chunk, vocab] tensors.
     """Apply a function in chunks along the first dimension to reduce peak memory."""
     total_seqlen = logits.shape[0]
     assert total_seqlen > 0, "Input logits must have at least one element"
@@ -68,6 +88,8 @@ def _chunked_gather_logprobs(
     temperature: float = 1.0,
     chunk_size: int = 1024,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Chunked dense logprob gathering with temperature.
     fn = functools.partial(_gather_logprobs, temperature=temperature)
     return _chunked_apply(fn, logits, labels, chunk_size)
 
@@ -78,11 +100,17 @@ def _chunked_gather_logprobs_entropy(
     temperature: float = 1.0,
     chunk_size: int = 1024,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Chunked dense logprob + entropy gathering with temperature.
     fn = functools.partial(_gather_logprobs_entropy, temperature=temperature)
     return _chunked_apply(fn, logits, labels, chunk_size)
 
 
 class _VocabParallelLogProbs(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd Function computing logprobs of global label ids from vocab-sharded float
+    # logits over a TP group. Saves only the softmax and reuses it in place as the
+    # gradient (no retain_graph / double backward support).
     """Compute log probabilities when logits are sharded on the vocab dimension.
 
     Given sharded logits [..., vocab_size/tp] and labels [...], computes:
@@ -124,6 +152,14 @@ class _VocabParallelLogProbs(torch.autograd.Function):
         labels: torch.Tensor,
         tp_group: dist.ProcessGroup,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Computes this rank's vocab range from its TP rank and shard width; all-reduces
+        # (MAX) the row max, exponentiates shifted logits and all-reduces (SUM) the
+        # partition sums; picks the shifted logit at the label when it falls in this
+        # shard (0 otherwise) and all-reduces (SUM) it; logprob = picked - log(sum_exp).
+        # Turns exp_logits into softmax in place and saves softmax, out-of-shard mask
+        # and local label indices. Three collectives. Returns logprobs with labels'
+        # shape.
         # Get TP rank info
         tp_rank = dist.get_rank(tp_group)
 
@@ -170,6 +206,10 @@ class _VocabParallelLogProbs(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> tuple:
+        # [FUNCTION DOC]
+        # Gradient w.r.t. logits: (one_hot(label) - softmax) * grad_output, computed in
+        # place on the saved softmax (subtracting 1 at in-shard label positions, scaling
+        # and negating). Returns (grad_logits, None, None).
         softmax, labels_mask, masked_labels_1d = ctx.saved_tensors
 
         # Gradient of logprobs w.r.t. logits: one_hot(labels) - softmax
@@ -196,6 +236,10 @@ class _VocabParallelLogProbs(torch.autograd.Function):
 
 
 class _VocabParallelLogProbsEntropy(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd Function computing both logprobs and entropy from vocab-sharded float
+    # logits, sharing reductions. Saves softmax plus small per-token tensors (E[logits],
+    # log Z); the backward allocates one new [*, vocab/tp] tensor.
     """Compute both log probabilities and entropy when logits are sharded.
 
     Input tensors can have arbitrary leading dimensions:
@@ -256,6 +300,11 @@ class _VocabParallelLogProbsEntropy(torch.autograd.Function):
         labels: torch.Tensor,
         tp_group: dist.ProcessGroup,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Like _VocabParallelLogProbs.forward, plus all-reduces E[x] = sum(softmax *
+        # original logits) (via vecdot) and computes entropy = log Z - E[x] where log Z
+        # = max + log sum_exp. Saves softmax, E[x], log Z, label mask, local labels and
+        # shard width. Four collectives. Returns (logprobs, entropy).
         # Get TP rank info
         tp_rank = dist.get_rank(tp_group)
         partition_vocab_size = vocab_parallel_logits.size(-1)
@@ -326,6 +375,10 @@ class _VocabParallelLogProbsEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_logprobs: torch.Tensor, grad_entropy: torch.Tensor) -> tuple:
+        # [FUNCTION DOC]
+        # Gradient: grad_entropy * softmax * (E[x] - log Z - log softmax) plus
+        # grad_logprobs * (one_hot(label) - softmax), assembled into one new tensor with
+        # in-place ops (xlogy for 0*log0). Returns (grad_logits, None, None).
         (
             softmax,
             sum_softmax_times_logits,
@@ -379,11 +432,19 @@ def _all_reduce_if_needed(
     op: dist.ReduceOp.RedOpType,
     tp_group: dist.ProcessGroup | None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: All-reduces tensor in place with op over tp_group only if the group exists
+    # and has more than one rank.
     if tp_group is not None and dist.get_world_size(tp_group) > 1:
         dist.all_reduce(tensor, op=op, group=tp_group)
 
 
 class _InplaceVocabParallelLogProbsEntropy(torch.autograd.Function):
+    # [CLASS DOC]
+    # Autograd Function for the destructive Megatron path: forward overwrites the
+    # contiguous CUDA FP32 logits with softmax, backward overwrites the same storage
+    # with dlogits, processing chunk_size rows at a time inside the node. Entropy is
+    # non-differentiable.
     """Megatron-compatible destructive logprob and entropy computation.
 
     The input must be a contiguous CUDA FP32 tensor dedicated to loss computation.
@@ -401,6 +462,18 @@ class _InplaceVocabParallelLogProbsEntropy(torch.autograd.Function):
         temperature: float,
         chunk_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Validates temperature (finite, > 0; ValueError) and that logits rows equal
+        # label count (ValueError). Computes local label indices (-1 when outside this
+        # shard). Allocates per-token logprobs/entropy outputs and small reusable
+        # workspaces. Per chunk: all-reduces row max; picks tempered shifted label
+        # logits (0 if not local); runs fused_exp_sum_inplace (writes exp values in
+        # place and per-tile partial sums of exp and exp*logit); reduces [label logit,
+        # sum_exp, weighted sum] and all-reduces them together (padding unused rows with
+        # zeros); sets logprob = label logit - log sum_exp and entropy = log sum_exp -
+        # weighted/sum_exp; normalizes the chunk to softmax in place. Bumps the tensor's
+        # autograd version, saves it and local targets, marks entropy non-
+        # differentiable. Returns (logprobs, entropy) shaped like labels.
         from areal.utils.functional.vocab_parallel_kernels import (
             fused_exp_sum_inplace,
             fused_normalize_inplace,
@@ -494,6 +567,11 @@ class _InplaceVocabParallelLogProbsEntropy(torch.autograd.Function):
         grad_logprobs: torch.Tensor | None,
         grad_entropy: torch.Tensor | None,
     ) -> tuple:
+        # [FUNCTION DOC]
+        # Ignores grad_entropy. For each chunk runs fused_softmax_backward_inplace,
+        # which turns saved softmax into dlogits = (one_hot - softmax) * grad_logprob *
+        # inv_temperature in place (or zeros when grad is None). Bumps version and
+        # returns the overwritten storage as the logits gradient.
         from areal.utils.functional.vocab_parallel_kernels import (
             fused_softmax_backward_inplace,
         )
@@ -527,6 +605,9 @@ def _vocab_parallel_logprobs(
     tp_group: dist.ProcessGroup,
     temperature: float = 1.0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: Casts logits to float (dividing by temperature if != 1) and applies
+    # _VocabParallelLogProbs over tp_group.
     if temperature != 1.0:
         logits = vocab_parallel_logits.float() / temperature
     else:
@@ -540,6 +621,9 @@ def _vocab_parallel_logprobs_entropy(
     tp_group: dist.ProcessGroup,
     temperature: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Casts logits to float (tempered) and applies
+    # _VocabParallelLogProbsEntropy.
     if temperature != 1.0:
         logits = vocab_parallel_logits.float() / temperature
     else:
@@ -554,6 +638,9 @@ def _inplace_vocab_parallel_logprobs_entropy(
     temperature: float = 1.0,
     chunk_size: int = 1024,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: Applies _InplaceVocabParallelLogProbsEntropy on the workspace logits;
+    # returns (logprobs, entropy). Destroys the input logits contents.
     """Destructively reuse CUDA FP32 logits as softmax and dlogits storage."""
     logprobs, entropy = _InplaceVocabParallelLogProbsEntropy.apply(
         vocab_parallel_logits, labels, tp_group, temperature, chunk_size
@@ -568,6 +655,11 @@ def gather_logprobs(
     tp_group: dist.ProcessGroup | None = None,
     chunk_size: int = 1024,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Returns per-label logprobs. If tp_group has more than one rank, applies the vocab-
+    # parallel autograd function chunk-wise (collectives per chunk); otherwise uses the
+    # chunked dense path. Leading dims of logits/labels must match; chunking is on dim
+    # 0.
     """Compute log probabilities with optional vocab parallelism for FSDP.
 
     Args:
@@ -602,6 +694,11 @@ def gather_logprobs_entropy(
     chunk_size: int = 1024,
     reuse_logits: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Returns (logprobs, entropy) at labels. If reuse_logits and the logits qualify (see
+    # reusable_vocab_parallel_logits: CUDA, contiguous FP32), uses the destructive in-
+    # place path (entropy then carries no gradient). Otherwise vocab-parallel chunked
+    # path when tp_group has > 1 rank, else dense chunked path.
     """Compute log probabilities and entropy with optional vocab parallelism for FSDP.
 
     This function computes both values in a single pass, sharing intermediate results

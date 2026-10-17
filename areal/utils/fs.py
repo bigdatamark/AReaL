@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Filesystem helpers: a per-user cache directory and validation that shared paths exist
+# and live on a network filesystem (detected via mount table keyword matching).
 # SPDX-License-Identifier: Apache-2.0
 
 import getpass
@@ -51,6 +54,10 @@ NETWORK_FS_KEYWORDS = {
 
 
 def get_user_tmp():
+    # [FUNCTION DOC]
+    # Returns /home/<user>/.cache/areal, creating it if needed (side effect: mkdir).
+    # KNOWN ISSUE: hardcodes /home/<user> instead of the real home directory, which
+    # fails for users whose home is elsewhere (e.g. root).
     user = getpass.getuser()
     user_tmp = os.path.join("/home", user, ".cache", "areal")
     os.makedirs(user_tmp, exist_ok=True)
@@ -58,6 +65,16 @@ def get_user_tmp():
 
 
 def validate_shared_path(path: str, name: str = "path", warn_nfs: bool = True) -> None:
+    # [FUNCTION DOC]
+    # Validates a shared path. Empty path is a no-op. Raises FileNotFoundError if it
+    # does not exist. If warn_nfs, resolves the real path, finds the longest-prefix
+    # mount from psutil.disk_partitions(all=True), and treats it as network if its
+    # fstype+device contains any NETWORK_FS_KEYWORDS, the device has ":" and is not
+    # under /dev, or starts with "//". Logs a warning (does not raise) if not on network
+    # storage. Returns None.
+    # KNOWN ISSUE: the mountpoint prefix match is a plain string prefix, so "/data" also
+    # matches "/data2/..."; and substring keywords like "afs" or "efs" can false-
+    # positive.
     """
     Validate that a path exists for shared/distributed access.
 

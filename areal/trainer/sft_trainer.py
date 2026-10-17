@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# SFT trainer entry point. Defines SFTTrainer, which wires config, datasets, scheduler,
+# actor engine (FSDP/Megatron/Archon, local SPMD or single-controller), dataloaders,
+# evaluator, saver, recovery, stats logging and perf tracing, and runs the training loop
+# calling actor.train_lm.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -56,12 +61,31 @@ logger = logging.getLogger("SFTTrainer")
 
 
 class SFTTrainer:
+    # [CLASS DOC]
+    # Orchestrates supervised fine-tuning end to end. Works in SPMD mode (each rank runs
+    # this; batches broadcast within model/context parallel groups) or single-controller
+    # mode (this process drives remote workers through a scheduler). Usable as a context
+    # manager that closes resources on exit.
     def __init__(
         self,
         config: SFTConfig,
         train_dataset: Dataset,
         valid_dataset: Dataset | None = None,
     ):
+        # [FUNCTION DOC]
+        # Builds the whole training setup. Inputs: config (SFTConfig), train_dataset,
+        # optional valid_dataset. Steps: in single-controller mode sets up controller
+        # file logging and a scheduler; loads HF processor/tokenizer; seeds RNG with key
+        # "trainer<RANK>"; parses the actor allocation string and creates the actor
+        # engine/controller; if the train dataset is a remote RDataset (single-
+        # controller only) starts a DataController and connects the dataset to it;
+        # builds the train dataloader sharded by actor DP rank/size; builds a
+        # FinetuneSpec (dataset_size = number of batches times batch size) and
+        # initializes the actor; optionally builds a validation dataloader (connecting a
+        # valid RDataset to the same DataController); creates Evaluator, Saver,
+        # RecoverHandler, StatsLogger; loads recover state (may restore
+        # actor/dataloader/etc.) into self.recover_info; configures the perf tracer.
+        # Side effects: process spawning via scheduler, file I/O, GPU model init.
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             logging.setup_file_logging(StatsLogger.get_log_path(config.stats_logger))
@@ -150,6 +174,19 @@ class SFTTrainer:
         self._config_perf_tracer()
 
     def train(self):
+        # [FUNCTION DOC]
+        # Main training loop. Resumes from recover_info's next global step (else 0) and
+        # iterates global steps up to epochs times steps_per_epoch, stopping early at
+        # total_train_steps if set. Each step: loads/broadcasts a batch; waits for async
+        # checkpoint staging; optionally starts a CUDA memory profile (only on ranks
+        # allowed by env AREAL_MEMORY_PROFILER_RANKS); runs actor.train_lm(batch) and
+        # steps the LR scheduler (logging device stats) inside a trace scope with the
+        # torch profiler enabled (record_shapes on, profile_memory from env
+        # AREAL_TORCH_PROFILER_PROFILE_MEMORY, default true); dumps memory snapshots to
+        # <log_dir>/memory_snapshots/step_<n> if profiling; sets actor version to
+        # step+1; saves HF checkpoint, recover checkpoint, runs evaluation (each timed
+        # and traced); in single-controller mode clears cached batches on actor and
+        # DataController; exports and commits stats; saves perf traces. Returns None.
         config = self.config
         rank = int(os.getenv("RANK", "0"))
         memory_profile_this_rank = rank_in_env_filter(
@@ -294,6 +331,12 @@ class SFTTrainer:
             self._save_perf_tracer(step=global_step)
 
     def close(self):
+        # [FUNCTION DOC]
+        # Tears down: finalizes the saver (flushes async checkpoints), closes connected
+        # RDatasets, destroys the DataController, closes the stats logger, destroys the
+        # actor and force-saves perf traces.
+        # KNOWN ISSUE: unlike RWTrainer it accesses _train_rdataset etc. without hasattr
+        # guards, so close on a partially constructed instance raises AttributeError.
         self.saver.finalize()
         if self._train_rdataset is not None:
             self._train_rdataset.close()
@@ -306,6 +349,10 @@ class SFTTrainer:
         perf_tracer.save(force=True)
 
     def _config_perf_tracer(self):
+        # [FUNCTION DOC]
+        # HELPER: If a perf_tracer config exists, configures the local tracer as role
+        # "master" with RANK from env, and in single-controller mode also configures the
+        # actor's tracer.
         rank = int(os.getenv("RANK", "0"))
         if self.config.perf_tracer is None:
             return
@@ -315,12 +362,19 @@ class SFTTrainer:
         self.actor.config_perf_tracer(self.config.perf_tracer, role="actor")
 
     def _save_perf_tracer(self, step: int):
+        # [FUNCTION DOC]
+        # HELPER: If perf tracing is configured, saves actor and local perf traces for
+        # the step.
         if self.config.perf_tracer is None:
             return
         self.actor.save_perf_tracer(step=step)
         perf_tracer.save(step=step)
 
     def _init_scheduler(self) -> Scheduler:
+        # [FUNCTION DOC]
+        # HELPER: Instantiates a Local/Ray/Slurm scheduler based on
+        # config.scheduler.type with the full experiment config. Raises
+        # NotImplementedError for unknown types.
         cfg = self.config.scheduler
         if cfg.type == "local":
             return LocalScheduler(exp_config=self.config)
@@ -337,6 +391,10 @@ class SFTTrainer:
         rank: int,
         world_size: int,
     ) -> StatefulDataLoader:
+        # [FUNCTION DOC]
+        # HELPER: Wraps create_dataloader for the dataset with the given DP rank/world
+        # size and dataset config, using collate_samples_to_list as collate_fn. Returns
+        # a StatefulDataLoader.
         return create_dataloader(
             dataset,
             rank=rank,
@@ -348,6 +406,12 @@ class SFTTrainer:
     def _create_actor(
         self, actor_config: TrainEngineConfig
     ) -> FSDPLMEngine | MegatronLMEngine | ArchonLMEngine | LMController:
+        # [FUNCTION DOC]
+        # HELPER: Chooses the language-model engine class by backend ("fsdp",
+        # "megatron", "archon"; lazily imported), else raises ValueError. In single-
+        # controller mode builds a remote controller via as_controller(config,
+        # scheduler), otherwise instantiates the engine locally. Creates its process
+        # groups with the allocation's parallel strategy and returns it.
         if self.actor_alloc.backend == "fsdp":
             from areal.engine import FSDPLMEngine
 
@@ -373,6 +437,11 @@ class SFTTrainer:
         return actor
 
     def _load_bcast_from(self, data_generator):
+        # [FUNCTION DOC]
+        # HELPER: Pulls the next batch from the generator. In single-controller mode
+        # returns it as is; otherwise moves tensors to the current device and broadcasts
+        # from the DP head across the context+model parallel group (data is identical
+        # within that group).
         batch = next(data_generator)
 
         if is_single_controller():
@@ -387,6 +456,10 @@ class SFTTrainer:
         return batch
 
     def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Saves an HF-format model (with tokenizer/processor) via Saver if due;
+        # when not in async mode, barriers on the actor CPU group and synchronizes the
+        # device.
         self.saver.save(
             self.actor,
             epoch,
@@ -401,6 +474,11 @@ class SFTTrainer:
             current_platform.synchronize()
 
     def _save_recover_checkpoint(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Dumps a recoverable checkpoint (actor as "default", step info,
+        # saver/evaluator/ stats logger/dataloader states, tokenizer/processor) via
+        # RecoverHandler if due, then barriers on the CPU group and synchronizes the
+        # device.
         to_save: dict = dict(default=self.actor)
         step_info = StepInfo(
             global_step=global_step,
@@ -423,6 +501,12 @@ class SFTTrainer:
         current_platform.synchronize()
 
     def _evaluate_fn(self):
+        # [FUNCTION DOC]
+        # HELPER: Runs one full pass over the validation dataloader,
+        # loading/broadcasting each batch and calling actor.evaluate_lm, then barrier +
+        # device sync.
+        # KNOWN ISSUE: assumes valid_dataloader is not None (only called via _evaluate
+        # which checks).
         data_generator = cycle_dataloader(self.valid_dataloader, num_cycles=1)
         for _ in range(len(self.valid_dataloader)):
             data = self._load_bcast_from(data_generator)
@@ -437,6 +521,10 @@ class SFTTrainer:
         epoch_step: int,
         global_step: int,
     ):
+        # [FUNCTION DOC]
+        # HELPER: If a validation dataloader exists, lets the Evaluator decide (by
+        # frequency) whether to run _evaluate_fn, then barrier + device sync. Returns
+        # None.
         if self.valid_dataloader is None:
             return
         self.evaluator.evaluate(
@@ -449,6 +537,9 @@ class SFTTrainer:
         current_platform.synchronize()
 
     def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Exports actor stats (reduced across ranks) and commits them to the
+        # StatsLogger for the step, then barrier + device sync.
         stats = self.actor.export_stats()
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
 
@@ -456,9 +547,14 @@ class SFTTrainer:
         current_platform.synchronize()
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Context-manager entry; returns self.
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Context-manager exit: logs the exception with traceback if one occurred, calls
+        # close(), and returns False so exceptions propagate.
         if exc_type is not None:
             logger.error(f"Training failed with exception: {exc_value}", exc_info=True)
         self.close()

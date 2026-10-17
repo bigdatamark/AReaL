@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Dependency-free validation for delta weight-transfer (DTE) in separation-mode rollout,
+# and propagation of the related runtime environment variables to the current process
+# and to worker scheduling specs.
 # SPDX-License-Identifier: Apache-2.0
 """Dependency-free configuration helpers for separation DTE updates."""
 
@@ -10,10 +14,15 @@ from typing import Any
 
 
 def _enum_value(value: Any) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Returns value.value for Enum members, otherwise the value unchanged.
     return value.value if isinstance(value, Enum) else value
 
 
 def _backend_name(value: Any) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the lowercase backend name: the part of the (enum-unwrapped)
+    # string before the first ":" (e.g. "megatron:d4" -> "megatron").
     return str(_enum_value(value)).split(":", maxsplit=1)[0].lower()
 
 
@@ -21,6 +30,17 @@ def apply_dte_config_envvars(
     config: Any,
     environ: MutableMapping[str, str] | None = None,
 ) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # If config.actor.enable_delta_weight_update is falsy returns {} with no side
+    # effects. Otherwise validates: rollout scheduling strategy is "separation", delta
+    # method is "adamw", anchor interval non-negative, actor backend megatron, rollout
+    # backend sglang, both actor and rollout _version "v2", weight_update_mode "awex",
+    # no LoRA; raises ValueError on any violation. Then builds env vars
+    # DTE_SEPARATION_WEIGHT_UPDATE=1, DTE_DELTA_TRANSFER=1,
+    # DTE_DELTA_ANCHOR_INTERVAL=<interval>, DTE_STREAMING_RECONSTRUCT=1, updates environ
+    # (default os.environ), and merges them into env_vars of every scheduling_spec of
+    # actor and rollout (dicts or objects, creating env_vars if missing). Returns the
+    # exported dict.
     """Validate delta weight-transfer config and propagate runtime switches."""
     if not getattr(config.actor, "enable_delta_weight_update", False):
         return {}

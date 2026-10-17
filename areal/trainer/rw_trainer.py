@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Reward-model trainer entry point. Defines rw_modeling_collate_fn and RWTrainer, which
+# wires config, datasets, scheduler, actor engine (FSDP/Megatron/Archon, local SPMD or
+# single-controller), dataloaders, evaluator, saver, recovery, stats logging and perf
+# tracing, and runs the training loop calling actor.train_rw.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -52,6 +57,12 @@ logger = logging.getLogger("RWTrainer")
 
 
 def rw_modeling_collate_fn(items):
+    # [FUNCTION DOC]
+    # Collate function for reward-model data. Input: list of items each with
+    # "chosen_ids" and "rejected_ids" (tensors or lists). Output: a flat list with two
+    # dicts per item (chosen then rejected), each holding "input_ids" of shape [1,
+    # seqlen] and an all-True bool "attention_mask" of the same shape. Non-tensors are
+    # converted with torch.tensor.
     """Collate reward-model items into per-sequence tensor dicts.
 
     Each dataset item has ``chosen_ids`` and ``rejected_ids``.  This produces
@@ -74,12 +85,31 @@ def rw_modeling_collate_fn(items):
 
 
 class RWTrainer:
+    # [CLASS DOC]
+    # Orchestrates pairwise reward-model training end to end. Works in SPMD mode (each
+    # rank runs this; batches broadcast within model/context parallel groups) or single-
+    # controller mode (this process drives remote workers through a scheduler). Usable
+    # as a context manager that closes resources on exit.
     def __init__(
         self,
         config: RWConfig,
         train_dataset: Dataset,
         valid_dataset: Dataset | None = None,
     ):
+        # [FUNCTION DOC]
+        # Builds the whole training setup. Inputs: config (RWConfig), train_dataset,
+        # optional valid_dataset. Steps: in single-controller mode sets up controller
+        # file logging and a scheduler; loads HF processor/tokenizer; seeds RNG with key
+        # "trainer<RANK>"; parses the actor allocation string and creates the actor
+        # engine/controller; if the train dataset is a remote RDataset (single-
+        # controller only) starts a DataController and connects the dataset to it;
+        # builds the train dataloader sharded by actor DP rank/size; builds a
+        # FinetuneSpec (dataset_size = number of batches times batch size) and
+        # initializes the actor; optionally builds a validation dataloader (connecting a
+        # valid RDataset to the same DataController); creates Evaluator, Saver,
+        # RecoverHandler, StatsLogger; loads recover state (may restore
+        # actor/dataloader/etc.) into self.recover_info; configures the perf tracer.
+        # Side effects: process spawning via scheduler, file I/O, GPU model init.
         rank = int(os.getenv("RANK", "0"))
         if is_single_controller():
             # Set up file logging for controller process
@@ -179,6 +209,17 @@ class RWTrainer:
         self._config_perf_tracer()
 
     def train(self):
+        # [FUNCTION DOC]
+        # Main training loop. Resumes from recover_info's next global step (else 0) and
+        # iterates global steps up to epochs times steps_per_epoch, stopping early at
+        # total_train_steps if set. Each step: loads/broadcasts a batch; waits for async
+        # checkpoint staging; optionally starts a CUDA memory profile; runs
+        # actor.train_rw(batch) and steps the LR scheduler (logging device stats); dumps
+        # memory snapshots to <log_dir>/memory_snapshots/step_<n> if profiling; sets
+        # actor version to step+1; saves HF checkpoint, recover checkpoint, runs
+        # evaluation (each timed and traced); in single-controller mode clears cached
+        # batches on actor and DataController; exports and commits stats; saves perf
+        # traces. Returns None.
         config = self.config
         start_step = (
             self.recover_info.last_step_info.next().global_step
@@ -309,6 +350,11 @@ class RWTrainer:
             self._save_perf_tracer(step=global_step)
 
     def close(self):
+        # [FUNCTION DOC]
+        # Tears down: finalizes the saver (flushes async checkpoints), closes connected
+        # RDatasets, destroys the DataController, closes the stats logger, destroys the
+        # actor and force-saves perf traces. Uses hasattr guards so it is safe on
+        # partially constructed instances.
         self.saver.finalize()
         if hasattr(self, "_train_rdataset") and self._train_rdataset is not None:
             self._train_rdataset.close()
@@ -321,6 +367,10 @@ class RWTrainer:
         perf_tracer.save(force=True)
 
     def _config_perf_tracer(self):
+        # [FUNCTION DOC]
+        # HELPER: If a perf_tracer config exists, configures the local tracer as role
+        # "master" with RANK from env, and in single-controller mode also configures the
+        # actor's tracer.
         rank = int(os.getenv("RANK", "0"))
         if self.config.perf_tracer is None:
             return
@@ -330,12 +380,19 @@ class RWTrainer:
         self.actor.config_perf_tracer(self.config.perf_tracer, role="actor")
 
     def _save_perf_tracer(self, step: int):
+        # [FUNCTION DOC]
+        # HELPER: If perf tracing is configured, saves actor and local perf traces for
+        # the step.
         if self.config.perf_tracer is None:
             return
         self.actor.save_perf_tracer(step=step)
         perf_tracer.save(step=step)
 
     def _init_scheduler(self) -> Scheduler:
+        # [FUNCTION DOC]
+        # HELPER: Instantiates a Local/Ray/Slurm scheduler based on
+        # config.scheduler.type with the full experiment config. Raises
+        # NotImplementedError for unknown types.
         cfg = self.config.scheduler
         if cfg.type == "local":
             return LocalScheduler(exp_config=self.config)
@@ -352,6 +409,10 @@ class RWTrainer:
         rank: int,
         world_size: int,
     ) -> StatefulDataLoader:
+        # [FUNCTION DOC]
+        # HELPER: Wraps create_dataloader for the dataset with the given DP rank/world
+        # size and dataset config, using rw_modeling_collate_fn as collate_fn. Returns a
+        # StatefulDataLoader.
         return create_dataloader(
             dataset,
             rank=rank,
@@ -363,6 +424,12 @@ class RWTrainer:
     def _create_actor(
         self, actor_config: TrainEngineConfig
     ) -> FSDPRWEngine | MegatronRWEngine | ArchonRWEngine | RWController:
+        # [FUNCTION DOC]
+        # HELPER: Chooses the reward-model engine class by backend ("fsdp", "megatron",
+        # "archon"; lazily imported), else raises ValueError. In single-controller mode
+        # builds a remote controller via as_controller(config, scheduler), otherwise
+        # instantiates the engine locally. Creates its process groups with the
+        # allocation's parallel strategy and returns it.
         if self.actor_alloc.backend == "fsdp":
             from areal.engine import FSDPRWEngine
 
@@ -388,6 +455,11 @@ class RWTrainer:
         return actor
 
     def _load_bcast_from(self, data_generator):
+        # [FUNCTION DOC]
+        # HELPER: Pulls the next batch from the generator. In single-controller mode
+        # returns it as is; otherwise moves tensors to the current device and broadcasts
+        # from the DP head across the context+model parallel group (data is identical
+        # within that group).
         batch = next(data_generator)
 
         if is_single_controller():
@@ -403,6 +475,10 @@ class RWTrainer:
         return batch
 
     def _save_hf(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Saves an HF-format model (with tokenizer/processor) via Saver if due;
+        # when not in async mode, barriers on the actor CPU group and synchronizes the
+        # device.
         # Save as HF models for evaluation
         self.saver.save(
             self.actor,
@@ -419,6 +495,11 @@ class RWTrainer:
             current_platform.synchronize()
 
     def _save_recover_checkpoint(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Dumps a recoverable checkpoint (actor as "default", step info,
+        # saver/evaluator/ stats logger/dataloader states, tokenizer/processor) via
+        # RecoverHandler if due, then barriers on the CPU group and synchronizes the
+        # device.
         # Save recoverable checkpoints
         to_save: dict = dict(default=self.actor)
         step_info = StepInfo(
@@ -442,6 +523,12 @@ class RWTrainer:
         current_platform.synchronize()
 
     def _evaluate_fn(self):
+        # [FUNCTION DOC]
+        # HELPER: Runs one full pass over the validation dataloader,
+        # loading/broadcasting each batch and calling actor.evaluate_rw, then barrier +
+        # device sync.
+        # KNOWN ISSUE: assumes valid_dataloader is not None (only called via _evaluate
+        # which checks).
         data_generator = cycle_dataloader(self.valid_dataloader, num_cycles=1)
         for _ in range(len(self.valid_dataloader)):
             data = self._load_bcast_from(data_generator)
@@ -456,6 +543,10 @@ class RWTrainer:
         epoch_step: int,
         global_step: int,
     ):
+        # [FUNCTION DOC]
+        # HELPER: If a validation dataloader exists, lets the Evaluator decide (by
+        # frequency) whether to run _evaluate_fn, then barrier + device sync. Returns
+        # None.
         if self.valid_dataloader is None:
             return
         self.evaluator.evaluate(
@@ -468,6 +559,9 @@ class RWTrainer:
         current_platform.synchronize()
 
     def _export_and_commit_stats(self, epoch: int, epoch_step: int, global_step: int):
+        # [FUNCTION DOC]
+        # HELPER: Exports actor stats (reduced across ranks) and commits them to the
+        # StatsLogger for the step, then barrier + device sync.
         # Upload statistics to the logger (e.g., wandb)
         stats = self.actor.export_stats()
         self.stats_logger.commit(epoch, epoch_step, global_step, stats)
@@ -476,9 +570,14 @@ class RWTrainer:
         current_platform.synchronize()
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Context-manager entry; returns self.
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # [FUNCTION DOC]
+        # Context-manager exit: logs the exception with traceback if one occurred, calls
+        # close(), and returns False so exceptions propagate.
         if exc_type is not None:
             logger.error(f"Training failed with exception: {exc_value}", exc_info=True)
         self.close()

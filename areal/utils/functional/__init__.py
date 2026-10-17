@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Functional RL math package: re-exports policy/critic loss functions, DPO helpers,
+# normalization, rejection sampling and overlong reward penalty from functional.py, and
+# vocab-parallel-aware logprob/entropy gathering from vocab_parallel.py.
 # SPDX-License-Identifier: Apache-2.0
 
 from areal.utils.functional.functional import (

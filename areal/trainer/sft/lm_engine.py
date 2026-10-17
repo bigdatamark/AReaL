@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Supervised fine-tuning (SFT) glue. Defines LMEngine, which wraps a TrainEngine to
+# train/evaluate with a packed next-token NLL loss, the controller classes that dispatch
+# those calls (RPC TrainController and HTTP-gateway V2), and compute_packed_sft_loss.
+# Batches are packed sequences described by "cu_seqlens" with a per-token "loss_mask".
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Any
@@ -16,15 +21,32 @@ from areal.v2.training_service.controller.controller import (
 
 
 class LMEngine:
+    # [CLASS DOC]
+    # Worker-side SFT trainer that holds a TrainEngine and exposes train_lm /
+    # evaluate_lm over lists of micro-batch dicts.
     def __init__(self, engine: TrainEngine):
+        # [FUNCTION DOC]
+        # Stores the wrapped TrainEngine in self.engine.
         self.engine = engine
 
     @trace_perf("lm_engine.train_lm", category="compute")
     @stats_tracker.scope_func_wrapper("sft")
     def train_lm(self, data: list[dict[str, Any]]) -> None:
+        # [FUNCTION DOC]
+        # Trains on each dict in data via batched_call (unpack=False) under the "sft"
+        # stats scope and perf tracing. Returns None.
         batched_call(self._train_lm, data, unpack=False)
 
     def _train_lm(self, data: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Trains on one batch. Sets train mode, shifts loss_mask left by one
+        # (converted to bool, roll along last dim) so it aligns with next-token
+        # logprobs, mutating data in place, then calls train_batch with
+        # compute_packed_sft_loss and loss weight = number of masked tokens, and records
+        # the returned stats as scalars.
+        # KNOWN ISSUE: torch.roll wraps the first mask entry to the last position
+        # instead of zero-filling, so the final token of the packed batch may inherit a
+        # stale mask value.
         self.engine.train()
         data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
         stats = self.engine.train_batch(
@@ -37,9 +59,16 @@ class LMEngine:
     @trace_perf("lm_engine.evaluate_lm", category="compute")
     @stats_tracker.scope_func_wrapper("sft-eval")
     def evaluate_lm(self, data: list[dict[str, Any]]) -> None:
+        # [FUNCTION DOC]
+        # Evaluates each dict in data via batched_call under the "sft-eval" stats scope.
+        # Returns None.
         batched_call(self._evaluate_lm, data, unpack=False)
 
     def _evaluate_lm(self, data: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Evaluates one batch: eval mode, same in-place loss_mask roll as
+        # _train_lm, then eval_batch with compute_packed_sft_loss and token-count loss
+        # weight. Result discarded.
         self.engine.eval()
         data["loss_mask"] = torch.roll(data["loss_mask"].bool(), shifts=-1, dims=-1)
         self.engine.eval_batch(
@@ -50,12 +79,19 @@ class LMEngine:
 
 
 class LMController(TrainController):
+    # [CLASS DOC]
+    # RPC controller forwarding SFT calls to workers via _custom_function_call.
     def train_lm(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Remotely invokes "train_lm" with broadcast rpc_meta. Returns None.
         self._custom_function_call(
             "train_lm", *args, rpc_meta={"broadcast": True}, **kwargs
         )
 
     def evaluate_lm(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Pads eval args with group_size=1 for even DP dispatch, then remotely invokes
+        # "evaluate_lm" with broadcast rpc_meta. Returns None.
         args, kwargs = self._pad_eval_dispatch_args(args, kwargs, group_size=1)
         self._custom_function_call(
             "evaluate_lm", *args, rpc_meta={"broadcast": True}, **kwargs
@@ -63,7 +99,11 @@ class LMController(TrainController):
 
 
 class LMControllerV2(GatewayTrainController):
+    # [CLASS DOC]
+    # HTTP-gateway controller variant posting SFT calls to the training service.
     def train_lm(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Serializes args (list) and kwargs and POSTs to "/sft/train". Returns None.
         payload = {
             "args": serialize_value(list(args)),
             "kwargs": serialize_value(kwargs),
@@ -71,6 +111,8 @@ class LMControllerV2(GatewayTrainController):
         self._gateway_post_result("/sft/train", payload)
 
     def evaluate_lm(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Serializes args (list) and kwargs and POSTs to "/sft/evaluate". Returns None.
         payload = {
             "args": serialize_value(list(args)),
             "kwargs": serialize_value(kwargs),
@@ -87,6 +129,17 @@ def compute_packed_sft_loss(
     vocab_mean_logits: torch.Tensor | None = None,
     vocab_norm_logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Packed SFT loss. Inputs: per-token logprobs and entropy (1D over packed tokens),
+    # input_ with "cu_seqlens" and (already shifted) "loss_mask", and optional per-token
+    # vocab logit statistics. Returns the mean negative logprob over masked tokens (sum
+    # divided by masked count plus 1e-5). Side effects: logs denominators n_seqs
+    # (sequences with any valid token), n_tokens, n_valid_tokens, prompt_tokens, and
+    # stats ppl (exp of per-sequence mean NLL), per-token loss, masked entropy, and
+    # vocab min/max and mean/norm logits when both of a pair are given. The per-sequence
+    # loop calls .item() (GPU sync) once per sequence; sequences with no valid tokens
+    # (padding dummies) are skipped. No extra CP reduction is done because inputs are
+    # already CP-replicated (see docstring).
     """Compute SFT loss from logprobs.
 
     CP NOTE: MegatronEngine reassembles the CP-local per-token scalars
