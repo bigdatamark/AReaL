@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Defines the `agent` click command group ("Manage agent services") and registers
+# its subcommands: run, stop, status, ps and a logs command bound to the agent
+# lifecycle manager.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -25,6 +29,10 @@ from areal.v2.cli.commands.logs import LogsCommand
 )
 @click.pass_context
 def agent(ctx: click.Context, config_file: Path | None) -> None:
+    # [FUNCTION DOC]
+    # Click group callback. Accepts optional --config TOML path; sets the click
+    # context's default_map from ~/.areal/agent/config.toml merged with that extra file,
+    # so subcommand option defaults come from config.
     ctx.default_map = load_click_default_map(extra=config_file)
 
 

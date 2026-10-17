@@ -1,3 +1,6 @@
+# [PACKAGE DOC]
+# Worker subpackage: stateless HTTP server that loads a user agent class and runs
+# turns. Re-exports create_worker_app.
 # SPDX-License-Identifier: Apache-2.0
 
 from .app import create_worker_app

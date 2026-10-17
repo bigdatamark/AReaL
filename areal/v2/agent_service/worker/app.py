@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# FastAPI Worker app: loads one AgentRunnable implementation and exposes /run for
+# executing turns, plus health, per-session close and shutdown hooks. Holds no
+# session state itself.
 # SPDX-License-Identifier: Apache-2.0
 
 """Agent Worker — stateless HTTP server for agent execution."""
@@ -25,16 +29,27 @@ logger = logging.getLogger("AgentWorker")
 
 
 class _CollectingEmitter:
+    # [CLASS DOC]
+    # HELPER: In-memory EventEmitter implementation that appends each event as a dict
+    # to self.events so it can be returned with the structured response.
     def __init__(self) -> None:
+        # [FUNCTION DOC]
+        # Initializes the empty events list.
         self.events: list[dict[str, Any]] = []
 
     async def emit_delta(self, text: str) -> None:
+        # [FUNCTION DOC]
+        # Appends {"type": "delta", "text"}.
         self.events.append({"type": "delta", "text": text})
 
     async def emit_tool_call(self, name: str, args: str) -> None:
+        # [FUNCTION DOC]
+        # Appends {"type": "tool_call", "name", "args"}.
         self.events.append({"type": "tool_call", "name": name, "args": args})
 
     async def emit_tool_result(self, name: str, result: str) -> None:
+        # [FUNCTION DOC]
+        # Appends {"type": "tool_result", "name", "result"}.
         self.events.append({"type": "tool_result", "name": name, "result": result})
 
 
@@ -42,6 +57,10 @@ def create_worker_app(
     agent_cls_path: str,
     **agent_kwargs: Any,
 ) -> FastAPI:
+    # [FUNCTION DOC]
+    # Imports the class at agent_cls_path, instantiates it with agent_kwargs, verifies
+    # it satisfies AgentRunnable (raises TypeError otherwise), logs, and returns a
+    # FastAPI app with the routes below.
     app = FastAPI(title="AReaL Agent Worker")
 
     cls = import_from_string(agent_cls_path)
@@ -55,10 +74,15 @@ def create_worker_app(
 
     @app.get("/health")
     async def health():
+        # [FUNCTION DOC]
+        # GET /health: returns {"status": "ok"}.
         return {"status": "ok"}
 
     @app.post("/session/{session_key}/close")
     async def close_session(session_key: str):
+        # [FUNCTION DOC]
+        # POST /session/<key>/close: awaits the agent's optional close_session(key) if
+        # defined. Returns status ok.
         close_fn = getattr(agent, "close_session", None)
         if close_fn is not None:
             await close_fn(session_key)
@@ -66,12 +90,22 @@ def create_worker_app(
 
     @app.on_event("shutdown")
     async def shutdown():
+        # [FUNCTION DOC]
+        # App shutdown hook: awaits the agent's optional close_all_sessions() if defined.
         close_all_fn = getattr(agent, "close_all_sessions", None)
         if close_all_fn is not None:
             await close_all_fn()
 
     @app.post("/run")
     async def run(body: dict[str, Any]):
+        # [FUNCTION DOC]
+        # POST /run: builds an AgentRequest from the JSON body (missing fields default to
+        # empty; queue_mode parsed into QueueMode, invalid value raises ValueError -> 500),
+        # runs the agent with a collecting emitter. On agent exception logs and returns a
+        # 500 JSON {"error": {message, type}}. For StreamResponse, strips content-length,
+        # transfer-encoding and connection headers, adds the passthrough marker header and
+        # streams the body with the agent's status/content-type. Otherwise returns the
+        # AgentResponse fields as JSON plus "events" from the emitter.
         """Single agent entry point for every protocol and streaming mode.
 
         Calls the agent's ``run`` and relays whichever shape it returns:

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# FastAPI Gateway app: public entry point exposing a health check, an admin
+# session-close endpoint and an authenticated WebSocket that accepts protocol req
+# frames, routes each session via the Router, forwards the turn to the owning
+# DataProxy over HTTP and replays the resulting events as protocol frames.
 # SPDX-License-Identifier: Apache-2.0
 
 """Agent Gateway — public-facing HTTP/WebSocket server."""
@@ -41,6 +46,9 @@ logger = logging.getLogger("AgentGateway")
 
 
 def _make_accepted_json(request_id: str, run_id: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the JSON string of an ok "res" frame with status accepted for the
+    # given request id and run id (equivalent to serializing make_accepted_response).
     return json.dumps(
         {
             "type": FrameType.RES,
@@ -52,12 +60,19 @@ def _make_accepted_json(request_id: str, run_id: str) -> str:
 
 
 def create_gateway_app(config: GatewayConfig) -> FastAPI:
+    # [FUNCTION DOC]
+    # Builds the Gateway app. Creates one shared httpx.AsyncClient (forward_timeout),
+    # admin auth headers for calls to the Router, and the admin auth dependency for
+    # inbound admin routes. Registers the routes below and returns the app.
     app = FastAPI(title="AReaL Agent Gateway")
     http_client = httpx.AsyncClient(timeout=config.forward_timeout)
     _auth_headers = admin_headers(config.admin_api_key)
     _admin = make_admin_dependency(config.admin_api_key)
 
     async def _route(session_key: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Asks the Router (POST /route, admin headers, router_timeout) which DataProxy
+        # owns session_key; returns its address. Raises httpx errors on failure.
         resp = await http_client.post(
             f"{config.router_addr}/route",
             json={"session_key": session_key},
@@ -75,6 +90,10 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
         queue_mode: str,
         metadata: dict,
     ) -> dict:
+        # [FUNCTION DOC]
+        # HELPER: POSTs {message, run_id, queue_mode, metadata} to
+        # <data_proxy>/session/<key>/turn and returns the parsed JSON result (expected to
+        # contain "events" and "summary"). Raises on HTTP error.
         resp = await http_client.post(
             f"{data_proxy_addr}/session/{session_key}/turn",
             json={
@@ -89,10 +108,18 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
 
     @app.get("/health")
     async def health():
+        # [FUNCTION DOC]
+        # GET /health: returns {"status": "ok"}.
         return {"status": "ok"}
 
     @app.post("/sessions/close", dependencies=[Depends(_admin)])
     async def close_session(body: dict[str, Any]):
+        # [FUNCTION DOC]
+        # POST /sessions/close (admin): requires body "session_key" (HTTP 400 if empty),
+        # routes it to its DataProxy and POSTs /session/<key>/close there. Returns status ok;
+        # HTTP errors from Router/DataProxy propagate.
+        # KNOWN ISSUE: routing an unknown key makes the Router assign it a new proxy as a
+        # side effect before closing.
         """Close a session, forwarding to the DataProxy that owns it.
 
         The ``session_key`` is supplied in the request body.  Session lifecycle
@@ -113,6 +140,17 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket, token: str = Query(default="")):
+        # [FUNCTION DOC]
+        # WebSocket /ws: the "token" query param must equal the admin key (constant-time),
+        # else closes with code 4001. Then loops reading text frames: non-req frames,
+        # non-agent methods and missing sessionKey get a failed res frame. Valid requests
+        # get an accepted frame with a fresh run id, then the turn is routed and sent
+        # synchronously (metadata is the full params dict); returned delta and tool_call
+        # events are sent as event frames (tool_result events are dropped), followed by a
+        # complete frame with the summary. Turn errors are logged and returned as a failed
+        # frame. Disconnect ends the loop (logged).
+        # KNOWN ISSUE: a malformed frame makes parse_frame raise, which escapes to the outer
+        # handler and silently ends the connection without closing it or sending an error.
         if not hmac.compare_digest(token, config.admin_api_key):
             await websocket.close(code=4001, reason="Invalid admin key")
             return
@@ -209,6 +247,8 @@ def create_gateway_app(config: GatewayConfig) -> FastAPI:
 
     @app.on_event("shutdown")
     async def shutdown():
+        # [FUNCTION DOC]
+        # Shutdown hook: closes the shared HTTP client.
         await http_client.aclose()
 
     return app

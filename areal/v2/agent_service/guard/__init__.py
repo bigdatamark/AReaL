@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Guard subpackage: a process supervisor for agent services that is a pure
+# pass-through to the shared areal.infra.rpc.guard implementation. No code here;
+# see the app and __main__ modules.
 # SPDX-License-Identifier: Apache-2.0
 
 """Agent Service Guard — process supervisor backed by the shared guard.

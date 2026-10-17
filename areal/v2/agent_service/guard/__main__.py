@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# CLI entry point that starts the Agent Service guard HTTP server.
 # SPDX-License-Identifier: Apache-2.0
 
 """CLI entrypoint: ``python -m areal.v2.agent_service.guard``"""
@@ -16,6 +18,10 @@ from areal.v2.agent_service.guard.app import (
 
 
 def main():
+    # [FUNCTION DOC]
+    # Builds the shared guard base argument parser, parses known args (unknown ones
+    # are ignored), configures the module-level guard state from them (returns the bind
+    # host) and runs the guard server on args.port. Blocks.
     parser = make_base_parser(
         description="AReaL Agent Service Guard — process supervisor for agent workers"
     )

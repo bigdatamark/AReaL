@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Distributed training-statistics tracker. Values are recorded under hierarchical
+# "/"-joined keys (scope stack + key) as masked tensors, scalars or timings, and
+# exported as aggregated floats, optionally all-reduced across a process group
+# (with per-key group overrides and cross-rank key/metadata synchronization so all
+# ranks issue identical collectives). Exposes a module-level DEFAULT_TRACKER with
+# bound shortcuts (stat, denominator, export, scope, scalar, record_timing,
+# scope_func_wrapper), a registry TRACKERS of named trackers, get() and export_all().
+# MOE_AUX_LOSSES is a module-level dict placeholder for MoE auxiliary losses.
 # SPDX-License-Identifier: Apache-2.0
 
 import time
@@ -18,6 +27,10 @@ logger = logging.getLogger("StatsTracker")
 
 
 class ReduceType(Enum):
+    # [CLASS DOC]
+    # How a key is aggregated: AVG_MIN_MAX (emits key/avg, key/min, key/max), AVG, SUM,
+    # MIN, MAX (all masked by a denominator mask) or SCALAR (mean of plain floats plus a
+    # "__count" key).
     AVG_MIN_MAX = auto()
     AVG = auto()
     SUM = auto()
@@ -28,6 +41,9 @@ class ReduceType(Enum):
 
 @dataclass(frozen=True)
 class _StatMetadata:
+    # [CLASS DOC]
+    # HELPER: Frozen per-key metadata exchanged across ranks: reduce type, denominator
+    # key (or None) and whether a per-key reduce group override exists.
     reduce_type: ReduceType
     denominator: str | None
     has_reduce_group: bool
@@ -37,7 +53,15 @@ MOE_AUX_LOSSES = {}
 
 
 class DistributedStatsTracker:
+    # [CLASS DOC]
+    # Holds a lock, a scope stack (optionally seeded with the tracker's name), maps of
+    # key -> denominator key, key -> ReduceType, key -> reduce-group override, and
+    # key -> list of recorded values (tensors or floats). Recording is lock-protected;
+    # export performs reductions.
     def __init__(self, name: str = ""):
+        # [FUNCTION DOC]
+        # Initializes the lock, scope stack (name with surrounding "/" stripped, if
+        # given) and empty metadata/stat maps.
         self.lock = Lock()
         self.scope_stack = []
         if name:
@@ -53,15 +77,27 @@ class DistributedStatsTracker:
         self.stats = defaultdict(list)
 
     def scope(self, name):
+        # [FUNCTION DOC]
+        # Returns a Scope context manager that pushes name onto the scope stack while
+        # active.
+        # KNOWN ISSUE: the lock only guards creating the Scope object; the scope stack is
+        # shared and mutated without locking, so concurrent threads interleave scopes.
         """Context manager for hierarchical scoping"""
         with self.lock:
             return self.Scope(self, name)
 
     def scope_func_wrapper(self, name):
+        # [FUNCTION DOC]
+        # Returns a decorator that runs the wrapped function inside scope(name).
         """Decorator for hierarchical scoping"""
 
         def decorator(func):
+            # [FUNCTION DOC]
+            # HELPER: Wraps func with the scoping wrapper (no functools.wraps, so metadata is
+            # lost).
             def wrapper(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Calls func with its arguments inside the scope and returns its result.
                 with self.scope(name):
                     return func(*args, **kwargs)
 
@@ -70,18 +106,28 @@ class DistributedStatsTracker:
         return decorator
 
     class Scope:
+        # [CLASS DOC]
+        # HELPER: Context manager bound to a tracker and a scope name (slashes stripped).
         def __init__(self, tracker, name):
+            # [FUNCTION DOC]
+            # Stores the tracker and the stripped name.
             self.tracker = tracker
             self.name = name.strip("/")
 
         def __enter__(self):
+            # [FUNCTION DOC]
+            # Pushes the name on the tracker's scope stack; returns self.
             self.tracker.scope_stack.append(self.name)
             return self
 
         def __exit__(self, exc_type, exc_val, exc_tb):
+            # [FUNCTION DOC]
+            # Pops the top of the scope stack; exceptions propagate.
             self.tracker.scope_stack.pop()
 
     def _get_full_key(self, key):
+        # [FUNCTION DOC]
+        # HELPER: Joins the scope stack and key with "/" (just key when no scope).
         """Combine scope stack with current key"""
         if not self.scope_stack:
             return key
@@ -89,6 +135,11 @@ class DistributedStatsTracker:
 
     @contextmanager
     def disable_scope(self):
+        # [FUNCTION DOC]
+        # Context manager that temporarily empties the scope stack so keys are recorded
+        # unscoped, restoring it afterwards.
+        # KNOWN ISSUE: no try/finally, so the scope stack is not restored if the body
+        # raises.
         tmp = self.scope_stack
         self.scope_stack = []
         yield
@@ -96,6 +147,10 @@ class DistributedStatsTracker:
 
     @contextmanager
     def record_timing(self, key):
+        # [FUNCTION DOC]
+        # Context manager timing its body with perf_counter; on exit (even on error)
+        # appends the elapsed seconds as a SCALAR under "timeperf/<key>" (ignores the
+        # current scope).
         start_time = time.perf_counter()
         try:
             yield
@@ -107,6 +162,10 @@ class DistributedStatsTracker:
                 self.stats[full_key].append(time.perf_counter() - start_time)
 
     def denominator(self, *, reduce_group=None, **kwargs):
+        # [FUNCTION DOC]
+        # Records boolean mask tensors (kwargs name -> tensor) as SUM-type keys under the
+        # current scope (detached clones). Optional reduce_group becomes a per-key
+        # override. Raises ValueError for non-bool or empty tensors.
         with self.lock:
             for key, value in kwargs.items():
                 if not isinstance(value, torch.Tensor) or value.dtype != torch.bool:
@@ -122,6 +181,9 @@ class DistributedStatsTracker:
                     self.reduce_groups[full_key] = reduce_group
 
     def scalar(self, *, reduce_group=None, **kwargs):
+        # [FUNCTION DOC]
+        # Records each kwarg value converted to float as a SCALAR key under the current
+        # scope; optional reduce_group is stored as a per-key override.
         with self.lock:
             for key, value in kwargs.items():
                 full_key = self._get_full_key(key)
@@ -138,6 +200,15 @@ class DistributedStatsTracker:
         reduce_group=None,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Records float32 tensors masked by a previously recorded denominator key
+        # (resolved under the current scope). Validates dtype float, non-empty, not SCALAR
+        # type, denominator exists, and that each value's shape matches the corresponding
+        # denominator entry (assert). Remembers the denominator, sets the reduce type
+        # (default AVG_MIN_MAX), appends a detached clone and stores any per-key reduce
+        # group.
+        # KNOWN ISSUE: a non-tensor value triggers AttributeError when building the error
+        # message (value.dtype).
         """Record multiple values from a dictionary.
 
         If `reduce_group` is provided, it overrides the `reduce_group` passed
@@ -173,6 +244,9 @@ class DistributedStatsTracker:
                     self.reduce_groups[full_key] = reduce_group
 
     def _set_reduce_type(self, key, reduce_type):
+        # [FUNCTION DOC]
+        # HELPER: Validates reduce_type is a ReduceType (ValueError otherwise) and records
+        # it for key.
         if not isinstance(reduce_type, ReduceType):
             raise ValueError("reduce_type must be a ReduceType enum")
         self.reduce_types[key] = reduce_type
@@ -184,6 +258,11 @@ class DistributedStatsTracker:
         sync_metadata: dict[str, _StatMetadata] | None = None,
         key_sync_group=None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Chooses the process group to reduce key over. If synced metadata says
+        # some rank has a per-key override: use key_sync_group, else the local override,
+        # else raise RuntimeError. Otherwise the local override if present, else the
+        # default group (may be None meaning no reduction).
         """Return the per-key reduce_group override if any, else the default."""
         if sync_metadata is not None:
             metadata = sync_metadata.get(key)
@@ -201,6 +280,10 @@ class DistributedStatsTracker:
         return default_reduce_group
 
     def _device_for_placeholder_tensor(self, group=None):
+        # [FUNCTION DOC]
+        # HELPER: Picks a device for identity tensors: the accelerator if the group's
+        # backend matches the platform's communication backend or the platform is
+        # initialized; otherwise "cpu". Lookup errors are ignored.
         if group is not None:
             try:
                 backend = str(dist.get_backend(group)).lower()
@@ -222,6 +305,9 @@ class DistributedStatsTracker:
         like: torch.Tensor | None = None,
         group=None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Returns a float32 scalar tensor with value fill on like's device, or on
+        # the device chosen for group.
         """Scalar identity tensor for reductions (0.0 for SUM/AVG, +/-inf for
         MIN/MAX). Placed on ``like``'s device if given, else on the device
         matching ``group``."""
@@ -237,6 +323,9 @@ class DistributedStatsTracker:
         )
 
     def _local_metadata(self, keys: list[str]) -> dict[str, _StatMetadata]:
+        # [FUNCTION DOC]
+        # HELPER: Builds _StatMetadata for each key from local maps (missing reduce type
+        # defaults to SCALAR).
         return {
             key: _StatMetadata(
                 reduce_type=self.reduce_types.get(key, ReduceType.SCALAR),
@@ -250,6 +339,9 @@ class DistributedStatsTracker:
     def _merge_metadata(
         all_metadata: list[dict[str, _StatMetadata]],
     ) -> dict[str, _StatMetadata]:
+        # [FUNCTION DOC]
+        # HELPER: Merges per-rank metadata dicts into one; raises ValueError if ranks
+        # disagree on a key's metadata.
         metadata: dict[str, _StatMetadata] = {}
         for rank_metadata in all_metadata:
             for key, key_metadata in rank_metadata.items():
@@ -269,6 +361,16 @@ class DistributedStatsTracker:
         key_sync_group=None,
         reset=True,
     ) -> dict[str, float]:
+        # [FUNCTION DOC]
+        # Aggregates and returns stats as {name: float}. With key: aggregates that single
+        # scoped key (over reduce_group) and optionally resets it. Otherwise: if
+        # reduce_group is given, all-gathers metadata over it and merges (so ranks missing a
+        # key still join its collectives); if key_sync_group is given, also syncs metadata
+        # of per-key-override keys over that group (ValueError on conflict). Keys are then
+        # sorted for consistent collective order, each is aggregated, state is cleared if
+        # reset, and tensor results are moved to CPU floats. Collective when groups given.
+        # KNOWN ISSUE: the single-key path returns unconverted tensors for avg values and
+        # raises KeyError on reset if the key has no recorded stats.
         """Get aggregated statistics"""
         with self.lock:
             if key is not None:
@@ -353,6 +455,12 @@ class DistributedStatsTracker:
         sync_metadata: dict[str, _StatMetadata] | None = None,
         key_sync_group=None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Dispatches on the key's reduce type (local, else synced metadata, else
+        # SCALAR) to the matching reducer and returns a dict of output names to values.
+        # SCALAR: sums and counts local floats, all-reduces both over the effective group
+        # and emits mean (0.0 if count is 0) plus "<key>__count". Drops None results.
+        # Raises ValueError for unknown types.
         metadata = sync_metadata.get(key) if sync_metadata is not None else None
         reduce_type = self.reduce_types.get(
             key,
@@ -411,6 +519,10 @@ class DistributedStatsTracker:
         sync_metadata: dict[str, _StatMetadata] | None = None,
         key_sync_group=None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Sums all recorded tensors (masked by the denominator if the key has one;
+        # ValueError if the denominator is missing), all-reduces SUM over the effective
+        # group and returns a float. With no local values contributes 0 to the collective.
         values = self.stats.get(key, [])
         effective_group = self._effective_reduce_group(
             key, reduce_group, sync_metadata, key_sync_group
@@ -448,6 +560,9 @@ class DistributedStatsTracker:
         key,
         sync_metadata: dict[str, _StatMetadata] | None = None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Returns the key's denominator from local map or synced metadata; raises
+        # ValueError if none.
         if key in self.denominators:
             return self.denominators[key]
         metadata = sync_metadata.get(key) if sync_metadata is not None else None
@@ -462,6 +577,10 @@ class DistributedStatsTracker:
         sync_metadata: dict[str, _StatMetadata] | None = None,
         key_sync_group=None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Masked mean: sums masked values and mask counts, all-reduces both, returns
+        # sum / count as a tensor, or None when the total count is 0. With no local values
+        # contributes zeros to the collectives.
         values = self.stats.get(key, [])
         if not values:
             effective_group = self._effective_reduce_group(
@@ -503,6 +622,10 @@ class DistributedStatsTracker:
         sync_metadata: dict[str, _StatMetadata] | None = None,
         key_sync_group=None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Masked minimum (unmasked positions treated as +inf), all-reduced with MIN;
+        # returns a float or None if the result is infinite (no valid entries). With no
+        # local values contributes +inf.
         values = self.stats.get(key, [])
         if not values:
             effective_group = self._effective_reduce_group(
@@ -538,6 +661,9 @@ class DistributedStatsTracker:
         sync_metadata: dict[str, _StatMetadata] | None = None,
         key_sync_group=None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Masked maximum (unmasked positions -inf), all-reduced with MAX; returns a
+        # float or None if infinite. With no local values contributes -inf.
         values = self.stats.get(key, [])
         if not values:
             effective_group = self._effective_reduce_group(
@@ -581,6 +707,9 @@ LOCK = Lock()
 
 
 def get(name: str = ""):
+    # [FUNCTION DOC]
+    # Returns the named tracker from the global registry, creating a
+    # DistributedStatsTracker(name) under a global lock if absent. "" is the default.
     global TRACKERS, LOCK
     with LOCK:
         if name not in TRACKERS:
@@ -589,6 +718,12 @@ def get(name: str = ""):
 
 
 def export_all(reduce_group=None, key_sync_group=None, reset=True) -> dict[str, float]:
+    # [FUNCTION DOC]
+    # Exports every registered tracker and merges results into one dict. If a sync group
+    # (key_sync_group, else reduce_group) is given, all-gathers tracker names over it so
+    # every rank exports the same sorted set (creating missing trackers). Passes
+    # reduce_group, key_sync_group and reset to each export. Logs a warning listing
+    # duplicate output keys (later trackers win).
     stat = {}
     duplicate_keys = set()
     tracker_keys = list(TRACKERS.keys())

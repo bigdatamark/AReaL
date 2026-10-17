@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Sequence packing / load-balancing algorithms used to split variable-length
+# sequences into micro-batches or across workers: contiguous balanced partitioning
+# (numba DP), balanced batch reordering, First-Fit-Decreasing (FFD) and
+# Karmarkar-Karp (KK, largest differencing) bin packing with a name registry
+# ("ffd", "kk"), packing quality metrics and an equal-count greedy partition. Pure
+# CPU computations; running the module directly benchmarks ffd_allocate on random
+# data and prints results.
 # SPDX-License-Identifier: Apache-2.0
 
 import bisect
@@ -16,11 +24,20 @@ logger = logging.getLogger("SeqPack")
 
 
 def flat2d(arr: list[list[Any]]) -> list[Any]:
+    # [FUNCTION DOC]
+    # HELPER: Flattens a list of lists into one list (one level).
     return list(itertools.chain(*arr))
 
 
 @numba.njit
 def partition_balanced(nums: np.ndarray, k: int, min_size: int = 1):
+    # [FUNCTION DOC]
+    # Numba-JIT dynamic program splitting nums into k contiguous subarrays (each at
+    # least min_size long) minimizing the spread between the largest and smallest
+    # subarray sums. dp[i, j] holds the best spread for the first i items in j parts,
+    # with running max/min part sums and the chosen split point; the answer is
+    # reconstructed by backtracking from n. Returns k + 1 boundary indices starting at
+    # 0 and ending at len(nums). Integer sums (int64); O(k * n^2).
     """Partition an array into k subarrays with a minimum absolute difference
     of sums and minimum subarray size.
 
@@ -79,6 +96,8 @@ def partition_balanced(nums: np.ndarray, k: int, min_size: int = 1):
 def partition_balanced_tuples(
     nums: np.ndarray, k: int, min_size: int = 1
 ) -> list[tuple[int, int]]:
+    # [FUNCTION DOC]
+    # Runs partition_balanced and returns the k (start, end) index pairs.
     lst = partition_balanced(nums, k, min_size)
     return [(lst[i], lst[i + 1]) for i in range(k)]
 
@@ -86,6 +105,11 @@ def partition_balanced_tuples(
 def min_abs_diff_partition(
     arr: np.ndarray | list, k: int, min_size: int = 1
 ) -> list[tuple[int, int]]:
+    # [FUNCTION DOC]
+    # Validated wrapper around partition_balanced_tuples: converts lists to arrays,
+    # requires a 1-D array with length >= k and >= k * min_size (ValueError otherwise),
+    # then checks the result is contiguous and has no empty parts (ValueError with a
+    # hint about dataset/batch-size bugs). Returns the (start, end) pairs.
     err_hint = (
         " Errors should not be reported in this function. It is probably a bug in the dataset code"
         " or too small batch size with pipeline parallelism."
@@ -127,6 +151,12 @@ def reorder_to_balanced_batches(
     seqlens: np.ndarray,
     n_seqs_per_batch: int,
 ) -> tuple[np.ndarray, int]:
+    # [FUNCTION DOC]
+    # Greedily assigns sequences (longest first) to ceil(n / n_seqs_per_batch) bins,
+    # each time choosing the non-full bin with the smallest total length. Returns
+    # (indices concatenated bin by bin in descending bin-total order, maximum pairwise
+    # difference of bin totals). Consecutive slices of n_seqs_per_batch indices thus
+    # form balanced batches.
     max_bins = (len(seqlens) + n_seqs_per_batch - 1) // n_seqs_per_batch
 
     bins = [[] for _ in range(max_bins)]
@@ -165,6 +195,9 @@ PACKING_ALGORITHMS = {PACKING_ALGORITHM_FFD, PACKING_ALGORITHM_KK}
 
 
 def get_allocate_fn(algorithm: str = PACKING_ALGORITHM_FFD):
+    # [FUNCTION DOC]
+    # Maps an algorithm name ("ffd" default or "kk") to ffd_allocate / kk_allocate;
+    # raises ValueError for unknown names.
     """Return the allocation function for the given algorithm name.
 
     Args:
@@ -196,6 +229,14 @@ def get_allocate_fn(algorithm: str = PACKING_ALGORITHM_FFD):
 def _ffd_allocate(
     values: np.ndarray, capacity: int, min_groups: int, n_groups_divisor: int = 1
 ) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: One FFD pass. Processes values in descending order keeping groups sorted
+    # by current sum: opens a new group while fewer than min_groups exist or when even
+    # the smallest group cannot fit the value; otherwise among groups whose sum plus the
+    # value fits capacity it picks the one with the fewest items and adds the value.
+    # Returns groups as lists of indices.
+    # KNOWN ISSUE: n_groups_divisor is accepted but unused (divisibility is enforced by
+    # the caller).
     """A greedy allocation algorithm that partitions a list of numbers
     into k groups, where the summation of each group is less than capacity
     and (k >= min_groups and k % n_groups_divisor == 0). We want to minimize
@@ -234,6 +275,14 @@ def _ffd_allocate(
 def ffd_allocate(
     values: list[int], capacity: int, min_groups: int, n_groups_divisor: int = 1
 ) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # FFD packing satisfying capacity, at least min_groups groups (raised to
+    # n_groups_divisor if smaller or None) and a group count divisible by
+    # n_groups_divisor. Raises RuntimeError if any value exceeds capacity or there are
+    # fewer values than min_groups. Repeats _ffd_allocate, bumping min_groups to the
+    # next multiple of the divisor, until the group count is divisible; raises
+    # RuntimeError if min_groups exceeds the number of values first. Returns lists of
+    # indices.
     if min_groups is None or min_groups < n_groups_divisor:
         min_groups = n_groups_divisor
     if any(v > capacity for v in values):
@@ -270,24 +319,35 @@ def ffd_allocate(
 
 
 class _KKSet:
+    # [CLASS DOC]
+    # HELPER: Mutable set of (index, value) items with a running sum; ordered by sum,
+    # then item count, then items lexicographically.
     """A set of items with a running sum, used inside KK partitioning."""
 
     __slots__ = ("sum", "items")
 
     def __init__(self) -> None:
+        # [FUNCTION DOC]
+        # Starts empty with sum 0.
         self.sum: int = 0
         self.items: list[tuple[int, int]] = []  # (original_index, value)
 
     def add(self, idx: int, val: int) -> None:
+        # [FUNCTION DOC]
+        # Appends one (idx, val) item and adds val to the sum.
         self.items.append((idx, val))
         self.sum += val
 
     def merge(self, other: "_KKSet") -> None:
+        # [FUNCTION DOC]
+        # Appends all items of other and adds their values to the sum (other unchanged).
         for idx, val in other.items:
             self.items.append((idx, val))
             self.sum += val
 
     def __lt__(self, other: "_KKSet") -> bool:
+        # [FUNCTION DOC]
+        # Ordering by (sum, number of items, items).
         if self.sum != other.sum:
             return self.sum < other.sum
         if len(self.items) != len(other.items):
@@ -296,6 +356,9 @@ class _KKSet:
 
 
 class _KKState:
+    # [CLASS DOC]
+    # HELPER: One partial k-way partition in the KK priority queue: k _KKSets kept
+    # sorted by descending sum.
     """Represents one candidate partitioning state in the KK priority queue.
 
     Each state contains *k* sets.  Two states are merged by pairing the
@@ -306,6 +369,9 @@ class _KKState:
     __slots__ = ("k", "sets")
 
     def __init__(self, items: list[tuple[int, int]], k: int) -> None:
+        # [FUNCTION DOC]
+        # Creates k empty sets, places the given items (exactly 1 or k items, asserted)
+        # one per set, and sorts sets descending.
         self.k = k
         self.sets = [_KKSet() for _ in range(k)]
         assert len(items) in (1, k), f"{len(items)} not in [1, {k}]"
@@ -314,9 +380,14 @@ class _KKState:
         self.sets.sort(reverse=True)
 
     def get_partitions(self) -> list[list[int]]:
+        # [FUNCTION DOC]
+        # Returns the indices of each set, in the current (descending-sum) set order.
         return [[idx for idx, _ in s.items] for s in self.sets]
 
     def merge(self, other: "_KKState") -> None:
+        # [FUNCTION DOC]
+        # Merges other into self by pairing self's i-th largest set with other's i-th
+        # smallest set, then re-sorts. Mutates self (and shares item lists' contents).
         # Pair the largest set of *self* with the smallest set of *other*
         # and vice-versa, so that the combined spread is minimised.
         for i in range(self.k):
@@ -325,9 +396,14 @@ class _KKState:
 
     @property
     def spread(self) -> int:
+        # [FUNCTION DOC]
+        # Property: largest set sum minus smallest set sum.
         return self.sets[0].sum - self.sets[-1].sum
 
     def __lt__(self, other: "_KKState") -> bool:
+        # [FUNCTION DOC]
+        # Inverted ordering so heapq pops the state with the largest spread first (ties:
+        # larger top set first).
         # Max-heap by spread: largest spread is popped first.
         if self.spread != other.spread:
             return self.spread > other.spread
@@ -337,6 +413,12 @@ class _KKState:
 def _kk_partition(
     values: list[int], k: int, equal_size: bool = False
 ) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # HELPER: Largest differencing method. Seeds the heap with one state per value
+    # (or, if equal_size, one state per consecutive run of k ascending-sorted values,
+    # asserting len(values) divisible by k), then repeatedly pops the two largest-spread
+    # states, merges them and pushes the result until one remains. Returns its k index
+    # partitions.
     """Core KK partitioning using the Largest Differencing Method.
 
     Args:
@@ -384,6 +466,12 @@ def _kk_partition(
 def _compute_packing_metrics(
     values: list[int], partitions: list[list[int]], capacity: int
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: Computes load statistics for a partition: number of groups, per-group
+    # sums, max/min/mean load, spread, imbalance ratio (spread/mean), standard
+    # deviation, coefficient of variation, max/mean ratio, utilization (mean/capacity)
+    # and wasted tokens (sum of capacity minus load). Returns zeros for no groups.
+    # Ratios are 0 when the denominator is 0.
     """Compute comprehensive packing quality metrics for a given partition.
 
     Args:
@@ -450,6 +538,15 @@ def kk_allocate(
     n_groups_divisor: int = 1,
     equal_size: bool = False,
 ) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # KK packing as a drop-in replacement for ffd_allocate. Normalizes min_groups like
+    # ffd_allocate and raises RuntimeError for oversized values or too few values.
+    # Chooses k = max(min_groups, ceil(total / capacity)), rounded up to a multiple of
+    # n_groups_divisor and capped at len(values); with equal_size, k must divide
+    # len(values) (RuntimeError). Runs _kk_partition; if any group exceeds capacity it
+    # logs a warning and falls back to ffd_allocate. Returns lists of indices.
+    # KNOWN ISSUE: capping k at len(values) can break divisibility by
+    # n_groups_divisor, and the FFD fallback ignores equal_size.
     """Partition *values* into groups using the Karmarkar-Karp differencing method.
 
     This is a **drop-in replacement** for :func:`ffd_allocate` that typically
@@ -538,6 +635,10 @@ def kk_allocate(
 
 
 def balanced_greedy_partition(nums: list[int], K: int) -> list[list[int]]:
+    # [FUNCTION DOC]
+    # Splits nums into K groups of exactly len(nums) / K items each: processes values in
+    # descending order and assigns each to the non-full group with the smallest current
+    # sum. Returns index lists. Raises ValueError if len(nums) < K or not divisible by K.
     """
     Splits `nums` into K groups such that the maximum difference between group sums is minimized.
 

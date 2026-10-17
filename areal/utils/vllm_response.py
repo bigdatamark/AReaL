@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Converts raw vLLM HTTP generation responses into AReaL's HttpGenerationResult.
+# Defines _AMBIGUOUS_VLLM_LOGPROB (-9999.0), vLLM's sentinel for missing/clamped
+# logprobs, which is rejected.
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import Any
@@ -14,6 +18,15 @@ _AMBIGUOUS_VLLM_LOGPROB = -9999.0
 def parse_vllm_generation_response(
     response: dict[str, Any],
 ) -> HttpGenerationResult:
+    # [FUNCTION DOC]
+    # Reads the first choice's finish_reason and logprobs. Supports the completions
+    # format (logprobs.tokens as "token_id:<id>" strings plus token_logprobs) and the
+    # chat format (logprobs.content entries with "token" strings "...:<id>" and
+    # "logprob"); token ids are parsed from the part after the first colon. Raises
+    # ValueError for any other format or if any logprob equals the -9999.0 sentinel.
+    # Returns HttpGenerationResult(output_tokens, output_logprobs, stop_reason); an
+    # "abort" with no tokens yields empty lists. KeyError/TypeError if fields are
+    # missing (e.g. logprobs is null).
     """Normalize a vLLM generation response into AReaL's shared result type."""
     meta_info = response["choices"][0]
     stop_reason = meta_info["finish_reason"]

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# AgentController: synchronous orchestrator that creates Guard workers through a
+# Scheduler and then, via the guards' HTTP API (alloc_ports / fork /
+# kill_forked_worker), launches the Router, Worker+DataProxy pairs and the Gateway,
+# registers proxies with the Router, monitors pair health in a background thread and
+# supports scaling pairs up/down. Uses blocking requests calls.
 # SPDX-License-Identifier: Apache-2.0
 
 """AgentController — orchestrates agent service micro-services via Guards.
@@ -53,6 +59,9 @@ _DEFAULT_SETUP_TIMEOUT = 120.0
 
 @dataclass
 class _WorkerPair:
+    # [CLASS DOC]
+    # HELPER: Record of one Worker+DataProxy pair: index, hosting guard address, worker
+    # and proxy host/port and their full http addresses.
     pair_index: int
     guard_addr: str
     worker_host: str
@@ -64,6 +73,11 @@ class _WorkerPair:
 
 
 class AgentController:
+    # [CLASS DOC]
+    # Owns the service stack lifecycle. State: guard addresses/workers, scheduler roles
+    # created, router/gateway addresses, pairs (guarded by a lock), the list of forked
+    # (guard, role, index) services for teardown, base env vars for forks and a
+    # health-monitor thread with stop event.
     """Orchestrator for the Agent Service micro-service stack.
 
     Parameters
@@ -79,6 +93,8 @@ class AgentController:
         config: AgentConfig,
         scheduler: Scheduler,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores config (AgentConfig) and scheduler and initializes empty state. No I/O.
         self.config = config
         self.scheduler = scheduler
 
@@ -104,6 +120,9 @@ class AgentController:
     # ------------------------------------------------------------------
 
     def initialize(self) -> None:
+        # [FUNCTION DOC]
+        # Runs _do_initialize; on any exception logs, calls destroy() to roll back and
+        # re-raises.
         """Launch the full micro-service stack.
 
         Order: Guards (via scheduler) → Router → Worker+DataProxy pairs →
@@ -118,6 +137,14 @@ class AgentController:
             raise
 
     def _do_initialize(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Creates one guard job (from the first scheduling spec, gpu forced to 0,
+        # command running the agent guard module, env saved as base env) via the scheduler
+        # and records guard addresses. Forks the Router on guard 0 (with admin key), scales
+        # up the default pair count (1), forks the Gateway on guard 0 pointing at the
+        # Router, and starts the daemon health-monitor thread. Raises on any failure.
+        # KNOWN ISSUE: guard count and pair count are hardcoded to 1 rather than read from
+        # config.
         from areal.api.cli_args import SchedulingSpec, SchedulingStrategy
         from areal.api.scheduler_api import Job
 
@@ -194,6 +221,10 @@ class AgentController:
             self._health_thread.start()
 
     def destroy(self) -> None:
+        # [FUNCTION DOC]
+        # Stops the health monitor, kills all forked services in reverse order (errors
+        # logged), deletes scheduler workers per role in reverse order (errors logged) and
+        # clears all state and addresses. Safe to call repeatedly.
         """Tear down all services in reverse order."""
         self._stop_health_monitor()
 
@@ -229,6 +260,12 @@ class AgentController:
         self._gateway_addr = ""
 
     def scale_up(self, count: int) -> list[int]:
+        # [FUNCTION DOC]
+        # For count times: allocates the next pair index, picks a guard round-robin, forks a
+        # Worker (agent class path, log level info) then a DataProxy pointing at it, and
+        # registers the proxy with the Router. On registration failure kills the pair's
+        # forks and re-raises. Records the pair and returns the list of created indices.
+        # Fork failures (HTTP/timeout) propagate without cleaning up that pair.
         """Add *count* Worker+DataProxy pairs.
 
         Pairs are distributed across guards round-robin.
@@ -307,6 +344,13 @@ class AgentController:
         return created
 
     def scale_down(self, count: int) -> list[int]:
+        # [FUNCTION DOC]
+        # Removes up to count pairs, highest index first: unregisters the proxy from the
+        # Router with retries (skips the pair on failure), waits for it to drain, drops it
+        # from pairs, then kills the DataProxy and Worker forks and removes them from the
+        # forked list. Returns removed indices.
+        # KNOWN ISSUE: _kill_forked_service never raises, so the except branch is dead and
+        # entries are removed from the forked list even if the kill failed.
         """Remove *count* pairs (LIFO order).
 
         For each pair: unregister from Router (with retry) → drain active
@@ -366,14 +410,20 @@ class AgentController:
 
     @property
     def router_addr(self) -> str:
+        # [FUNCTION DOC]
+        # Property: Router base URL ("" before initialize / after destroy).
         return self._router_addr
 
     @property
     def gateway_addr(self) -> str:
+        # [FUNCTION DOC]
+        # Property: Gateway base URL ("" if not running).
         return self._gateway_addr
 
     @property
     def pairs(self) -> dict[int, _WorkerPair]:
+        # [FUNCTION DOC]
+        # Property: thread-safe shallow copy of the pair index -> _WorkerPair map.
         with self._pairs_lock:
             return dict(self._pairs)
 
@@ -390,6 +440,12 @@ class AgentController:
         health_path: str = "/health",
         env: dict[str, str] | None = None,
     ) -> tuple[str, int]:
+        # [FUNCTION DOC]
+        # HELPER: Allocates one port on the guard (POST /alloc_ports), appends --host/--port
+        # to raw_cmd, POSTs /fork with role, worker_index, command and merged env (base env
+        # overridden by env; omitted if empty), records the fork, then blocks until
+        # GET <addr><health_path> returns 200. Returns (host, port). Raises
+        # requests.HTTPError on guard errors and TimeoutError if never healthy.
         resp = requests.post(
             f"{guard_addr}/alloc_ports",
             json={"count": 1},
@@ -427,6 +483,9 @@ class AgentController:
         return host, port
 
     def _cleanup_pair_forks(self, pair_index: int, guard_addr: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For the pair's proxy and worker roles still in the forked list, tries to
+        # kill them (errors ignored) and removes the entries.
         for role_prefix in ("agent-proxy-", "agent-worker-"):
             role = f"{role_prefix}{pair_index}"
             entry = (guard_addr, role, pair_index)
@@ -440,6 +499,11 @@ class AgentController:
     def _kill_forked_service(
         self, guard_addr: str, role: str, worker_index: int
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: POSTs /kill_forked_worker {role, worker_index} to the guard (10s timeout);
+        # logs success on 200, warning otherwise. Request errors are logged and swallowed.
+        # KNOWN ISSUE: callers catch requests.RequestException from this method, but it
+        # never propagates one.
         try:
             resp = requests.post(
                 f"{guard_addr}/kill_forked_worker",
@@ -463,6 +527,10 @@ class AgentController:
     def _wait_for_service(
         self, url: str, name: str, timeout: float | None = None
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Polls url every 0.5s (2s per-request timeout) until a 200 response,
+        # logging success; raises TimeoutError after timeout seconds (default 120 when
+        # None or 0).
         timeout = timeout or _DEFAULT_SETUP_TIMEOUT
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -477,6 +545,9 @@ class AgentController:
         raise TimeoutError(f"{name} did not become healthy at {url} within {timeout}s")
 
     def _register_proxy(self, proxy_addr: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: No-op if no Router yet; otherwise POSTs {"addr"} to Router /register with
+        # the admin bearer header and raises on HTTP error. Logs success.
         """Raises on failure so that ``scale_up`` callers know the pair is
         non-functional.
         """
@@ -492,6 +563,11 @@ class AgentController:
         logger.info("Registered proxy %s with Router", proxy_addr)
 
     def _drain_proxy(self, proxy_addr: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Polls the proxy's /health every 1s for up to 30s until active_sessions is
+        # 0 (returns early, logged). A request error stops polling. Otherwise logs a
+        # drain-timeout warning.
+        # KNOWN ISSUE: after a request error the "drain timed out" warning is still logged.
         timeout = _DEFAULT_DRAIN_TIMEOUT
         if timeout <= 0:
             return
@@ -515,6 +591,9 @@ class AgentController:
         )
 
     def _check_pair_health(self, pair_index: int, proxy_addr: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: GETs the proxy /health (2s timeout) and logs a warning on non-200 or
+        # unreachable. Takes no corrective action.
         try:
             resp = requests.get(f"{proxy_addr}/health", timeout=2)
             if resp.status_code != 200:
@@ -528,6 +607,11 @@ class AgentController:
             logger.warning("Pair %d proxy %s unreachable", pair_index, proxy_addr)
 
     def _health_monitor_loop(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Thread body: every 5s until the stop event is set, snapshots pairs and
+        # checks each in a small thread pool (max 4 workers), ignoring per-check errors.
+        # KNOWN ISSUE: as_completed(timeout=10) can raise TimeoutError, which is not caught
+        # and would terminate the monitor thread.
         interval = _DEFAULT_HEALTH_POLL_INTERVAL
         while not self._health_stop.wait(timeout=interval):
             with self._pairs_lock:
@@ -548,12 +632,18 @@ class AgentController:
                         pass
 
     def _stop_health_monitor(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sets the stop event and joins the monitor thread (5s timeout), clearing it.
         self._health_stop.set()
         if self._health_thread is not None:
             self._health_thread.join(timeout=5)
             self._health_thread = None
 
     def _unregister_proxy(self, proxy_addr: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: No-op without a Router. POSTs {"addr"} to /unregister with admin header,
+        # up to 3 attempts with 1s sleeps between; logs each failure and re-raises the last
+        # requests exception after all attempts fail.
         """Unregister with retry. Raises after all retries exhausted."""
         if not self._router_addr:
             return

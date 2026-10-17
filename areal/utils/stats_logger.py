@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Experiment metrics logger (rank 0 only) that fans training statistics out to
+# Weights & Biases, SwanLab, Trackio and TensorBoard and pretty-prints them to the
+# "StatsLogger" logger.
 # SPDX-License-Identifier: Apache-2.0
 
 import getpass
@@ -21,7 +25,16 @@ logger = logging.getLogger("StatsLogger", "system")
 
 
 class StatsLogger:
+    # [CLASS DOC]
+    # Wraps experiment-tracking backends. Built from the full experiment config (uses
+    # its stats_logger section) and a FinetuneSpec (for epoch/step totals in log lines).
+    # Tracks the last committed step so logged steps stay monotonic across restarts.
+    # All public methods are no-ops on non-zero ranks when torch.distributed is
+    # initialized.
     def __init__(self, config: BaseExperimentConfig, ft_spec: FinetuneSpec):
+        # [FUNCTION DOC]
+        # Rejects a bare StatsLoggerConfig (ValueError, deprecated usage), stores configs,
+        # calls init() and sets the last commit step to -1.
         if isinstance(config, StatsLoggerConfig):
             raise ValueError(
                 "Passing config.stats_logger as the config is deprecated. "
@@ -35,6 +48,15 @@ class StatsLogger:
         self._last_commit_step = -1
 
     def init(self):
+        # [FUNCTION DOC]
+        # Rank 0 only. Exports WANDB_BASE_URL / WANDB_API_KEY env vars if configured,
+        # records a start time, logs into wandb unless disabled, builds the full experiment
+        # config dict plus git/version info, and initializes wandb (project/name/group
+        # defaults from experiment and trial names, id "<exp>_<trial>_<suffix>" where suffix
+        # "timestamp" becomes the current time, resume allowed, dir from get_log_path).
+        # Logs into SwanLab if enabled and always calls swanlab.init (mode may be
+        # disabled); initializes Trackio if enabled; creates a TensorBoard SummaryWriter if
+        # a tensorboard path is set. Network I/O and directory creation.
         if dist.is_initialized() and dist.get_rank() != 0:
             return
 
@@ -112,14 +134,23 @@ class StatsLogger:
             self.summary_writer = SummaryWriter(log_dir=self.config.tensorboard.path)
 
     def state_dict(self):
+        # [FUNCTION DOC]
+        # Returns {"last_commit_step": ...} for checkpointing.
         return {
             "last_commit_step": self._last_commit_step,
         }
 
     def load_state_dict(self, state_dict):
+        # [FUNCTION DOC]
+        # Restores last_commit_step from a state dict (KeyError if missing).
         self._last_commit_step = state_dict["last_commit_step"]
 
     def close(self):
+        # [FUNCTION DOC]
+        # Rank 0 only: logs total elapsed time and finishes wandb, swanlab, trackio (if
+        # enabled) and closes the TensorBoard writer.
+        # KNOWN ISSUE: start_time comes from time.perf_counter() but elapsed time is
+        # computed with time.monotonic(), so the reported duration is meaningless.
         if dist.is_initialized() and dist.get_rank() != 0:
             return
         logger.info(
@@ -133,6 +164,12 @@ class StatsLogger:
             self.summary_writer.close()
 
     def commit(self, epoch: int, step: int, global_step: int, data: dict | list[dict]):
+        # [FUNCTION DOC]
+        # Rank 0 only. Logs an epoch/step progress line, then for each stats dict (a single
+        # dict is wrapped in a list) drops keys ending in "__count", prints the table and
+        # logs it to every enabled backend at step log_step + i, where log_step is
+        # max(global_step, last_commit_step + 1). Updates last_commit_step to the last
+        # step used.
         if dist.is_initialized() and dist.get_rank() != 0:
             return
         logger.info(
@@ -159,6 +196,8 @@ class StatsLogger:
         self._last_commit_step = log_step + len(data) - 1
 
     def print_stats(self, stats: dict[str, float]):
+        # [FUNCTION DOC]
+        # Logs the stats dict as a tabulated grid at INFO level.
         logger.info("\n" + tabulate_stats(stats))
 
     @staticmethod
@@ -168,6 +207,10 @@ class StatsLogger:
         trial_name: str | None = None,
         fileroot: str | None = None,
     ) -> str:
+        # [FUNCTION DOC]
+        # Returns "<fileroot>/logs/<user>/<experiment>/<trial>", taking the three values from
+        # config if given, else from the arguments; creates the directory. Raises
+        # ValueError if any is missing.
         if config is not None:
             experiment_name = config.experiment_name
             trial_name = config.trial_name

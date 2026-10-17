@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Wire protocol for the Agent Service gateway WebSocket (OpenClaw-like): JSON text
+# frames discriminated by "type" (req / res / event), enums for frame type, request
+# method, queue mode and run status, frame dataclasses, JSON (de)serialization and
+# factory helpers. Also defines PASSTHROUGH_HEADER, the HTTP header the Worker sets
+# to mark a raw passthrough turn. All functions are pure (no I/O).
 # SPDX-License-Identifier: Apache-2.0
 
 """Gateway protocol frame parsing for the Agent Service.
@@ -27,6 +33,8 @@ PASSTHROUGH_HEADER = "x-areal-passthrough"
 
 
 class FrameType(str, Enum):
+    # [CLASS DOC]
+    # String enum of frame discriminators: "req", "res", "event".
     """WebSocket frame type discriminator."""
 
     REQ = "req"
@@ -35,12 +43,17 @@ class FrameType(str, Enum):
 
 
 class RequestMethod(str, Enum):
+    # [CLASS DOC]
+    # String enum of supported req methods; only "agent".
     """Supported request methods in ``req`` frames."""
 
     AGENT = "agent"
 
 
 class QueueMode(str, Enum):
+    # [CLASS DOC]
+    # String enum for how new messages are handled while a session run is active:
+    # "collect" (coalesce, default) or "followup" (enqueue for the next turn).
     """Queue mode for inbound messages when a session is already running.
 
     Controls how the gateway handles new ``req`` frames that arrive while
@@ -57,6 +70,8 @@ class QueueMode(str, Enum):
 
 
 class RunStatus(str, Enum):
+    # [CLASS DOC]
+    # String enum of statuses carried in res payloads: accepted, complete, failed.
     """Status values for ``res`` frame payloads."""
 
     ACCEPTED = "accepted"
@@ -71,6 +86,9 @@ class RunStatus(str, Enum):
 
 @dataclass
 class RequestFrame:
+    # [CLASS DOC]
+    # Client->gateway request: id, method and a params dict (camelCase keys message,
+    # sessionKey, idempotencyKey, queueMode) exposed through convenience properties.
     """Client-to-gateway request frame.
 
     Attributes
@@ -90,18 +108,27 @@ class RequestFrame:
 
     @property
     def message(self) -> str:
+        # [FUNCTION DOC]
+        # Returns params["message"] or "".
         return self.params.get("message", "")
 
     @property
     def session_key(self) -> str:
+        # [FUNCTION DOC]
+        # Returns params["sessionKey"] or "".
         return self.params.get("sessionKey", "")
 
     @property
     def idempotency_key(self) -> str:
+        # [FUNCTION DOC]
+        # Returns params["idempotencyKey"] or "".
         return self.params.get("idempotencyKey", "")
 
     @property
     def queue_mode(self) -> QueueMode:
+        # [FUNCTION DOC]
+        # Returns params["queueMode"] coerced to QueueMode; missing or invalid values fall
+        # back to COLLECT.
         raw = self.params.get("queueMode", QueueMode.COLLECT)
         try:
             return QueueMode(raw)
@@ -111,6 +138,9 @@ class RequestFrame:
 
 @dataclass
 class ResponseFrame:
+    # [CLASS DOC]
+    # Gateway->client response: id of the originating request, ok flag and a payload
+    # dict (runId, status, optional summary/error).
     """Gateway-to-client response frame.
 
     Attributes
@@ -129,15 +159,22 @@ class ResponseFrame:
 
     @property
     def run_id(self) -> str:
+        # [FUNCTION DOC]
+        # Returns payload["runId"] or "".
         return self.payload.get("runId", "")
 
     @property
     def status(self) -> str:
+        # [FUNCTION DOC]
+        # Returns payload["status"] or "".
         return self.payload.get("status", "")
 
 
 @dataclass
 class EventFrame:
+    # [CLASS DOC]
+    # Gateway->client streaming event: event category (e.g. "agent") and payload with
+    # runId and optional delta / toolCall.
     """Gateway-to-client streaming event frame.
 
     Attributes
@@ -154,14 +191,20 @@ class EventFrame:
 
     @property
     def run_id(self) -> str:
+        # [FUNCTION DOC]
+        # Returns payload["runId"] or "".
         return self.payload.get("runId", "")
 
     @property
     def delta(self) -> str | None:
+        # [FUNCTION DOC]
+        # Returns payload["delta"] or None.
         return self.payload.get("delta")
 
     @property
     def tool_call(self) -> dict[str, Any] | None:
+        # [FUNCTION DOC]
+        # Returns payload["toolCall"] dict or None.
         return self.payload.get("toolCall")
 
 
@@ -175,6 +218,15 @@ Frame = RequestFrame | ResponseFrame | EventFrame
 
 
 def parse_frame(raw: str | bytes) -> Frame:
+    # [FUNCTION DOC]
+    # Decodes JSON text/bytes and builds the frame dataclass for its "type": req needs
+    # "id" (method defaults to "agent", params {}), res needs "id" (ok defaults True,
+    # payload {}), event uses event (default "agent") and payload. Raises ValueError for
+    # a missing/unknown type or invalid method, KeyError for missing "id", and JSON
+    # decode errors for malformed input.
+    # KNOWN ISSUE: the non-str/bytes branch (passing an already-decoded dict) is
+    # unreachable per the type hint but silently accepted; a missing "id" raises
+    # KeyError rather than the documented ValueError.
     """Parse a raw WebSocket text frame into a typed dataclass.
 
     Parameters
@@ -220,6 +272,9 @@ def parse_frame(raw: str | bytes) -> Frame:
 
 
 def serialize_frame(frame: Frame) -> str:
+    # [FUNCTION DOC]
+    # Encodes a frame dataclass to a JSON string with its "type" field plus its own
+    # fields (method emitted as its string value). Raises TypeError for other objects.
     """Serialize a frame dataclass to a JSON string.
 
     Parameters
@@ -268,6 +323,8 @@ def serialize_frame(frame: Frame) -> str:
 
 
 def make_accepted_response(request_id: str, run_id: str) -> ResponseFrame:
+    # [FUNCTION DOC]
+    # Builds an ok ResponseFrame with payload {runId, status: accepted}.
     """Create an ``accepted`` response frame for a request."""
     return ResponseFrame(
         id=request_id,
@@ -279,6 +336,9 @@ def make_accepted_response(request_id: str, run_id: str) -> ResponseFrame:
 def make_complete_response(
     request_id: str, run_id: str, summary: str = ""
 ) -> ResponseFrame:
+    # [FUNCTION DOC]
+    # Builds an ok ResponseFrame with {runId, status: complete}, adding "summary" only
+    # if non-empty.
     """Create a ``complete`` response frame for a finished run."""
     payload: dict[str, Any] = {"runId": run_id, "status": RunStatus.COMPLETE}
     if summary:
@@ -289,6 +349,9 @@ def make_complete_response(
 def make_failed_response(
     request_id: str, run_id: str, error: str = ""
 ) -> ResponseFrame:
+    # [FUNCTION DOC]
+    # Builds a ResponseFrame with ok False and {runId, status: failed}, adding "error"
+    # only if non-empty.
     """Create a ``failed`` response frame for an errored run."""
     payload: dict[str, Any] = {"runId": run_id, "status": RunStatus.FAILED}
     if error:
@@ -297,6 +360,8 @@ def make_failed_response(
 
 
 def make_delta_event(run_id: str, delta: str) -> EventFrame:
+    # [FUNCTION DOC]
+    # Builds an "agent" EventFrame with payload {runId, delta}.
     """Create a text delta streaming event."""
     return EventFrame(
         event="agent",
@@ -305,6 +370,8 @@ def make_delta_event(run_id: str, delta: str) -> EventFrame:
 
 
 def make_tool_call_event(run_id: str, tool_name: str, tool_args: str) -> EventFrame:
+    # [FUNCTION DOC]
+    # Builds an "agent" EventFrame with payload {runId, toolCall: {name, args}}.
     """Create a tool call streaming event."""
     return EventFrame(
         event="agent",
@@ -316,5 +383,7 @@ def make_tool_call_event(run_id: str, tool_name: str, tool_args: str) -> EventFr
 
 
 def generate_run_id() -> str:
+    # [FUNCTION DOC]
+    # Returns "run-" followed by the first 12 hex chars of a random UUID4.
     """Generate a unique run ID."""
     return f"run-{uuid.uuid4().hex[:12]}"

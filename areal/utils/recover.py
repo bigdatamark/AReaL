@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Fault-tolerance (recover) support for training loops: periodically saves DCP
+# checkpoints of the train engine(s) together with a "recover_info" directory
+# holding step counters and state dicts of the saver, evaluator, stats logger,
+# dataloader and recover frequency controller; on restart restores all of them,
+# reloads the checkpoint and re-syncs rollout engine weights (including the
+# colocated AWEX pause/offload protocol). Layout lives under Saver's save root.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
@@ -35,11 +42,17 @@ logger = logging.getLogger("Recover")
 
 
 class InValidRecoverInfo(Exception):
+    # [CLASS DOC]
+    # Raised when a recover_info directory exists but cannot be fully loaded/parsed.
     pass
 
 
 @dataclasses.dataclass
 class RecoverInfo:
+    # [CLASS DOC]
+    # Dataclass snapshot of training progress: last completed StepInfo (resume starts
+    # at its next()), state dicts of saver, evaluator, stats logger, checkpoint
+    # frequency controller, and dataloader state (per-rank list when distributed).
     # Last step info is the counter of the saved checkpoint.
     # Recover will start from the next iteration, obtained by `last_step_info.next()`.
     last_step_info: StepInfo
@@ -51,6 +64,12 @@ class RecoverInfo:
     checkpoint_info: dict
 
     def dump(self, dump_dir: str):
+        # [FUNCTION DOC]
+        # Writes the snapshot to dump_dir. When torch.distributed is initialized, all-gathers
+        # every rank's dataloader state (collective; all ranks must call) and only rank 0
+        # writes. Creates the directory and writes step_info.json, saver_info.json,
+        # evaluator_info.json, stats_logger_info.json, checkpoint_info.json (JSON) and
+        # dataloader_info.pkl (pickle).
         # Dumps the recover info to multiple files in `dump_dir`:
         # 1. step_info.json: contains the recover info
         # 2. *_info.json or *_info.pkl: contains other informantion required for recover.
@@ -95,6 +114,11 @@ class RecoverInfo:
 
     @classmethod
     def load(cls, load_dir: str):
+        # [FUNCTION DOC]
+        # Classmethod: raises FileNotFoundError if load_dir is missing; otherwise reads the
+        # same six files and builds a RecoverInfo. A list dataloader state is indexed by the
+        # current rank when distributed (asserts the world size matches). Any failure is
+        # logged and re-raised as InValidRecoverInfo. Uses pickle (trusted input only).
         # Loads the recover info from multiple files in `load_dir`:
         if not os.path.exists(load_dir):
             raise FileNotFoundError(
@@ -150,7 +174,16 @@ class RecoverInfo:
 
 
 class RecoverHandler:
+    # [CLASS DOC]
+    # Drives recover checkpointing for a run: holds RecoverConfig, FinetuneSpec, the
+    # last dumped StepInfo and an EpochStepTimeFreqCtl from config freq_epochs /
+    # freq_steps / freq_secs. Engines may be a single engine/controller or a dict
+    # name -> engine (one checkpoint per name). Not supported with
+    # GatewayTrainController (v2).
     def __init__(self, config: RecoverConfig, ft_spec: FinetuneSpec):
+        # [FUNCTION DOC]
+        # Stores config and spec, initializes last_step_info to all -1 counters and builds
+        # the frequency controller.
         self.config = config
         self.ft_spec = ft_spec
         self.last_step_info = StepInfo(
@@ -171,6 +204,8 @@ class RecoverHandler:
         trial_name: str,
         fileroot: str,
     ):
+        # [FUNCTION DOC]
+        # Returns "<save_root>/recover_info" (creating the save root as a side effect).
         return os.path.join(
             Saver.get_save_root(experiment_name, trial_name, fileroot),
             "recover_info",
@@ -182,6 +217,9 @@ class RecoverHandler:
         | TrainController
         | dict[str, TrainEngine | TrainController],
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if engine, or any value of a dict of engines, is a
+        # GatewayTrainController (imported lazily).
         from areal.v2.training_service.controller.controller import (
             GatewayTrainController,
         )
@@ -201,6 +239,8 @@ class RecoverHandler:
         | TrainController
         | dict[str, TrainEngine | TrainController],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Raises NotImplementedError if a GatewayTrainController is involved.
         if self._is_gateway_train_controller(engine):
             raise NotImplementedError(
                 "Recovery is not supported with GatewayTrainController "
@@ -214,6 +254,8 @@ class RecoverHandler:
         | TrainController
         | dict[str, TrainEngine | TrainController],
     ) -> dict[str, TrainEngine | TrainController]:
+        # [FUNCTION DOC]
+        # HELPER: Returns a dict as-is, else wraps a single engine as {"default": engine}.
         if isinstance(engine, dict):
             return engine
         return {"default": engine}
@@ -224,6 +266,9 @@ class RecoverHandler:
         weight_update_meta: WeightUpdateMeta | None,
         colocated_rollout: bool,
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True iff an inference engine is given, the weight update meta's type is
+        # "awex" and the rollout is colocated with the actor.
         """Whether recovery must drive the AWEX colocate pre-transfer sequence.
 
         The transport type alone is not enough: v2 selects AWEX for every
@@ -240,6 +285,10 @@ class RecoverHandler:
     def _require_colocate_rollout_protocol(
         inference_engine: InferenceEngine,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Verifies the inference engine has a callable pause_generation_sync and an
+        # offload method accepting a "tags" parameter (unknown signatures are accepted).
+        # Raises NotImplementedError listing missing capabilities.
         missing = []
         if not callable(getattr(inference_engine, "pause_generation_sync", None)):
             missing.append("pause_generation_sync()")
@@ -277,6 +326,12 @@ class RecoverHandler:
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
     ):
+        # [FUNCTION DOC]
+        # No-op if mode is "disabled"/"off". Rejects unsupported controllers, ticks the
+        # frequency controller (epoch tick when step_info is the epoch's last step) and
+        # returns if not due. Otherwise saves a DCP checkpoint per engine, records
+        # step_info as last_step_info, collects all component state dicts into a
+        # RecoverInfo and dumps it to the recover_info path (distributed collective inside).
         if self.config.mode in ("disabled", "off"):
             return
         self._ensure_recover_supported(engine)
@@ -327,6 +382,19 @@ class RecoverHandler:
         inference_engine_update_from: str = "default",
         colocated_rollout: bool = False,
     ) -> RecoverInfo | None:
+        # [FUNCTION DOC]
+        # No-op (returns None) if mode is disabled/off. Raises ValueError if an inference
+        # engine is given without weight_update_meta. Loads RecoverInfo and restores saver,
+        # frequency controller, evaluator, stats logger and dataloader state. Loads each
+        # engine's DCP checkpoint (deferred for colocated AWEX until the rollout engine has
+        # paused generation and offloaded kv_cache and weights, to avoid OOM). If an
+        # inference engine is given: connects the engine named inference_engine_update_from
+        # to it with meta versioned global_step + 1, pauses rollout, pushes weights
+        # (always resuming afterwards), then sets both versions. Returns the RecoverInfo.
+        # FileNotFoundError / InValidRecoverInfo are caught and logged as a warning,
+        # returning None.
+        # KNOWN ISSUE: a FileNotFoundError from checkpoint loading after component states
+        # were already restored is also swallowed, leaving a partially recovered run.
         if self.config.mode in ("disabled", "off"):
             return
         self._ensure_recover_supported(engine)
@@ -421,6 +489,10 @@ class RecoverHandler:
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Saves engine state in DCP format to the recover checkpoint path for name,
+        # with optimizer state unless config.no_save_optim; passes tokenizer, processor and
+        # base_model_path through. Logs the path.
         path = Saver.get_recover_checkpoint_path(
             self.config.experiment_name,
             self.config.trial_name,
@@ -447,6 +519,11 @@ class RecoverHandler:
         tokenizer: PreTrainedTokenizerFast | None = None,
         base_model_path: str | None = None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Loads the DCP checkpoint for name into engine (optimizer unless
+        # config.no_load_optim). Raises FileNotFoundError if the path is missing.
+        # KNOWN ISSUE: the path helper creates the directory, so the existence check
+        # always passes; tokenizer and base_model_path parameters are ignored.
         path = Saver.get_recover_checkpoint_path(
             self.config.experiment_name,
             self.config.trial_name,
@@ -469,6 +546,13 @@ class RecoverHandler:
 
 
 def check_if_auto_recover(config: RecoverConfig) -> bool:
+    # [FUNCTION DOC]
+    # Returns True if recover_info exists and loads, its last epoch is >= 0, and every
+    # subdirectory of the save root has a recover checkpoint directory; logs and
+    # returns False otherwise.
+    # KNOWN ISSUE: get_recover_checkpoint_path creates the directory it returns, so the
+    # per-model existence check always passes (and creates stray directories,
+    # including under recover_info itself).
     # This method is called by check_if_recover to check if the experiment should
     # recover from a previous run when recovery is enabled ("on" or "auto" mode).
     experiment_name = config.experiment_name
@@ -509,6 +593,9 @@ def check_if_auto_recover(config: RecoverConfig) -> bool:
 
 
 def check_if_recover(config: RecoverConfig, _run_id: int) -> bool:
+    # [FUNCTION DOC]
+    # Returns False when config.mode is "disabled"/"off"; otherwise (on/auto) delegates
+    # to check_if_auto_recover. _run_id is unused.
     """Check if the experiment should be a recover run.
 
     When recovery is enabled ('on' or 'auto'), this checks if valid recover

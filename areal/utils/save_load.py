@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Helpers to load raw model weights (state dicts) from a HuggingFace Hub repo id or
+# a local path, and to test for an existing local path.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -7,6 +10,18 @@ import torch
 
 
 def get_state_dict_from_repo_id_or_path(repo_id_or_path: str) -> dict:
+    # [FUNCTION DOC]
+    # If huggingface_hub is importable and the string is a syntactically valid repo id,
+    # downloads a snapshot (network, HF cache) and uses its directory; otherwise treats
+    # it as a local path. For a directory, collects all top-level *.safetensors and
+    # *.bin files; a file path is loaded alone; anything else raises ValueError. Loads
+    # files in parallel (thread pool of min(4, max(1, cpu_count // 8)) workers) to CPU
+    # (safetensors loader or torch.load) and merges them into one dict (later files
+    # overwrite duplicate keys). Wraps loading errors in RuntimeError. Returns the
+    # merged state dict.
+    # KNOWN ISSUE: a relative local path like "org/name" is a valid repo id and will be
+    # downloaded instead of read locally; an empty directory returns {} silently;
+    # os.cpu_count() may be None (TypeError).
     """
     Obtain a state dictionary from either a Hugging Face repo ID or a local path.
 
@@ -60,6 +75,9 @@ def get_state_dict_from_repo_id_or_path(repo_id_or_path: str) -> dict:
         )
 
     def _load(filepath: str):
+        # [FUNCTION DOC]
+        # HELPER: Loads one .safetensors or .bin file to CPU and returns its dict; other
+        # extensions raise ValueError.
         if filepath.endswith(".safetensors"):
             state_dict = safetensors_load(filepath)
         elif filepath.endswith(".bin"):
@@ -90,6 +108,9 @@ def get_state_dict_from_repo_id_or_path(repo_id_or_path: str) -> dict:
 
 
 def is_existing_local_path(path: str) -> bool:
+    # [FUNCTION DOC]
+    # Returns True if path exists as a file or directory; False otherwise or if Path
+    # construction / stat raises ValueError or OSError.
     try:
         path_obj = Path(path)
         return path_obj.exists() and (path_obj.is_file() or path_obj.is_dir())

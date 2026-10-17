@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Shared helpers for tests and profiling: resolve model/dataset paths (local mount
+# first, else HuggingFace Hub download), load an Archon model initialized with HF
+# weights, and a dummy RolloutWorkflow. Importing this module eagerly resolves the
+# DENSE_MODEL_PATHS / MOE_MODEL_PATHS / MODEL_PATHS tables (model_type -> path),
+# which may trigger large network downloads as an import side effect.
 # SPDX-License-Identifier: Apache-2.0
 
 """Common utilities for testing and profiling.
@@ -24,6 +30,10 @@ logger = logging.getLogger("TestingUtils")
 
 
 def get_model_path(local_path: str, hf_id: str) -> str:
+    # [FUNCTION DOC]
+    # Returns local_path if it exists (logged); otherwise downloads hf_id with
+    # snapshot_download, skipping *.gguf, *.ggml and consolidated* files, and returns
+    # the cached path. Download errors are logged and re-raised.
     """Get model path, preferring local storage over HuggingFace Hub.
 
     If local_path exists, returns it directly. Otherwise downloads
@@ -55,6 +65,10 @@ def get_model_path(local_path: str, hf_id: str) -> str:
 
 
 def get_dataset_path(local_path: str, hf_id: str) -> str:
+    # [FUNCTION DOC]
+    # Like get_model_path but for datasets: returns local_path if it exists, else
+    # downloads hf_id as a dataset repo and returns its path; errors logged and
+    # re-raised.
     """Get dataset path, preferring local storage over HuggingFace Hub.
 
     If local_path exists, returns it directly. Otherwise downloads
@@ -132,6 +146,13 @@ MODEL_PATHS = {**DENSE_MODEL_PATHS, **MOE_MODEL_PATHS}
 def load_archon_model(
     model_path: str, dtype: torch.dtype = torch.bfloat16, skip_unsupported: bool = False
 ):
+    # [FUNCTION DOC]
+    # Reads the HF config at model_path; if Archon does not support its model_type,
+    # returns (None, None) when skip_unsupported else raises ValueError. Otherwise
+    # builds the Archon model from the model spec's args (non-critic) directly on the
+    # current accelerator device, loads all HF weights to CPU, converts them with the
+    # spec's state-dict adapter, loads them non-strictly, casts to dtype (default
+    # bfloat16) and sets eval mode. Returns (model, adapter). Uses GPU memory.
     """Load Archon model with same weights as HuggingFace model.
 
     Args:
@@ -171,11 +192,19 @@ def load_archon_model(
 
 
 class TestWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # Dummy RolloutWorkflow producing random trajectories, for exercising rollout
+    # plumbing without a real engine.
     """Simple test workflow for testing RolloutWorkflow functionality."""
 
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, Any] | None | dict[str, InteractionWithTokenLogpReward]:
+        # [FUNCTION DOC]
+        # Ignores engine and data; sleeps 0.1s, then returns a dict of tensors for one
+        # random sequence: input_ids [1, L] with random ids in [0, 100), all-true
+        # attention_mask, loss_mask false for a 2-8 token prompt and true for a 2-8 token
+        # completion, and a random normal reward of shape [1].
         await asyncio.sleep(0.1)
         prompt_len = random.randint(2, 8)
         gen_len = random.randint(2, 8)

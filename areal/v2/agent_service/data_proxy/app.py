@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# FastAPI DataProxy app: stateful per-session proxy in front of one Worker. Keeps
+# in-memory conversation history per session key, injects optional inference
+# routing (self-evolution) into turn metadata, forwards turns to the Worker's /run,
+# relays raw-passthrough responses verbatim, and reaps idle sessions.
 # SPDX-License-Identifier: Apache-2.0
 
 """Data Proxy — stateful session proxy between Gateway and Worker."""
@@ -23,6 +28,10 @@ logger = logging.getLogger("AgentDataProxy")
 
 @dataclass
 class _SessionData:
+    # [CLASS DOC]
+    # HELPER: Per-session state: OpenAI-style message history list, metadata dict,
+    # last_active monotonic timestamp, optional reward (unused here) and cached
+    # inference routing dict {base_url, api_key, model} or None.
     history: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     last_active: float = field(default_factory=time.monotonic)
@@ -39,11 +48,20 @@ class _SessionData:
 
 
 def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
+    # [FUNCTION DOC]
+    # Builds the DataProxy app with a sessions dict and one httpx.AsyncClient
+    # (request_timeout). Registers startup/shutdown hooks and the routes below; returns
+    # the app.
+    # KNOWN ISSUE: the idle-reaper task started on startup is never cancelled on
+    # shutdown, and the shutdown hook only closes the HTTP client.
     app = FastAPI(title="AReaL Data Proxy")
     sessions: dict[str, _SessionData] = {}
     http_client = httpx.AsyncClient(timeout=config.request_timeout)
 
     async def _close_worker_session(session_key: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Best-effort POST to <worker>/session/<key>/close with a 5s timeout; any
+        # exception is swallowed and logged at debug level.
         try:
             await http_client.post(
                 f"{config.worker_addr}/session/{session_key}/close", timeout=5
@@ -54,6 +72,12 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
     def _resolve_inference(
         session: _SessionData, body: dict[str, Any], metadata: dict[str, Any]
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Reads inf_base_url (trailing "/" stripped), session_api_key and inf_model
+        # from the turn body. If either of the first two is present, both are required
+        # (else HTTPException 400) and the session's cached inference dict is replaced.
+        # If the session has cached inference, returns a copy of metadata with
+        # "areal_inference" set to a copy of it; otherwise returns metadata unchanged.
         """Forward caller-supplied inference routing to the worker metadata.
 
         Self-evolution decouples the Agent Service from the training side: the
@@ -98,6 +122,10 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
         return metadata
 
     async def _reap_idle_sessions() -> None:
+        # [FUNCTION DOC]
+        # HELPER: Background loop: every 60s deletes sessions idle longer than
+        # session_timeout seconds and best-effort closes them on the Worker; logs the count.
+        # Runs until cancelled.
         while True:
             await asyncio.sleep(60)
             now = time.monotonic()
@@ -114,14 +142,21 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
 
     @app.on_event("startup")
     async def startup():
+        # [FUNCTION DOC]
+        # Startup hook: launches the idle-session reaper as an asyncio task stored on
+        # app.state.reaper_task.
         app.state.reaper_task = asyncio.create_task(_reap_idle_sessions())
 
     @app.on_event("shutdown")
     async def shutdown():
+        # [FUNCTION DOC]
+        # Shutdown hook: closes the shared HTTP client.
         await http_client.aclose()
 
     @app.get("/health")
     async def health():
+        # [FUNCTION DOC]
+        # GET /health: returns status ok, active session count and the worker address.
         return {
             "status": "ok",
             "active_sessions": len(sessions),
@@ -130,6 +165,22 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/session/{session_key}/turn")
     async def turn(session_key: str, body: dict[str, Any]):
+        # [FUNCTION DOC]
+        # POST /session/<key>/turn: creates the session if new, resolves inference routing
+        # (may raise 400), and streams a POST to <worker>/run with message, session_key,
+        # run_id, a copy of the history, queue_mode (default "collect") and metadata.
+        # If the Worker response carries the passthrough header "1", relays the raw body
+        # as a StreamingResponse with the same status and content-type, minus hop-by-hop,
+        # content-length and passthrough headers; no history is recorded. Otherwise reads
+        # the JSON body; status >= 400 is forwarded unchanged without touching history.
+        # On success appends the user message, then for each tool_call event an assistant
+        # message with a synthetic call id "call_<name>_<run_id>_<n>", for each tool_result
+        # a tool message referencing the most recent call id, and finally the summary as an
+        # assistant message if non-empty. Updates last_active and returns the JSON result.
+        # KNOWN ISSUE: tool results are always paired with the latest call id, so
+        # interleaved/parallel tool calls get mismatched ids; a non-JSON Worker error body
+        # or a Worker connection failure raises (500) instead of a structured error; the
+        # class docstring mentions inspecting Content-Type but only the marker is used.
         """Single turn endpoint for every protocol and streaming mode.
 
         The worker's ``/run`` decides the shape of the turn and signals it via
@@ -188,6 +239,9 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
             # Raw-passthrough turn: relay the worker body verbatim, keep no
             # history (parsing the stream would fight the byte-exact relay).
             async def _relay():
+                # [FUNCTION DOC]
+                # HELPER: Async generator yielding raw Worker body chunks; always closes the
+                # response and refreshes the session's last_active when done.
                 try:
                     async for chunk in resp.aiter_raw():
                         yield chunk
@@ -269,12 +323,18 @@ def create_data_proxy_app(config: DataProxyConfig) -> FastAPI:
 
     @app.post("/session/{session_key}/close")
     async def close_session(session_key: str):
+        # [FUNCTION DOC]
+        # POST /session/<key>/close: drops the session (no-op if unknown) and best-effort
+        # closes it on the Worker. Returns status ok. Does not notify the Router.
         sessions.pop(session_key, None)
         await _close_worker_session(session_key)
         return {"status": "ok"}
 
     @app.get("/session/{session_key}/history")
     async def get_history(session_key: str):
+        # [FUNCTION DOC]
+        # GET /session/<key>/history: returns {"history": [...]} (empty list for unknown
+        # sessions). The live list object is returned, not a copy.
         session = sessions.get(session_key)
         if session is None:
             return {"history": []}

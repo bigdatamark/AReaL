@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Helpers for querying installed package versions (importlib.metadata) and comparing
+# them with PEP 440 semantics (packaging.version.Version).
 # SPDX-License-Identifier: Apache-2.0
 
 from importlib.metadata import PackageNotFoundError
@@ -7,6 +10,9 @@ from packaging.version import Version
 
 
 def is_available(pkg_name):
+    # [FUNCTION DOC]
+    # Returns True if package metadata for pkg_name is installed (non-empty version),
+    # False if PackageNotFoundError.
     try:
         return bool(get_version(pkg_name))
     except PackageNotFoundError:
@@ -14,6 +20,9 @@ def is_available(pkg_name):
 
 
 def compare_versions(version1: str, version2: str) -> int:
+    # [FUNCTION DOC]
+    # Parses both strings as PEP 440 versions and returns -1, 0 or 1 for <, ==, >.
+    # Raises InvalidVersion for unparseable strings.
     """
     Compare two version strings.
 
@@ -32,6 +41,9 @@ def compare_versions(version1: str, version2: str) -> int:
 
 
 def is_version_greater_or_equal(package_name: str, target_version: str) -> bool:
+    # [FUNCTION DOC]
+    # True if the installed version of package_name >= target_version. Raises
+    # PackageNotFoundError if the package is not installed.
     """
     Check if the installed version of a package is greater than or equal to the target version.
 
@@ -44,6 +56,9 @@ def is_version_greater_or_equal(package_name: str, target_version: str) -> bool:
 
 
 def is_version_less(package_name: str, target_version: str) -> bool:
+    # [FUNCTION DOC]
+    # True if the installed version of package_name < target_version. Raises
+    # PackageNotFoundError if not installed.
     """
     Check if the installed version of a package is less than the target version.
 
@@ -56,6 +71,9 @@ def is_version_less(package_name: str, target_version: str) -> bool:
 
 
 def is_version_equal(package_name: str, target_version: str) -> bool:
+    # [FUNCTION DOC]
+    # True if the installed version equals target_version under PEP 440 comparison.
+    # Raises PackageNotFoundError if not installed.
     """
     Check if the installed version of a package is equal to the target version.
 

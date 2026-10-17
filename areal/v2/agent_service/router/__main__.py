@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Command-line launcher for a standalone Router server.
 # SPDX-License-Identifier: Apache-2.0
 
 """``python -m areal.v2.agent_service.router``"""
@@ -14,6 +16,10 @@ from .config import RouterConfig
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Parses CLI args (--host 0.0.0.0, --port 8081, --admin-api-key, --poll-interval
+    # 5s, --worker-health-timeout 2s, --log-level warning), validates the admin key for
+    # the bind host, builds a RouterConfig and runs the router app with uvicorn; blocks.
     parser = argparse.ArgumentParser(description="Agent Router")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8081)

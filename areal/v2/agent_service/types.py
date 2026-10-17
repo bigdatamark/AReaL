@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Public data types and structural protocols shared by the Agent Service: request /
+# response dataclasses passed between Worker and agent implementations, a raw
+# passthrough response type, and the EventEmitter / AgentRunnable protocols.
 # SPDX-License-Identifier: Apache-2.0
 
 """Public types for the Agent Service protocol."""
@@ -13,6 +17,11 @@ from .protocol import QueueMode
 
 @dataclass
 class AgentRequest:
+    # [CLASS DOC]
+    # Dataclass for one agent turn: message text, session_key, run_id, prior history
+    # (list of message dicts, default empty), queue_mode (QueueMode, default COLLECT)
+    # and free-form metadata (reserved keys "areal_inference" and "chat_request" are
+    # described in the docstring).
     """Structured request passed to the agent.
 
     Core fields are stable protocol-level attributes.  Framework-specific
@@ -45,6 +54,9 @@ class AgentRequest:
 
 @dataclass
 class AgentResponse:
+    # [CLASS DOC]
+    # Dataclass for a structured agent result: final summary text (default "") and a
+    # metadata dict. Serialised to JSON by the Worker together with collected events.
     """Structured result returned by the agent."""
 
     summary: str = ""
@@ -53,6 +65,9 @@ class AgentResponse:
 
 @dataclass
 class StreamResponse:
+    # [CLASS DOC]
+    # Dataclass for a raw passthrough reply: HTTP status_code, headers dict and an
+    # async byte iterator body, relayed verbatim by Worker/DataProxy.
     """Raw streaming response from an agent, passed through verbatim.
 
     The structured channel (``run`` + :class:`EventEmitter` → ``AgentResponse``)
@@ -79,15 +94,28 @@ class StreamResponse:
 
 
 class EventEmitter(Protocol):
+    # [CLASS DOC]
+    # Structural protocol (typing.Protocol) of callbacks an agent uses to stream
+    # incremental events (text deltas, tool calls, tool results) to the caller.
     """Callback interface for streaming events from agent to caller."""
 
+    # [FUNCTION DOC]
+    # Protocol stub: report an incremental text chunk. No implementation.
     async def emit_delta(self, text: str) -> None: ...
+    # [FUNCTION DOC]
+    # Protocol stub: report a tool invocation by name with serialized args string.
     async def emit_tool_call(self, name: str, args: str) -> None: ...
+    # [FUNCTION DOC]
+    # Protocol stub: report the result string of a named tool call.
     async def emit_tool_result(self, name: str, result: str) -> None: ...
 
 
 @runtime_checkable
 class AgentRunnable(Protocol):
+    # [CLASS DOC]
+    # Runtime-checkable protocol for pluggable agents: only requires an async run
+    # method; isinstance checks only verify the attribute exists. Optional hooks
+    # close_session / close_all_sessions are discovered via getattr.
     """Minimal protocol for pluggable agent implementations.
 
     Agent classes are loaded via
@@ -124,6 +152,9 @@ class AgentRunnable(Protocol):
       shutdown.
     """
 
+    # [FUNCTION DOC]
+    # Protocol stub: execute one turn for the given AgentRequest, streaming events
+    # through the keyword-only emitter; returns AgentResponse or StreamResponse.
     async def run(
         self,
         request: AgentRequest,

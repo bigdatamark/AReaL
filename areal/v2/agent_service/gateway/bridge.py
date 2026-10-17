@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# HTTP protocol bridges mounted on the Gateway: an OpenAI Responses-compatible
+# POST /v1/responses (structured turns, optional SSE re-encoding) and an
+# OpenAI chat-completions-compatible POST /v1/chat/completions (raw byte passthrough).
+# Both resolve a session key, ask the Router for the owning DataProxy and send a
+# turn there, echoing the key back in the X-AReaL-Session-Key header.
+# KNOWN ISSUE: the CHAT_REQUEST_METADATA_KEY comment refers to an
+# AgentRunnable.stream method that does not exist (agents return StreamResponse
+# from run instead).
 # SPDX-License-Identifier: Apache-2.0
 
 """OpenResponses HTTP bridge — translates POST /v1/responses to DataProxy turns."""
@@ -30,22 +39,46 @@ SESSION_KEY_HEADER = "X-AReaL-Session-Key"
 
 
 class AgentBridge(ABC):
+    # [FUNCTION DOC]
+    # Abstract: translate one incoming FastAPI Request into an HTTP response.
+    # [CLASS DOC]
+    # Abstract base for protocol bridges; subclasses implement handle_request.
     @abstractmethod
     async def handle_request(self, request: Request) -> Any: ...
 
 
 class OpenResponsesBridge(AgentBridge):
+    # [CLASS DOC]
+    # Bridge for the OpenAI Responses API. Holds the Router address, admin auth headers
+    # and its own httpx.AsyncClient (600s timeout).
     def __init__(
         self, router_addr: str, admin_api_key: str = DEFAULT_ADMIN_API_KEY
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores router address, builds admin headers and creates the HTTP client.
         self._router_addr = router_addr
         self._auth_headers = admin_headers(admin_api_key)
         self._http = httpx.AsyncClient(timeout=600.0)
 
     async def close(self) -> None:
+        # [FUNCTION DOC]
+        # Closes the HTTP client.
         await self._http.aclose()
 
     async def handle_request(self, request: Request) -> Any:
+        # [FUNCTION DOC]
+        # Parses the JSON body (input items, instructions, model, user). Requires either the
+        # session-key header or "user" (else 400 invalid_request). Flattens input into a
+        # message, picks the session key (header, else derived from user+model), creates a
+        # run id and a "resp-<12 hex>" response id, and builds metadata {input,
+        # instructions, tools, model, idempotencyKey} merged with body["metadata"] (body
+        # wins). Routes via the Router, POSTs the turn (queue_mode collect, plus any
+        # inf_base_url / inf_model / session_api_key fields) to the DataProxy, converts the
+        # result into output items and returns either an SSE StreamingResponse (if
+        # body["stream"]) or a JSON "response" object with status completed. Any failure is
+        # logged and returned as a 500 server_error JSON. All responses carry the session
+        # key header.
+        # KNOWN ISSUE: an invalid JSON body raises before the try block (unhandled 500).
         body = await request.json()
 
         input_items: list[dict[str, Any]] = body.get("input", [])
@@ -157,6 +190,10 @@ class OpenResponsesBridge(AgentBridge):
 
     @staticmethod
     def _extract_message(input_items: list[dict[str, Any]], instructions: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Joins (newline) the instructions, the text of each "message" input item
+        # (string content or its input_text blocks) and "[tool result] <output>" for each
+        # function_call_output item. Returns the combined string.
         parts: list[str] = []
         if instructions:
             parts.append(instructions)
@@ -178,6 +215,10 @@ class OpenResponsesBridge(AgentBridge):
 
     @staticmethod
     def _build_output_items(result: dict[str, Any]) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # HELPER: Converts a turn result into Responses output items: an assistant message
+        # with one output_text block for a non-empty summary, then one function_call item
+        # (name, arguments) per tool_call event.
         """Translate a structured turn result into OpenAI Responses output items.
 
         A non-empty ``summary`` becomes an assistant ``message`` item; each
@@ -211,6 +252,10 @@ class OpenResponsesBridge(AgentBridge):
         output_items: list[dict[str, Any]],
         metadata: dict[str, Any],
     ) -> AsyncIterator[bytes]:
+        # [FUNCTION DOC]
+        # HELPER: Async generator of SSE bytes: response.created (in_progress), then for
+        # each text block of message items an output_text.delta and output_text.done, and
+        # finally response.completed carrying the full response (output and metadata).
         """Emit collected output items as an OpenAI Responses-format SSE stream.
 
         This is a re-encoding shim, not incremental generation: the structured
@@ -221,6 +266,8 @@ class OpenResponsesBridge(AgentBridge):
         """
 
         def _event(payload: dict[str, Any]) -> bytes:
+            # [FUNCTION DOC]
+            # HELPER: Encodes a payload dict as an SSE "data: <json>" line plus blank line, bytes.
             return f"data: {json.dumps(payload)}\n\n".encode()
 
         yield _event(
@@ -259,6 +306,9 @@ class OpenResponsesBridge(AgentBridge):
 
     @staticmethod
     def _derive_session_key(user: str, model: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Returns "agent:<model or default>:<user>"; with no user, a random
+        # 8-hex suffix instead (no affinity).
         if user:
             return f"agent:{model or 'default'}:{user}"
         return f"agent:{model or 'default'}:{uuid.uuid4().hex[:8]}"
@@ -269,14 +319,21 @@ def mount_bridge(
     bridge: OpenResponsesBridge,
     admin_api_key: str = DEFAULT_ADMIN_API_KEY,
 ) -> None:
+    # [FUNCTION DOC]
+    # Registers POST /v1/responses (admin-key protected) delegating to the bridge, and a
+    # shutdown hook that closes the bridge's HTTP client.
     auth = make_admin_dependency(admin_api_key)
 
     @app.post("/v1/responses", dependencies=[Depends(auth)])
     async def responses_endpoint(request: Request):
+        # [FUNCTION DOC]
+        # Route handler: awaits bridge.handle_request(request).
         return await bridge.handle_request(request)
 
     @app.on_event("shutdown")
     async def shutdown_bridge():
+        # [FUNCTION DOC]
+        # Shutdown hook: closes the bridge.
         await bridge.close()
 
 
@@ -289,6 +346,13 @@ CHAT_REQUEST_METADATA_KEY = "chat_request"
 
 
 class ChatCompletionsBridge(AgentBridge):
+    # [CLASS DOC]
+    # Bridge for /v1/chat/completions that relays the Worker/agent response verbatim
+    # (the full body is forwarded in metadata["chat_request"]). Session key comes from
+    # the header or the user field; holds Router address, admin headers and an
+    # httpx.AsyncClient (600s).
+    # KNOWN ISSUE: the docstring says the DataProxy distinguishes passthrough by
+    # Content-Type; it actually uses the x-areal-passthrough marker header.
     """OpenAI-compatible ``/v1/chat/completions`` → DataProxy raw stream.
 
     Translates a chat-completions request into a DataProxy ``turn`` and relays
@@ -325,14 +389,26 @@ class ChatCompletionsBridge(AgentBridge):
     def __init__(
         self, router_addr: str, admin_api_key: str = DEFAULT_ADMIN_API_KEY
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores router address, builds admin headers and creates the HTTP client.
         self._router_addr = router_addr
         self._auth_headers = admin_headers(admin_api_key)
         self._http = httpx.AsyncClient(timeout=600.0)
 
     async def close(self) -> None:
+        # [FUNCTION DOC]
+        # Closes the HTTP client.
         await self._http.aclose()
 
     async def handle_request(self, request: Request) -> Any:
+        # [FUNCTION DOC]
+        # Parses JSON (400 invalid_request on failure), resolves the session key (400 if
+        # none), extracts the last user text as the message and puts the whole body in
+        # metadata. Routes via the Router (502 server_error on failure), then opens a
+        # streaming POST of the turn (collect mode, plus optional inference fields) to the
+        # DataProxy (502 on send failure). Returns a StreamingResponse relaying the raw
+        # body with the DataProxy's status and content-type, hop-by-hop/length headers
+        # removed and the session key header added.
         try:
             body = await request.json()
         except Exception:
@@ -414,6 +490,8 @@ class ChatCompletionsBridge(AgentBridge):
             )
 
         async def _relay():
+            # [FUNCTION DOC]
+            # HELPER: Async generator yielding raw DataProxy chunks; closes the response at end.
             try:
                 async for chunk in resp.aiter_raw():
                     yield chunk
@@ -435,6 +513,9 @@ class ChatCompletionsBridge(AgentBridge):
 
     @staticmethod
     def _resolve_session_key(request: Request, body: dict[str, Any]) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns the session-key header if set, else "chat:<model or
+        # default>:<user>" if user is set, else None.
         """Resolve the session key, in priority order (see class docstring).
 
         Explicit ``X-AReaL-Session-Key`` header wins so a client can pin a
@@ -454,6 +535,10 @@ class ChatCompletionsBridge(AgentBridge):
 
     @staticmethod
     def _extract_last_user_text(messages: list[dict[str, Any]]) -> str:
+        # [FUNCTION DOC]
+        # HELPER: Scans messages from the end for the last role "user" message; returns
+        # its string content, or the concatenation of its "text" blocks if list content;
+        # "" if none found.
         for item in reversed(messages):
             if item.get("role") != "user":
                 continue
@@ -471,6 +556,9 @@ class ChatCompletionsBridge(AgentBridge):
 
 
 def mount_chat_bridge(app: FastAPI, bridge: ChatCompletionsBridge) -> None:
+    # [FUNCTION DOC]
+    # Registers POST /v1/chat/completions (intentionally without admin auth) delegating
+    # to the bridge, and a shutdown hook closing it.
     """Mount the chat-completions bridge.
 
     Deliberately **not** admin-gated: upstreams call ``/v1/chat/completions``
@@ -480,8 +568,12 @@ def mount_chat_bridge(app: FastAPI, bridge: ChatCompletionsBridge) -> None:
 
     @app.post("/v1/chat/completions")
     async def chat_completions_endpoint(request: Request):
+        # [FUNCTION DOC]
+        # Route handler: awaits bridge.handle_request(request).
         return await bridge.handle_request(request)
 
     @app.on_event("shutdown")
     async def shutdown_chat_bridge():
+        # [FUNCTION DOC]
+        # Shutdown hook: closes the bridge.
         await bridge.close()

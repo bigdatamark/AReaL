@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Instantiates the shared guard infrastructure for the Agent Service: a module-level
+# GuardState (_state), the guard web app built from it (app), and a logger
+# "AgentGuard". Importing this module creates the state and app as a side effect.
 # SPDX-License-Identifier: Apache-2.0
 
 """Agent Service Guard backed by the shared guard infrastructure.
@@ -27,4 +31,7 @@ app = create_app(_state)
 
 
 def cleanup_forked_children() -> None:
+    # [FUNCTION DOC]
+    # Terminates/cleans up all child processes forked by this guard by delegating to
+    # the shared cleanup implementation with the module-level state.
     _cleanup_impl(_state)

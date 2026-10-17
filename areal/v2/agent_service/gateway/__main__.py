@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Command-line launcher for a standalone Gateway server with both protocol bridges.
 # SPDX-License-Identifier: Apache-2.0
 
 """``python -m areal.v2.agent_service.gateway``"""
@@ -20,6 +22,13 @@ from .config import GatewayConfig
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Parses CLI args (--router-addr required; --host 0.0.0.0, --port 8080,
+    # --admin-api-key default key, --router-timeout 2s, --forward-timeout 120s,
+    # --log-level warning). Validates the admin key against the bind host (may raise if
+    # the default key is used on a non-local host), builds a GatewayConfig and the
+    # gateway app, mounts the OpenResponses bridge (admin-key protected) and the chat
+    # completions bridge, then runs uvicorn (access log disabled); blocks.
     parser = argparse.ArgumentParser(description="Agent Gateway")
     parser.add_argument("--router-addr", required=True, help="Router HTTP address")
     parser.add_argument("--host", default="0.0.0.0")

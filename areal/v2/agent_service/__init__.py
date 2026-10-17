@@ -1,3 +1,8 @@
+# [PACKAGE DOC]
+# Agent Service package: an agent-level inference tier exposing whole agent sessions
+# over HTTP microservices (Gateway -> Router -> DataProxy -> Worker), orchestrated by
+# the controller subpackage. Re-exports the public protocol types AgentRequest,
+# AgentResponse, AgentRunnable and EventEmitter from the types module.
 # SPDX-License-Identifier: Apache-2.0
 
 """AReaL Agent Service — agent-level inference tier.

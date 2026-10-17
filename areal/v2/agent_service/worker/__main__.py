@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Command-line launcher for a standalone Agent Worker (usually forked by the guard).
 # SPDX-License-Identifier: Apache-2.0
 
 """``python -m areal.v2.agent_service.worker``
@@ -18,6 +20,10 @@ from .app import create_worker_app
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Parses --agent (required import path), --host 0.0.0.0, --port 9000, --log-level
+    # warning; builds the worker app (which imports and instantiates the agent) and runs
+    # it with uvicorn (access log off); blocks.
     parser = argparse.ArgumentParser(description="Agent Worker")
     parser.add_argument("--agent", required=True, help="Agent import path")
     parser.add_argument("--host", default="0.0.0.0")

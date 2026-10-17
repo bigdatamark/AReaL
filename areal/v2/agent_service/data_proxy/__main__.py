@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Command-line launcher for a standalone DataProxy server via uvicorn.
 # SPDX-License-Identifier: Apache-2.0
 
 """``python -m areal.v2.agent_service.data_proxy``"""
@@ -11,6 +13,11 @@ from .config import DataProxyConfig
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Parses CLI args (--worker-addr required; --host 0.0.0.0, --port 9100,
+    # --request-timeout 600s, --session-timeout 3600s, --log-level warning), builds a
+    # DataProxyConfig, creates the DataProxy FastAPI app and runs it with uvicorn
+    # (access log disabled). Blocks until the server exits.
     parser = argparse.ArgumentParser(description="Agent DataProxy")
     parser.add_argument("--worker-addr", required=True, help="Worker HTTP address")
     parser.add_argument("--host", default="0.0.0.0")

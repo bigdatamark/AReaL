@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Lightweight performance and session tracing. PerfTracer records Chrome-Trace /
+# Perfetto compatible events (complete spans "X", instants "i", metadata "M") in
+# memory and appends them as JSON lines to
+# <fileroot>/logs/<user>/<exp>/<trial>/perf_tracer[/<role>]/traces-r<rank>.jsonl,
+# optionally wrapping scopes with torch.profiler at configured global steps and
+# merging its kernel traces. SessionTracer records per-rollout-session lifecycles
+# (submit/finalize timestamps, generate/reward/toolcall phase spans, counters) to
+# sessions-r<rank>.jsonl under session_tracer/. A process-global tracer
+# (GLOBAL_TRACER) is set via configure() and used by module-level helpers and
+# decorators; contextvars carry task_id, session_id, global_step and a
+# profiler-active flag across async code. Importing registers an atexit flush and
+# silences some pydantic warnings.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -61,6 +74,9 @@ _THREAD_LOCAL = threading.local()
 
 
 class PerfTraceCategory(str, Enum):
+    # [CLASS DOC]
+    # String enum of event categories (compute, comm, io, sync, scheduler, instr, misc)
+    # written to the "cat" field.
     """Categories for classifying performance trace events.
 
     These categories help organize and filter trace events in visualization tools
@@ -120,6 +136,9 @@ _SESSION_TRACE_FILENAME = "sessions.jsonl"
 
 
 class _NullContext(AbstractContextManager, AbstractAsyncContextManager):
+    # [CLASS DOC]
+    # HELPER: No-op sync/async context manager returned when tracing is disabled or no
+    # session is active.
     """No-op context manager returned when tracing is disabled.
 
     Provides both sync and async context manager interfaces that do nothing,
@@ -128,34 +147,52 @@ class _NullContext(AbstractContextManager, AbstractAsyncContextManager):
     """
 
     def __enter__(self):
+        # [FUNCTION DOC]
+        # Returns self.
         return self
 
     def __exit__(self, exc_type, exc, exc_tb):
+        # [FUNCTION DOC]
+        # Returns False (exceptions propagate).
         return False
 
     async def __aenter__(self):
+        # [FUNCTION DOC]
+        # Returns self.
         return self
 
     async def __aexit__(self, exc_type, exc, exc_tb):
+        # [FUNCTION DOC]
+        # Returns False.
         return False
 
 
 def _rank_qualified_filename(filename: str, rank: int) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Inserts "-r<rank>" before the extension (e.g. traces.jsonl ->
+    # traces-r3.jsonl).
     root, ext = os.path.splitext(filename)
     return f"{root}-r{rank}{ext}"
 
 
 def _maybe_duration(start: float | None, end: float | None) -> float | None:
+    # [FUNCTION DOC]
+    # HELPER: Returns end - start, or None if either is None.
     if start is None or end is None:
         return None
     return end - start
 
 
 def _normalize_save_interval(config: PerfTracerConfig) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns config.save_interval clamped to at least 1.
     return max(config.save_interval, 1)
 
 
 def _normalize_flush_threshold(config: SessionTracerConfig) -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns int(config.flush_threshold) clamped to >= 1; logs a warning and
+    # returns 1 if it is not convertible.
     try:
         value = int(config.flush_threshold)
     except (TypeError, ValueError):
@@ -168,6 +205,10 @@ def _normalize_flush_threshold(config: SessionTracerConfig) -> int:
 
 
 def _normalize_category(category: CategoryLike) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Maps None/empty/non-string to "misc", an enum to its value, known aliases
+    # (case-insensitive, e.g. "communication") to canonical values; other strings are
+    # returned unchanged (original case).
     """Normalize a category specification to a standard string value.
 
     Converts various category representations (enum, string, aliases) to their
@@ -205,6 +246,9 @@ def _default_trace_path(
     filename: str = _PERF_TRACE_FILENAME,
     subdir: str | None = None,
 ) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Builds <expanded fileroot>/logs/<user>/<exp>/<trial>[/<subdir>][/<role>]/
+    # <filename with -r<rank>>. Does not create directories.
     """Generate the default output path for trace files.
 
     Constructs a standardized path under fileroot/logs/user/experiment/trial/
@@ -245,6 +289,9 @@ def _default_trace_path(
 
 
 class SessionTraceEvent(str, Enum):
+    # [CLASS DOC]
+    # String enum of session lifecycle events: finalized and start/end of the generate,
+    # reward and toolcall phases.
     """Enumeration of lifecycle events for session tracking.
 
     These events represent key points in a session's lifecycle and are used to
@@ -297,6 +344,8 @@ class SessionTraceEvent(str, Enum):
 
 @dataclass
 class PhaseSpan:
+    # [CLASS DOC]
+    # One execution of a phase: wall-clock start_ts and optional end_ts.
     """Represents a single execution of a phase with start and end timestamps.
 
     A phase may execute multiple times within a session (e.g., multiple generate calls),
@@ -314,6 +363,8 @@ class PhaseSpan:
     end_ts: float | None = None
 
     def to_dict(self) -> dict[str, float | None]:
+        # [FUNCTION DOC]
+        # Returns {"start_ts", "end_ts"}.
         return {
             "start_ts": self.start_ts,
             "end_ts": self.end_ts,
@@ -323,6 +374,10 @@ class PhaseSpan:
 # NOTE: frozen=True is valid despite Pydantic warnings
 @dataclass(frozen=True)
 class PhaseSpec:
+    # [CLASS DOC]
+    # Frozen config of a tracked phase: name, start/end events, whether multiple
+    # executions are allowed, whether completion makes the session flushable, and an
+    # optional on_end payload callback.
     """Configuration specification for a tracked phase in session lifecycle.
 
     Defines how a phase should be tracked, including which events mark its boundaries,
@@ -355,6 +410,10 @@ class PhaseSpec:
 # NOTE: frozen=True is valid despite Pydantic warnings
 @dataclass(frozen=True)
 class EventBinding:
+    # [CLASS DOC]
+    # Frozen rule describing how an event updates a SessionRecord: timestamp attribute
+    # to set, phase name and role ("start"/"end"), allow_multiple, optional payload
+    # handler and whether it marks the record ready to flush.
     """Binding configuration for how a SessionTraceEvent updates SessionRecord state.
 
     Defines the actions to take when a specific event is recorded, such as updating
@@ -387,6 +446,9 @@ class EventBinding:
 # NOTE: frozen=True is valid despite Pydantic warnings
 @dataclass(frozen=True)
 class FieldSpec:
+    # [CLASS DOC]
+    # Frozen spec of one serialized output field: read attribute attr or call compute,
+    # output key (defaults to attr), and whether to omit None values.
     """Specification for serializing a field from SessionRecord to JSON output.
 
     Defines how to extract or compute a value from a SessionRecord for inclusion
@@ -411,6 +473,8 @@ class FieldSpec:
     omit_if_none: bool = True
 
     def resolve(self, record: SessionRecord) -> Any:
+        # [FUNCTION DOC]
+        # Returns compute(record) if set, else the record's attr; ValueError if neither.
         if self.compute is not None:
             return self.compute(record)
         if self.attr is None:
@@ -418,6 +482,8 @@ class FieldSpec:
         return getattr(record, self.attr)
 
     def key_name(self) -> str:
+        # [FUNCTION DOC]
+        # Returns key, else attr; ValueError if neither.
         if self.key is not None:
             return self.key
         if self.attr is None:
@@ -427,6 +493,12 @@ class FieldSpec:
 
 @dataclass
 class SessionRecord:
+    # [CLASS DOC]
+    # Mutable lifecycle record for one session: task/session ids, rank, role,
+    # submit_ts, status (pending/accepted/rejected/failed/dropped), reason,
+    # finalized_ts, per-phase span lists, counters and currently open span per phase.
+    # Class-level PHASE_CONFIGS, COUNTERS and FIELD_SPECS (assigned after the class
+    # from the default_* builders) drive behavior.
     """Record of a single session's lifecycle with timestamps and computed metrics.
 
     This class represents the complete execution trace of a rollout session, including
@@ -495,12 +567,18 @@ class SessionRecord:
     FIELD_SPECS: ClassVar[tuple[FieldSpec, ...]] = ()
 
     def __post_init__(self) -> None:
+        # [FUNCTION DOC]
+        # Initializes empty span lists and no active span for each configured phase, and
+        # zeroed counters for COUNTERS.
         self.phases = {cfg.name: [] for cfg in self.PHASE_CONFIGS}
         self._active_phases = {cfg.name: None for cfg in self.PHASE_CONFIGS}
         self.counters = {name: 0 for name in self.COUNTERS}
 
     @classmethod
     def default_phase_configs(cls) -> tuple[PhaseSpec, ...]:
+        # [FUNCTION DOC]
+        # Returns PhaseSpecs for "generate", "reward" and "toolcall", all allowing multiple
+        # executions.
         return (
             PhaseSpec(
                 name="generate",
@@ -523,6 +601,9 @@ class SessionRecord:
         )
 
     def is_ready_to_flush(self) -> bool:
+        # [FUNCTION DOC]
+        # True for terminal statuses rejected/failed/dropped, or accepted with a
+        # finalized_ts.
         if self.status in {"rejected", "failed", "dropped"}:
             return True
         if self.status == "accepted" and self.finalized_ts is not None:
@@ -530,6 +611,8 @@ class SessionRecord:
         return False
 
     def increment_counter(self, name: str, value: int = 1) -> None:
+        # [FUNCTION DOC]
+        # Adds value (default 1) to the named counter, creating it if needed.
         self.counters[name] = self.counters.get(name, 0) + value
 
     def apply_phase_event(
@@ -540,6 +623,13 @@ class SessionRecord:
         *,
         allow_multiple: bool,
     ) -> None:
+        # [FUNCTION DOC]
+        # On "start": closes the open span at timestamp only if multiple executions are not
+        # allowed, then opens a new span and makes it active. On "end": closes the active
+        # open span, or records a zero-length span if none is open, and clears the active
+        # span.
+        # KNOWN ISSUE: with allow_multiple, overlapping starts leave earlier spans open
+        # forever (they are no longer active), so they never count toward durations.
         entries = self.phases.setdefault(phase, [])
         current = self._active_phases.get(phase)
         if role == "start":
@@ -559,6 +649,9 @@ class SessionRecord:
 
     @staticmethod
     def _on_finalized(record: SessionRecord, payload: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Payload handler for FINALIZED: sets status if provided and reason if the
+        # key is present.
         """Handle terminal event for a session."""
         status = payload.get("status")
         if status is not None:
@@ -568,6 +661,10 @@ class SessionRecord:
 
     @classmethod
     def build_event_rules(cls) -> dict[SessionTraceEvent, EventBinding]:
+        # [FUNCTION DOC]
+        # Builds the event -> EventBinding map: FINALIZED sets finalized_ts, runs
+        # _on_finalized and marks ready; each phase's start/end events bind to that phase
+        # (end events carry on_end and ready_on_complete).
         rules: dict[SessionTraceEvent, EventBinding] = {
             # FINALIZED is the canonical terminal event for a session; it
             # records the wait/return timestamp and invokes the unified
@@ -594,6 +691,8 @@ class SessionRecord:
         return rules
 
     def _phase_total_duration(self, phase: str) -> float | None:
+        # [FUNCTION DOC]
+        # HELPER: Sum of durations of closed spans of the phase, or None if none closed.
         durations = [
             entry.end_ts - entry.start_ts
             for entry in self.phases.get(phase, [])
@@ -605,22 +704,33 @@ class SessionRecord:
 
     @staticmethod
     def _compute_total_time(record: SessionRecord) -> float | None:
+        # [FUNCTION DOC]
+        # HELPER: finalized_ts - submit_ts, or None.
         return _maybe_duration(record.submit_ts, record.finalized_ts)
 
     @staticmethod
     def _compute_generate_time(record: SessionRecord) -> float | None:
+        # [FUNCTION DOC]
+        # HELPER: Total closed "generate" span time.
         return record._phase_total_duration("generate")
 
     @staticmethod
     def _compute_reward_time(record: SessionRecord) -> float | None:
+        # [FUNCTION DOC]
+        # HELPER: Total closed "reward" span time.
         return record._phase_total_duration("reward")
 
     @staticmethod
     def _compute_toolcall_time(record: SessionRecord) -> float | None:
+        # [FUNCTION DOC]
+        # HELPER: Total closed "toolcall" span time.
         return record._phase_total_duration("toolcall")
 
     @classmethod
     def default_field_specs(cls) -> tuple[FieldSpec, ...]:
+        # [FUNCTION DOC]
+        # Returns FieldSpecs for ids, rank, role, status, reason, submit/finalized
+        # timestamps and derived total_s, generate_s, reward_s, toolcall_s.
         return (
             FieldSpec("task_id"),
             FieldSpec("session_id"),
@@ -653,6 +763,9 @@ class SessionRecord:
         )
 
     def to_dict(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # Serializes via FIELD_SPECS (skipping None where configured), adds "phases" (only
+        # non-empty phases, spans as dicts) and "counters" (only non-zero) when present.
         data: dict[str, Any] = {}
         for field_spec in self.FIELD_SPECS:
             value = field_spec.resolve(self)
@@ -691,6 +804,12 @@ def trace_session_event(
     task_id: int | None = None,
     **payload: Any,
 ) -> None:
+    # [FUNCTION DOC]
+    # Routes an event to the global SessionTracer (no-op if none). Targets session_id,
+    # else all sessions of task_id, else does nothing. method "increment_counter" adds
+    # payload "value" (default 1) to counter payload "name" (ignored if no name);
+    # otherwise method names like "mark_generate_start" are mapped to
+    # SessionTraceEvents (unknown names ignored) and recorded with the payload.
     """Record a session lifecycle event for tracking.
 
     This is the primary function for recording session events. It routes the event
@@ -745,6 +864,10 @@ def trace_session_event(
 
 
 class _SyncSessionPhaseScope(AbstractContextManager[Any]):
+    # [CLASS DOC]
+    # HELPER: Sync context manager emitting mark_<phase>_start on enter and
+    # mark_<phase>_end on exit (even on exception) for a session, with optional
+    # payloads.
     """Sync context manager for tracing session phases.
 
     Automatically calls mark_{phase}_start on enter and mark_{phase}_end on exit,
@@ -759,6 +882,8 @@ class _SyncSessionPhaseScope(AbstractContextManager[Any]):
         start_payload: dict[str, Any] | None = None,
         end_payload: dict[str, Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores session id, phase, derived method names and payloads (None -> {}).
         self._session_id = session_id
         self._phase = phase
         self._start_method = f"mark_{phase}_start"
@@ -767,12 +892,16 @@ class _SyncSessionPhaseScope(AbstractContextManager[Any]):
         self._end_payload = end_payload or {}
 
     def __enter__(self) -> _SyncSessionPhaseScope:
+        # [FUNCTION DOC]
+        # Emits the start event; returns self.
         trace_session_event(
             self._start_method, session_id=self._session_id, **self._start_payload
         )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC]
+        # Emits the end event; returns False.
         # Always call end event, even if exception occurred
         trace_session_event(
             self._end_method, session_id=self._session_id, **self._end_payload
@@ -781,6 +910,8 @@ class _SyncSessionPhaseScope(AbstractContextManager[Any]):
 
 
 class _AsyncSessionPhaseScope(AbstractAsyncContextManager[Any]):
+    # [CLASS DOC]
+    # HELPER: Async twin of _SyncSessionPhaseScope.
     """Async context manager for tracing session phases.
 
     Automatically calls mark_{phase}_start on enter and mark_{phase}_end on exit,
@@ -795,6 +926,8 @@ class _AsyncSessionPhaseScope(AbstractAsyncContextManager[Any]):
         start_payload: dict[str, Any] | None = None,
         end_payload: dict[str, Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores session id, phase, method names and payloads.
         self._session_id = session_id
         self._phase = phase
         self._start_method = f"mark_{phase}_start"
@@ -803,12 +936,16 @@ class _AsyncSessionPhaseScope(AbstractAsyncContextManager[Any]):
         self._end_payload = end_payload or {}
 
     async def __aenter__(self) -> _AsyncSessionPhaseScope:
+        # [FUNCTION DOC]
+        # Emits the start event; returns self.
         trace_session_event(
             self._start_method, session_id=self._session_id, **self._start_payload
         )
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # [FUNCTION DOC]
+        # Emits the end event; returns False.
         # Always call end event, even if exception occurred
         trace_session_event(
             self._end_method, session_id=self._session_id, **self._end_payload
@@ -822,6 +959,9 @@ def trace_session_phase(
     start_payload: dict[str, Any] | None = None,
     end_payload: dict[str, Any] | None = None,
 ) -> AbstractContextManager[Any]:
+    # [FUNCTION DOC]
+    # Returns a sync phase scope for the session id in the current context, or a
+    # _NullContext when no session is active.
     """Sync context manager for tracing session phases.
 
     Automatically pairs mark_{phase}_start and mark_{phase}_end events,
@@ -874,6 +1014,8 @@ def atrace_session_phase(
     start_payload: dict[str, Any] | None = None,
     end_payload: dict[str, Any] | None = None,
 ) -> AbstractAsyncContextManager[Any]:
+    # [FUNCTION DOC]
+    # Async variant of trace_session_phase.
     """Async context manager for tracing session phases.
 
     Automatically pairs mark_{phase}_start and mark_{phase}_end events,
@@ -921,6 +1063,11 @@ def atrace_session_phase(
 
 
 class SessionTracer:
+    # [CLASS DOC]
+    # Thread-safe registry of SessionRecords. Assigns sequential session ids, maps task
+    # ids to their session ids, applies events via the shared event rules, tracks
+    # records ready to flush, and appends ready records as JSON lines (fsync'd) to
+    # output_path once flush_threshold of them accumulate.
     """Tracer for tracking per-session lifecycle events and computing derived metrics.
 
     This class manages the complete lifecycle of individual rollout sessions, from
@@ -968,6 +1115,9 @@ class SessionTracer:
         rank: int,
         role: str | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores config, rank, role, output path and normalized flush threshold; creates
+        # the lock and empty task/record/ready maps. No I/O.
         self._config = config
         self._rank = rank
         self._role = role
@@ -982,6 +1132,8 @@ class SessionTracer:
         self._event_rules = _SESSION_EVENT_RULES
 
     def register_task(self, task_id: int) -> None:
+        # [FUNCTION DOC]
+        # Ensures task_id has an (initially empty) session set.
         """Register a new logical task (dataset-level) given a task_id.
 
         Tasks group multiple sessions (one per generated sample). Use
@@ -991,6 +1143,9 @@ class SessionTracer:
             self._task_to_sessions.setdefault(task_id, set())
 
     def register_session(self, task_id: int) -> int:
+        # [FUNCTION DOC]
+        # Creates a SessionRecord with the next session id and the current wall time as
+        # submit_ts, links it to task_id and returns the id.
         """Register a new session and optionally associate it with a task.
 
         Returns the newly-created session_id.
@@ -1010,6 +1165,9 @@ class SessionTracer:
         return session_id
 
     def get_session_ids(self, task_id: int) -> list[int]:
+        # [FUNCTION DOC]
+        # Returns a list copy of the session ids registered under task_id (empty if
+        # unknown).
         """Get all session IDs associated with the given task_id."""
         with self._lock:
             return list(self._task_to_sessions.get(task_id, []))
@@ -1020,6 +1178,11 @@ class SessionTracer:
         event: SessionTraceEvent,
         payload: dict[str, Any] | None = None,
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: Under the lock, applies the event's rule to the record (unknown event or
+        # session -> False): sets timestamp attribute, updates phase spans, runs the payload
+        # handler, and adds the session to the ready set if the rule marks ready or the
+        # record is flushable. Returns True when the ready set reaches the flush threshold.
         rule = self._event_rules.get(event)
         if rule is None:
             return False
@@ -1053,11 +1216,16 @@ class SessionTracer:
         event: SessionTraceEvent,
         **payload: Any,
     ) -> None:
+        # [FUNCTION DOC]
+        # Applies an event with payload and flushes if the threshold was reached.
         should_flush = self._apply_event(session_id, event, payload)
         if should_flush:
             self.flush()
 
     def increment_counter(self, session_id: int, name: str, value: int = 1) -> None:
+        # [FUNCTION DOC]
+        # Increments a record's counter (unknown session ignored) and marks it ready if
+        # flushable. Does not trigger a flush.
         with self._lock:
             record = self._records.get(session_id)
             if record is None:
@@ -1067,6 +1235,13 @@ class SessionTracer:
                 self._ready.add(session_id)
 
     def flush(self, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Selects ready-and-flushable records (or all records if force), removes them from
+        # memory, then outside the lock serializes them and appends JSON lines to the
+        # output file (creating parent dirs, flush + fsync). On OSError/TypeError logs and
+        # restores the records and their ready flags.
+        # KNOWN ISSUE: task-to-session mappings are never pruned, so they grow without
+        # bound.
         with self._lock:
             if force:
                 candidate_ids = list(self._records.keys())
@@ -1118,6 +1293,9 @@ class SessionTracer:
                         self._ready.add(session_id)
 
     def reset(self) -> None:
+        # [FUNCTION DOC]
+        # Force-flushes everything, then clears records and ready set, restarts session
+        # ids from 0 and re-reads the flush threshold (task mapping is kept).
         self.flush(force=True)
         with self._lock:
             self._records.clear()
@@ -1127,6 +1305,11 @@ class SessionTracer:
 
 
 class _Scope(AbstractContextManager[Any]):
+    # [CLASS DOC]
+    # HELPER: Sync context manager behind PerfTracer.trace_scope: measures a span with
+    # perf_counter_ns, propagates args["global_step"] into the global-step contextvar,
+    # optionally runs a torch.profiler session (CPU+CUDA) and merges its trace, and
+    # records a complete event (adding the exception type name to args on error).
     """Internal sync context manager for PerfTracer.trace_scope().
 
     Automatically records complete events (duration spans) with proper timestamp
@@ -1144,6 +1327,9 @@ class _Scope(AbstractContextManager[Any]):
         profiler_args: dict[str, Any] | None = None,
         args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores tracer, name, category and args; builds a torch profiler (record_shapes
+        # and with_stack default False, plus profiler_args) only if enabled.
         self._tracer = tracer
         self._name = name
         self._category = category
@@ -1166,6 +1352,9 @@ class _Scope(AbstractContextManager[Any]):
             )
 
     def __enter__(self) -> _Scope:
+        # [FUNCTION DOC]
+        # Sets the global-step contextvar if args has global_step, starts the profiler (and
+        # sets the profiler-active flag) if any, records the start time; returns self.
         step = None
         if self._args is not None:
             step = self._args.get("global_step")
@@ -1181,6 +1370,11 @@ class _Scope(AbstractContextManager[Any]):
         return self
 
     def __exit__(self, exc_type, exc, exc_tb):
+        # [FUNCTION DOC]
+        # No-op if never entered. Stops the profiler, takes the end time, resets the
+        # profiler flag, exports the profiler trace to a temp JSON file, loads it and merges
+        # it into the tracer; resets the global-step contextvar; records the complete event
+        # with duration and args (plus "exception" on error). Returns False.
         if self._start_ns is None:
             return False
 
@@ -1224,6 +1418,8 @@ class _Scope(AbstractContextManager[Any]):
 
 
 class _AsyncScope(AbstractAsyncContextManager[Any]):
+    # [CLASS DOC]
+    # HELPER: Async wrapper delegating to an internal _Scope.
     """Internal async context manager for PerfTracer.atrace_scope().
 
     Wraps _Scope to provide async context manager interface while reusing the
@@ -1240,6 +1436,8 @@ class _AsyncScope(AbstractAsyncContextManager[Any]):
         profiler_args: dict[str, Any] | None = None,
         args: dict[str, Any] | None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Builds the wrapped _Scope with the same arguments.
         self._scope = _Scope(
             tracer,
             name,
@@ -1250,14 +1448,21 @@ class _AsyncScope(AbstractAsyncContextManager[Any]):
         )
 
     async def __aenter__(self) -> _AsyncScope:
+        # [FUNCTION DOC]
+        # Enters the wrapped scope; returns self.
         self._scope.__enter__()
         return self
 
     async def __aexit__(self, exc_type, exc, exc_tb):
+        # [FUNCTION DOC]
+        # Exits the wrapped scope and returns its result (False).
         return self._scope.__exit__(exc_type, exc, exc_tb)
 
 
 def _thread_id() -> int:
+    # [FUNCTION DOC]
+    # HELPER: Returns the OS native thread id (fallback: Python ident), cached in
+    # thread-local storage.
     cached = getattr(_THREAD_LOCAL, "tid", None)
     if cached is not None:
         return cached
@@ -1270,6 +1475,12 @@ def _thread_id() -> int:
 
 
 class PerfTracer:
+    # [CLASS DOC]
+    # Per-process Chrome-trace recorder. Enabled when config.enabled and the rank
+    # passes the AREAL_PERF_TRACER_RANKS env filter. Buffers events under a lock with
+    # timestamps relative to a perf_counter origin (microseconds), emits process/thread
+    # metadata once, assigns negative virtual tids to merged profiler threads, saves
+    # every save_interval steps, and optionally owns a SessionTracer.
     """A lightweight tracer that emits Chrome Trace compatible JSON.
 
     This is the main tracer class for recording performance events during training
@@ -1303,6 +1514,10 @@ class PerfTracer:
     def __init__(
         self, config: PerfTracerConfig, *, rank: int, role: str | None = None
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates rank >= 0 (ValueError), computes enabled state, initializes buffers,
+        # locks, origin time, metadata sets, virtual tid map, output path, save interval,
+        # normalized profile_steps, and configures the session tracer if enabled in config.
         if rank < 0:
             raise ValueError("rank must be a non-negative integer")
         self._config = config
@@ -1336,14 +1551,22 @@ class PerfTracer:
     # ------------------------------------------------------------------
     @property
     def enabled(self) -> bool:
+        # [FUNCTION DOC]
+        # Property: whether recording is active.
         return self._enabled
 
     def set_enabled(self, flag: bool) -> None:
+        # [FUNCTION DOC]
+        # Turns recording on/off at runtime.
         self._enabled = flag
 
     def _configure_session_tracer(
         self, config: PerfTracerConfig, *, rank: int, role: str | None = None
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: If config.session_tracer.enabled, creates a SessionTracer writing to the
+        # session trace path (RuntimeError if one already exists); otherwise force-flushes
+        # and drops any existing one.
         session_cfg = getattr(config, "session_tracer", None)
         enabled = bool(session_cfg and getattr(session_cfg, "enabled", False))
         if enabled:
@@ -1371,6 +1594,8 @@ class PerfTracer:
 
     @property
     def session_tracer(self) -> SessionTracer | None:
+        # [FUNCTION DOC]
+        # Property: the SessionTracer or None.
         return self._session_tracer
 
     # ------------------------------------------------------------------
@@ -1385,6 +1610,11 @@ class PerfTracer:
         profiler_args: dict[str, Any] | None = None,
         args: dict[str, Any] | None = None,
     ) -> AbstractContextManager[Any]:
+        # [FUNCTION DOC]
+        # Returns a _NullContext when disabled; otherwise a _Scope with the normalized
+        # category. The profiler is enabled only if requested, no profiler is already
+        # active in this context, and the effective global step (args or contextvar) is in
+        # profile_steps.
         if not self._enabled:
             return _NullContext()
         global_step = self._get_global_step(args)
@@ -1410,6 +1640,8 @@ class PerfTracer:
         profiler_args: dict[str, Any] | None = None,
         args: dict[str, Any] | None = None,
     ) -> AbstractAsyncContextManager[Any]:
+        # [FUNCTION DOC]
+        # Async variant of trace_scope returning an _AsyncScope.
         if not self._enabled:
             return _NullContext()
         global_step = self._get_global_step(args)
@@ -1433,6 +1665,9 @@ class PerfTracer:
         category: CategoryLike = None,
         args: dict[str, Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Records a thread-scoped instant ("i") event at the current time with category and
+        # args. No-op when disabled.
         if not self._enabled:
             return
         self._record_event(
@@ -1458,6 +1693,15 @@ class PerfTracer:
         *,
         args: dict[str, Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # Merges a loaded torch.profiler Chrome trace dict: shifts timestamps so the
+        # earliest event aligns with base_time_ns relative to the tracer origin
+        # (RuntimeError if no event has "ts"), drops profiler-internal pids and source
+        # process/thread metadata, skips non-integer or negative pids, maps each (pid, tid)
+        # to a new negative virtual tid with a generated thread_name ("[Profiler Stream N]"
+        # for GPU streams, else "[Profiler Thread T]"), rewrites pid to this process and
+        # adds rank/role to args. Appends to the buffer under the lock. args is unused.
+        # No-op when disabled or no events.
         """Merge PyTorch Profiler traces into the current trace stream.
 
         This method ingests a raw PyTorch Profiler JSON trace (loaded as a dict),
@@ -1609,6 +1853,13 @@ class PerfTracer:
     # Persistence helpers
     # ------------------------------------------------------------------
     def save(self, *, step: int | None = None, force: bool = False) -> None:
+        # [FUNCTION DOC]
+        # Force-flushes the session tracer when force. If enabled, and either force, no
+        # step, interval 1, or (step + 1) is a multiple of save_interval: swaps out the
+        # buffered events and appends them as JSON lines to the output file (mkdir, flush,
+        # fsync). On OSError/TypeError logs and puts the events back at the buffer front.
+        # KNOWN ISSUE: if json serialization raises TypeError, output_path is not yet bound
+        # and the error handler raises NameError.
         if self._session_tracer is not None and force:
             self._session_tracer.flush(force=True)
 
@@ -1652,6 +1903,10 @@ class PerfTracer:
                 self._events[0:0] = events_to_write
 
     def reset(self) -> None:
+        # [FUNCTION DOC]
+        # Resets the session tracer, clears buffered events and metadata markers, restarts
+        # the time origin and recomputes enabled state and save interval (virtual tid map
+        # is kept).
         if self._session_tracer is not None:
             self._session_tracer.reset()
         with self._lock:
@@ -1676,6 +1931,9 @@ class PerfTracer:
         category: str,
         args: dict[str, Any] | None = None,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Records an "X" event with relative start (us) and duration clamped to at
+        # least 1 us, current thread id, category and args.
         event = {
             "name": name,
             "ph": "X",
@@ -1691,6 +1949,10 @@ class PerfTracer:
         self._record_event(event)
 
     def _record_event(self, event: dict[str, Any]) -> None:
+        # [FUNCTION DOC]
+        # HELPER: No-op when disabled. Emits thread/process metadata on first sight, forces
+        # this pid, adds rank (and role) to args of non-metadata events, and appends under
+        # the lock.
         if not self._enabled:
             return
         tid = event.get("tid")
@@ -1707,6 +1969,8 @@ class PerfTracer:
             self._events.append(event)
 
     def _get_global_step(self, args: dict[str, Any] | None) -> int | None:
+        # [FUNCTION DOC]
+        # HELPER: Returns args["global_step"] if present, else the contextvar value.
         if args and "global_step" in args:
             return args["global_step"]
         return _current_global_step.get()
@@ -1716,6 +1980,8 @@ class PerfTracer:
         requested: bool,
         global_step: int | None,
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True iff requested, profile_steps non-empty and global_step is in it.
         return bool(
             requested
             and self._profile_steps
@@ -1725,6 +1991,9 @@ class PerfTracer:
 
     @staticmethod
     def _normalize_profile_steps(steps: list[int] | None) -> frozenset[int]:
+        # [FUNCTION DOC]
+        # HELPER: Converts profile_steps to a frozenset of ints, warning about and skipping
+        # invalid entries; empty/None gives an empty set.
         if not steps:
             return frozenset()
         normalized: set[int] = set()
@@ -1738,6 +2007,9 @@ class PerfTracer:
         return frozenset(normalized)
 
     def _ensure_thread_metadata(self, tid: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Once per tid, appends a thread_name metadata event using the current
+        # thread's name.
         if tid in self._thread_meta_emitted:
             return
         self._thread_meta_emitted.add(tid)
@@ -1753,6 +2025,9 @@ class PerfTracer:
             self._events.append(meta_event)
 
     def _ensure_process_metadata(self, pid: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Once per pid, appends process_name ("[role] Rank N, Process" or
+        # "Rank N, Process") and process_sort_index (rank) metadata events.
         if pid in self._process_meta_emitted:
             return
         self._process_meta_emitted.add(pid)
@@ -1776,9 +2051,14 @@ class PerfTracer:
             self._events.extend([process_name_event, sort_event])
 
     def _now_us(self) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Current time relative to origin in microseconds.
         return self._relative_us(time.perf_counter_ns())
 
     def _relative_us(self, ts_ns: int) -> int:
+        # [FUNCTION DOC]
+        # HELPER: Converts a perf_counter_ns value to non-negative microseconds since
+        # origin.
         return max((ts_ns - self._origin_ns) // 1000, 0)
 
 
@@ -1787,6 +2067,9 @@ _GLOBAL_TRACER_LOCK = threading.Lock()
 
 
 def _save_at_exit() -> None:
+    # [FUNCTION DOC]
+    # HELPER: atexit hook force-saving the global tracer if configured and enabled;
+    # errors are logged.
     tracer = GLOBAL_TRACER
     if tracer is None or not tracer.enabled:
         return
@@ -1803,6 +2086,9 @@ atexit.register(_save_at_exit)
 # Module-level convenience functions
 # ----------------------------------------------------------------------
 def _require_configured_tracer() -> PerfTracer:
+    # [FUNCTION DOC]
+    # HELPER: Returns GLOBAL_TRACER or raises RuntimeError if configure() was not
+    # called.
     tracer = GLOBAL_TRACER
     if tracer is None:
         raise RuntimeError(
@@ -1812,10 +2098,14 @@ def _require_configured_tracer() -> PerfTracer:
 
 
 def get_tracer() -> PerfTracer:
+    # [FUNCTION DOC]
+    # Returns the configured global PerfTracer (RuntimeError if none).
     return _require_configured_tracer()
 
 
 def get_session_tracer() -> SessionTracer | None:
+    # [FUNCTION DOC]
+    # Returns the global tracer's SessionTracer, or None if not configured/enabled.
     tracer = GLOBAL_TRACER
     if tracer is None:
         return None
@@ -1828,6 +2118,9 @@ def configure(
     rank: int,
     role: str | None = None,
 ) -> PerfTracer:
+    # [FUNCTION DOC]
+    # Creates the process-global PerfTracer under a lock and logs its settings;
+    # raises RuntimeError if already configured. Returns it.
     global GLOBAL_TRACER
     with _GLOBAL_TRACER_LOCK:
         if GLOBAL_TRACER is not None:
@@ -1847,12 +2140,17 @@ def configure(
 
 
 def is_configured() -> bool:
+    # [FUNCTION DOC]
+    # True if a global tracer exists.
     global GLOBAL_TRACER
     with _GLOBAL_TRACER_LOCK:
         return GLOBAL_TRACER is not None
 
 
 def reset() -> None:
+    # [FUNCTION DOC]
+    # Detaches the global tracer under the lock, then resets it (flushing session
+    # records) so configure() can be called again.
     """Clear the global tracer so the next configure() call reinitializes it."""
     global GLOBAL_TRACER
     with _GLOBAL_TRACER_LOCK:
@@ -1870,6 +2168,8 @@ def trace_scope(
     profiler_args: dict[str, Any] | None = None,
     args: dict[str, Any] | None = None,
 ):
+    # [FUNCTION DOC]
+    # Module-level trace_scope on the global tracer; _NullContext if not configured.
     tracer = GLOBAL_TRACER
     if tracer is None:
         return _NullContext()
@@ -1890,6 +2190,8 @@ def atrace_scope(
     profiler_args: dict[str, Any] | None = None,
     args: dict[str, Any] | None = None,
 ):
+    # [FUNCTION DOC]
+    # Module-level async trace scope; _NullContext if not configured.
     tracer = GLOBAL_TRACER
     if tracer is None:
         return _NullContext()
@@ -1908,6 +2210,8 @@ def instant(
     category: CategoryLike = None,
     args: dict[str, Any] | None = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # Records an instant event on the global tracer if configured.
     tracer = GLOBAL_TRACER
     if tracer is None:
         return
@@ -1915,6 +2219,8 @@ def instant(
 
 
 def save(*, step: int | None = None, force: bool = False) -> None:
+    # [FUNCTION DOC]
+    # Saves the global tracer's events (respecting step/force) if configured.
     tracer = GLOBAL_TRACER
     if tracer is None:
         return
@@ -1922,6 +2228,9 @@ def save(*, step: int | None = None, force: bool = False) -> None:
 
 
 def trace_perf(name: str, *, category: CategoryLike = None):
+    # [FUNCTION DOC]
+    # Decorator factory tracing each call of a sync or async function as a scope with
+    # the given name and category (via the module-level scope helpers).
     """
     Decorator for tracing function performance with PerfTracer.
 
@@ -1949,10 +2258,15 @@ def trace_perf(name: str, *, category: CategoryLike = None):
     """
 
     def decorator(func):
+        # [FUNCTION DOC]
+        # HELPER: Wraps func with an async or sync tracing wrapper depending on whether it
+        # is a coroutine function (functools.wraps preserved).
         if asyncio.iscoroutinefunction(func):
 
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Awaits func inside atrace_scope and returns its result.
                 async with atrace_scope(name, category=category):
                     return await func(*args, **kwargs)
 
@@ -1961,6 +2275,8 @@ def trace_perf(name: str, *, category: CategoryLike = None):
 
             @functools.wraps(func)
             def sync_wrapper(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Calls func inside trace_scope and returns its result.
                 with trace_scope(name, category=category):
                     return func(*args, **kwargs)
 
@@ -1970,26 +2286,36 @@ def trace_perf(name: str, *, category: CategoryLike = None):
 
 
 def set_session_id(session_id: int | None) -> None:
+    # [FUNCTION DOC]
+    # Sets the session id contextvar for the current context.
     """Set the session_id for the current async context."""
     _current_session_id.set(session_id)
 
 
 def get_session_id() -> int | None:
+    # [FUNCTION DOC]
+    # Returns the session id contextvar (None by default).
     """Get the session_id from the current async context."""
     return _current_session_id.get()
 
 
 def set_task_id(task_id: int | None) -> None:
+    # [FUNCTION DOC]
+    # Sets the task id contextvar.
     """Set the task_id for the current async context."""
     _current_task_id.set(task_id)
 
 
 def get_task_id() -> int | None:
+    # [FUNCTION DOC]
+    # Returns the task id contextvar.
     """Get the task_id from the current async context."""
     return _current_task_id.get()
 
 
 def register_task(task_id: int) -> None:
+    # [FUNCTION DOC]
+    # Registers task_id with the global SessionTracer if any.
     """Register a new task given a task_id in the current async context."""
     tracer = get_session_tracer()
     if tracer is not None:
@@ -1997,6 +2323,9 @@ def register_task(task_id: int) -> None:
 
 
 def register_session(task_id: int) -> int | None:
+    # [FUNCTION DOC]
+    # Registers a new session under task_id with the global SessionTracer and returns
+    # its id, or None if session tracing is off.
     """Register a new session under the given task_id and return the session_id."""
     session_id = None
     tracer = get_session_tracer()
@@ -2006,6 +2335,10 @@ def register_session(task_id: int) -> int | None:
 
 
 def session_context():
+    # [FUNCTION DOC]
+    # Decorator factory: before each call, registers a new session for the current
+    # task id (if any) and stores it (or None) in the session contextvar. No
+    # restoration after the call.
     """Decorator factory that populates ``session_id`` from the active task.
 
     Each wrapped invocation registers a session when a ``task_id`` exists and
@@ -2020,7 +2353,12 @@ def session_context():
     """
 
     def decorator(func):
+        # [FUNCTION DOC]
+        # HELPER: Wraps func with an async or sync wrapper that activates a session first.
         def _activate_session() -> None:
+            # [FUNCTION DOC]
+            # HELPER: Registers a session for the current task id (None if no task) and sets
+            # the session contextvar.
             task_id = get_task_id()
             session_id = register_session(task_id) if task_id is not None else None
             set_session_id(session_id)
@@ -2029,6 +2367,8 @@ def session_context():
 
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Activates a session then awaits func.
                 _activate_session()
                 return await func(*args, **kwargs)
 
@@ -2037,6 +2377,8 @@ def session_context():
 
             @functools.wraps(func)
             def sync_wrapper(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Activates a session then calls func.
                 _activate_session()
                 return func(*args, **kwargs)
 
@@ -2046,6 +2388,10 @@ def session_context():
 
 
 def trace_session(phase: str):
+    # [FUNCTION DOC]
+    # Decorator factory wrapping each call of a sync or async function in a
+    # trace_session_phase / atrace_session_phase for the given phase (uses the session
+    # id from context at call time).
     """
     Decorator for tracing session phases using contextvars.
 
@@ -2080,10 +2426,14 @@ def trace_session(phase: str):
     """
 
     def decorator(func):
+        # [FUNCTION DOC]
+        # HELPER: Chooses the async or sync wrapper based on func.
         if asyncio.iscoroutinefunction(func):
 
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Awaits func inside the async phase scope.
                 async with atrace_session_phase(phase):
                     return await func(*args, **kwargs)
 
@@ -2092,6 +2442,8 @@ def trace_session(phase: str):
 
             @functools.wraps(func)
             def sync_wrapper(*args, **kwargs):
+                # [FUNCTION DOC]
+                # HELPER: Calls func inside the sync phase scope.
                 with trace_session_phase(phase):
                     return func(*args, **kwargs)
 
