@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# FastAPI application for the weight-update gateway. Defines request/response models,
+# retrying aiohttp helpers, training-metadata merging, and create_app() which wires
+# endpoints: /health, /connect (awex, disk or colocate pairing), /update_weights,
+# /disconnect, and a KV store API under /weight_meta used by workers to exchange
+# metadata and colocate handles. All endpoints except /health and KV GET require the
+# admin Bearer key.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
@@ -29,6 +36,10 @@ logger = logging.getLogger("WeightUpdateGateway")
 
 
 class ConnectRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of POST /connect: pair name, training and inference worker base URLs, NCCL
+    # master addr/port (awex mode), mode 'awex' or 'disk', disk/LoRA options and
+    # colocate flag.
     pair_name: str
     train_worker_urls: list[str]
     inference_worker_urls: list[str]
@@ -43,54 +54,79 @@ class ConnectRequest(BaseModel):
 
 
 class UpdateWeightsRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of POST /update_weights: pair name and version (default 0).
     pair_name: str
     version: int = 0
 
 
 class DisconnectRequest(BaseModel):
+    # [CLASS DOC]
+    # Body of POST /disconnect: pair name.
     pair_name: str
 
 
 class KVPutBody(BaseModel):
+    # [CLASS DOC]
+    # Body of KV PUT: arbitrary JSON value.
     value: Any = None
 
 
 class KVSetAddBody(BaseModel):
+    # [CLASS DOC]
+    # Body of KV set-add: string member.
     value: str = ""
 
 
 class HealthResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of /health: status 'healthy'.
     status: str = "healthy"
 
 
 class ConnectResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of /connect: the pair name.
     pair_name: str
 
 
 class DisconnectResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of /disconnect: status 'ok' and pair name.
     status: str = "ok"
     pair_name: str
 
 
 class StatusResponse(BaseModel):
+    # [CLASS DOC]
+    # Generic 'ok' status response.
     status: str = "ok"
 
 
 class KVDeleteResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of KV delete: status and whether the key existed.
     status: str = "ok"
     deleted: bool
 
 
 class KVGetResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of KV get: stored value.
     value: Any = None
 
 
 class KVSetSizeResponse(BaseModel):
+    # [CLASS DOC]
+    # Response of KV set size: integer size.
     size: int
 
 
 @async_http_retry
 async def _get_json(session: aiohttp.ClientSession, url: str, timeout_s: float) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: GET url with total timeout timeout_s, raise for HTTP error status, return
+    # parsed JSON. Wrapped with async_http_retry (retries on failures).
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     async with session.get(url, timeout=timeout) as resp:
         resp.raise_for_status()
@@ -104,6 +140,9 @@ async def _post_json(
     timeout_s: float,
     json_data: Any = None,
 ) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: POST json_data to url with timeout, raise for status, return parsed JSON.
+    # Retried via async_http_retry.
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     async with session.post(url, json=json_data, timeout=timeout) as resp:
         resp.raise_for_status()
@@ -117,12 +156,18 @@ async def _post(
     timeout_s: float,
     json_data: Any = None,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: POST json_data to url with timeout and raise for status; returns None.
+    # Retried via async_http_retry.
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     async with session.post(url, json=json_data, timeout=timeout) as resp:
         resp.raise_for_status()
 
 
 def _get_own_ip() -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns this host's outbound IPv4 address by 'connecting' a UDP socket to
+    # 8.8.8.8 (no packet sent); falls back to 127.0.0.1 on error.
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("8.8.8.8", 80))
@@ -132,6 +177,12 @@ def _get_own_ip() -> str:
 
 
 def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
+    # [FUNCTION DOC]
+    # HELPER: Merges serialized ParameterMeta dicts (possibly wrapped as {'data': ...})
+    # that share a parameter name: the first entry is kept and later entries' shards are
+    # appended to its shards list and to its first replica's shards. Entries without a
+    # name are warned about and appended at the end. Mutates the input dicts; returns
+    # merged list (unique names first, then nameless).
     """Merge serialized training ParameterMeta entries by parameter name.
 
     Each FSDP worker reports metadata for its own local shard only.
@@ -168,10 +219,18 @@ def _merge_training_meta_by_name(meta_list: list[dict]) -> list[dict]:
 
 
 def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
+    # [FUNCTION DOC]
+    # Builds the FastAPI app with lifespan-managed aiohttp session, a WeightMetaStore
+    # and PairRegistry (also stored on app.state with config), and registers all
+    # endpoints as closures over them. config defaults to WeightUpdateConfig(). Returns
+    # the app.
     config = config or WeightUpdateConfig()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # [FUNCTION DOC]
+        # HELPER: Lifespan context: opens a shared aiohttp ClientSession on app.state on
+        # startup and closes it on shutdown.
         app.state.http_session = aiohttp.ClientSession()
         yield
         await app.state.http_session.close()
@@ -186,14 +245,35 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     app.state.config = config
 
     def _auth(request: Request) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Enforces the admin Bearer key on a request (raises HTTPException
+        # 401/403).
         require_admin_key(request, config.admin_api_key)
 
     @app.get("/health")
     async def health() -> HealthResponse:
+        # [FUNCTION DOC]
+        # GET /health: returns HealthResponse (no auth).
         return HealthResponse()
 
     @app.post("/connect")
     async def connect(request: Request, body: ConnectRequest) -> ConnectResponse:
+        # [FUNCTION DOC]
+        # POST /connect (auth). Colocate -> delegates to _connect_colocate. Disk mode:
+        # validates save_path present/absolute and lora_name when use_lora (400 JSON
+        # errors), registers the pair and returns. Awex mode: rejects LoRA (400);
+        # fetches parallelism from the first train and inference worker; computes
+        # num_engines = number of inference URLs, total inference ranks = per-engine
+        # world * num_engines and total world = that + train world; collects weight
+        # metadata from all workers (merging training metadata by name) and stores both
+        # lists in the KV store; derives kv_store_url from the bind host (or the NCCL
+        # master addr when bound to all interfaces); POSTs init_weights_update_group to
+        # all workers concurrently (inference engines get transfer_rank = engine index,
+        # training workers total_infer_ranks + i); runs a batch_isend_irecv liveness
+        # test on all workers; registers PairInfo and returns ConnectResponse.
+        # KNOWN ISSUE: when bound to 0.0.0.0 and nccl_master_addr is empty the
+        # kv_store_url host is empty (colocate path uses _get_own_ip instead). Duplicate
+        # pair names raise ValueError (HTTP 500) only after NCCL groups were created.
         _auth(request)
         pair_name = body.pair_name
         train_urls = body.train_worker_urls
@@ -399,6 +479,13 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         train_urls: list[str],
         inference_urls: list[str],
     ) -> ConnectResponse:
+        # [FUNCTION DOC]
+        # HELPER: Colocate connect: fetches parallelism, sets infer world = per-engine
+        # world * num engines, collects/merges metadata into the KV store, builds
+        # kv_store_url (own IP when bound to all interfaces), picks a free NCCL port,
+        # POSTs init_colocate_weight_update to all workers (inference rank i, training
+        # rank infer_world + i, with admin key), registers a colocate PairInfo and
+        # returns ConnectResponse.
         session = request.app.state.http_session
         init_timeout_s = config.init_timeout_s
 
@@ -520,6 +607,12 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         session: aiohttp.ClientSession,
         timeout_s: float,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Colocate update sequence, each step concurrent across workers:
+        # training release 'optimizer'; inference resume 'weights'; all workers
+        # execute_colocate_weight_update(version); training release 'weights'; inference
+        # resume 'kv_cache'. Finally deletes the per-rank colocate weight/done KV keys
+        # for this version.
         await asyncio.gather(
             *[
                 _post(
@@ -605,6 +698,9 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         session: aiohttp.ClientSession,
         timeout_s: float,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Awex update: concurrently POSTs /awex/update_weights with version to
+        # all training and inference workers (they rendezvous over NCCL).
         await asyncio.gather(
             *[
                 _post(
@@ -623,6 +719,13 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
         session: aiohttp.ClientSession,
         timeout_s: float,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Disk update: asks every training worker to /save HF weights (no
+        # optimizer) to <save_path>/weight_update_v<version> via serialized RPC payload.
+        # With LoRA, loads the versioned adapter on all inference workers and, if
+        # lora_keep_versions > 0, best-effort unloads the adapter version - keep.
+        # Otherwise calls /update_weights_from_disk on inference workers with
+        # abort_all_requests=True.
         from areal.api.io_struct import SaveLoadMeta, get_versioned_lora_name
         from areal.infra.rpc.serialization import serialize_value
 
@@ -667,6 +770,9 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
                 )
 
                 async def _unload(url: str) -> None:
+                    # [FUNCTION DOC]
+                    # HELPER: Best-effort unload of the stale LoRA adapter on one
+                    # inference URL; logs a warning on failure.
                     try:
                         await _post_json(
                             session,
@@ -705,6 +811,11 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     async def update_weights(
         request: Request, body: UpdateWeightsRequest
     ) -> WeightUpdateResult:
+        # [FUNCTION DOC]
+        # POST /update_weights (auth): 404 if pair unknown; dispatches to
+        # colocate/disk/awex transfer with update_timeout_s; on exception logs and
+        # returns status 'error' with duration and message (HTTP 200); on success
+        # records last_version, logs and returns status 'ok' with duration_ms.
         _auth(request)
 
         pair_info = registry.get_by_name(body.pair_name)
@@ -761,6 +872,9 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     async def disconnect(
         request: Request, body: DisconnectRequest
     ) -> DisconnectResponse:
+        # [FUNCTION DOC]
+        # POST /disconnect (auth): 404 if unknown; unregisters the pair and clears its
+        # KV data. Does not tear down worker NCCL groups.
         _auth(request)
 
         pair_info = registry.get_by_name(body.pair_name)
@@ -777,6 +891,8 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
 
     @app.get("/weight_meta/{pair_name}/{key}")
     async def kv_get(pair_name: str, key: str) -> KVGetResponse:
+        # [FUNCTION DOC]
+        # GET /weight_meta/{pair}/{key} (no auth): returns stored value or 404.
         # No auth — workers read metadata during init_weight_update_group
         # without credentials.
         value = kv_store.get(pair_name, key)
@@ -788,12 +904,17 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     async def kv_put(
         pair_name: str, key: str, request: Request, body: KVPutBody
     ) -> StatusResponse:
+        # [FUNCTION DOC]
+        # PUT /weight_meta/{pair}/{key} (auth): stores the body value.
         _auth(request)
         kv_store.put(pair_name, key, body.value)
         return StatusResponse()
 
     @app.delete("/weight_meta/{pair_name}/{key}")
     async def kv_delete(pair_name: str, key: str, request: Request) -> KVDeleteResponse:
+        # [FUNCTION DOC]
+        # DELETE /weight_meta/{pair}/{key} (auth): deletes key and reports whether it
+        # existed.
         _auth(request)
         deleted = kv_store.delete(pair_name, key)
         return KVDeleteResponse(deleted=deleted)
@@ -802,6 +923,9 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     async def kv_set_add(
         pair_name: str, key: str, request: Request, body: KVSetAddBody
     ) -> StatusResponse:
+        # [FUNCTION DOC]
+        # PUT /weight_meta/{pair}/set/{key} (auth): adds the body string to a set
+        # (barrier helper).
         _auth(request)
         kv_store.add_to_set(pair_name, key, body.value)
         return StatusResponse()
@@ -810,6 +934,8 @@ def create_app(config: WeightUpdateConfig | None = None) -> FastAPI:
     async def kv_set_size(
         pair_name: str, key: str, request: Request
     ) -> KVSetSizeResponse:
+        # [FUNCTION DOC]
+        # GET /weight_meta/{pair}/set/{key}/size (auth): returns the set size.
         _auth(request)
         size = kv_store.set_size(pair_name, key)
         return KVSetSizeResponse(size=size)

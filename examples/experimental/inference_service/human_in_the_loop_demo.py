@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Automated human-in-the-loop online RL demo: launches online_rollout.py as a
+# subprocess, waits for its proxy gateway address in the log, temporarily points the
+# zeroclaw CLI agent at that gateway (~/.zeroclaw/config.toml, restored afterwards),
+# runs BATCH_SIZE (4) question rounds via zeroclaw with optional corrective feedback,
+# posts rewards to /rl/set_reward, and checks the rollout log for completion.
 """Automated human-in-the-loop (HITL) online RL demo.
 
 Procedure:
@@ -43,10 +49,14 @@ ROLLOUT_COMPLETE_WAIT_SECS = 60
 
 
 def _strip_ansi(text: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Removes ANSI color escape sequences from text.
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
 
 
 def _print_header(title: str) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Prints a title framed by separator lines.
     sep = "=" * 64
     print(f"\n{sep}\n  {title}\n{sep}")
 
@@ -60,6 +70,11 @@ def _patch_zeroclaw_config(
     api_key: str,
     model: str | None = None,
 ) -> Path:
+    # [FUNCTION DOC]
+    # HELPER: Backs up the zeroclaw config to '<name>.demo_bak', rewrites
+    # default_provider to 'custom:<gateway>', sets or prepends api_key, optionally sets
+    # default_model, writes it back and returns the backup path. Raises if the config
+    # file does not exist.
     backup = config_path.with_suffix(".demo_bak")
     shutil.copy2(config_path, backup)
 
@@ -93,6 +108,9 @@ def _patch_zeroclaw_config(
 
 
 def _restore_zeroclaw_config(config_path: Path, backup: Path) -> None:
+    # [FUNCTION DOC]
+    # HELPER: If the backup exists, copies it over the config, deletes it and prints a
+    # message.
     if backup.exists():
         shutil.copy2(backup, config_path)
         backup.unlink()
@@ -103,6 +121,9 @@ def _restore_zeroclaw_config(config_path: Path, backup: Path) -> None:
 
 
 def _set_reward(gateway_addr: str, api_key: str, reward: float) -> None:
+    # [FUNCTION DOC]
+    # HELPER: POSTs {'reward': reward} to <gateway>/rl/set_reward with Bearer api_key
+    # (10s timeout); raises on HTTP error.
     print(f"    Setting reward={reward}")
     resp = requests.post(
         f"{gateway_addr}/rl/set_reward",
@@ -125,6 +146,14 @@ def _do_round(
     question: str,
     label: str,
 ) -> None:
+    # [FUNCTION DOC]
+    # HELPER: One HITL round with a temp zeroclaw session file: asks the question via
+    # 'zeroclaw agent' (ZEROCLAW_API_KEY env), and if the answer matches the expected
+    # pattern ('3' or 'three') sets reward 1.0; otherwise sends a correction plus the
+    # question again in the same session and sets 1.0 if now correct, else 0.0. zeroclaw
+    # failures are treated as empty answers. Deletes the session file.
+    # KNOWN ISSUE: uses insecure tempfile.mktemp; the correction text is hard-coded for
+    # the strawberry question regardless of --question.
     session_file = tempfile.mktemp(suffix=".json", prefix="zeroclaw_session_")
 
     print(f"\n  ── {label} ──")
@@ -199,6 +228,15 @@ def _do_round(
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Parses CLI options (actor path, admin key, request timeout, gateway wait,
+    # question, backend, external API url/key, model), installs SIGINT/SIGTERM cleanup
+    # handlers, launches online_rollout.py with config overrides and log redirected to a
+    # temp file, polls the log for the gateway address (exits 1 if the process dies or
+    # times out), patches zeroclaw config, runs the rounds, waits up to 60s for 'Rollout
+    # complete' in the log and prints the log tail and result. Always runs cleanup.
+    # KNOWN ISSUE: BATCH_SIZE is fixed at 4 and must match the YAML batch size; the
+    # signal handler cleans up but does not exit, so execution continues after Ctrl-C.
     parser = argparse.ArgumentParser(
         description="Automated HITL online RL demo with zeroclaw"
     )
@@ -257,6 +295,10 @@ def main() -> None:
     zeroclaw_backup: Path | None = None
 
     def cleanup(signum=None, frame=None):
+        # [FUNCTION DOC]
+        # HELPER: Terminates the rollout subprocess (kill after 10s), restores the
+        # zeroclaw config if patched, and prints where the log is kept. Also used as a
+        # signal handler (signum/frame ignored).
         _print_header("Cleanup")
         if rollout_proc is not None and rollout_proc.poll() is None:
             print(f"  Stopping online_rollout.py (PID {rollout_proc.pid}) ...")

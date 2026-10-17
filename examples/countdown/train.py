@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Example GRPO training on the Countdown task with a simple single-turn workflow that
+# tokenizes the raw 'query' text and scores with reward_score.compute_score. Imports
+# reward_score as a top-level module, so the countdown directory must be on sys.path.
 import sys
 import uuid
 
@@ -18,11 +22,17 @@ logger = logging.getLogger(f"CountDown @ {worker_id}")
 
 
 class CountDownWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow generating one completion per prompt and scoring it with
+    # compute_score.
     def __init__(
         self,
         gconfig: GenerationHyperparameters,
         tokenizer: PreTrainedTokenizerFast | str,
     ):
+        # [FUNCTION DOC]
+        # Loads tokenizer if given as path and derives gconfig with tokenizer stop/pad
+        # ids.
         if isinstance(tokenizer, str):
             from areal.utils.hf_utils import load_hf_tokenizer
 
@@ -31,6 +41,12 @@ class CountDownWorkflow(RolloutWorkflow):
         self.tokenizer = tokenizer
 
     async def arun_episode(self, engine: InferenceEngine, data):
+        # [FUNCTION DOC]
+        # Encodes data['query'] without special tokens, generates one sample, builds
+        # input_ids/loss_mask/logprobs/versions/attention_mask (batch dim 1, prompt
+        # masked), computes the reward from decoded completion and the data row
+        # (target/numbers), records it to stats_tracker, and returns the tensor dict
+        # with rewards shape [1].
         input_ids = self.tokenizer.encode(data["query"], add_special_tokens=False)
 
         req = ModelRequest(
@@ -68,6 +84,9 @@ class CountDownWorkflow(RolloutWorkflow):
 
 
 def get_countdown_dataset(dataset_path, rank, world_size):
+    # [FUNCTION DOC]
+    # Loads a JSON dataset's train split from dataset_path and shards it by
+    # rank/world_size. Unused by main.
     dataset = load_dataset(
         path="json",
         split="train",
@@ -77,6 +96,9 @@ def get_countdown_dataset(dataset_path, rank, world_size):
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Loads GRPOConfig, loads the JSON train dataset from config.train_dataset.path (no
+    # tokenization), and runs PPOTrainer.train with CountDownWorkflow by import path.
     config, _ = load_expr_config(args, GRPOConfig)
 
     train_dataset = load_dataset(

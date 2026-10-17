@@ -1,3 +1,5 @@
+# [PACKAGE DOC]
+# LangChain-based math agent workflows. Re-exports MathAgent and MathToolAgent.
 # SPDX-License-Identifier: Apache-2.0
 
 """LangChain-based agent workflows for AReaL training."""

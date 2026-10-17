@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Example agent workflow using claude_agent_sdk: defines an in-process MCP calculator
+# server (add/subtract/multiply/divide/power/sqrt) and MathToolAgent which solves a math
+# question through the Claude agent SDK (pointed at AReaL's proxy via base_url) and
+# returns a math_verify reward.
 # SPDX-License-Identifier: Apache-2.0
 
 import math
@@ -18,6 +23,9 @@ from areal.api import AsyncRewardWrapper
 
 
 def math_reward_fn(completions: str, answer: str) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Parses completion text and gold answer with math_verify and returns 1.0 if
+    # they verify as equivalent, else 0.0.
     ans = parse(completions)
     gold = parse(answer)
     return float(verify(ans, gold))
@@ -25,24 +33,36 @@ def math_reward_fn(completions: str, answer: str) -> float:
 
 @tool("add", "Add two numbers", {"a": float, "b": float})
 async def add(args: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Calculator MCP tool: a + b; returns an MCP text content dict with the result as a
+    # string.
     result = args["a"] + args["b"]
     return {"content": [{"type": "text", "text": str(result)}]}
 
 
 @tool("subtract", "Subtract two numbers", {"a": float, "b": float})
 async def subtract(args: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Calculator MCP tool: a - b; returns an MCP text content dict with the result as a
+    # string.
     result = args["a"] - args["b"]
     return {"content": [{"type": "text", "text": str(result)}]}
 
 
 @tool("multiply", "Multiply two numbers", {"a": float, "b": float})
 async def multiply(args: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Calculator MCP tool: a * b; returns an MCP text content dict with the result as a
+    # string.
     result = args["a"] * args["b"]
     return {"content": [{"type": "text", "text": str(result)}]}
 
 
 @tool("divide", "Divide two numbers (b must not be zero)", {"a": float, "b": float})
 async def divide(args: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Calculator MCP tool: a / b; returns an is_error result for division by zero;
+    # returns an MCP text content dict with the result as a string.
     if args["b"] == 0:
         return {
             "content": [{"type": "text", "text": "Error: Division by zero"}],
@@ -54,12 +74,18 @@ async def divide(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool("power", "Raise base to the exponent power", {"base": float, "exponent": float})
 async def power(args: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Calculator MCP tool: base ** exponent; returns an MCP text content dict with the
+    # result as a string.
     result = args["base"] ** args["exponent"]
     return {"content": [{"type": "text", "text": str(result)}]}
 
 
 @tool("sqrt", "Calculate square root of a non-negative number", {"n": float})
 async def sqrt(args: dict[str, Any]) -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Calculator MCP tool: square root of n; is_error result for negative n; returns an
+    # MCP text content dict with the result as a string.
     if args["n"] < 0:
         return {
             "content": [{"type": "text", "text": "Error: Cannot sqrt negative number"}],
@@ -88,6 +114,9 @@ CALCULATOR_MCP_TOOLS = [
 
 
 class MathToolAgent:
+    # [CLASS DOC]
+    # Agent run by AReaL's agent proxy/workflow: forces the model to use calculator MCP
+    # tools. kwargs are stored (max_turns used, default 10).
     """Math agent with calculator tools using claude_agent_sdk"""
 
     SYSTEM_PROMPT = (
@@ -96,9 +125,20 @@ class MathToolAgent:
     )
 
     def __init__(self, **kwargs):
+        # [FUNCTION DOC]
+        # Stores constructor kwargs.
         self.kwargs = kwargs
 
     async def run(self, data: dict, **extra_kwargs) -> float:
+        # [FUNCTION DOC]
+        # Takes the last message content from data['messages'], resolves
+        # base_url/api_key from extra_kwargs or ANTHROPIC_* env, sets
+        # CLAUDE_CODE_STREAM_CLOSE_TIMEOUT=300000 in the process env (global side
+        # effect), builds SDK env (only when base_url is set) with max output tokens
+        # from max_completion_tokens (default 1024) and telemetry disabled, runs a
+        # ClaudeSDKClient session with the calculator server and allowed tools,
+        # concatenates assistant text blocks, and returns the math reward vs
+        # data['answer'].
         """Run the agent on a math problem.
 
         Args:

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Demo launcher: starts AReaL's Agent Service (router, gateway and one worker pair
+# running examples.agent_service.agent.ClaudeAgent) via a LocalScheduler and offers an
+# interactive terminal chat through the gateway's /v1/responses endpoint.
 # SPDX-License-Identifier: Apache-2.0
 
 """Launch the Agent Service with Claude Agent SDK.
@@ -26,6 +30,9 @@ from areal.v2.agent_service.controller import AgentController
 
 
 async def _wait_healthy(url: str, timeout: float = 60.0) -> None:
+    # [FUNCTION DOC]
+    # HELPER: Polls url every 0.5s until HTTP 200 or timeout (default 60s, then
+    # TimeoutError); connection errors are retried.
     async with httpx.AsyncClient() as client:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -40,6 +47,11 @@ async def _wait_healthy(url: str, timeout: float = 60.0) -> None:
 
 
 async def interactive_loop(gateway_addr: str, admin_key: str) -> None:
+    # [FUNCTION DOC]
+    # Interactive REPL: uses a per-run session key as 'user', reads stdin (blocking)
+    # until quit/exit/q/EOF/Ctrl-C, POSTs each message to <gateway>/v1/responses with
+    # Bearer admin key, prints output_text blocks and function_call names when
+    # completed, or the truncated error message.
     session_key = f"session-{int(time.time())}"
     print("Type your message (or 'quit' to exit):\n")
 
@@ -79,6 +91,11 @@ async def interactive_loop(gateway_addr: str, admin_key: str) -> None:
 
 
 def main() -> None:
+    # [FUNCTION DOC]
+    # Parses --admin-api-key (default 'areal-agent-admin'), creates a LocalScheduler and
+    # AgentController with the ClaudeAgent class path, initializes services, prints
+    # addresses, waits for gateway health, runs the interactive loop, and always
+    # destroys the controller.
     parser = argparse.ArgumentParser(description="Agent Service — Claude Agent SDK")
     parser.add_argument(
         "--admin-api-key",

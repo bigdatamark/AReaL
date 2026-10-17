@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Rollout-only example for the v2 inference_service stack in online mode: launches
+# RolloutControllerV2 (local or Slurm scheduler), exposes a proxy gateway that external
+# agents talk to, collects one batch of online trajectories and logs them or their
+# average reward.
 """Rollout-only online example via the inference_service gateway stack."""
 
 from __future__ import annotations
@@ -10,6 +15,18 @@ from pathlib import Path
 
 
 def main(args: list[str]) -> None:
+    # [FUNCTION DOC]
+    # Adds the repo root to sys.path; parses --api-url, --provider-api-key and --model
+    # (the rest go to load_expr_config as PPOConfig). Requires rollout.agent.mode ==
+    # 'online' (ValueError) and single-controller execution (NotImplementedError).
+    # Creates a Local or Slurm scheduler, copies rollout config forcing dump_to_file
+    # False (warning if it was set), applies model override, and either targets an
+    # external API (no server args) or derives SGLang/vLLM server args from the rollout
+    # backend (ValueError if unsupported). Initializes the controller, logs the gateway
+    # address, rolls out one batch of size train_dataset.batch_size with no
+    # data/workflow, then logs truncated request/response per interaction (external) or
+    # the mean localized reward (internal). Always destroys the controller and scheduler
+    # workers.
     repo_root = Path(__file__).resolve().parents[3]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))

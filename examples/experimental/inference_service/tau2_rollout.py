@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Rollout-only Tau2 benchmark example with the v2 inference_service gateway stack:
+# builds a Tau2 task-id dataset, launches RolloutControllerV2 (local or Slurm scheduler,
+# SGLang or vLLM servers), and runs examples.tau2.agent.Tau2AgentWorkflow over every
+# batch, logging per-batch rewards.
 """Rollout-only script for Tau2 benchmark using RolloutControllerV2.
 
 This example demonstrates how to run rollouts (data generation) without
@@ -43,6 +48,10 @@ logger = logging.getLogger("Tau2GatewayRollout")
 
 @dataclass
 class Tau2EnvConfig:
+    # [CLASS DOC]
+    # Tau2 environment settings passed to the workflow: domain, max steps, thinking tool
+    # and solo mode flags, user-simulator LLM base URL/name/args, turn discount and
+    # invalid-format penalty.
     """Environment configuration for Tau2 benchmark."""
 
     domain: str = field(
@@ -89,6 +98,11 @@ def get_tau2_dataset(
     type: str = "rl",
     split: str = "train",
 ) -> Dataset:
+    # [FUNCTION DOC]
+    # Loads task-id splits for the tau2 domain via tau2.registry and returns a HF
+    # Dataset of {'task_id', 'split'} rows, repeating the list until it has at least 128
+    # rows. Asserts type == 'rl'; raises ValueError if no loader exists or the split is
+    # unknown. Logs the size.
     """Create a HuggingFace Dataset from tau2 task IDs.
 
     Args:
@@ -136,6 +150,9 @@ def get_tau2_dataset(
 
 @dataclass
 class Tau2GatewayRolloutConfig(BaseExperimentConfig):
+    # [CLASS DOC]
+    # BaseExperimentConfig plus generation hyperparameters, rollout engine config,
+    # model_path, Tau2 env config, SGLang config and train dataset config.
     """Configuration for Tau2 rollout-only with RolloutControllerV2."""
 
     gconfig: GenerationHyperparameters = field(
@@ -154,6 +171,17 @@ class Tau2GatewayRolloutConfig(BaseExperimentConfig):
 
 
 def main(argv: list[str]) -> None:
+    # [FUNCTION DOC]
+    # Silences pydantic UserWarnings, loads config, copies rollout config with model set
+    # to model_path, builds the dataset (split = last path component of
+    # train_dataset.path) and a DataLoader, creates a Local/Slurm scheduler
+    # (NotImplementedError otherwise), derives server args by backend (ValueError if
+    # unsupported), initializes the controller, then for each batch converts columns to
+    # row dicts, calls rollout_batch with the Tau2 workflow and kwargs (env config,
+    # temperature, max_completion_tokens, 600s timeout), and logs localized rewards or a
+    # warning for empty results. Always destroys controller and workers after the loop.
+    # KNOWN ISSUE: controller initialization happens outside the try/finally, so a
+    # failed initialize leaves scheduler workers running.
     warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
     config, _ = load_expr_config(argv, Tau2GatewayRolloutConfig)

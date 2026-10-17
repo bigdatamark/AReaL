@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# AWEX training-side adapter for Megatron engines. Reports full (TP-gathered, HF-
+# converted) per-rank parameters as unsharded awex metadata, performs NCCL P2P pushes
+# along an awex TransferPlan, optionally sends sparse AdamW-derived delta updates (DTE
+# 'separation' mode, enabled via DTERuntimeConfig env), and supports colocated transfer
+# via CUDA IPC handles exchanged through the gateway KV store plus CPU offload/reload of
+# weights and optimizer state.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
@@ -51,6 +58,11 @@ logger = logging.getLogger("AwexMegatronAdapter")
 
 
 class AwexMegatronAdapter(AwexTrainingAdapter):
+    # [CLASS DOC]
+    # Implements AwexTrainingAdapter for MegatronEngine (DP/TP/PP/EP). Holds transfer
+    # plan, NCCL/Gloo groups, transfer rank/world size, DTE delta tracker/detector and
+    # transport, colocate HTTP client/settings and a lock, plus CPU-offload bookkeeping
+    # (offloaded optimizer state, offloaded weights, set of released tags).
     """Awex training adapter for MegatronEngine supporting DP, TP, and PP.
 
     PP: get_named_parameters already yields only the current stage's layers
@@ -65,6 +77,11 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
     """
 
     def __init__(self, engine: MegatronEngine):
+        # [FUNCTION DOC]
+        # Stores the engine and initializes all state: groups/plan None, empty offload
+        # dicts, a threading lock for colocate updates, default admin key 'areal-admin-
+        # key', 120s colocate timeout, DTE config read from environment, delta
+        # components lazily created later.
         self._engine = engine
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
@@ -86,6 +103,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
 
     @property
     def parallelism_strategy(self) -> dict:
+        # [FUNCTION DOC]
+        # Returns parallelism dict from megatron parallel_state: world_size, tp/pp/ep
+        # sizes, dp size from engine, and dp_replicated=True when TP or CP size > 1
+        # (gathered tensors are identical across those ranks).
         from megatron.core import parallel_state as mpu
 
         tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -100,6 +121,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         }
 
     def get_weight_metadata(self) -> list[ParameterMeta]:
+        # [FUNCTION DOC]
+        # Builds one ParameterMeta per HF parameter yielded by _iter_hf_params; each is
+        # described as a single unsharded shard (zero offset, NO_SHARDING) with
+        # rank_info fields, global shape = local gathered shape, and one replica.
         rank_info = self._build_rank_info()
         metadata: list[ParameterMeta] = []
 
@@ -144,6 +169,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
     def get_local_shard_parameters(
         self, required_names: list[str] | None = None
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Returns dict HF-name -> gathered tensor for this rank, optionally filtered to
+        # required_names (None/empty = all). Triggers TP all-gathers.
         required = set(required_names) if required_names else None
         result: dict[str, torch.Tensor] = {}
         for hf_name, tensor in self._iter_hf_params():
@@ -153,6 +181,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         return result
 
     def save_parameters(self, save_path: str, names: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Saves local HF params (optionally filtered) to save_path with torch.save on
+        # CPU copies; temporarily resumes offloaded weights if 'weights' tag was
+        # released and re-releases them afterwards (in finally).
         weights_offloaded = "weights" in self._released_tags
         if weights_offloaded:
             self.resume_memory(tags=["weights"])
@@ -176,6 +208,12 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
+        # [FUNCTION DOC]
+        # Like the FSDP adapter: validates world sizes if DTE enabled, records transfer
+        # rank and world size, fetches KV metadata, builds the local TransferPlan,
+        # disables TORCHELASTIC agent store env, creates NCCL 'awex_<pair>' and Gloo
+        # 'awex_<pair>_gloo' groups; if DTE enabled, agrees on wire dtypes across the
+        # Gloo group. Logs.
         if self._dte_config.enabled:
             validate_dte_world_size(world_size, infer_world_size, train_world_size)
 
@@ -227,6 +265,11 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
     def execute_weight_update(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # Pushes weights for version. If DTE enabled: releases DDP grad buffers, runs
+        # the separation (delta or dense) update, and always restores grad buffers.
+        # Otherwise validates initialized state (RuntimeError otherwise), sends all
+        # params via NCCL ops built from the plan (blocking), then Gloo-barriers.
         if self._dte_config.enabled:
             self._release_grad_buffers_for_separation_sync()
             try:
@@ -260,6 +303,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         dist.barrier(group=self._weights_update_group_gloo)
 
     def _release_grad_buffers_for_separation_sync(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls offload_grad_buffers(synchronize=False, empty_cache=False) on
+        # each model chunk that supports it to free memory during transfer. No-op if no
+        # model.
         """Temporarily release Megatron DDP grad buffers during transfer."""
         model = getattr(self._engine, "model", None)
         if model is None:
@@ -271,6 +318,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 release(synchronize=False, empty_cache=False)
 
     def _restore_grad_buffers_after_separation_sync(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Calls restore_grad_buffers(synchronize=False) on each model chunk that
+        # supports it.
         """Restore Megatron DDP grad buffers even when transfer fails."""
         model = getattr(self._engine, "model", None)
         if model is None:
@@ -282,6 +332,14 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 restore(synchronize=False)
 
     def _execute_separation_weight_update(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Separation-mode update. Validates state (RuntimeError), gathers
+        # params, lazily creates delta components, captures the synced state, prepares
+        # sparse masks, and agrees across the Gloo group (MIN all-reduce) whether all
+        # ranks can use delta. Sends sparse delta payloads or dense NCCL ops
+        # accordingly, barriers on Gloo (receiver joins after applying), then marks the
+        # delta tracker committed (delta only) and records the synced watermark in the
+        # detector.
         """Send an AdamW-derived sparse update, with a dense fallback."""
         if self._transfer_plan is None:
             raise RuntimeError("Transfer plan is not initialized")
@@ -331,6 +389,13 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         params: dict[str, torch.Tensor],
         version: int,
     ) -> tuple[dict[str, torch.Tensor] | None, bool]:
+        # [FUNCTION DOC]
+        # HELPER: Decides whether this version can be sent sparsely. Gets a full-sync
+        # reason from the tracker (or 'initial_full' if no watermark), promotes it
+        # across ranks, then tries AdamW-inversion mask computation (errors ->
+        # 'adamw_inversion_error', None -> 'adamw_inversion_infeasible'), promotes
+        # again. On fallback seeds the tracker without snapshot and returns (None,
+        # False); otherwise returns (masks, True). Logs the path chosen.
         reason = self._delta_tracker.full_sync_reason(version)
         if reason is None and not self._delta_detector.has_synced_watermark():
             reason = "initial_full"
@@ -367,6 +432,12 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         return masks, True
 
     def _sync_full_reason(self, reason: str | None, version: int) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: If torch.distributed is initialized with world size > 1, MAX-all-
+        # reduces a needs-full flag on the default group (CUDA device if available) so
+        # any rank's fallback forces all ranks; returns the local reason,
+        # 'peer_rank_fallback' if only a peer needed it, or None. Returns reason
+        # unchanged when not distributed.
         """Promote a rank-local dense fallback to every training rank."""
         if not dist.is_available() or not dist.is_initialized():
             return reason
@@ -399,6 +470,13 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         masks: dict[str, torch.Tensor],
         version: int,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Sends sparse delta payloads using DTE colocate protocol. Asserts init
+        # state and raises RuntimeError if wire dtypes are missing. Flattens plan
+        # operations, groups by receive dtype, lazily creates an NCCL stream batch
+        # transport, and for each wire dtype builds per-op payloads from masks and runs
+        # a two-round delta exchange (send-only, identity rank mapping, empty recv plan)
+        # on the current CUDA device. Logs payload count.
         from dte.core.colocate_protocol import (
             _filter_plan_by_dtype,
             _ops_by_recv_dtype,
@@ -461,6 +539,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
     def batch_isend_irecv(self, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Same as FSDP adapter: runs setup_batch_isend_irecv on the NCCL group with Gloo
+        # barrier; RuntimeError if Gloo group missing.
         if self._weights_update_group_gloo is None:
             raise RuntimeError("Gloo weight update group is not initialized")
         setup_kwargs = {
@@ -475,6 +556,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
     def teardown_weight_update_group(self) -> None:
+        # [FUNCTION DOC]
+        # Destroys NCCL/Gloo groups (if dist initialized) and resets plan, ranks, world
+        # size, delta transport/dtypes/tracker/detector, and closes the colocate HTTP
+        # client.
         if self._weights_update_group is not None and dist.is_initialized():
             dist.destroy_process_group(self._weights_update_group)
         if self._weights_update_group_gloo is not None and dist.is_initialized():
@@ -493,6 +578,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self._colocate_http_client = None
 
     def _build_rank_info(self) -> RankInfo:
+        # [FUNCTION DOC]
+        # HELPER: Builds awex RankInfo from megatron parallel_state (tp/pp/ep/etp/cp
+        # ranks and sizes), dp from engine, LOCAL_RANK env, engine_rank=0,
+        # is_infer=False, cp_mode 'ring' if cp>1 else 'none'.
         from megatron.core import parallel_state as mpu
 
         tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -536,6 +625,13 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         theta_by_id: dict[int, torch.Tensor] | None = None,
         consume_overrides: bool = False,
     ):
+        # [FUNCTION DOC]
+        # HELPER: Generator over (hf_name, detached tensor). For each megatron named
+        # parameter (optionally replaced by theta_by_id[id(param)], copying TP
+        # attributes onto the override), all-gathers across TP, converts to HF
+        # names/tensors (splitting experts), skips lm_head when embeddings are tied. If
+        # consume_overrides, removes used overrides from the dict as it goes (mutates
+        # caller's dict).
         """Yield (hf_name, tensor) for every parameter on this rank.
 
         Uses get_named_parameters + all_gather_param + convert_to_hf to produce
@@ -591,6 +687,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
                 overrides.pop(id(param), None)
 
     def _iter_model_params_for_delta(self):
+        # [FUNCTION DOC]
+        # HELPER: Yields unique megatron parameter objects (deduplicated by id) in
+        # converter order, for delta detection.
         """Yield model tensors in the same order used by the HF converter."""
         from areal.engine.megatron_utils.megatron import get_named_parameters
 
@@ -607,19 +706,31 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
     def _convert_hf_with_overrides(
         self, theta_by_id: dict[int, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: Returns a dict of HF params computed with the given per-param tensor
+        # overrides.
         return dict(self._iter_hf_params(theta_by_id))
 
     @torch.no_grad()
     def _iter_hf_with_overrides(self, theta_by_id: dict[int, torch.Tensor]):
+        # [FUNCTION DOC]
+        # HELPER: Under no_grad, streams HF params with overrides, consuming overrides
+        # as used.
         yield from self._iter_hf_params(theta_by_id, consume_overrides=True)
 
     def _ensure_delta_components(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Lazily creates the DTE delta tracker (from config) and the
+        # AdamWInversionDetector bound to this adapter.
         if self._delta_tracker is None:
             self._delta_tracker = self._dte_config.create_delta_tracker()
         if self._delta_detector is None:
             self._delta_detector = AdamWInversionDetector(self)
 
     def _get_inner_optimizers(self):
+        # [FUNCTION DOC]
+        # HELPER: Returns list of inner optimizers: [] if none, chained_optimizers or
+        # optimizers attribute if present, else [optimizer].
         optimizer = self._engine.optimizer
         if optimizer is None:
             return []
@@ -643,6 +754,10 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         admin_api_key: str = "areal-admin-key",
         timeout_s: float = 120.0,
     ) -> None:
+        # [FUNCTION DOC]
+        # Stores colocate settings (pair name, KV store URL, transfer rank, infer world
+        # size, admin API key, timeout) and creates an httpx client if needed.
+        # master_port, train_world_size and num_engines are accepted but unused. Logs.
         self._colocate_pair_name = pair_name
         self._colocate_kv_store_url = kv_store_url
         self._colocate_transfer_rank = transfer_rank
@@ -658,10 +773,20 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
     def execute_colocate_weight_update(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # Runs a colocated weight update for version while holding the colocate lock.
         with self._colocate_lock:
             self._execute_colocate_weight_update_locked(version)
 
     def _execute_colocate_weight_update_locked(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Colocated update body. Requires init_colocate_weight_update (assert).
+        # Resumes offloaded weights if needed, gathers params, groups tensors by
+        # shape/dtype, moves them to shared memory and serializes CUDA IPC handles with
+        # names; PUTs the hex blob to KV key 'colocate_weights_rank<r>_<version>' with
+        # Bearer admin auth. Then polls (100ms) GET of 'colocate_done_rank<r>_<version>'
+        # until 200 or timeout (TimeoutError). Frees buffers, gc + empty_cache, and re-
+        # releases weights if they were offloaded.
         kv_store_url = self._colocate_kv_store_url
         pair_name = self._colocate_pair_name
         transfer_rank = self._colocate_transfer_rank
@@ -736,6 +861,11 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
             self.release_memory(tags=["weights"])
 
     def release_memory(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Offloads GPU memory for tags (default both 'optimizer' and 'weights'); skips
+        # tags already released. Optimizer states and/or model weights are copied to CPU
+        # and replaced by empty tensors; tags recorded; then CUDA sync, gc and
+        # empty_cache. Logs.
         """Release GPU memory for specified tags by offloading to CPU.
 
         Supported tags:
@@ -764,6 +894,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         logger.info("release_memory: done for tags=%s", tags_to_release)
 
     def resume_memory(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Reloads previously released tags (default both) back to GPU: weights first,
+        # then optimizer states; updates released tags and CUDA-synchronizes. Logs.
         """Resume GPU memory for specified tags by reloading from CPU.
 
         Supported tags:
@@ -790,6 +923,13 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         logger.info("resume_memory: done for tags=%s", tags_to_resume)
 
     def _offload_optimizer_states(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: For every inner optimizer's base torch optimizer, moves CUDA state
+        # tensors to CPU (non_blocking), stores them keyed by param, and replaces state
+        # entries with empty CPU tensors. Warns if optimizer is missing or lacks
+        # 'optimizers'.
+        # KNOWN ISSUE: non_blocking copies to non-pinned CPU memory and does not handle
+        # 'chained_optimizers' unlike _get_inner_optimizers.
         """Move optimizer state tensors to CPU, keeping references for reload."""
         optimizer = self._engine.optimizer
         if optimizer is None:
@@ -824,6 +964,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
     def _reload_optimizer_states(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Restores saved optimizer state tensors to each param's device
+        # (non_blocking) and clears the store. No-op if nothing saved or no optimizer.
         """Restore optimizer state tensors from CPU back to GPU."""
         if not self._offloaded_optimizer_states:
             return
@@ -845,6 +988,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         logger.info("Reloaded optimizer states to GPU")
 
     def _offload_model_weights(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Copies each CUDA model parameter to CPU (stored by name) and replaces
+        # param.data with an empty CPU tensor. Logs count.
         """Move model parameters to CPU, keeping references for reload."""
         if self._engine.model is None:
             return
@@ -862,6 +1008,9 @@ class AwexMegatronAdapter(AwexTrainingAdapter):
         )
 
     def _reload_model_weights(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Restores saved parameter data to the engine device by name and clears
+        # the store. No-op if nothing saved or no model.
         """Restore model parameters from CPU back to GPU."""
         if not self._offloaded_weights:
             return

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Debug script comparing greedy outputs of HF Transformers (Gemma-3-4B-it on local CUDA)
+# and an SGLang server at 127.0.0.1:30000 on the CLEVR-count dataset, printing each
+# backend's exact-match accuracy for answers formatted as '[N]'. Runs entirely at import
+# time: downloads model/dataset, uses the GPU and sends HTTP requests.
 import base64
 from io import BytesIO
 
@@ -9,6 +14,11 @@ from transformers import AutoProcessor, Gemma3ForConditionalGeneration
 
 
 def image2base64(images: list[ImageObject] | ImageObject) -> list[str] | str:
+    # [FUNCTION DOC]
+    # HELPER: Encodes one PIL image or a list of images as PNG and returns a list of
+    # base64 strings.
+    # KNOWN ISSUE: the return annotation allows a single str, but a list is always
+    # returned.
     if isinstance(images, ImageObject):
         images = [images]
 

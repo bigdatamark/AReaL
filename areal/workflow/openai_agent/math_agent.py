@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Builds an OpenAI Agents SDK multi-agent math solver using handoffs between analyzer,
+# solver, refinement and verification agents.
 # SPDX-License-Identifier: Apache-2.0
 
 from agents import Agent as OpenAIAgent
@@ -6,6 +9,12 @@ from agents.extensions.handoff_prompt import RECOMMENDED_PROMPT_PREFIX
 
 
 def build_math_agent() -> OpenAIAgent:
+    # [FUNCTION DOC]
+    # Creates four specialist OpenAIAgents (Problem Analyzer, Solution Specialist,
+    # Refinement Agent, Verification Agent) with handoff-aware instructions, and a
+    # coordinator 'Math Problem Solver' agent exposing them as handoff tools
+    # (analyze_problem, solve_problem, refine_solution, verify_solution). Returns the
+    # coordinator. No I/O.
     """Create a multi-agent workflow using handoffs for different reasoning stages."""
 
     # Create specialized agents for different stages

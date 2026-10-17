@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Entry script for PPO training with framework-based agent workflows (OpenAI, Anthropic,
+# LangChain agents) loaded by import path. Adds its own directory to sys.path to import
+# configs.
 import pathlib
 import sys
 
@@ -11,6 +15,11 @@ from areal.utils.hf_utils import load_hf_tokenizer
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Loads AgentConfig from CLI args, tokenizer, train ('train') and valid ('test')
+    # datasets; builds workflow kwargs (temperature, top_p, max_tokens,
+    # max_completion_tokens from max_new_tokens, max_turns) and eval kwargs with
+    # temperature 0.6; runs PPOTrainer.train with the configured workflow classes.
     config, _ = load_expr_config(args, AgentConfig)
     tokenizer = load_hf_tokenizer(config.tokenizer_path)
 

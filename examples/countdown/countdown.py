@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Countdown dataset generator: samples random number sets and targets, ensures
+# solvability by DFS over pairwise arithmetic combinations, avoids a fixed list of known
+# (24-game) problems, and formats chat-templated prompts. When run as a script, prints a
+# sample and writes train/valid/test JSONL files under ./data/countdown/qwen/ (directory
+# must exist). Inserts the CWD into sys.path on import.
 import argparse
 import itertools
 import pathlib
@@ -12,6 +18,9 @@ sys.path.insert(0, str(pathlib.Path().resolve()))
 
 
 def get_existing_problems():
+    # [FUNCTION DOC]
+    # HELPER: Returns a set of sorted 4-number tuples taken from a hard-coded list of
+    # known puzzles, used to exclude duplicates.
     existing_problems = set()
     # All problems from the JS file, organized by sets of 10
     conditions = [
@@ -258,6 +267,9 @@ ASSISTANT = "Answer: <think>Let's think step by step:\n"
 
 
 def parse_solutions_words(result):
+    # [FUNCTION DOC]
+    # HELPER: Returns the content of the last <final_answer>...</final_answer> tag in
+    # result, or None (printing a warning) if absent. Unused elsewhere in this module.
     result = result.strip()
     if "</final_answer>" not in result:
         print("warning, no answer found")
@@ -275,6 +287,10 @@ def parse_solutions_words(result):
 
 
 def combine_nums(a, b):
+    # [FUNCTION DOC]
+    # HELPER: Given two numbers (cast to int), returns [value, description] candidates
+    # for a+b, a*b, the non-negative difference, and exact integer division of the
+    # larger by the smaller when divisible (non-zero divisor).
     # Implicitly makes assumptions about the order of operations and valid operations
     a = int(a)
     b = int(b)
@@ -291,6 +307,9 @@ def combine_nums(a, b):
 
 
 class CountDown:
+    # [CLASS DOC]
+    # Generator of Countdown tasks with configurable target range, starting set sizes
+    # and their sampling probabilities, and a tokenizer for chat templating.
     def __init__(
         self,
         max_target=25,
@@ -299,6 +318,10 @@ class CountDown:
         start_probs=[0.0, 0.4, 0.6],
         tokenizer_path: str = "Qwen/Qwen2.5-3B-Instruct",
     ):
+        # [FUNCTION DOC]
+        # Stores target bounds (default 10..25), start sizes [2,3,4] with probabilities,
+        # loads the HF tokenizer from tokenizer_path (network/disk I/O) and the known-
+        # problems set.
         self.max_target = max_target
         self.min_target = min_target
         self.start_size = start_size
@@ -307,9 +330,16 @@ class CountDown:
         self.existing_problems = get_existing_problems()
 
     def is_duplicate(self, nums):
+        # [FUNCTION DOC]
+        # HELPER: True if the sorted numbers match a known problem.
         return tuple(sorted(nums)) in self.existing_problems
 
     def generate(self, target):
+        # [FUNCTION DOC]
+        # Validates min_target <= target <= max_target (ValueError otherwise);
+        # repeatedly samples a start size and numbers in [1, max_target-1], skipping
+        # known problems, until DFS finds a solution. Returns (nums, list of step
+        # strings).
         if target > self.max_target:
             raise ValueError("Target cannot be greater than max target")
         if target < self.min_target:
@@ -330,6 +360,12 @@ class CountDown:
         return nums, solution
 
     def get_task(self, apply_chat_template=False, return_raw=False) -> dict[str, str]:
+        # [FUNCTION DOC]
+        # Samples a target and solvable numbers and builds the instruction query.
+        # return_raw -> {'query': query}. Otherwise builds system+user messages; with
+        # apply_chat_template formats them via the tokenizer with generation prompt and
+        # appends the assistant prefix, else concatenates SYSTEM, query and prefix as a
+        # plain prompt. Stores and returns {'query': prompt, 'target', 'numbers'}.
         target = random.randint(self.min_target, self.max_target)
         nums, solution = self.generate(target)
 
@@ -371,6 +407,11 @@ class CountDown:
         return self.current_task
 
     def search(self, target, nums, operations=[]):
+        # [FUNCTION DOC]
+        # HELPER: Depth-first search: with one number left returns the operation list if
+        # it equals target, else None; otherwise tries every pair and every combine_nums
+        # result recursively, returning the first full solution or None. The mutable
+        # default operations list is never mutated.
         # Navigate the entire solution tree, implemented with DFS
         if len(nums) == 1:
             if nums[0] == target:
@@ -396,6 +437,10 @@ def create_countdown_datasets(
     eval_size=1000,
     tokenizer_path="Qwen/Qwen2.5-3B-Instruct",
 ):
+    # [FUNCTION DOC]
+    # Seeds random, builds a CountDown generator (probabilities [0.1,0.4,0.5], targets
+    # 10..25), and generates num_samples chat-templated training tasks plus eval_size
+    # validation and eval_size test tasks. Returns (train, val, test) lists of dicts.
     random.seed(seed)
     countdown = CountDown(
         start_probs=[0.1, 0.4, 0.5],

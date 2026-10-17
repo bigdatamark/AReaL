@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Rollout workflow implementations (RLVR, multi-turn, vision RLVR) plus agent-framework
+# example workflows in subpackages. Top-level workflow classes are lazily imported on
+# first attribute access to avoid heavy imports.
 # SPDX-License-Identifier: Apache-2.0
 
 __all__ = [
@@ -14,6 +18,10 @@ _LAZY_IMPORTS = {
 
 
 def __getattr__(name: str):
+    # [FUNCTION DOC]
+    # Module __getattr__: for names in the lazy-import table imports the target module,
+    # caches the attribute in module globals and returns it; otherwise raises
+    # AttributeError.
     if name in _LAZY_IMPORTS:
         import importlib
 
@@ -25,4 +33,6 @@ def __getattr__(name: str):
 
 
 def __dir__():
+    # [FUNCTION DOC]
+    # Returns the public names (__all__) for dir().
     return list(__all__)

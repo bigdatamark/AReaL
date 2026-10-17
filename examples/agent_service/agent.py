@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Example AgentRunnable for AReaL's v2 Agent Service backed by the Claude Agent SDK.
+# Keeps one ClaudeSDKClient per session key so multi-turn chats retain context;
+# configured via CLAUDE_MODEL, CLAUDE_SYSTEM_PROMPT and CLAUDE_MAX_TURNS env vars; runs
+# with bypassPermissions.
 """Claude Agent for AReaL Agent Service.
 
 Implements :class:`AgentRunnable` using the Claude Agent SDK
@@ -45,6 +50,10 @@ _DEFAULT_PERMISSION_MODE: PermissionMode = "bypassPermissions"
 
 
 class ClaudeAgent:
+    # [CLASS DOC]
+    # Agent service runnable holding a dict session_key -> connected ClaudeSDKClient.
+    # KNOWN ISSUE: the docstring says request.history seeds new sessions, but history is
+    # never used.
     """AgentRunnable backed by the Claude Agent SDK.
 
     Maintains a ``ClaudeSDKClient`` per session for true multi-turn
@@ -54,6 +63,10 @@ class ClaudeAgent:
     """
 
     def __init__(self, **kwargs: Any) -> None:
+        # [FUNCTION DOC]
+        # Reads model (default claude-sonnet-4-6), optional system prompt and max turns
+        # (default 20) from env, sets permission mode bypassPermissions, initializes
+        # empty session map and logs. kwargs are ignored.
         self._model = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
         self._system_prompt = os.environ.get("CLAUDE_SYSTEM_PROMPT", "")
         self._max_turns = int(os.environ.get("CLAUDE_MAX_TURNS", "20"))
@@ -68,6 +81,9 @@ class ClaudeAgent:
         )
 
     def _make_options(self) -> ClaudeAgentOptions:
+        # [FUNCTION DOC]
+        # HELPER: Builds ClaudeAgentOptions with model, max_turns, permission mode and
+        # the system prompt if set.
         opts = ClaudeAgentOptions(
             model=self._model,
             max_turns=self._max_turns,
@@ -78,6 +94,9 @@ class ClaudeAgent:
         return opts
 
     async def _get_or_create_client(self, session_key: str) -> ClaudeSDKClient:
+        # [FUNCTION DOC]
+        # HELPER: Returns the existing client for session_key or creates one, enters its
+        # async context (spawning the SDK subprocess) and caches it. Logs new sessions.
         if session_key not in self._sessions:
             client = ClaudeSDKClient(options=self._make_options())
             await client.__aenter__()
@@ -86,6 +105,9 @@ class ClaudeAgent:
         return self._sessions[session_key]
 
     async def close_session(self, session_key: str) -> None:
+        # [FUNCTION DOC]
+        # Removes and exits the client for session_key if present; logs a warning on
+        # close errors.
         client = self._sessions.pop(session_key, None)
         if client is not None:
             try:
@@ -94,6 +116,8 @@ class ClaudeAgent:
                 logger.warning("Error closing session %s", session_key, exc_info=True)
 
     async def close_all_sessions(self) -> None:
+        # [FUNCTION DOC]
+        # Closes every open session.
         keys = list(self._sessions.keys())
         for key in keys:
             await self.close_session(key)
@@ -104,6 +128,12 @@ class ClaudeAgent:
         *,
         emitter: EventEmitter,
     ) -> AgentResponse:
+        # [FUNCTION DOC]
+        # Sends request.message to the session's client and streams the response: text
+        # blocks are emitted as deltas and collected, tool-use blocks emitted as tool
+        # calls (args stringified) and recorded; stops at ResultMessage. Returns
+        # AgentResponse with the first 200 chars of the text as summary and tool_calls
+        # metadata. On any exception closes the session and re-raises.
         client = await self._get_or_create_client(request.session_key)
 
         try:

@@ -1,8 +1,16 @@
+# [MODULE DOC]
+# Reward scoring for the Countdown arithmetic task: extracts the last
+# <answer>...</answer> equation from a completion, checks it uses exactly the given
+# numbers, evaluates it safely and compares to the target.
 import random
 import re
 
 
 def extract_solution(solution_str):
+    # [FUNCTION DOC]
+    # HELPER: Strips text up to the first 'Assistant:' or '<|im_start|>assistant'
+    # marker, keeps only the last line, and returns the content of the last
+    # <answer>...</answer> tag (stripped) or None.
     """Extract the equation from the solution string."""
     # Remove everything before the first "Assistant:"
     if "Assistant:" in solution_str:
@@ -23,6 +31,11 @@ def extract_solution(solution_str):
 
 
 def validate_equation(equation_str, available_numbers):
+    # [FUNCTION DOC]
+    # HELPER: Returns True if the multiset of integers found in the equation equals
+    # available_numbers (each used exactly once), False otherwise or on error.
+    # KNOWN ISSUE: digits are matched with an integer pattern, so decimals like '1.5'
+    # count as numbers 1 and 5.
     """Validate that equation only uses available numbers and each number once."""
     try:
         # Extract all numbers from the equation
@@ -39,6 +52,10 @@ def validate_equation(equation_str, available_numbers):
 
 
 def evaluate_equation(equation_str):
+    # [FUNCTION DOC]
+    # HELPER: Evaluates the equation with eval() after checking it contains only digits,
+    # + - * / ( ) . and whitespace, with builtins disabled; returns the result or None
+    # on any error.
     """Safely evaluate the arithmetic equation using eval() with precautions."""
     try:
         # Define a regex pattern that only allows numbers, operators, parentheses, and whitespace
@@ -56,6 +73,11 @@ def evaluate_equation(equation_str):
 def compute_score(
     solution_str, ground_truth, method="strict", format_score=0.1, score=1.0
 ):
+    # [FUNCTION DOC]
+    # Scores a solution: 0 if no equation found, format_score (default 0.1) if numbers
+    # invalid, unevaluable or the result differs from target (tolerance 1e-5), score
+    # (default 1.0) if correct. ground_truth must have 'target' and 'numbers'. method is
+    # unused. Randomly (1/64) prints debug info to stdout.
     """The scoring function for countdown task.
 
     Args:

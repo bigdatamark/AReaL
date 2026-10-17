@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# CLI entrypoint for the weight-update gateway: parses args, builds WeightUpdateConfig
+# and serves the FastAPI app with uvicorn.
 # SPDX-License-Identifier: Apache-2.0
 
 """CLI entrypoint: ``python -m areal.v2.weight_update.gateway``."""
@@ -8,6 +11,12 @@ import argparse
 
 
 def main():
+    # [FUNCTION DOC]
+    # Parses --host (0.0.0.0), --port (7080), --admin-api-key, --init-timeout (300s),
+    # --update-timeout (120s), --log-level (unknown args ignored); validates the admin
+    # key for the bind host; builds WeightUpdateConfig; silences HTTP loggers; creates
+    # the app and runs uvicorn (blocking) with access log off and the project's default
+    # uvicorn kwargs.
     parser = argparse.ArgumentParser(description="AReaL Weight Update Gateway")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=7080, help="Bind port")

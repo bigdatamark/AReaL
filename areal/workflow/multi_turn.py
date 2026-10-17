@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# MultiTurnWorkflow: a rollout workflow that re-prompts the model with a fixed 'your
+# answer is wrong' user turn until the reward becomes non-zero or max_turns is reached,
+# producing one concatenated token trajectory with a turn-discounted reward.
 # SPDX-License-Identifier: Apache-2.0
 
 import uuid
@@ -17,6 +21,9 @@ logger = logging.getLogger("MultiTurnWorkflow")
 
 
 class MultiTurnWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow that performs repeated attempts on one prompt (n_samples forced to
+    # 1) and returns a single padded-batch-of-one trajectory dict.
     """Multi-attempt workflow that retries generation until the reward is positive."""
 
     def __init__(
@@ -27,6 +34,13 @@ class MultiTurnWorkflow(RolloutWorkflow):
         max_turns: int,
         turn_discount: float,
     ):
+        # [FUNCTION DOC]
+        # Validates max_turns > 0 and turn_discount in (0, 1] (ValueError otherwise);
+        # stores reward_fn (also wrapped in AsyncRewardWrapper), tokenizer, and gconfig
+        # augmented with tokenizer stop/pad ids. Precomputes multi_turn_prompt_ids: the
+        # chat-template token delta between an assistant-only message and the same plus
+        # a retry user message with generation prompt, so it can be appended to token
+        # sequences without re-encoding.
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
         if not (0.0 < turn_discount <= 1.0):
@@ -56,6 +70,21 @@ class MultiTurnWorkflow(RolloutWorkflow):
         self.multi_turn_prompt_ids = s2[len(s1) :]
 
     async def arun_episode(self, engine: InferenceEngine, data: dict[str, Any]):
+        # [FUNCTION DOC]
+        # Applies the chat template to data['messages'], then loops: generate one
+        # sample, decode prompt/completion, compute reward with (prompt_str,
+        # completion_str, input_tokens, output_tokens, **data); append new prompt tokens
+        # (loss_mask 0, logprob 0, version -1, turn id -1) and output tokens (loss_mask
+        # 1, logprobs, versions, turn id t) to the running sequence, asserting the
+        # engine's input prefix matches it. If still zero reward and turns remain,
+        # appends output tokens, an EOS if missing, and the retry prompt ids, and
+        # multiplies the discount. Final reward = reward * discount; records reward and
+        # num_turns to stats_tracker under the workflow scope. Returns dict of tensors
+        # (input_ids, logprobs, loss_mask, versions, turn_ids, attention_mask, scalar
+        # rewards) each unsqueezed to batch dim 1.
+        # KNOWN ISSUE: the class docstring says it retries until the reward is positive,
+        # but the loop only retries while the reward is exactly 0.0 (a negative reward
+        # stops it).
         # Enforces `n_samples=1`
         # Placeholders for the results
         seq, logprobs, loss_mask, versions, turn_ids = [], [], [], [], []

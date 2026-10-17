@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Example OpenAI-SDK math agents for AReaL proxy-based training: single-turn chat
+# completion, multi-turn retry agent, and an OpenAI Agents SDK tool agent with
+# calculator function tools; all scored with math_verify.
 # SPDX-License-Identifier: Apache-2.0
 
 import os
@@ -19,13 +23,24 @@ from areal.api import AsyncRewardWrapper
 
 
 def math_reward_fn(completions: str, answer: str) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Returns 1.0 if math_verify judges the completion equivalent to the gold
+    # answer, else 0.0.
     ans = parse(completions)
     gold = parse(answer)
     return float(verify(ans, gold))
 
 
 class MathAgent:
+    # [CLASS DOC]
+    # Single-turn chat-completions agent.
     def __init__(self, **kwargs):
+        # [FUNCTION DOC]
+        # Normalizes kwargs for chat.completions: removes max_new_tokens (and max_turns
+        # where applicable) and uses it as max_tokens when max_tokens is not given;
+        # otherwise drops max_tokens. Creates an async-wrapped math reward.
+        # KNOWN ISSUE: an explicitly passed max_tokens is always discarded (the else
+        # branch pops it).
         self.kwargs = kwargs.copy()
         max_new_tokens = self.kwargs.pop("max_new_tokens", None)
         self.kwargs.pop("max_turns", None)
@@ -36,6 +51,12 @@ class MathAgent:
         self._reward_fn = AsyncRewardWrapper(math_reward_fn)
 
     async def run(self, data: dict, **extra_kwargs):
+        # [FUNCTION DOC]
+        # Creates AsyncOpenAI (no retries) from extra_kwargs
+        # http_client/base_url/api_key or OPENAI_* env; uses data['messages_chat'] or
+        # data['messages'] (string wrapped as a user message); calls chat.completions
+        # with model 'default' and stored kwargs; returns the reward of the first choice
+        # content vs data['answer'].
         http_client = extra_kwargs.get("http_client", None)
         base_url = extra_kwargs.get("base_url", None) or os.getenv("OPENAI_BASE_URL")
         api_key = extra_kwargs.get("api_key", None) or os.getenv("OPENAI_API_KEY")
@@ -55,7 +76,14 @@ class MathAgent:
 
 
 class MultiTurnMathAgent:
+    # [CLASS DOC]
+    # Multi-turn agent that retries with a corrective user message up to max_turns until
+    # reward == 1.
     def __init__(self, max_turns: int = 8, **kwargs):
+        # [FUNCTION DOC]
+        # Stores max_turns (default 8) and normalizes kwargs like MathAgent (max_turns
+        # is a named arg here).
+        # KNOWN ISSUE: an explicitly passed max_tokens is always discarded.
         self.max_turns = max_turns
         self.kwargs = kwargs.copy()
         max_new_tokens = self.kwargs.pop("max_new_tokens", None)
@@ -66,6 +94,13 @@ class MultiTurnMathAgent:
         self._reward_fn = AsyncRewardWrapper(math_reward_fn)
 
     async def run(self, data: dict, **extra_kwargs):
+        # [FUNCTION DOC]
+        # Copies the message list, then up to max_turns times: requests a completion,
+        # appends the assistant message, computes its reward and records it under the
+        # completion id; stops when reward == 1 else appends a retry prompt. Returns
+        # dict completion_id -> reward (per-turn rewards for the proxy).
+        # KNOWN ISSUE: list() is applied before the string check, so a string prompt
+        # would be split into characters and never wrapped.
         http_client = extra_kwargs.get("http_client", None)
         base_url = extra_kwargs.get("base_url", None) or os.getenv("OPENAI_BASE_URL")
         api_key = extra_kwargs.get("api_key", None) or os.getenv("OPENAI_API_KEY")
@@ -105,24 +140,32 @@ class MultiTurnMathAgent:
 
 @function_tool
 def add(a: float, b: float) -> float:
+    # [FUNCTION DOC]
+    # Agents SDK tool: returns a + b.
     """Add two numbers."""
     return a + b
 
 
 @function_tool
 def subtract(a: float, b: float) -> float:
+    # [FUNCTION DOC]
+    # Agents SDK tool: returns a - b.
     """Subtract two numbers."""
     return a - b
 
 
 @function_tool
 def multiply(a: float, b: float) -> float:
+    # [FUNCTION DOC]
+    # Agents SDK tool: returns a * b.
     """Multiply two numbers."""
     return a * b
 
 
 @function_tool
 def divide(a: float, b: float) -> float:
+    # [FUNCTION DOC]
+    # Agents SDK tool: returns a / b; ValueError if b is 0.
     """Divide two numbers."""
     if b == 0:
         raise ValueError("Division by zero is not allowed.")
@@ -131,12 +174,16 @@ def divide(a: float, b: float) -> float:
 
 @function_tool
 def power(a: float, b: float) -> float:
+    # [FUNCTION DOC]
+    # Agents SDK tool: returns a ** b.
     """Raise a to the power of b."""
     return a**b
 
 
 @function_tool
 def sqrt(a: float) -> float:
+    # [FUNCTION DOC]
+    # Agents SDK tool: returns a ** 0.5; ValueError if a < 0.
     """Calculate the square root of a number."""
     if a < 0:
         raise ValueError("Cannot compute square root of a negative number.")
@@ -144,13 +191,23 @@ def sqrt(a: float) -> float:
 
 
 class MathToolAgent:
+    # [CLASS DOC]
+    # OpenAI Agents SDK agent using calculator function tools.
     def __init__(self, **kwargs):
+        # [FUNCTION DOC]
+        # Copies kwargs, dropping max_tokens and max_turns (remaining keys become
+        # ModelSettings); creates the reward wrapper.
         self.kwargs = kwargs.copy()
         self.kwargs.pop("max_tokens", None)
         self.kwargs.pop("max_turns", None)
         self._reward_fn = AsyncRewardWrapper(math_reward_fn)
 
     async def run(self, data: dict, **extra_kwargs):
+        # [FUNCTION DOC]
+        # Builds AsyncOpenAI client and a RunConfig (OpenAIProvider, model 'default',
+        # tracing disabled, ModelSettings from kwargs); creates an Agent with calculator
+        # tools and tool-forcing instructions; runs it on the last message content with
+        # an SQLiteSession('math'); returns reward of final_output vs data['answer'].
         http_client = extra_kwargs.get("http_client", None)
         base_url = extra_kwargs.get("base_url", None) or os.getenv("OPENAI_BASE_URL")
         api_key = extra_kwargs.get("api_key", None) or os.getenv("OPENAI_API_KEY")

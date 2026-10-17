@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Example LangChain math agents for AReaL's proxy-based agent training: a single-turn
+# ChatOpenAI agent and a tool-calling agent (create_agent with calculator tools), both
+# scored with math_verify.
 # SPDX-License-Identifier: Apache-2.0
 
 """LangChain-based math agent implementation for AReaL training.
@@ -18,6 +22,9 @@ from areal.api import AsyncRewardWrapper
 
 
 def math_reward_fn(completions: str, answer: str) -> float:
+    # [FUNCTION DOC]
+    # HELPER: Returns 1.0 if math_verify judges the parsed completion equivalent to the
+    # parsed gold answer, else 0.0.
     """Calculate reward based on math answer correctness."""
     ans = parse(completions)
     gold = parse(answer)
@@ -27,24 +34,32 @@ def math_reward_fn(completions: str, answer: str) -> float:
 # Tool definitions using LangChain's @tool decorator
 @tool
 def add(a: float, b: float) -> float:
+    # [FUNCTION DOC]
+    # LangChain tool: returns a + b.
     """Add two numbers together."""
     return a + b
 
 
 @tool
 def subtract(a: float, b: float) -> float:
+    # [FUNCTION DOC]
+    # LangChain tool: returns a - b.
     """Subtract the second number from the first."""
     return a - b
 
 
 @tool
 def multiply(a: float, b: float) -> float:
+    # [FUNCTION DOC]
+    # LangChain tool: returns a * b.
     """Multiply two numbers together."""
     return a * b
 
 
 @tool
 def divide(a: float, b: float) -> float:
+    # [FUNCTION DOC]
+    # LangChain tool: returns a / b; raises ValueError when b is 0.
     """Divide the first number by the second."""
     if b == 0:
         raise ValueError("Division by zero is not allowed.")
@@ -53,12 +68,16 @@ def divide(a: float, b: float) -> float:
 
 @tool
 def power(base: float, exponent: float) -> float:
+    # [FUNCTION DOC]
+    # LangChain tool: returns base ** exponent.
     """Raise base to the power of exponent."""
     return base**exponent
 
 
 @tool
 def sqrt(n: float) -> float:
+    # [FUNCTION DOC]
+    # LangChain tool: returns sqrt(n); raises ValueError for negative n.
     """Calculate the square root of a number."""
     if n < 0:
         raise ValueError("Cannot compute square root of a negative number.")
@@ -69,6 +88,8 @@ CALCULATOR_TOOLS = [add, subtract, multiply, divide, power, sqrt]
 
 
 class MathAgent:
+    # [CLASS DOC]
+    # Single-turn agent; kwargs may carry temperature, top_p and max_completion_tokens.
     """Simple single-turn math agent using LangChain ChatOpenAI.
 
     This agent uses the AReaL proxy to generate responses and calculates
@@ -76,9 +97,17 @@ class MathAgent:
     """
 
     def __init__(self, **kwargs):
+        # [FUNCTION DOC]
+        # Stores a copy of kwargs.
         self.kwargs = kwargs.copy()
 
     async def run(self, data: dict, **extra_kwargs) -> float:
+        # [FUNCTION DOC]
+        # Builds ChatOpenAI (model 'default') with base_url/api_key from extra_kwargs or
+        # OPENAI_* env, temperature/top_p (default 1.0), max_tokens from
+        # max_completion_tokens (default 1024) and the proxy's async http client;
+        # invokes on data['messages'] and returns the async-wrapped math reward of the
+        # response content vs data['answer'].
         """Run the agent on a single problem.
 
         Args:
@@ -113,6 +142,8 @@ class MathAgent:
 
 
 class MathToolAgent:
+    # [CLASS DOC]
+    # Tool-calling agent built with LangChain create_agent and the calculator tools.
     """Math agent with calculator tools using LangChain's create_agent.
 
     This agent uses LangChain's official agent API with calculator tools
@@ -120,9 +151,16 @@ class MathToolAgent:
     """
 
     def __init__(self, **kwargs):
+        # [FUNCTION DOC]
+        # Stores a copy of kwargs.
         self.kwargs = kwargs.copy()
 
     async def run(self, data: dict, **extra_kwargs) -> float:
+        # [FUNCTION DOC]
+        # Builds the same ChatOpenAI client, creates an agent with a system prompt
+        # mandating calculator tool use, runs it on only the last message content as a
+        # user message, takes the final message content (or its string form) and returns
+        # the math reward vs data['answer'].
         """Run the agent with tool-calling capabilities.
 
         Args:

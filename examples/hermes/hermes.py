@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# HermesAgent: AgentRunnable for AReaL's Agent Service that runs one in-process Hermes
+# AIAgent (from the hermes-agent package, module run_agent) per session. Each turn
+# replays the DataProxy-supplied history, routes LLM calls to a per-session upstream
+# (AReaL inference metadata or HERMES_UPSTREAM_* env), and serves both the structured
+# channel (AgentResponse) and an OpenAI chat-completions bridge (JSON or SSE
+# StreamResponse). Configured via HERMES_* environment variables.
 # SPDX-License-Identifier: Apache-2.0
 
 """Hermes Agent for AReaL Agent Service (in-process per-session ``AIAgent``).
@@ -62,12 +69,18 @@ logger = logging.getLogger("HermesAgent")
 
 
 def _split_csv(value: str) -> list[str] | None:
+    # [FUNCTION DOC]
+    # HELPER: Splits a comma-separated string into stripped non-empty items; returns
+    # None if none.
     items = [item.strip() for item in value.split(",") if item.strip()]
     return items or None
 
 
 @dataclass
 class _Upstream:
+    # [CLASS DOC]
+    # Upstream LLM endpoint for an AIAgent: base_url, api_key, model. Equality is used
+    # to detect upstream changes.
     """Upstream LLM that a Hermes ``AIAgent`` routes its calls to."""
 
     base_url: str
@@ -76,6 +89,10 @@ class _Upstream:
 
     @classmethod
     def from_inference(cls, meta: dict[str, Any]) -> _Upstream | None:
+        # [FUNCTION DOC]
+        # Builds an upstream from areal_inference metadata (base_url, api_key, model
+        # default 'default'); returns None if base_url or api_key is missing. Trailing
+        # slash removed from base_url.
         """Build an upstream from a turn's ``metadata['areal_inference']``.
 
         The DataProxy injects this when a turn opts into AReaL's inference
@@ -91,6 +108,9 @@ class _Upstream:
 
     @classmethod
     def from_env(cls) -> _Upstream | None:
+        # [FUNCTION DOC]
+        # Builds an upstream from HERMES_UPSTREAM_BASE_URL/API_KEY/MODEL env vars (model
+        # default 'default'); None if URL or key is missing.
         base_url = os.environ.get("HERMES_UPSTREAM_BASE_URL", "")
         api_key = os.environ.get("HERMES_UPSTREAM_API_KEY", "")
         if not base_url or not api_key:
@@ -101,6 +121,9 @@ class _Upstream:
 
 @dataclass
 class _SessionState:
+    # [CLASS DOC]
+    # HELPER: Per-session record: session key, the AIAgent, its upstream, and free-form
+    # metadata.
     session_key: str
     agent: Any  # Hermes ``AIAgent`` instance.
     upstream: _Upstream | None = None
@@ -108,9 +131,16 @@ class _SessionState:
 
 
 class HermesAgent:
+    # [CLASS DOC]
+    # Runnable holding per-session states, per-session asyncio locks and a guard lock
+    # for the lock table, plus config read from env.
     """AgentRunnable that runs one in-process Hermes ``AIAgent`` per session."""
 
     def __init__(self, **_: Any) -> None:
+        # [FUNCTION DOC]
+        # Reads HERMES_MAX_TURNS (default 10), enabled/disabled toolsets CSV and env
+        # upstream; initializes session/lock maps and logs. Constructor kwargs are
+        # ignored.
         self._max_turns = int(os.environ.get("HERMES_MAX_TURNS", "10"))
         self._enabled_toolsets = _split_csv(
             os.environ.get("HERMES_ENABLED_TOOLSETS", "")
@@ -135,6 +165,11 @@ class HermesAgent:
     # ------------------------------------------------------------------
 
     def _build_agent(self, upstream: _Upstream) -> Any:
+        # [FUNCTION DOC]
+        # HELPER: Lazily imports run_agent.AIAgent and constructs a headless, stateless
+        # agent bound to the upstream (max iterations, toolsets, no trajectory saving,
+        # quiet, no context files/memory/session DB). Raises ImportError if hermes-agent
+        # is missing.
         """Construct a headless Hermes ``AIAgent`` bound to ``upstream``.
 
         Imported lazily so this module is importable (and unit-testable)
@@ -159,6 +194,9 @@ class HermesAgent:
         )
 
     async def _session_lock(self, session_key: str) -> asyncio.Lock:
+        # [FUNCTION DOC]
+        # HELPER: Returns (creating if needed) the asyncio lock for a session under the
+        # guard lock.
         async with self._locks_guard:
             lock = self._locks.get(session_key)
             if lock is None:
@@ -167,6 +205,9 @@ class HermesAgent:
             return lock
 
     async def _teardown_state(self, state: _SessionState) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Best-effort call of the agent's close() (sync or async); errors logged
+        # at debug level.
         # ``AIAgent`` cleanup is best-effort: not every build exposes a
         # ``close``, and a failing teardown must not mask the caller's intent.
         close = getattr(state.agent, "close", None)
@@ -185,6 +226,10 @@ class HermesAgent:
         *,
         rebuild: bool = False,
     ) -> _SessionState:
+        # [FUNCTION DOC]
+        # HELPER: Under the session lock, returns the existing state unless rebuild is
+        # requested (then tears it down), otherwise builds a new AIAgent in a worker
+        # thread, stores and returns the new state. Logs builds.
         lock = await self._session_lock(session_key)
         async with lock:
             existing = self._sessions.get(session_key)
@@ -211,6 +256,10 @@ class HermesAgent:
     # ------------------------------------------------------------------
 
     async def close_session(self, session_key: str) -> None:
+        # [FUNCTION DOC]
+        # Removes and tears down the session's agent and drops its lock entry.
+        # KNOWN ISSUE: does not take the session lock, so it can tear down an agent
+        # while a turn is running on it.
         state = self._sessions.pop(session_key, None)
         if state is not None:
             await self._teardown_state(state)
@@ -220,6 +269,8 @@ class HermesAgent:
             self._locks.pop(session_key, None)
 
     async def close_all_sessions(self) -> None:
+        # [FUNCTION DOC]
+        # Closes every live session.
         for key in list(self._sessions.keys()):
             await self.close_session(key)
 
@@ -228,6 +279,11 @@ class HermesAgent:
     # ------------------------------------------------------------------
 
     async def _resolve_state(self, request: AgentRequest) -> _SessionState:
+        # [FUNCTION DOC]
+        # HELPER: Determines the upstream (inference metadata preferred, else env). If
+        # no session exists, requires an upstream (RuntimeError otherwise) and builds
+        # one; if a session exists and a different upstream is resolved, rebuilds it;
+        # otherwise reuses the session.
         """Pick (or build) the Hermes ``AIAgent`` backing this turn.
 
         Session-first: an existing per-session agent is reused as-is, so a turn
@@ -266,6 +322,10 @@ class HermesAgent:
         message: str,
         history: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Under the session lock, runs the blocking
+        # AIAgent.run_conversation(message, conversation_history or None, random task
+        # id) in a worker thread and returns its result dict.
         """Run one blocking Hermes turn off the event loop, serialized per session.
 
         ``run_conversation`` is synchronous and mutates agent state, so the
@@ -284,6 +344,10 @@ class HermesAgent:
 
     @staticmethod
     def _collect_tool_calls(result: dict[str, Any]) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # HELPER: Extracts {name, input(arguments string)} for every tool call in
+        # assistant messages of the result transcript (reported only in metadata, not
+        # emitted as events).
         """Surface tool calls from the result transcript for observability.
 
         Like the OpenClaw runtime, tool calls are reported in ``metadata`` only
@@ -312,6 +376,12 @@ class HermesAgent:
         *,
         emitter: EventEmitter,
     ) -> AgentResponse | StreamResponse:
+        # [FUNCTION DOC]
+        # Resolves the session state; if metadata contains 'chat_request', serves the
+        # chat-completions channel and returns a StreamResponse. Otherwise runs the
+        # conversation with request.message/history, emits the final text as one delta
+        # (if any) and returns AgentResponse(summary=final text, metadata with
+        # tool_calls, completed flag, api_calls count).
         """Single entry point for both the structured and chat-completions channels.
 
         The ``/v1/chat/completions`` bridge stashes the original request body
@@ -347,6 +417,10 @@ class HermesAgent:
 
     @staticmethod
     def _extract_chat(chat_body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+        # [FUNCTION DOC]
+        # HELPER: Finds the last user message in a chat body (joining text blocks for
+        # list content) and returns (its text, messages before it); if no user message,
+        # returns ('', all messages).
         """Split a chat-completions body into (last user message, prior history)."""
         messages = list(chat_body.get("messages") or [])
         message = ""
@@ -369,6 +443,11 @@ class HermesAgent:
         state: _SessionState,
         chat_body: dict[str, Any],
     ) -> StreamResponse:
+        # [FUNCTION DOC]
+        # HELPER: Runs one turn from a chat-completions body and returns the final text
+        # as an SSE stream if body['stream'] is truthy, else a single JSON
+        # chat.completion. Model name = body model, else upstream model, else 'hermes-
+        # agent'.
         """Chat-completions channel for the ``/v1/chat/completions`` bridge.
 
         Hermes has no OpenAI-compatible HTTP server to relay byte-for-byte, so
@@ -391,6 +470,10 @@ class HermesAgent:
 
     @staticmethod
     def _chat_json_response(content: str, model: str) -> StreamResponse:
+        # [FUNCTION DOC]
+        # HELPER: Builds a 200 StreamResponse whose body yields one JSON chat.completion
+        # object (random id, current time, single assistant choice with finish_reason
+        # 'stop').
         payload = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -407,6 +490,8 @@ class HermesAgent:
         body = json.dumps(payload).encode("utf-8")
 
         async def _iter() -> Any:
+            # [FUNCTION DOC]
+            # HELPER: Async generator yielding the encoded JSON body once.
             yield body
 
         return StreamResponse(
@@ -417,10 +502,17 @@ class HermesAgent:
 
     @staticmethod
     def _chat_sse_response(content: str, model: str) -> StreamResponse:
+        # [FUNCTION DOC]
+        # HELPER: Builds a 200 text/event-stream StreamResponse emitting OpenAI
+        # chat.completion.chunk events: role chunk, content chunk (if non-empty), stop
+        # chunk, then 'data: [DONE]'.
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
 
         def _chunk(delta: dict[str, Any], finish: str | None) -> bytes:
+            # [FUNCTION DOC]
+            # HELPER: Encodes one chunk event with the shared id/created/model, given
+            # delta and finish reason, as an SSE 'data:' line.
             payload = {
                 "id": cmpl_id,
                 "object": "chat.completion.chunk",
@@ -431,6 +523,8 @@ class HermesAgent:
             return f"data: {json.dumps(payload)}\n\n".encode()
 
         async def _iter() -> Any:
+            # [FUNCTION DOC]
+            # HELPER: Async generator yielding the SSE chunks in order.
             yield _chunk({"role": "assistant"}, None)
             if content:
                 yield _chunk({"content": content}, None)

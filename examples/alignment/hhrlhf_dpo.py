@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Entry script for DPO training (e.g. on HH-RLHF) with DPOTrainer.
 import sys
 
 from areal import DPOTrainer
@@ -7,6 +9,9 @@ from areal.utils.hf_utils import load_hf_tokenizer
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Loads DPOConfig from args, tokenizer, train dataset (configured split) and
+    # optional valid dataset, then runs DPOTrainer.train().
     config, _ = load_expr_config(args, DPOConfig)
 
     tokenizer = load_hf_tokenizer(config.tokenizer_path)

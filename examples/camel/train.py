@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Example GRPO training with a CAMEL ChatAgent: the agent talks to AReaL's inference
+# engine through ArealOpenAI (an OpenAI-compatible client that records interactions), is
+# rewarded via math-verify on GSM8K-style answers, and the recorded interactions are
+# exported as training data.
 from dataclasses import dataclass, field
 
 from camel.agents import ChatAgent
@@ -16,6 +21,8 @@ from areal.utils.hf_utils import load_hf_tokenizer
 
 @dataclass
 class AgentRLConfig(GRPOConfig):
+    # [CLASS DOC]
+    # GRPOConfig plus max_tokens_per_trajectory (default 32768).
     max_tokens_per_trajectory: int = field(
         default=32768,
         metadata={
@@ -25,6 +32,9 @@ class AgentRLConfig(GRPOConfig):
 
 
 def gsm8k_reward_fn(result, answer):
+    # [FUNCTION DOC]
+    # Verifies str(result) against str(answer) with the shared math-verify worker;
+    # returns its score or 0.0 on any exception.
     try:
         worker = get_math_verify_worker()
         return worker.verify(str(result), str(answer))
@@ -33,18 +43,30 @@ def gsm8k_reward_fn(result, answer):
 
 
 class CamelMathAgent:
+    # [CLASS DOC]
+    # CAMEL-based single-step math agent using an AReaL-backed OpenAI-compatible model.
     def __init__(
         self,
         tokenizer: PreTrainedTokenizerFast,
         max_tokens_per_turn: int = 1024,
         max_total_tokens: int = 32768,
     ):
+        # [FUNCTION DOC]
+        # Stores tokenizer and token limits and creates an async reward wrapper.
+        # KNOWN ISSUE: max_tokens_per_turn is stored but never used; max_total_tokens is
+        # passed as the per-request max_tokens.
         self.tokenizer = tokenizer
         self.max_tokens_per_turn = max_tokens_per_turn
         self.max_total_tokens = max_total_tokens
         self.async_reward_fn = AsyncRewardWrapper(gsm8k_reward_fn)
 
     async def run_agent(self, data, client: ArealOpenAI):
+        # [FUNCTION DOC]
+        # Builds a CAMEL ChatAgent over AReaLOpenAICompatibleModel(client) with
+        # max_tokens=max_total_tokens and step timeout from the engine's
+        # request_timeout, steps it on the last message content, computes the reward vs
+        # data['answer'], records it on the client as the last interaction's reward, and
+        # returns it.
         model_config_dict = {"max_tokens": self.max_total_tokens}
         rollout_engine_request_timeout = client.engine.config.request_timeout
 
@@ -66,12 +88,18 @@ class CamelMathAgent:
 
 
 class CamelRLVRWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow running CamelMathAgent once per episode and exporting the client's
+    # recorded interactions.
     def __init__(
         self,
         gconfig: GenerationHyperparameters,
         tokenizer: PreTrainedTokenizerFast | str,
         max_tokens: int = 32768,
     ):
+        # [FUNCTION DOC]
+        # Loads tokenizer if a path is given, derives gconfig with stop/pad ids and
+        # forces n_samples=1, stores max_tokens, and creates the agent.
         if isinstance(tokenizer, str):
             from areal.utils.hf_utils import load_hf_tokenizer
 
@@ -89,6 +117,11 @@ class CamelRLVRWorkflow(RolloutWorkflow):
         )
 
     async def arun_episode(self, engine, data):
+        # [FUNCTION DOC]
+        # Creates an ArealOpenAI client on the engine, runs the agent, records reward to
+        # stats_tracker, applies a 0.9 per-turn reward discount, and returns
+        # interactions exported in 'individual' style (dict of interaction id ->
+        # interaction with reward).
         client = ArealOpenAI(engine=engine, tokenizer=self.tokenizer)
 
         # Collect single trajectory
@@ -104,6 +137,9 @@ class CamelRLVRWorkflow(RolloutWorkflow):
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Loads AgentRLConfig, tokenizer and train dataset, then runs PPOTrainer.train with
+    # CamelRLVRWorkflow (by import path) and no eval workflow.
     config, _ = load_expr_config(args, AgentRLConfig)
 
     tokenizer = load_hf_tokenizer(config.tokenizer_path)

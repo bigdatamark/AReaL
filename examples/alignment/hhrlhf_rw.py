@@ -1,3 +1,5 @@
+# [MODULE DOC]
+# Entry script for reward-model training (e.g. on HH-RLHF) with RWTrainer.
 import sys
 
 from areal import RWTrainer
@@ -7,6 +9,9 @@ from areal.utils.hf_utils import load_hf_tokenizer
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Loads RWConfig from args, tokenizer, train ('train') and valid ('test') datasets,
+    # then runs RWTrainer.train().
     config, _ = load_expr_config(args, RWConfig)
 
     tokenizer = load_hf_tokenizer(config.tokenizer_path)

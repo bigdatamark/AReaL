@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Script that generates docs/en/cli_reference.md and docs/zh/cli_reference.md from the
+# dataclasses in areal.api.cli_args: discovers and categorizes config dataclasses,
+# renders a table of contents and one Markdown table per class (field, type, default,
+# help/choices), formats with mdformat. Side effects on import: inserts the project root
+# into sys.path and imports areal.api.cli_args.
 """
 Script to automatically generate CLI documentation from areal.api.cli_args dataclasses.
 This creates markdown documentation compatible with jupyter-book.
@@ -26,6 +32,8 @@ import areal.api.cli_args as cli_args_module  # noqa: E402
 
 
 def discover_dataclasses() -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Returns {name: class} for every public dataclass found in the cli_args module.
     """Discover all dataclasses in the cli_args module."""
     dataclasses = {}
     for name in dir(cli_args_module):
@@ -38,6 +46,11 @@ def discover_dataclasses() -> dict[str, Any]:
 def categorize_dataclasses(
     dataclasses: dict[str, Any],
 ) -> dict[str, list[tuple[str, Any]]]:
+    # [FUNCTION DOC]
+    # Buckets dataclasses into fixed categories (core experiment, training, inference,
+    # dataset, system/cluster, logging/monitoring) by hard-coded name lists; everything
+    # else goes to 'Others'. Returns only non-empty categories as {category: [(name,
+    # cls)]} preserving discovery order.
     """Categorize dataclasses by their purpose/type."""
     categories = {
         "Core Experiment Configurations": [],
@@ -113,6 +126,9 @@ def categorize_dataclasses(
 
 
 def get_anchor_name(class_name: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Converts CamelCase class name to kebab-case and removes '-config' and
+    # '-spec' substrings to form a Markdown anchor.
     """Convert a class name to an anchor name for hyperlinks."""
     # Convert CamelCase to kebab-case
     import re
@@ -127,6 +143,10 @@ def get_anchor_name(class_name: str) -> str:
 
 
 def get_class_description(cls: Any) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Returns the first line of the class docstring, unless it is the auto-
+    # generated dataclass signature docstring or empty, in which case 'Configuration
+    # class: <Name>'.
     """Get description for a dataclass from its docstring."""
     if cls.__doc__ and not cls.__doc__.startswith(cls.__name__ + "("):
         # Clean up the docstring
@@ -141,6 +161,11 @@ def get_class_description(cls: Any) -> str:
 
 
 def get_type_description(field_type, all_dataclasses: dict[str, Any]) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Renders a type annotation as readable Markdown: Optional/union types
+    # joined by an escaped pipe, int/float/str/bool as words, lists as 'list of X',
+    # known dataclasses as links to their section anchor, other named types in
+    # backticks, else the stringified type without 'typing.'.
     """Convert a type annotation to a readable string."""
     # Handle union types (Type | None)
     origin = get_origin(field_type)
@@ -184,6 +209,11 @@ def get_type_description(field_type, all_dataclasses: dict[str, Any]) -> str:
 
 
 def format_default_value(field_obj) -> str:
+    # [FUNCTION DOC]
+    # HELPER: Formats a dataclass field default: '**Required**' for omegaconf MISSING or
+    # no default, backticked values (strings quoted), '[]'/'{}' for empty factory
+    # results, '*TypeName*' for other factory results, or '*default <factory>*' if the
+    # factory raises.
     """Format default values for display."""
 
     if field_obj.default is not DATACLASSES_MISSING:
@@ -222,6 +252,11 @@ def generate_config_section(
     description: str = "",
     anchor: str = "",
 ) -> str:
+    # [FUNCTION DOC]
+    # Renders a Markdown section for one dataclass: MyST anchor label, title (derived
+    # from class name if not given), description (first docstring line) plus remaining
+    # docstring lines, and a table row per field with type, default, help metadata and
+    # optional choices. Returns '' for non-dataclasses.
     """Generate documentation for a single configuration dataclass."""
     if not is_dataclass(config_class):
         return ""
@@ -285,6 +320,10 @@ def generate_config_section(
 
 
 def generate_cli_documentation(lang: str = "en"):
+    # [FUNCTION DOC]
+    # Builds the full document for lang ('en' or 'zh', unknown falls back to en header):
+    # header text, per-category table of contents with links, a separator, and every
+    # class section. Returns the Markdown string.
     """Generate the complete CLI documentation automatically."""
     # Discover all dataclasses
     all_dataclasses = discover_dataclasses()
@@ -369,6 +408,11 @@ python3 train.py --config path/to/config.yaml actor.lr=1e-4 seed=42
 
 
 def main():
+    # [FUNCTION DOC]
+    # For en and zh, generates the documentation, formats it with mdformat (wrap 88,
+    # gfm/tables/frontmatter), writes docs/<lang>/cli_reference.md (creating
+    # directories) and prints status. Returns True on success; on any exception prints
+    # the error and traceback and returns False.
     """Generate the CLI documentation and save it to markdown files."""
     docs_dir = Path(__file__).parent
     output_paths = {

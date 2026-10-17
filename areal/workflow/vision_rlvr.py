@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# VisionRLVRWorkflow: RLVR variant for vision-language models. Uses a HF processor to
+# tokenize text+images, sends base64 images with the request, passes reward args by
+# keyword, and returns multi-modal inputs alongside the usual trajectory tensors.
 # SPDX-License-Identifier: Apache-2.0
 
 import uuid
@@ -24,6 +28,9 @@ logger = logging.getLogger("VisionRLVRWorkflow")
 
 
 class VisionRLVRWorkflow(RLVRWorkflow):
+    # [CLASS DOC]
+    # Extends RLVRWorkflow with an AutoProcessor; default prompt hooks of the parent are
+    # not used.
     def __init__(
         self,
         reward_fn: Callable[..., Any] | str,
@@ -32,6 +39,9 @@ class VisionRLVRWorkflow(RLVRWorkflow):
         processor: AutoProcessor | str,
         enable_thinking: bool,
     ):
+        # [FUNCTION DOC]
+        # Initializes the parent (reward, gconfig, tokenizer, thinking) and loads the
+        # processor from a path if a string is given.
         super().__init__(
             reward_fn,
             gconfig,
@@ -49,6 +59,12 @@ class VisionRLVRWorkflow(RLVRWorkflow):
         prompt_str: str,
         task_data: dict[str, Any],
     ) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Traced 'reward' phase. Decodes output tokens and awaits the reward
+        # function with keyword args prompt, completions, prompt_ids, completion_ids
+        # plus task_data; returns the reward.
+        # KNOWN ISSUE: the docstring says it logs the metric to the stats tracker, but
+        # logging happens in _collect_samples.
         """Decode completion and compute reward.
 
         Traces reward phase execution for SessionTracer. Decodes output tokens
@@ -80,6 +96,9 @@ class VisionRLVRWorkflow(RLVRWorkflow):
         prompt_str: str,
         task_data: dict[str, Any],
     ) -> tuple[ModelResponse, float]:
+        # [FUNCTION DOC]
+        # HELPER: Same as parent: generate in a 'generate' phase, compute reward, record
+        # it to stats_tracker, return (response, reward).
         """Generate one sample and compute its reward.
 
         Registers a new session for this sample, calls engine.agenerate,
@@ -103,6 +122,16 @@ class VisionRLVRWorkflow(RLVRWorkflow):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Resolves a string reward_fn lazily; runs the processor on data['images'] and
+        # data['messages'] (expected to be already-templated text) without padding;
+        # takes input_ids and mm_token_type_ids of the first row; base64-encodes images;
+        # builds a ModelRequest with image data, optional vLLM chat messages
+        # (data['messages_chat']), n_samples=1, tokenizer and processor; collects one
+        # sample. Returns batch-of-one tensors: input_ids and mm_token_type_ids (long;
+        # output tokens typed 0), loss_mask, logprobs, versions, turn_ids,
+        # attention_mask, rewards, plus multi_modal_input list holding pixel_values and
+        # optional image_grid_thw.
         # NOTE: load reward function dynamically if given as string
         if isinstance(self.reward_fn, str):
             self.reward_fn = import_from_string(self.reward_fn)

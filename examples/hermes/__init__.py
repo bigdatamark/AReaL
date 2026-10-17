@@ -1,3 +1,7 @@
+# [PACKAGE DOC]
+# Hermes example package: hosts an in-process, per-session AgentRunnable
+# (examples.hermes.hermes.HermesAgent) for AReaL's Agent Service, creating one Hermes
+# AIAgent per RL session inside the worker process.
 # SPDX-License-Identifier: Apache-2.0
 
 """Hermes example: an in-process per-session :class:`AgentRunnable`.

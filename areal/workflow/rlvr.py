@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# RLVRWorkflow: single-turn reinforcement learning with verifiable rewards. Tokenizes a
+# prompt via chat template, generates one sample from the inference engine, scores it
+# with a (possibly lazily imported) reward function, and returns a batch-of-one
+# trajectory tensor dict. Includes perf-tracer session instrumentation.
 # SPDX-License-Identifier: Apache-2.0
 
 import uuid
@@ -33,6 +38,9 @@ def default_get_input_ids_fn(
     tokenizer: PreTrainedTokenizerFast,
     enable_thinking: bool,
 ) -> list[int]:
+    # [FUNCTION DOC]
+    # HELPER: Default prompt tokenizer: applies the tokenizer chat template to data with
+    # generation prompt and the enable_thinking flag; returns token ids.
     return apply_chat_template(
         tokenizer,
         data,
@@ -43,10 +51,16 @@ def default_get_input_ids_fn(
 
 
 def default_data_extract_prompt_fn(data: dict[str, Any]) -> Any:
+    # [FUNCTION DOC]
+    # HELPER: Default prompt extractor: returns data['messages'].
     return data["messages"]
 
 
 class RLVRWorkflow(RolloutWorkflow):
+    # [CLASS DOC]
+    # RolloutWorkflow generating one response per call to arun_episode. Configurable
+    # reward function, tokenizer, thinking mode and prompt extraction/tokenization hooks
+    # (callables or dotted import strings).
     """Single-turn reward learning workflow supporting optional thinking tokens."""
 
     def __init__(
@@ -60,6 +74,11 @@ class RLVRWorkflow(RolloutWorkflow):
         data_extract_prompt_fn: Callable[[dict[str, Any]], Any]
         | str = default_data_extract_prompt_fn,
     ):
+        # [FUNCTION DOC]
+        # Stores reward_fn (wrapped in AsyncRewardWrapper immediately unless it is an
+        # import string, which is resolved lazily in arun_episode); loads the tokenizer
+        # if given as a path; derives gconfig with tokenizer stop/pad ids; resolves
+        # get_input_ids_fn and data_extract_prompt_fn from import strings if needed.
         self.reward_fn = reward_fn
         self.tokenizer = tokenizer
         if isinstance(self.tokenizer, str):
@@ -87,6 +106,12 @@ class RLVRWorkflow(RolloutWorkflow):
         prompt_str: str,
         task_data: dict[str, Any],
     ) -> float:
+        # [FUNCTION DOC]
+        # HELPER: Traced as session phase 'reward'. Decodes output tokens and awaits the
+        # async reward with positional (prompt_str, completion_str, input_tokens,
+        # output_tokens) plus task_data as kwargs; returns the reward.
+        # KNOWN ISSUE: the docstring says it logs the metric to the stats tracker, but
+        # logging happens in _collect_samples.
         """Decode completion and compute reward.
 
         Traces reward phase execution for SessionTracer. Decodes output tokens
@@ -116,6 +141,10 @@ class RLVRWorkflow(RolloutWorkflow):
         prompt_str: str,
         task_data: dict[str, Any],
     ) -> tuple[ModelResponse, float]:
+        # [FUNCTION DOC]
+        # HELPER: Runs inside a new perf-tracer session. Awaits engine.agenerate(req) in
+        # a 'generate' phase, computes reward, records reward to stats_tracker under the
+        # current workflow scope, returns (response, reward).
         """Generate one sample and compute its reward.
 
         Registers a new session for this sample, calls engine.agenerate,
@@ -139,6 +168,13 @@ class RLVRWorkflow(RolloutWorkflow):
     async def arun_episode(
         self, engine: InferenceEngine, data: dict[str, Any]
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Resolves a string reward_fn on first use, builds input ids via the hooks,
+        # creates a ModelRequest (random rid, n_samples=1), decodes prompt, collects one
+        # sample, and returns tensors with batch dim 1: input_ids (prompt+output,
+        # int32), loss_mask (0 prompt, 1 output), logprobs (0 for prompt), versions (-1
+        # for prompt), turn_ids (-1 prompt, 0 output), attention_mask (all True), and
+        # scalar rewards.
         # NOTE: load reward function dynamically if given as string
         if isinstance(self.reward_fn, str):
             self.reward_fn = import_from_string(self.reward_fn)

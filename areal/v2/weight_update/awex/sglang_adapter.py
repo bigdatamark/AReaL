@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# AWEX inference-side adapter running inside an SGLang scheduler process. Describes the
+# SGLang model's local (TP/EP-sharded) parameters in HF naming (unfusing qkv/gate_up/MoE
+# expert tensors), receives weights from training ranks via NCCL P2P along an awex
+# TransferPlan (dense or DTE sparse delta), supports colocated updates via CUDA IPC
+# handles fetched from the gateway KV store, and maps memory release/resume to SGLang's
+# native occupation API.
 # SPDX-License-Identifier: Apache-2.0
 # pyright: reportMissingImports=false
 from __future__ import annotations
@@ -53,9 +60,18 @@ logger = logging.getLogger("AwexSGLangAdapter")
 
 
 class AwexSGLangAdapter(AwexInferenceAdapter):
+    # [CLASS DOC]
+    # Implements AwexInferenceAdapter for an in-process SGLang scheduler. Holds the
+    # plan, NCCL/Gloo groups, global transfer rank/world size, cached rank info and
+    # parameter views, released memory tags, colocate client/transport/plans and
+    # train<->infer rank mappings, and DTE config.
     """Awex inference adapter for in-process SGLang schedulers."""
 
     def __init__(self, scheduler: Any):
+        # [FUNCTION DOC]
+        # Stores the scheduler and initializes all state to empty/None; reads
+        # DTERuntimeConfig from environment; default colocate admin key 'areal-admin-
+        # key' and 120s timeout.
         self._scheduler = scheduler
         self._transfer_plan: TransferPlan | None = None
         self._weights_update_group = None
@@ -76,9 +92,17 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         self._dte_config = DTERuntimeConfig.from_env()
 
     def _get_model(self) -> torch.nn.Module:
+        # [FUNCTION DOC]
+        # HELPER: Returns the nn.Module from scheduler.tp_worker.model_runner.model.
         return self._scheduler.tp_worker.model_runner.model
 
     def _get_model_context(self) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: Builds the model-context dict consumed by awex sglang sharding
+        # helpers: scheduler, tp/pp rank and size, dp size, world_size and global_rank
+        # (from torch.distributed if initialized, else tp*pp and tp_rank), local_rank
+        # (scheduler attr, LOCAL_RANK env, or gpu_id), attention tp rank/size and
+        # attention dp rank (with fallbacks).
         server_args = self._scheduler.server_args
         tp_size = int(getattr(server_args, "tp_size", 1))
         pp_size = int(getattr(server_args, "pp_size", 1))
@@ -122,6 +146,9 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
 
     @property
     def parallelism_strategy(self) -> dict:
+        # [FUNCTION DOC]
+        # Returns dict with world_size, tp/pp/dp/ep sizes from server_args (falling back
+        # to model context; ep default 1) and num_engines=1.
         model_context = self._get_model_context()
         server_args = self._scheduler.server_args
         tp_size = int(getattr(server_args, "tp_size", model_context["tp_size"]))
@@ -141,6 +168,15 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     def _unfuse_params(
         self, name: str, tensor: torch.Tensor
     ) -> list[tuple[str, torch.Tensor]]:
+        # [FUNCTION DOC]
+        # HELPER: Splits one SGLang fused parameter into HF-named views: qkv_proj ->
+        # q/k/v by head-count ratio; gate_up_proj -> gate/up halves; shared_experts
+        # gate_up_weight -> gate_proj/up_proj weights, down_weight -> down_proj.weight;
+        # experts.w13_weight [E,2F,H] -> per-expert gate/up weights; experts.w2_weight
+        # -> per-expert down weights. Experts beyond the routed count (config
+        # num_experts or n_routed_experts) map to shared_experts (indexed if more than
+        # one). Other params returned unchanged. Returns list of (name, view) pairs
+        # (views share storage).
         """Split SGLang fused parameters into HuggingFace-style unfused pairs.
 
         SGLang fuses Q/K/V into ``qkv_proj`` and gate/up into ``gate_up_proj``
@@ -239,10 +275,17 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         return [(name, tensor)]
 
     def _build_rank_info(self) -> RankInfo:
+        # [FUNCTION DOC]
+        # HELPER: Returns awex RankInfo derived from the model context with
+        # engine_rank=0.
         model_context = self._get_model_context()
         return get_sglang_rank_info(model_context, engine_rank=0)
 
     def _build_sharding_strategy(self, rank_info: RankInfo):
+        # [FUNCTION DOC]
+        # HELPER: Determines model architecture name (config.architectures[0] or the
+        # module class name) and returns the awex SGLang sharding strategy for it,
+        # server_args and rank_info.
         model = self._get_model()
         model_name = None
         model_config = getattr(model, "config", None)
@@ -258,6 +301,14 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         return get_sglang_sharding_strategy(model_name, infer_engine_config, rank_info)
 
     def get_weight_metadata(self) -> list[ParameterMeta]:
+        # [FUNCTION DOC]
+        # Builds ParameterMeta list for all unfused params: for each, queries the
+        # sharding strategy (type, dim, num_shards), chooses the rank position by
+        # sharding type (tp, attn tp, ep, ep_tp, else 0), computes global offset =
+        # rank_pos*local_dim and global shape = local_dim*num_shards along the sharded
+        # dim. Caches rank_info on self. Returns metadata.
+        # KNOWN ISSUE: assumes evenly sized shards; uneven TP splits would produce wrong
+        # offsets/global shapes.
         rank_info = self._build_rank_info()
         strategy = self._build_sharding_strategy(rank_info)
         self._rank_info = rank_info
@@ -339,6 +390,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     def get_local_shard_parameters(
         self, required_names: list[str] | None = None
     ) -> dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Returns dict HF-name -> local (unfused view) tensor, optionally filtered;
+        # caches the result in self._parameters. Writes into these views update the live
+        # model weights.
         required = set(required_names) if required_names else None
         local_params: dict[str, torch.Tensor] = {}
 
@@ -351,11 +406,17 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         return local_params
 
     def save_parameters(self, save_path: str, names: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Saves local unfused params (optionally filtered) to save_path via torch.save
+        # of CPU clones.
         params = self.get_local_shard_parameters(names)
         cpu_params = {k: v.detach().cpu().clone() for k, v in params.items()}
         torch.save(cpu_params, save_path)
 
     def randomize_parameters(self) -> None:
+        # [FUNCTION DOC]
+        # Overwrites every model parameter in place with standard normal noise (test
+        # utility).
         for _, param in self._get_model().named_parameters():
             param.data.normal_()
 
@@ -371,6 +432,14 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         train_world_size: int,
         num_engines: int,
     ) -> None:
+        # [FUNCTION DOC]
+        # Validates DTE world sizes if enabled; checks infer_world_size/num_engines
+        # equals local tp*pp (RuntimeError otherwise); computes this rank's global
+        # transfer rank as transfer_rank (engine index) * per-engine world +
+        # pp_rank*tp_size + tp_rank; records it and world_size; fetches KV metadata,
+        # builds the local plan, disables TORCHELASTIC agent store env, and creates NCCL
+        # and Gloo groups 'awex_<pair>' / 'awex_<pair>_gloo' with role inference; syncs
+        # wire dtypes if DTE. Logs.
         if self._dte_config.enabled:
             validate_dte_world_size(world_size, infer_world_size, train_world_size)
 
@@ -438,6 +507,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
 
     def execute_weight_update(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # Receives a weight update. DTE enabled -> separation path. Otherwise checks
+        # initialization (RuntimeError), builds NCCL recv ops into local parameter
+        # views, runs them blocking, copies temporary contiguous buffers back into non-
+        # contiguous originals, synchronizes the device and Gloo-barriers (signals the
+        # sender it can proceed). version is unused here.
         if self._dte_config.enabled:
             self._execute_separation_weight_update(version)
             return
@@ -469,6 +544,11 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         dist.barrier(group=self._weights_update_group_gloo)
 
     def _execute_separation_weight_update(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Separation-mode receive. Validates init state, joins the MIN all-
+        # reduce on the Gloo group (contributing 1, so the trainer's decision wins),
+        # then receives either sparse delta updates or dense NCCL recv ops (with
+        # contiguous copy-back), synchronizes and Gloo-barriers.
         """Receive either a sparse AdamW update or its dense fallback."""
         if self._transfer_plan is None:
             raise RuntimeError("Transfer plan is not initialized")
@@ -509,6 +589,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         recv_params: dict[str, torch.Tensor],
         version: int,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: Receives sparse delta payloads via DTE two_round_delta_exchange for
+        # each wire dtype (receive-only plans filtered per dtype, identity rank mapping,
+        # lazily created stream transport, current CUDA device), applying them into
+        # recv_params in place. Raises RuntimeError if plan/group/rank/wire dtypes are
+        # not initialized. Logs op count.
         from dte.core.colocate_protocol import (
             _filter_plan_by_dtype,
             _ops_by_recv_dtype,
@@ -571,6 +657,9 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
 
     def batch_isend_irecv(self, **kwargs) -> None:
+        # [FUNCTION DOC]
+        # Runs setup_batch_isend_irecv on the NCCL group with the Gloo group as barrier;
+        # RuntimeError if the Gloo group is missing.
         if self._weights_update_group_gloo is None:
             raise RuntimeError("Gloo weight update group is not initialized")
         setup_kwargs = {
@@ -585,6 +674,9 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
 
     def teardown_weight_update_group(self) -> None:
+        # [FUNCTION DOC]
+        # Destroys NCCL/Gloo groups if dist is initialized and resets all
+        # plan/rank/cache/delta/colocate state, closing the HTTP client.
         if self._weights_update_group is not None and dist.is_initialized():
             dist.destroy_process_group(self._weights_update_group)
         if self._weights_update_group_gloo is not None and dist.is_initialized():
@@ -619,6 +711,16 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         admin_api_key: str = "areal-admin-key",
         timeout_s: float = 120.0,
     ) -> None:
+        # [FUNCTION DOC]
+        # Sets up colocated updates. Requires infer_world_size == train_world_size
+        # (ValueError). Stores settings, creates HTTP client, fetches KV metadata,
+        # builds train->infer rank mapping (train rank = infer_world_size + i), and
+        # builds two local plans: a send plan as seen by the paired training rank and a
+        # recv plan for this rank. Creates a local NCCL group 'awex_colocate_<pair>' on
+        # 127.0.0.1 over infer ranks and an NCCL stream batch transport. Logs.
+        # KNOWN ISSUE: this rank's global transfer rank is set to the raw transfer_rank
+        # (overwriting the value set by init_weight_update_group); train_world_size and
+        # num_engines only feed the plan builder.
         if infer_world_size != train_world_size:
             raise ValueError(
                 f"Colocate mode requires infer_world_size == train_world_size. "
@@ -686,6 +788,13 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         )
 
     def execute_colocate_weight_update(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # Performs one colocated update: polls the KV store (100ms, up to timeout) for
+        # 'colocate_weights_rank<paired train rank>_<version>' (TimeoutError if absent),
+        # deserializes CUDA IPC handles into tensors mapped by name, gets local param
+        # views, and lets the colocate transport redistribute training tensors into
+        # local params. Then PUTs 'colocate_done_rank<r>_<version>'=True with admin
+        # auth, frees buffers (gc, empty_cache) and logs. Asserts init was called.
         kv_store_url = self._colocate_kv_store_url
         pair_name = self._colocate_pair_name
         transfer_rank = self._transfer_rank
@@ -772,6 +881,12 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
     _SGLANG_MEMORY_TAGS = {"kv_cache"}
 
     def release_memory(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Releases SGLang memory for tags supported natively (only 'kv_cache') via
+        # scheduler.release_memory_occupation, recording them as released; warns about
+        # unsupported tags. Logs.
+        # KNOWN ISSUE: with tags=None nothing is released (no default-all behavior
+        # unlike the Megatron adapter).
         from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
 
         native_tags = (
@@ -794,6 +909,10 @@ class AwexSGLangAdapter(AwexInferenceAdapter):
         logger.info("release_memory completed with tags=%s", tags)
 
     def resume_memory(self, tags: list[str] | None = None) -> None:
+        # [FUNCTION DOC]
+        # Resumes previously released native tags (only 'kv_cache') via
+        # scheduler.resume_memory_occupation and removes them from the released set;
+        # warns about unsupported tags; tags=None is a no-op. Logs.
         from sglang.srt.managers.io_struct import ResumeMemoryOccupationReqInput
 
         native_tags = (

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Helpers to create extra (non-default) torch.distributed process groups spanning
+# training and inference processes for weight transfer, plus a P2P warm-up/verification
+# routine.
 # SPDX-License-Identifier: Apache-2.0
 """NCCL process group initialization utilities for weight updates."""
 
@@ -25,6 +29,17 @@ def init_custom_process_group(
     group_name=None,
     pg_options=None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: Creates an independent process group (adapted from PyTorch/OpenRLHF)
+    # outside the default world. Forbids both store and init_method; sets
+    # TORCHELASTIC_USE_AGENT_STORE=False env; without a store, rendezvouses via
+    # init_method (default env://) and wraps the store in a PrefixStore named
+    # group_name; uses default timeout if None; creates the group via the private
+    # _new_process_group_helper passing pg_options under the version-appropriate
+    # keyword, and registers an identity rank mapping in _world. Returns the
+    # ProcessGroup.
+    # KNOWN ISSUE: the torch version check compares strings ('2.10' < '2.6'
+    # lexicographically), selecting the wrong keyword for torch >= 2.10.
     from torch.distributed.distributed_c10d import (
         Backend,
         PrefixStore,
@@ -93,6 +108,12 @@ def init_weights_update_group(
     backend="nccl",
     role="",
 ):
+    # [FUNCTION DOC]
+    # Creates a weight-update group via tcp://master_address:master_port with given
+    # rank/world_size/group_name/backend ('nccl' default; 'hccl' builds NPU options with
+    # buffer size from AWEX_P2P_HCCL_BUFFER_SIZE, default 200MB; 'gloo' allowed).
+    # Requires the default group to be initialized and a non-empty name (assert). Logs
+    # device/env details. Returns the group; wraps any failure in RuntimeError.
     """Initialize the Torch process group for model parameter updates."""
     assert torch.distributed.is_initialized(), (
         "Default torch process group must be initialized"
@@ -143,6 +164,14 @@ def setup_batch_isend_irecv(
     dtype=torch.float32,
     barrier_group=None,
 ):
+    # [FUNCTION DOC]
+    # Warm-up and sanity test for a new group: each rank fills a small tensor
+    # (tensor_size elements of dtype) with its rank. Even world: first half receives
+    # from rank+half, second half sends to rank-half; odd world: ring (recv from
+    # previous, send to next); world<=1: no P2P. Executes via batch_isend_irecv and
+    # waits, synchronizes the device, barriers on barrier_group (or process_group with
+    # device ids), then asserts received values equal the expected peer rank. Logs
+    # progress.
     """
     Perform a simple communication using batch_isend_irecv to avoid the hang for later sub-ranks.
 
