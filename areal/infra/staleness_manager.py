@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Staleness/concurrency capacity accounting for asynchronous rollout generation. Defines
+# a version-provider protocol and StalenessManager, a lock-protected counter set
+# (enqueued/running/accepted/rejected in an areal.api RolloutStat) used by the workflow
+# executor to decide how many new rollouts may be launched.
 # SPDX-License-Identifier: Apache-2.0
 
 """Staleness-aware capacity manager for rollout generation.
@@ -13,11 +18,21 @@ from areal.api import RolloutStat
 
 
 class VersionProvider(Protocol):
+    # [CLASS DOC]
+    # Structural Protocol for any object exposing the current model weight version (e.g.
+    # an InferenceEngine).
     def get_version(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the current integer model version. Protocol stub; raises
+        # NotImplementedError if called on the protocol itself.
         raise NotImplementedError()
 
 
 class StalenessManager:
+    # [CLASS DOC]
+    # Tracks rollout lifecycle counters under a threading.Lock and computes available
+    # capacity as the minimum of a concurrency limit and an off-policy staleness limit.
+    # Lifecycle: enqueued -> submitted(running) -> accepted or rejected.
     """Manages rollout capacity based on staleness and concurrency constraints.
 
     The manager ensures that:
@@ -44,6 +59,10 @@ class StalenessManager:
         consumer_batch_size: int,
         max_staleness: int,
     ):
+        # [FUNCTION DOC]
+        # Stores version_provider, max_concurrent_rollouts, consumer_batch_size and
+        # max_staleness; creates the lock and a fresh zeroed RolloutStat. No side
+        # effects.
         """Initialize the staleness manager.
 
         Parameters
@@ -67,6 +86,9 @@ class StalenessManager:
         self.rollout_stat = RolloutStat()
 
     def get_pending_limit(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the max number of enqueued (pending) rollouts: (max_staleness + 1)
+        # times consumer_batch_size. Not lock-protected; pure computation.
         """Get the maximum number of pending rollouts allowed.
 
         Returns
@@ -77,6 +99,12 @@ class StalenessManager:
         return (self.max_staleness + 1) * self.consumer_batch_size
 
     def get_capacity(self) -> int:
+        # [FUNCTION DOC]
+        # Under the lock, reads the current version from the provider and returns
+        # min(concurrency_capacity, staleness_capacity) where concurrency_capacity is
+        # max(1, max_concurrent_rollouts) minus running, and staleness_capacity is
+        # (max_staleness + version + 1) * max(1, consumer_batch_size) minus (accepted +
+        # running). Result may be negative when over capacity.
         """Calculate available capacity for new rollouts.
 
         Considers both concurrency limits and staleness constraints.
@@ -113,6 +141,11 @@ class StalenessManager:
             return capacity
 
     def on_version_recovered(self, version: int) -> None:
+        # [FUNCTION DOC]
+        # After checkpoint recovery, sets accepted to version * max(1,
+        # consumer_batch_size) under the lock so the staleness formula yields
+        # (max_staleness+1)*batch minus running instead of a burst of extra capacity.
+        # Mutates rollout_stat.accepted.
         """Adjust accepted count after checkpoint recovery.
 
         When a checkpoint is recovered, the version jumps from 0 to the
@@ -131,6 +164,8 @@ class StalenessManager:
             self.rollout_stat.accepted = version * consumer_bs
 
     def on_rollout_enqueued(self) -> None:
+        # [FUNCTION DOC]
+        # Thread-safely increments the enqueued counter.
         """Callback when a rollout is enqueued as a pending input task.
 
         Thread-safe method to increment the enqueued counters.
@@ -139,6 +174,9 @@ class StalenessManager:
             self.rollout_stat.enqueued += 1
 
     def on_rollout_submitted(self) -> None:
+        # [FUNCTION DOC]
+        # Thread-safely moves one rollout from enqueued to running (enqueued -1, running
+        # +1).
         """Callback when a rollout is submitted for execution.
 
         Thread-safe method to decrement enqueued counter and increment running counters.
@@ -148,6 +186,8 @@ class StalenessManager:
             self.rollout_stat.running += 1
 
     def on_rollout_accepted(self) -> None:
+        # [FUNCTION DOC]
+        # Thread-safely moves one rollout from running to accepted.
         """Callback when a rollout completes successfully and is accepted.
 
         Thread-safe method to decrement running counter and increment accepted counter.
@@ -157,6 +197,8 @@ class StalenessManager:
             self.rollout_stat.accepted += 1
 
     def on_rollout_rejected(self) -> None:
+        # [FUNCTION DOC]
+        # Thread-safely moves one rollout from running to rejected.
         """Callback when a rollout completes but is rejected.
 
         Thread-safe method to decrement running counter and increment rejected counter.
@@ -166,6 +208,10 @@ class StalenessManager:
             self.rollout_stat.rejected += 1
 
     def get_stats(self) -> RolloutStat:
+        # [FUNCTION DOC]
+        # Returns a new RolloutStat copy of the four counters taken under the lock.
+        # KNOWN ISSUE: docstring lists only enqueued/accepted/running but rejected is
+        # also copied.
         """Get a snapshot of current rollout statistics.
 
         Returns

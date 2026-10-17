@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Workflow execution context and shared HTTP clients. A ContextVar holds an immutable
+# WorkflowContext (eval flag, task id, sample index in group) readable by workflows,
+# with set/get helpers and a stats scope helper. HttpClientManager lazily creates one
+# aiohttp session and one httpx client per thread, bound to the event loop they were
+# created on, and registers loop-close cleanup to close them. Logger "WorkflowContext".
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -23,6 +29,10 @@ logger = logging.getLogger("WorkflowContext")
 
 @dataclass(frozen=True)
 class WorkflowContext:
+    # [CLASS DOC]
+    # Frozen dataclass: is_eval (default False), task_id (executor-assigned, or None),
+    # sample_idx (index within a grouped rollout, or None). Default instance is the
+    # ContextVar default.
     """Execution context available to workflows via contextvars.
 
     Attributes
@@ -48,16 +58,23 @@ _current_context: ContextVar[WorkflowContext] = ContextVar(
 
 
 def set(ctx: WorkflowContext) -> None:
+    # [FUNCTION DOC]
+    # Sets the ContextVar to ctx for the current context (task/thread). Shadows the
+    # builtin name set within this module.
     """Set the current workflow context."""
     _current_context.set(ctx)
 
 
 def get() -> WorkflowContext:
+    # [FUNCTION DOC]
+    # Returns the current WorkflowContext (a default instance if never set).
     """Get the current workflow context."""
     return _current_context.get()
 
 
 def stat_scope() -> str:
+    # [FUNCTION DOC]
+    # Returns "eval-rollout" if the current context is eval mode, else "rollout".
     """Get the appropriate stats_tracker scope based on current context.
 
     Returns
@@ -69,6 +86,10 @@ def stat_scope() -> str:
 
 
 class HttpClientManager:
+    # [CLASS DOC]
+    # Per-thread holder of a lazily created aiohttp ClientSession and httpx AsyncClient
+    # plus the event loop they belong to. If accessed from a different running loop, the
+    # old clients are closed and recreated.
     """Per-thread manager for shared HTTP clients.
 
     This class manages shared aiohttp and httpx clients for workflow execution,
@@ -77,12 +98,19 @@ class HttpClientManager:
     """
 
     def __init__(self) -> None:
+        # [FUNCTION DOC]
+        # Initializes session, client and owning event loop to None.
         """Initialize the HttpClientManager instance."""
         self._aiohttp_session: aiohttp.ClientSession | None = None
         self._httpx_client: httpx.AsyncClient | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
 
     async def _check_event_loop_change(self) -> None:
+        # [FUNCTION DOC]
+        # HELPER: if a loop is running and differs from the recorded one, logs a
+        # warning, attempts to close the old aiohttp session and httpx client (errors
+        # logged as warnings), then resets both clients and the recorded loop to None.
+        # No-op when no loop is running.
         """Check if event loop changed and close stale clients if so."""
         try:
             current_loop = asyncio.get_running_loop()
@@ -118,6 +146,12 @@ class HttpClientManager:
             self._event_loop = None
 
     async def get_aiohttp_session(self) -> aiohttp.ClientSession:
+        # [FUNCTION DOC]
+        # Checks for loop change, then lazily creates an aiohttp session with
+        # DEFAULT_REQUEST_TIMEOUT for total/connect/sock_connect, 10MB read buffer and
+        # the default no-keepalive connector; records the running loop and registers a
+        # cleanup closing that specific session when the loop closes. Returns the
+        # session.
         """Get the shared aiohttp.ClientSession for the current workflow execution.
 
         The session is lazily created on first access and reused for all subsequent
@@ -153,6 +187,9 @@ class HttpClientManager:
             session_to_close = self._aiohttp_session
 
             async def cleanup_aiohttp_session():
+                # [FUNCTION DOC]
+                # HELPER: loop-close callback that closes the captured session if not
+                # closed.
                 if session_to_close is not None and not session_to_close.closed:
                     await session_to_close.close()
 
@@ -161,6 +198,10 @@ class HttpClientManager:
         return self._aiohttp_session
 
     async def get_httpx_client(self) -> httpx.AsyncClient:
+        # [FUNCTION DOC]
+        # Checks for loop change, then lazily creates an httpx client via
+        # create_httpx_client with DEFAULT_REQUEST_TIMEOUT, records the running loop and
+        # registers a loop-close cleanup that acloses that client. Returns the client.
         """Get the shared httpx.AsyncClient for the current workflow execution.
 
         The client is lazily created on first access and reused for all subsequent
@@ -187,6 +228,9 @@ class HttpClientManager:
             client_to_close = self._httpx_client
 
             async def cleanup_httpx_client():
+                # [FUNCTION DOC]
+                # HELPER: loop-close callback that acloses the captured client if not
+                # closed.
                 if client_to_close is not None and not client_to_close.is_closed:
                     await client_to_close.aclose()
 
@@ -202,6 +246,11 @@ _managers_lock = threading.Lock()
 
 
 def _get_manager() -> HttpClientManager:
+    # [FUNCTION DOC]
+    # HELPER: returns (creating under a lock) the HttpClientManager keyed by the current
+    # thread ident in the module-global dict.
+    # KNOWN ISSUE: entries are never removed, so managers of dead threads persist and a
+    # reused thread ident inherits the old manager.
     """Get or create the HttpClientManager for the current thread.
 
     Returns
@@ -217,6 +266,8 @@ def _get_manager() -> HttpClientManager:
 
 
 async def get_aiohttp_session() -> aiohttp.ClientSession:
+    # [FUNCTION DOC]
+    # Module-level shortcut returning the current thread manager's aiohttp session.
     """Get the shared aiohttp.ClientSession for the current workflow execution.
 
     The session is lazily created on first access and reused for all subsequent
@@ -232,6 +283,8 @@ async def get_aiohttp_session() -> aiohttp.ClientSession:
 
 
 async def get_httpx_client() -> httpx.AsyncClient:
+    # [FUNCTION DOC]
+    # Module-level shortcut returning the current thread manager's httpx client.
     """Get the shared httpx.AsyncClient for the current workflow execution.
 
     The client is lazily created on first access and reused for all subsequent

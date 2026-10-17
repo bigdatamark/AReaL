@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Fast loading of HuggingFace safetensors checkpoints into Megatron-Core models via an
+# mbridge Bridge. Maps each local Megatron parameter to its HF tensor names, groups
+# parameters into bins that touch disjoint file sets (union-find), and loads bins in
+# parallel threads. Per parameter it reads lazy safetensors slices, handles FP8
+# checkpoints (dequantize, or direct FP8-to-TE-FP8 copy), converts layouts (QKV merge
+# /interleave, gate+up merge, stacked MoE experts, vision QKV) and slices for tensor
+# /expert parallelism before copying into the parameter. Also handles tied embeddings
+# and critic value heads. Logger "HFLoader".
 # SPDX-License-Identifier: Apache-2.0
 
 import json
@@ -28,6 +37,9 @@ logger = logging.getLogger("HFLoader")
 
 
 def _get_tp_slice(shape, dim, tp_rank, tp_size) -> tuple:
+    # [FUNCTION DOC]
+    # HELPER: returns a tuple of slices selecting the tp_rank-th equal chunk (shape[dim]
+    # // tp_size) along dim, with full slices on earlier dims.
     size_per_tp = shape[dim] // tp_size
     res = [slice(None) for _ in range(dim)]
     res.append(slice(tp_rank * size_per_tp, (tp_rank + 1) * size_per_tp))
@@ -35,6 +47,8 @@ def _get_tp_slice(shape, dim, tp_rank, tp_size) -> tuple:
 
 
 def _get_shape(obj) -> list:
+    # [FUNCTION DOC]
+    # HELPER: returns the shape as a list for a tensor or a safetensors PySafeSlice.
     """Get shape from either a tensor or PySafeSlice object."""
     if isinstance(obj, torch.Tensor):
         return list(obj.shape)
@@ -50,6 +64,13 @@ def _merge_qkv_weights(
     tp_rank: int,
     tp_size: int,
 ) -> torch.Tensor | FP8BlockwiseTensorHelper:
+    # [FUNCTION DOC]
+    # HELPER: builds the Megatron fused QKV weight/bias from separate Q, K, V sources
+    # for GQA. Uses the language config's heads, KV heads, hidden size and head_dim.
+    # Takes this TP rank's slice of KV groups from Q (group_dim = head_dim * heads /
+    # kv_heads rows per group) and of K and V, reshapes each to [groups, rows, -1],
+    # concatenates per group as [q-group, k, v] and flattens to [-1, hidden] (or 1D for
+    # bias names).
     """Merge Q, K, V weights into a single QKV weight tensor."""
     assert len(hf_weights_safe_slice) == 3
     text_cfg = lang_config(hf_config)
@@ -80,6 +101,11 @@ def _load_fused_qkv_weight(
     tp_rank: int,
     tp_size: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: converts a single HF fused QKV tensor laid out [Q_all, K_all, V_all] into
+    # Megatron per-head interleaved [H, 3, D] order (weight [rows, hidden] or 1D bias),
+    # infers head_dim from the row count, asserts no GQA (kv heads == heads), and keeps
+    # this TP rank's contiguous block of heads. Returns a contiguous tensor.
     """Load fused QKV weight/bias with format conversion and TP slicing.
 
     HF stores fused QKV in concatenated format:
@@ -145,6 +171,9 @@ def _merge_gate_up_weights(
     tp_rank: int,
     tp_size: int,
 ) -> torch.Tensor | FP8BlockwiseTensorHelper:
+    # [FUNCTION DOC]
+    # HELPER: TP-slices gate and up projections along dim 0 and concatenates them (gate
+    # first) into the SwiGLU fc1 weight.
     """Merge gate_proj and up_proj into a single fc1 weight tensor."""
     assert len(hf_weights_safe_slice) == 2, len(hf_weights_safe_slice)
     gate, up = hf_weights_safe_slice
@@ -161,6 +190,9 @@ def _slice_moe_expert_weight(
     tp_rank: int,
     tp_size: int,
 ) -> torch.Tensor | FP8BlockwiseTensorHelper:
+    # [FUNCTION DOC]
+    # HELPER: returns the TP slice along dim 1 of a single per-expert HF weight (used
+    # for expert fc2/down projections).
     """Slice MoE expert weight along the appropriate dimension."""
     assert len(hf_weights_safe_slice) == 1
     x = hf_weights_safe_slice[0]
@@ -171,6 +203,9 @@ def _slice_moe_expert_weight(
 
 
 def _parse_local_expert_idx(mcore_weights_name: str) -> int:
+    # [FUNCTION DOC]
+    # HELPER: returns the integer after the last ".weight" in a grouped-MoE Megatron
+    # param name (rank-local expert index).
     """Extract the per-rank-local expert index from an mcore expert param name.
 
     mcore weight names for grouped MoE end with ``weight{idx}`` where ``idx`` is
@@ -189,6 +224,11 @@ def _slice_moe_expert_fc1_stacked_gate_up(
     tp_rank: int,
     tp_size: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: for HF stacked gate_up_proj [E, hidden, 2*expert_dim] (Qwen3-VL-MoE
+    # style), selects global expert local_idx + (experts/ep_size) * ep_rank,
+    # materializes it, transposes to [2*expert_dim, hidden], splits into gate and up
+    # halves, TP-slices each on dim 0 and concatenates them.
     """Slice a per-expert ``linear_fc1.weight{idx}`` shard from a 3D stacked
     HF ``gate_up_proj`` of shape ``[E, hidden, 2*expert_dim]``.
 
@@ -223,6 +263,9 @@ def _slice_moe_expert_fc2_stacked_down(
     tp_rank: int,
     tp_size: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: for HF stacked down_proj [E, expert_dim, hidden], selects the global
+    # expert, transposes to [hidden, expert_dim] and TP-slices along dim 1.
     """Slice a per-expert ``linear_fc2.weight{idx}`` shard from a 3D stacked
     HF ``down_proj`` of shape ``[E, expert_dim, hidden]``.
 
@@ -250,6 +293,10 @@ def _slice_generic_weight(
     tp_rank: int,
     tp_size: int,
 ) -> torch.Tensor | FP8BlockwiseTensorHelper:
+    # [FUNCTION DOC]
+    # HELPER: returns the whole (materialized) tensor if its shape equals the Megatron
+    # param shape; otherwise asserts equal rank, finds the first differing dim and
+    # returns this TP rank's chunk along it.
     """Slice generic weight tensor based on shape mismatch."""
     assert len(hf_weights_safe_slice) == 1
     x = hf_weights_safe_slice[0]
@@ -277,6 +324,11 @@ def _convert_vision_qkv_hf_to_mcore(
     tp_rank: int,
     tp_size: int,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: concatenates separate Q/K/V (or uses a fused tensor) in HF grouped order,
+    # then, if hf_config has vision_config, reshapes to per-head interleaved order using
+    # vision num_heads and head_dim = hidden/heads (weight or bias), and finally slices
+    # generically for TP. Without vision_config it only slices.
     """Convert vision encoder QKV from HF format to mcore format.
 
     HF format: grouped [Q_all | K_all | V_all] (3 sections of num_heads*head_dim rows).
@@ -334,6 +386,17 @@ def _weight_to_mcore_tp(
     tp_size: int,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor | FP8BlockwiseTensorHelper:
+    # [FUNCTION DOC]
+    # HELPER: dispatches conversion for one Megatron param by name: linear_qkv (not
+    # layernorm) uses QKV merge for 3 text sources, vision QKV conversion for
+    # vision_model names, fused no-GQA conversion, or split-then-merge for fused GQA
+    # tensors; linear_fc1 uses gate/up merge (2 sources), stacked-expert slicing (3D
+    # expert tensor, EP rank/size from Megatron parallel state) or generic slicing;
+    # expert linear_fc2 uses stacked or per-expert dim-1 slicing; others use generic
+    # slicing. Casts to dtype unless dtype is None or the result is an FP8 helper.
+    # KNOWN ISSUE: the inline comment on the fused no-GQA branch says the tensor is
+    # already interleaved and only TP-sliced, but _load_fused_qkv_weight actually
+    # reorders from [Q|K|V] to per-head interleaved.
     """Convert HF weights to Megatron-Core format with tensor/expert parallelism.
 
     Dispatches to specialized handlers based on weight type:
@@ -459,6 +522,18 @@ def _load_weight_with_bridge_worker(
     weights_path: str,
     fp8_direct_convert: bool = False,
 ):
+    # [FUNCTION DOC]
+    # HELPER: thread worker loading a bin of parameters. Opens every listed safetensors
+    # file (CPU) and collects lazy slices. For each local name chooses expert TP or
+    # regular TP rank/size (experts but not shared experts use expert TP), reads the HF
+    # sources skipping _scale_inv names; FP8 sources (with a matching _scale_inv) become
+    # FP8BlockwiseTensorHelper when the param is TE FP8 and direct FP8 conversion is
+    # enabled (bridge config fp8 and fp8_param), otherwise are dequantized on the device
+    # to the bridge dtype and moved back to CPU. Raises RuntimeError when mixing FP8 and
+    # non-FP8 sources for a TE FP8 param. Converts via _weight_to_mcore_tp, then either
+    # writes FP8 data directly into the TE FP8 param (ImportError without
+    # transformer_engine, ValueError on dtype mismatch) or param.copy_ non-blocking
+    # (Megatron quantizes FP8 params internally). Mutates state_dict tensors in place.
     all_slices = {}
     for filename in filenames:
         safetensor_file = os.path.join(weights_path, filename)
@@ -569,6 +644,10 @@ def _load_weight_with_bridge_worker(
 def make_filename_bins(
     local_to_file_map: dict[str, list[str]],
 ) -> tuple[list[list[str]], list[list[str]]]:
+    # [FUNCTION DOC]
+    # Partitions local parameter names into groups such that groups share no files,
+    # using union-find over names linked by common files. Returns (list of name groups,
+    # list of corresponding file lists); empty input returns two empty lists.
     # Allocate local weight name into bins, where each bin access independent files
     # Then we can use multiple threads to concurrently load each bin's parameters.
     # This function has a complexity of O(F + L²)
@@ -591,11 +670,15 @@ def make_filename_bins(
     rank = [0] * n
 
     def find(x):
+        # [FUNCTION DOC]
+        # HELPER: union-find root lookup with path compression.
         if parent[x] != x:
             parent[x] = find(parent[x])  # Path compression
         return parent[x]
 
     def union(x, y):
+        # [FUNCTION DOC]
+        # HELPER: union-find merge by rank of the sets containing x and y.
         root_x, root_y = find(x), find(y)
         if root_x == root_y:
             return
@@ -646,6 +729,20 @@ def load_weights_from_hf_with_mbridge_fast(
     is_critic: bool = False,
     fp8_direct_convert: bool = False,
 ) -> None:
+    # [FUNCTION DOC]
+    # Loads HF weights into the given Megatron model chunks (one per virtual pipeline
+    # stage). Resolves the actual HF path, reads the weight_map from
+    # model.safetensors.index.json or scans all *.safetensors (FileNotFoundError if
+    # none). If embeddings exist but lm_head does not, ties lm_head to embed_tokens.
+    # Pre-computes state dicts, maps local names to global and then HF names (excluding
+    # _extra_state), skips output_layer when is_critic, collects needed files (including
+    # _scale_inv files), bins them and runs workers in a thread pool (default min(8,
+    # cpu_count / world_size) threads, capped at the number of bins). For critics on the
+    # last pipeline stage, loads value_head.pt into each model's output_layer if present
+    # (logs either way). Requires torch.distributed initialized.
+    # KNOWN ISSUE: without an index file the map stores full glob paths that are later
+    # joined with weights_path, which only works when weights_path is absolute; zero
+    # bins makes max_workers 0 and ThreadPoolExecutor raises ValueError.
     weights_path = bridge._get_actual_hf_path(weights_path)
     index_file = os.path.join(weights_path, "model.safetensors.index.json")
     manual_tie_word_embedding = False

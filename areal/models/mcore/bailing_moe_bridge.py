@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# mbridge bridge for BailingMoeV2.5 (model types bailing_moe_v2, bailing_moe_linear,
+# bailing_hybrid), letting MegatronEngine load/save these models via AutoBridge. Defines
+# Megatron-to-HF weight name templates for Lightning attention layers, MLA layers
+# (direct-Q or low-rank-Q variants) and MLP/MoE weights, and converts the Lightning
+# fused QKV layout between HF [Q_all|K_all|V_all] and Megatron per-head interleaved
+# [q,k,v per head]. Logger "BailingMoeBridge".
 # SPDX-License-Identifier: Apache-2.0
 
 """mbridge Bridge for BailingMoeV2.5 (bailing_moe_linear model_type).
@@ -85,6 +92,11 @@ _MLA_ATTENTION_MAPPING_COMMON = {
 @register_model("bailing_moe_linear")
 @register_model("bailing_hybrid")
 class BailingMoeBridge(LLMBridge):
+    # [CLASS DOC]
+    # LLMBridge subclass registered for the three model types; uses
+    # MLATransformerConfig, a direct mapping for embeddings/final norm/lm_head, and an
+    # MLP mapping covering dense MLP, shared experts, pre-MLP norm, router weight/expert
+    # bias and per-expert weights (gate+up merged into fc1).
     """Bridge for BailingMoeV2.5 with heterogeneous Lightning + MLA attention."""
 
     TransformerConfigClass = MLATransformerConfig
@@ -133,6 +145,15 @@ class BailingMoeBridge(LLMBridge):
     # _ATTENTION_MAPPING is not used directly; we override _weight_name_mapping_attention
 
     def _build_config(self):
+        # [FUNCTION DOC]
+        # Builds the MLATransformerConfig via the base-class helper from the HF config
+        # with the same MLA/MoE settings as hf_to_mcore_config_bailing_moe
+        # (moe_layer_freq, shared-expert size, LoRA ranks, head dims, plain unfused
+        # rope, group-limited sigmoid routing, grouped GEMM, fp32 router, bias update
+        # rate 0, z-loss 3.5e-6), plus fused attention backend, alltoall dispatcher,
+        # persisted layernorm and bias fusions. Returns the config.
+        # KNOWN ISSUE: does not pin mscale/mscale_all_dim to 0.707 as the standalone
+        # converter does, so YaRN mscale defaults may differ between the two paths.
         hf_config = self.hf_config
 
         # Build moe_layer_freq
@@ -211,6 +232,11 @@ class BailingMoeBridge(LLMBridge):
         )
 
     def _get_gptmodel_args(self) -> dict:
+        # [FUNCTION DOC]
+        # Returns GPTModel kwargs: vocab size, max sequence length
+        # (max_position_embeddings), rope position embeddings and rotary_base from
+        # rope_theta (default 10000).
+        # KNOWN ISSUE: ignores rope_parameters["rope_theta"], unlike _build_config.
         return dict(
             vocab_size=self.hf_config.vocab_size,
             max_sequence_length=self.hf_config.max_position_embeddings,
@@ -219,6 +245,10 @@ class BailingMoeBridge(LLMBridge):
         )
 
     def _get_transformer_layer_spec(self, vp_stage: int | None = None):
+        # [FUNCTION DOC]
+        # Asserts RMSNorm, marks has_vp_stage False (VPP unsupported) and returns the
+        # heterogeneous, PP-sliced block spec from make_mcore_layer_specs_bailing_moe
+        # with TE enabled.
         """Override to return heterogeneous layer specs (Lightning + MLA).
 
         PP slicing is handled inside make_mcore_layer_specs_bailing_moe via
@@ -234,6 +264,11 @@ class BailingMoeBridge(LLMBridge):
         )
 
     def _weight_name_mapping_mcore_to_hf(self, mcore_weights_name: str) -> list[str]:
+        # [FUNCTION DOC]
+        # Maps one Megatron parameter name (must not be an _extra_state) to its HF name
+        # list: direct mapping first, attention/input-layernorm names via the attention
+        # mapper, MLP and pre-MLP layernorm via the MLP mapper; otherwise
+        # NotImplementedError.
         assert "_extra_state" not in mcore_weights_name
 
         if mcore_weights_name in self._DIRECT_MAPPING:
@@ -257,6 +292,10 @@ class BailingMoeBridge(LLMBridge):
         tp_shards: list[torch.Tensor],
         param: torch.Tensor,
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # For MLA linear_q_down_proj / linear_kv_down_proj (replicated across TP)
+        # returns a clone of the first shard; otherwise defers to the base
+        # implementation.
         """Override to handle MLA duplicated weights.
 
         linear_q_down_proj and linear_kv_down_proj use parallel_mode='duplicated'
@@ -273,6 +312,10 @@ class BailingMoeBridge(LLMBridge):
     def _weight_to_mcore_format(
         self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
     ) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # For a single-source linear_qkv weight or bias (Lightning layer), reshapes HF
+        # [3, H, D(, hidden)] to Megatron [H, 3, D(, hidden)] and flattens back (logs
+        # INFO); head_dim is config head_dim or hidden/heads. Otherwise defers to base.
         """Convert HF weights to mcore format.
 
         For Lightning Attention layers, the fused QKV weight needs to be
@@ -317,6 +360,10 @@ class BailingMoeBridge(LLMBridge):
     def _weight_to_hf_format(
         self, mcore_weights_name: str, mcore_weights: torch.Tensor
     ) -> tuple[list[str], list[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Inverse of _weight_to_mcore_format: for Lightning fused QKV (single HF name),
+        # permutes [H, 3, D] back to [3, H, D] and returns (names, [tensor]); otherwise
+        # defers to base.
         """Convert mcore weights to HF format.
 
         For Lightning Attention layers, convert fused QKV weight back from
@@ -351,6 +398,15 @@ class BailingMoeBridge(LLMBridge):
         return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
 
     def _weight_name_mapping_attention(self, name: str) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: parses the layer number (third dotted component), selects the
+        # Lightning mapping or the MLA mapping (common plus Q-LoRA or direct-Q depending
+        # on q_lora_rank), returns HF names of the first mapping key that is a substring
+        # of the name, formatted with the layer number. NotImplementedError if none
+        # match.
+        # KNOWN ISSUE: the layer index in Megatron names is the local (per pipeline
+        # stage) index; if it is not converted to global upstream, Lightning/MLA
+        # classification is wrong under PP.
         """Dispatch to Lightning or MLA mapping based on layer number."""
         layer_number_str = name.split(".")[2]
         layer_number = int(layer_number_str)
@@ -384,6 +440,11 @@ class BailingMoeBridge(LLMBridge):
         return convert_names
 
     def _weight_name_mapping_mlp(self, name: str) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: parses the layer number and returns HF names of the first MLP mapping
+        # key contained in the name; for expert weights the expert id is the text after
+        # the last "weight" in the Megatron name (e.g. weight7 gives 7).
+        # NotImplementedError if none.
         layer_number = name.split(".")[2]
         convert_names = []
         for keyword, mapping_names in self._MLP_MAPPING.items():

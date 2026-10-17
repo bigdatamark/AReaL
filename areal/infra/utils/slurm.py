@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Slurm CLI helpers and templates: squeue field list and Slurm-state to JobState
+# mapping, sacct terminal-state lookup, the sbatch script template (discovers node
+# IPs/free ports, launches srun commands in background, monitors them and kills all on
+# first failure), srun and Apptainer/Singularity command templates, and helpers to
+# cancel/query jobs, expand nodelists and get node IPs. All functions shell out to Slurm
+# binaries. Logger "SlurmUtils".
 # SPDX-License-Identifier: Apache-2.0
 
 import subprocess
@@ -40,6 +47,11 @@ STATUS_MAPPING = {
 
 
 def query_terminal_state_sacct(job_id: int) -> JobState | None:
+    # [FUNCTION DOC]
+    # Runs "sacct -j <id> --format=State -X -n" and maps the first token of the first
+    # line (trailing "+" stripped) to a JobState via prefix match against the status
+    # mapping. Returns None if sacct is missing, fails, prints nothing or the state is
+    # unmapped.
     """Look up a job's state via sacct after it has left the squeue window.
 
     squeue forgets jobs almost immediately after they finish and then exits
@@ -185,6 +197,12 @@ def cancel_jobs(
     slurm_ids: list[int] | None = None,
     signal: Literal["SIGINT", "SIGKILL"] = "SIGKILL",
 ):
+    # [FUNCTION DOC]
+    # Runs scancel with the given signal (default SIGKILL) on either job names (-n,
+    # comma-joined) or job ids. Raises RuntimeError if neither or both are given. Logs
+    # success at INFO; a non-zero scancel exit is logged as a warning, not raised.
+    # KNOWN ISSUE: passing an empty list for one and None for the other skips the
+    # "neither" check and runs scancel with no targets (or "-n" with an empty value).
     if slurm_names is None and slurm_ids is None:
         raise RuntimeError("Must specify slurm_names or slurm_ids.")
     if slurm_names and slurm_ids:
@@ -210,6 +228,14 @@ def query_jobs(
     status: str = "all",
     delimiter: str = "__PSI__",
 ) -> list[JobInfo]:
+    # [FUNCTION DOC]
+    # Runs squeue with a custom -O format joining SQUEUE_FIELDS with the delimiter and
+    # -t<status> (default all), optionally filtered by names and/or ids. Skips the
+    # header line and parses each row into a JobInfo (name, mapped state, nodelist as
+    # host, submit/start times, integer id). Raises CalledProcessError if squeue fails.
+    # KNOWN ISSUE: states not in STATUS_MAPPING (e.g. SUSPENDED, PREEMPTED) raise
+    # KeyError; fields are not stripped of squeue padding except job id; empty output
+    # still yields no rows only because the header is skipped.
     squeue_format = f":.{delimiter},".join(SQUEUE_FIELDS)
     cmd = ["squeue", "-O", squeue_format, f"-t{status}"]
     if slurm_names is not None:
@@ -239,6 +265,9 @@ def query_jobs(
 
 
 def parse_slurm_nodelist(nodelist: str) -> list[str]:
+    # [FUNCTION DOC]
+    # Expands a compressed Slurm nodelist into hostnames via "scontrol show hostnames"
+    # and returns them as a list.
     return (
         subprocess.check_output(
             [
@@ -255,6 +284,11 @@ def parse_slurm_nodelist(nodelist: str) -> list[str]:
 
 
 def get_slurm_host_ip(node: str, srun_addtional_args: str):
+    # [FUNCTION DOC]
+    # Runs a tiny immediate srun on node executing "hostname --ip-address" and returns
+    # the stripped output. On CalledProcessError logs a warning and returns None.
+    # KNOWN ISSUE: the command is split on single spaces, so empty or multi-space
+    # srun_addtional_args produce empty argv entries passed to srun.
     try:
         cmd = f"srun {srun_addtional_args} --immediate=1 --nodes=1 --ntasks=1 -n1 -c1 --mem=10M --nodelist={node} hostname --ip-address"
         return subprocess.check_output(cmd.split(" ")).decode("utf-8").strip()

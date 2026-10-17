@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Fast distributed saving of Megatron-Core models to HuggingFace safetensors via an
+# mbridge Bridge. Every rank builds weight specs for its local parameters, the number of
+# output shards is agreed per pipeline stage, TP/expert-TP shards are all-gathered
+# (coalesced), merged and converted to HF names/layout (optionally dequantizing TE FP8
+# or re-quantizing to torch FP8), staged on CPU and split into shards that ranks of the
+# TP/DP/CP mesh (or expert DP/TP mesh) write in parallel threads. Global rank 0 writes
+# config.json, the safetensors index and copies tokenizer/remote-code files. Supports
+# per-expert-flat and stacked MoE HF layouts and critic value heads. Logger "HFSaver".
 # SPDX-License-Identifier: Apache-2.0
 
 import json
@@ -42,6 +51,11 @@ HF_MODEL_CONFIG_FILES = [
 def _maybe_convert_from_te_fp8_params(
     params, fp8_direct_convert: bool, weight_block_size: int
 ):
+    # [FUNCTION DOC]
+    # HELPER: for a param or list of params, converts Transformer Engine FP8 tensors
+    # either to FP8BlockwiseTensorHelper (fp8_direct_convert, using weight_block_size)
+    # or dequantizes them (to their high-precision dtype); non-FP8 tensors pass through.
+    # Returns the same structure (single item or list).
     """Convert TE FP8 parameters to the appropriate format.
 
     Args:
@@ -78,6 +92,11 @@ def _maybe_convert_to_torch_fp8_params(
     quantization_config,
     fp8_direct_convert: bool,
 ):
+    # [FUNCTION DOC]
+    # HELPER: if quantization_config is None returns names/params unchanged; otherwise
+    # converts FP8 helpers to native torch FP8 tensors plus scale entries
+    # (fp8_direct_convert) or quantizes high-precision params via quantize_params for
+    # global_name. Returns (names, params) lists, possibly with added scale tensors.
     """Convert HF-format parameters to PyTorch FP8 format if quantization is configured.
 
     This function handles three cases:
@@ -117,6 +136,11 @@ def _maybe_convert_to_torch_fp8_params(
 
 
 def copy_hf_configs(src_model_dir, dst_model_dir):
+    # [FUNCTION DOC]
+    # Copies generation/tokenizer config files, vocab, merges and special tokens from
+    # src to dst (missing files logged and skipped), plus any .py files starting with
+    # chat_format, configuration_, modeling_ or tokenization_, and files starting with
+    # chat_template. Logs each copy. Raises if src cannot be listed.
     for file in HF_MODEL_CONFIG_FILES:
         try:
             shutil.copy(
@@ -145,6 +169,10 @@ def copy_hf_configs(src_model_dir, dst_model_dir):
 
 
 def _patch_saved_config(base_model_path, saved_path):
+    # [FUNCTION DOC]
+    # HELPER: if both config.json files exist, restores model_type (when missing or
+    # empty) and torch_dtype (when absent) in the saved config from the original model
+    # config, rewriting it with 2-space indent and logging patched fields.
     """Patch saved config.json to preserve model_type and torch_dtype.
 
     Some HF config classes lack a ``model_type`` class attribute, causing
@@ -182,6 +210,10 @@ def _patch_saved_config(base_model_path, saved_path):
 
 
 def _bridge_uses_stacked_experts(bridge: Bridge) -> bool:
+    # [FUNCTION DOC]
+    # HELPER: returns True if the bridge's _MLP_MAPPING maps any mlp.experts.linear_fc*
+    # key to an HF name lacking an {expert_id} placeholder (stacked-experts HF format
+    # such as Qwen3-VL-MoE); False otherwise or with no mapping.
     """Detect bridges whose HF format keeps experts grouped under a single
     stacked tensor (e.g., Qwen3-VL-MoE ``mlp.experts.gate_up_proj`` shape
     ``[E, hidden, 2*expert_dim]``) rather than per-expert flat keys.
@@ -208,6 +240,10 @@ def _bridge_uses_stacked_experts(bridge: Bridge) -> bool:
 
 
 def split_state_dict_into_shards(state_dict: dict, n_shards: int) -> list[dict]:
+    # [FUNCTION DOC]
+    # Splits a dict into n_shards dicts of consecutive keys, each with len // n keys and
+    # the remainder all appended to the last shard. Returns [state_dict] when n is 1;
+    # raises ValueError if there are fewer keys than shards.
     if n_shards == 1:
         return [state_dict]
 
@@ -231,6 +267,12 @@ def split_state_dict_into_shards(state_dict: dict, n_shards: int) -> list[dict]:
 
 @dataclass
 class McoreDistributedWeightSpec:
+    # [CLASS DOC]
+    # Dataclass describing one local Megatron parameter for saving: the tensor, local
+    # and global names, local shape, dtype name string (e.g. "bfloat16"), whether it is
+    # TP-sharded, and its PP and VPP ranks.
+    # KNOWN ISSUE: callers derive dtype with a character-set lstrip of "torch.", which
+    # would mangle dtype names starting with those letters (e.g. complex types).
     param: torch.Tensor
     local_name: str
     global_name: str
@@ -241,6 +283,10 @@ class McoreDistributedWeightSpec:
     vpp_rank: int
 
     def full_param_size_byte(self) -> int:
+        # [FUNCTION DOC]
+        # Returns the full (unsharded) byte size: local element count times dtype item
+        # size, multiplied by the expert-TP size for expert fc params or the TP size for
+        # other TP-sharded params.
         s = np.prod(self.local_shape) * getattr(torch, self.dtype).itemsize
         if self.tensor_model_parallel:
             if ".mlp.experts.linear_fc" in self.global_name:
@@ -263,6 +309,17 @@ def _emit_stacked_moe_expert_sd(
     fp8_direct_convert: bool,
     weight_block_size: int,
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: stacked-MoE save path for EP > 1. Groups local expert specs by (layer,
+    # linear_fc kind) parsed from the local name (ValueError if unparsable), sorted by
+    # local expert index; all-gathers group keys across the EP group and asserts they
+    # agree and that each group has experts/ep_size members (assert on indivisible
+    # counts). Per group: merges TP shards (from the provided all-gather outputs when
+    # expert TP > 1) after TE FP8 conversion, stacks local experts, all-gathers them
+    # over EP into global expert order, feeds all experts to bridge._weight_to_hf_format
+    # by global index and keeps the final emitted stacked tensors, applies optional
+    # torch FP8 conversion, and on EP rank 0 only stores them (moved to CPU) in the
+    # result. Returns the dict (empty on other EP ranks). Collective over the EP group.
     """Stacked-MoE save path (e.g., Qwen3-VL-MoE).
 
     mbridge buffers per-expert tensors and only emits the stacked HF tensor
@@ -406,6 +463,12 @@ def _emit_per_expert_flat_expert_sd(
     fp8_direct_convert: bool,
     weight_block_size: int,
 ) -> dict:
+    # [FUNCTION DOC]
+    # HELPER: per-expert-flat save path. For each expert spec, takes its expert-TP
+    # gathered tensor (popped from all_gather_outputs) split into etp_size chunks or the
+    # local param, converts TE FP8, merges across TP, converts to HF names/layout and
+    # optional torch FP8, and stores the results on CPU (asserting no duplicate names).
+    # Returns the dict.
     """Per-expert-flat save path (Qwen3-MoE, BailingMoeV2, DeepSeekV3).
 
     HF format keys experts as ``mlp.experts.{idx}.{gate,up,down}_proj.weight``,
@@ -449,6 +512,27 @@ def save_weights_to_hf_with_mbridge_fast(
     max_workers: int | None = None,
     fp8_direct_convert: bool = False,
 ):
+    # [FUNCTION DOC]
+    # Collective save of model chunks to weights_path in HF format. Steps: unwrap models
+    # and build local-to-global name maps (without EP); create specs for named
+    # parameters plus router expert_bias buffers present only in state_dict (moved to
+    # device). Splits specs into non-expert and expert sets; for each computes this PP
+    # stage's shard count as ceil(total full bytes / max_shard_size_byte, default 3e9)
+    # capped by param count, all-gathers counts across PP (expert counts repeated
+    # ep_size times for flat layouts; stacked layouts count bytes times ep_size and are
+    # written by EP rank 0 only). Output files are named
+    # model-XXXXX-of-NNNNN.safetensors. Non-expert part: coalesced TP all-gather,
+    # merge/convert each param to HF, stage on CPU, split into the stage's shards; each
+    # rank of the TP/DP/CP mesh writes a contiguous block of shards with a thread pool
+    # (default min(8, cpu/world)); weight maps are all-gathered over PP. Expert part:
+    # offsets account for PP and EP rank; local expert names are renamed to global
+    # expert ids when EP > 1; expert-TP all-gather; stacked (EP > 1) or flat emission;
+    # the expert DP x TP mesh writes shards; weight maps are all-gathered over the
+    # expert-TP/model/pipeline group. Finally rank 0 saves the HF config, the index JSON
+    # (total_size and weight_map) and, with base_model_path, copies tokenizer /code
+    # files and patches config.json. Frees CUDA cache along the way.
+    # KNOWN ISSUE: the index total_size sums full Megatron param bytes before HF
+    # conversion/quantization, so it may differ from the bytes actually on disk.
     # 1. Prepare some global metadata required for saving the model.
     models = [unwrap_model(model) for model in models]
     pp_size = mpu.get_pipeline_model_parallel_world_size()
@@ -677,6 +761,9 @@ def save_weights_to_hf_with_mbridge_fast(
     shards = split_state_dict_into_shards(non_expert_sd, n_shards)
 
     def _save_one_shard(x):
+        # [FUNCTION DOC]
+        # HELPER: writes shard i of this rank's block to the file numbered shard_offset
+        # + local_start + i + 1 (non-expert pass).
         i, shard = x
         shard_idx = shard_offset + i + local_start
         save_file(
@@ -797,6 +884,9 @@ def save_weights_to_hf_with_mbridge_fast(
             shards = []
 
         def _save_one_shard(x):
+            # [FUNCTION DOC]
+            # HELPER: same as the non-expert writer but for expert shards, using the
+            # expert shard offset and local start.
             i, shard = x
             shard_idx = shard_offset + i + local_start
             save_file(
@@ -849,6 +939,10 @@ def save_weights_to_hf_with_mbridge_fast(
 
 
 def save_critic_value_head(models, weights_path):
+    # [FUNCTION DOC]
+    # On the last pipeline stage, only the rank that is first in both TP and DP (with
+    # CP), saves the output_layer state dict of the first model chunk that has one to
+    # weights_path/value_head.pt and logs it. No-op elsewhere.
     if mpu.is_pipeline_last_stage():
         is_tp_first = mpu.get_tensor_model_parallel_rank() == 0
         is_dp_first = mpu.get_data_parallel_rank(with_context_parallel=True) == 0

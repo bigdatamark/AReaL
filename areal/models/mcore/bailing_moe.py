@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Megatron-Core support for BailingMoeV2_5ForCausalLM: HF config to MLATransformerConfig
+# conversion and heterogeneous per-layer spec construction (Lightning linear attention
+# for most layers, MLA every layer_group_size-th layer; dense MLP for the first
+# first_k_dense_replace layers, MoE after). Import side effect: monkey-patches
+# Megatron's apply_rotary_pos_emb (in rope_utils, the MLA module and the rotary
+# embedding module) to fix MLA RoPE with packed THD sequences under context parallelism.
+# Logger "BailingMoe".
 # SPDX-License-Identifier: Apache-2.0
 
 """BailingMoeV2_5ForCausalLM support for megatron-core.
@@ -39,6 +47,17 @@ logger = logging.getLogger("BailingMoe")
 
 
 def _patch_mla_thd_rope_for_cp():
+    # [FUNCTION DOC]
+    # HELPER: installs a wrapper around Megatron's apply_rotary_pos_emb. When rope
+    # fusion is off, cu_seqlens is given, the CP group (default: the global CP group)
+    # has size above 1 and the frequency table has at least 2 rows but fewer rows than
+    # the total packed length (last cu_seqlens entry), it rebuilds the table for all
+    # positions as position times the row-1 frequencies (exact since freqs are positions
+    # times inverse frequencies) before delegating to the original. Replaces the
+    # function in three modules (ignoring import/attribute errors) and logs at INFO.
+    # Runs at import.
+    # KNOWN ISSUE: the reconstruction assumes row 0 is position 0 and linear RoPE with
+    # no offset/scaling; .item() on cu_seqlens forces a GPU sync.
     """Fix MLA RoPE for THD packed sequences with CP>1.
 
     Root cause: MLA's qkv_up_proj_and_rope_apply slices rotary_pos_emb to
@@ -56,6 +75,10 @@ def _patch_mla_thd_rope_for_cp():
     _original = rope_utils.apply_rotary_pos_emb
 
     def _patched(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None):
+        # [FUNCTION DOC]
+        # HELPER: the replacement apply_rotary_pos_emb with the same signature (t,
+        # freqs, config, cu_seqlens, mscale, cp_group); extends freqs as described and
+        # forwards.
         if cp_group is None:
             cp_group = parallel_state.get_context_parallel_group()
 
@@ -107,6 +130,10 @@ _patch_mla_thd_rope_for_cp()
 
 
 def is_lightning_layer(layer_number: int, layer_group_size: int) -> bool:
+    # [FUNCTION DOC]
+    # Returns True if 0-indexed layer_number uses Lightning attention: False when
+    # layer_group_size <= 1, otherwise True unless (layer_number + 1) is a multiple of
+    # layer_group_size (the last layer of each group is MLA).
     """Determine if a layer uses Lightning Attention (vs MLA).
 
     In BailingMoeV2_5, layers are grouped by `layer_group_size`. Within each group,
@@ -131,6 +158,20 @@ def hf_to_mcore_config_bailing_moe(
     hf_config: PretrainedConfig,
     dtype: torch.dtype,
 ) -> MLATransformerConfig:
+    # [FUNCTION DOC]
+    # Builds an MLATransformerConfig from the HF config. moe_layer_freq marks the first
+    # first_k_dense_replace layers dense (0) and the rest MoE (1). Shared-expert size is
+    # moe_shared_expert_intermediate_size or num_shared_experts times
+    # moe_intermediate_size (None when no shared experts). Base args come from the
+    # common converter with no linear/QKV bias and qk layernorm. MLA args: q/kv LoRA
+    # ranks, nope /rope/v head dims (defaults 128/64/128, kv rank 512), plain rope with
+    # theta from rope_parameters or rope_theta, scaling factor from rope_scaling
+    # (default 1), unfused rope, mscale and mscale_all_dim pinned to 0.707, original max
+    # positions from rope_scaling, top-level attribute or max_position_embeddings. MoE
+    # args: experts, top-k (8), score function (sigmoid), group routing (8 groups, top
+    # 4), routed scaling, expert FFN size, expert bias enabled, no aux load-balancing
+    # loss, grouped GEMM, fp32 router, bias update rate 0 and z-loss 3.5e-6. Unsupported
+    # keys are dropped by check_and_construct_configs.
     """Convert BailingMoeV2_5 HuggingFace config to megatron-core MLATransformerConfig.
 
     Args:
@@ -243,6 +284,12 @@ def hf_to_mcore_config_bailing_moe(
 
 
 def _build_lightning_attn_spec(hf_config: PretrainedConfig) -> ModuleSpec:
+    # [FUNCTION DOC]
+    # HELPER: returns a ModuleSpec for LightningSelfAttention using TE column/row
+    # parallel linears (falling back to Megatron tensor-parallel linears without TE) for
+    # qkv, gate and output projections, with params attn_head_dim (attn_head_dim, else
+    # head_dim, else 256), partial_rotary_factor (default 0.5) and
+    # linear_attn_norm_group_size (or group_norm_size, default 1).
     """Build a ModuleSpec for LightningSelfAttention with params from HF config.
 
     Returns:
@@ -292,6 +339,19 @@ def make_mcore_layer_specs_bailing_moe(
     use_te: bool = True,
     vp_stage: int | None = None,
 ) -> TransformerBlockSubmodules:
+    # [FUNCTION DOC]
+    # Builds the TransformerBlockSubmodules for the model. Asserts RMSNorm. Creates MLA
+    # dense/MoE specs from Megatron's TE GPT layer spec and Lightning dense/MoE specs by
+    # deep-copying non-MLA TE specs, swapping self_attention for the Lightning spec and
+    # restoring a real input layernorm (TENorm or torch fallback) because the Lightning
+    # projections have no fused layernorm. Chooses one of four specs per layer, logs the
+    # composition, and if CP > 1 with Lightning layers raises ValueError unless heads
+    # per TP rank divide by CP. Slices the specs to this pipeline stage using the
+    # explicit pipeline layout if present, otherwise layer offset and count from
+    # Megatron (respecting vp_stage), logging when sliced. Final layernorm is TENorm (or
+    # WrappedTorchNorm) when use_te, else FusedLayerNorm (or WrappedTorchNorm).
+    # KNOWN ISSUE: use_te only affects the final norm; all layer specs are always built
+    # from Transformer Engine specs.
     """Build heterogeneous layer specs for BailingMoeV2_5.
 
     Creates 4 types of layer specs based on attention type and MLP type:

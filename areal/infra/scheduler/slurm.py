@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Slurm implementation of the areal Scheduler API. Each role is launched as one sbatch
+# job whose single srun starts N RPC server processes (optionally inside an
+# Apptainer/Singularity container), with output streamed to per-role and merged logs
+# under fileroot/logs/<user>/<experiment>/<trial>. Workers register their address in
+# name_resolve; the scheduler discovers them, health-checks them over HTTP, allocates
+# extra ports, configures them with the experiment config, and then creates/calls
+# engines via HTTP RPC (/create_engine, /call, /set_env). Supports colocation (reuse
+# target workers, fork new processes on target workers, or submit a GPU-less job on the
+# same nodes) and two-phase teardown (engine destroy, then scancel). Job state is polled
+# via squeue with a 5s cache and sacct fallback. Logger "SlurmScheduler".
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -59,6 +70,10 @@ logger = logging.getLogger("SlurmScheduler")
 
 @dataclass
 class SlurmWorkerInfo:
+    # [CLASS DOC]
+    # Dataclass tracking one worker: the Worker record (id "role/idx", ip, ports), role,
+    # Slurm job id (-1 for forked workers), task index within the job, whether its
+    # address was discovered, its SchedulingSpec and node name.
     """Slurm worker information."""
 
     worker: Worker
@@ -71,6 +86,10 @@ class SlurmWorkerInfo:
 
 
 class SlurmScheduler(Scheduler):
+    # [CLASS DOC]
+    # Scheduler that manages roles as Slurm jobs. State: role-to-worker-info lists,
+    # role-to-job-id map, job status cache (state, timestamp) with 5s TTL, and a map of
+    # colocated/forked roles to their target role.
     def __init__(
         self,
         n_gpus_per_node: int = 8,
@@ -89,6 +108,15 @@ class SlurmScheduler(Scheduler):
         etcd3_addr: str = "localhost:2379",
         exp_config: BaseExperimentConfig | None = None,
     ):
+        # [FUNCTION DOC]
+        # Stores settings, letting exp_config override n_gpus_per_node, experiment/trial
+        # names, fileroot, cluster name, offload flag and name_resolve config. Raises
+        # ValueError without experiment and trial names. Validates fileroot and NFS
+        # name-resolve root as shared paths, reconfigures name_resolve and clears this
+        # trial's subtree (side effect on shared storage). Stores container type/mounts,
+        # extra srun args (default unbuffered, pmi2, kill-on-bad-exit, chdir to $PWD),
+        # startup timeout, health-check interval, and initializes internal state. Logs
+        # INFO.
         # Get n_gpus_per_node from parameter or config
         self._n_gpus_per_node = n_gpus_per_node
         if exp_config is not None:
@@ -160,12 +188,18 @@ class SlurmScheduler(Scheduler):
 
     @property
     def n_gpus_per_node(self) -> int:
+        # [FUNCTION DOC]
+        # Property returning GPUs per node.
         return self._n_gpus_per_node
 
     def _slurm_name(self, job_name: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: returns the Slurm job name "<experiment>_<trial>:<job_name>".
         return f"{self.experiment_name}_{self.trial_name}:{job_name}"
 
     def _log_path_of(self, role: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: creates the trial log dir if needed and returns <dir>/<role>.log.
         log_path = (
             Path(self.fileroot)
             / "logs"
@@ -177,6 +211,8 @@ class SlurmScheduler(Scheduler):
         return str(log_path / f"{role}.log")
 
     def _merged_log_path(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER: creates the trial log dir if needed and returns <dir>/merged.log.
         log_path = (
             Path(self.fileroot)
             / "logs"
@@ -188,6 +224,8 @@ class SlurmScheduler(Scheduler):
         return str(log_path / "merged.log")
 
     def _sbatch_path_of(self, role: str) -> str:
+        # [FUNCTION DOC]
+        # HELPER: creates the trial log dir if needed and returns <dir>/<role>.sh.
         sbatch_path = (
             Path(self.fileroot)
             / "logs"
@@ -199,6 +237,9 @@ class SlurmScheduler(Scheduler):
         return str(sbatch_path / f"{role}.sh")
 
     def _read_log_tail(self, role: str, lines: int = 50) -> str:
+        # [FUNCTION DOC]
+        # HELPER: returns the last lines (default 50) of the role log, or a bracketed
+        # error message if it cannot be read.
         try:
             with open(self._log_path_of(role)) as f:
                 all_lines = f.readlines()
@@ -207,6 +248,9 @@ class SlurmScheduler(Scheduler):
             return f"[Could not read log file: {e}]"
 
     def _find_worker_by_id(self, worker_id: str) -> SlurmWorkerInfo | None:
+        # [FUNCTION DOC]
+        # HELPER: linear search over all roles for a worker with the id; returns its
+        # info or None.
         """Find worker by ID across all roles."""
         for workers in self._workers.values():
             for worker_info in workers:
@@ -215,6 +259,14 @@ class SlurmScheduler(Scheduler):
         return None
 
     def _check_job_status(self, role: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: raises WorkerFailedError (with the role log tail) if the role's Slurm
+        # job is no longer active. Colocated/forked roles check their target role.
+        # Raises WorkerNotFoundError for unknown roles. Uses the cached state if younger
+        # than 5s; otherwise queries squeue (missing job counts as failed) and caches
+        # the state. Any terminal state, including COMPLETED, is a failure. If squeue
+        # errors, asks sacct and raises on a terminal state, otherwise only logs a
+        # warning.
         """Check Slurm job status and raise if failed/cancelled."""
         # For colocated/forked roles, check the target role's job status instead
         if role in self._colocated_roles:
@@ -276,6 +328,9 @@ class SlurmScheduler(Scheduler):
             logger.warning(f"Failed to query job status: {e}")
 
     def _verify_worker_alive(self, worker_id: str) -> SlurmWorkerInfo:
+        # [FUNCTION DOC]
+        # HELPER: returns the worker info for worker_id after checking its job status;
+        # raises WorkerNotFoundError if unknown.
         """Verify worker exists and job is running."""
         worker_info = self._find_worker_by_id(worker_id)
         if worker_info is None:
@@ -287,6 +342,10 @@ class SlurmScheduler(Scheduler):
         return worker_info
 
     def _wait_worker_ready(self, worker_info: SlurmWorkerInfo, timeout: int = 60):
+        # [FUNCTION DOC]
+        # HELPER: polls readiness once per second for up to timeout seconds (default
+        # 60).
+        # KNOWN ISSUE: returns silently on timeout without signalling failure.
         tik = time.time()
         while time.time() - tik < timeout:
             if self._is_worker_ready(worker_info):
@@ -294,6 +353,9 @@ class SlurmScheduler(Scheduler):
             time.sleep(1)
 
     def _is_worker_ready(self, worker_info: SlurmWorkerInfo) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True if the worker is discovered and GET /health on its first port
+        # returns 200 within 2s; any error yields False.
         """Check if worker is ready via health endpoint."""
         if not worker_info.discovered:
             return False
@@ -308,6 +370,14 @@ class SlurmScheduler(Scheduler):
             return False
 
     def _configure_worker(self, worker_info: SlurmWorkerInfo, worker_rank: int) -> None:
+        # [FUNCTION DOC]
+        # HELPER: busy-waits (100ms) until the worker is healthy, then POSTs the
+        # serialized exp_config, role and rank to /configure (300s timeout). Returns on
+        # 200; raises WorkerConfigurationError for 400/500/other codes, timeouts or
+        # unexpected errors; on connection errors checks job status then raises
+        # RPCConnectionError.
+        # KNOWN ISSUE: the readiness loop has no timeout and can spin forever if the
+        # worker never becomes healthy.
         # Wait for worker to be ready
         while not self._is_worker_ready(worker_info):
             time.sleep(0.1)
@@ -366,6 +436,13 @@ class SlurmScheduler(Scheduler):
             ) from e
 
     def _discover_worker_network(self, role: str) -> None:
+        # [FUNCTION DOC]
+        # HELPER: for each undiscovered worker of role, looks up its name_resolve
+        # discovery key (skips if not yet registered), records ip and port, marks it
+        # discovered, waits for health (up to 60s), and if the spec needs more than one
+        # port requests port_count - 1 extra ports from /alloc_ports and appends them.
+        # Raises WorkerNotFoundError for an unknown role and HTTP errors from port
+        # allocation.
         if role not in self._workers:
             raise WorkerNotFoundError(f"Role '{role}' is not created yet")
 
@@ -403,6 +480,12 @@ class SlurmScheduler(Scheduler):
     def _prepare_worker_specs(
         self, role: str, num_workers: int, schedulings: list[SchedulingSpec] | None
     ) -> list[SchedulingSpec]:
+        # [FUNCTION DOC]
+        # HELPER: raises ValueError if no specs. Mutates each spec's env_vars: adds TMS
+        # offload vars (if enabled), base cluster env vars, thread env vars from cpu
+        # count, then re-applies the user's original env vars so they win. Returns one
+        # spec repeated num_workers times, or the list if its length equals num_workers;
+        # else ValueError.
         """Prepare scheduling specs for workers."""
         if schedulings is None or len(schedulings) == 0:
             raise ValueError(f"No scheduling specs provided for role '{role}'")
@@ -437,6 +520,12 @@ class SlurmScheduler(Scheduler):
             )
 
     def _get_colocation_nodes(self, target_role: str, replicas: int) -> tuple[int, str]:
+        # [FUNCTION DOC]
+        # HELPER: for a target role with a Slurm job and the same replica count, returns
+        # (number of nodes, nodelist string) of the target job via squeue/scontrol.
+        # Raises WorkerNotFoundError, SchedulerError on replica mismatch, or
+        # WorkerCreationError if the job is missing or the query fails. (Not used within
+        # this module.)
         """Get node allocation for colocation strategy."""
         if target_role not in self._jobs:
             raise WorkerNotFoundError(
@@ -472,6 +561,9 @@ class SlurmScheduler(Scheduler):
         port: int,
         timeout: float = 60,
     ) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: async; polls GET /health on host:port every 0.5s (2s per request)
+        # until 200 or timeout (default 60s). Returns True if ready, False on timeout.
         url = f"http://{format_hostport(host, port)}/health"
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -495,6 +587,16 @@ class SlurmScheduler(Scheduler):
         target_role: str,
         command: str | None = None,
     ) -> SlurmWorkerInfo:
+        # [FUNCTION DOC]
+        # HELPER: async; creates forked worker idx of role on the node of target_wi:
+        # asks the target's guard /alloc_ports for one port, builds a command running
+        # module command (default the RPC server) with host, port, experiment/trial,
+        # role, index, name_resolve options and fileroot, POSTs it to /fork, waits for
+        # readiness (on timeout asks the guard to kill it and raises), then allocates
+        # the same number of extra ports as the target role's first worker from the
+        # forked server. Returns a discovered SlurmWorkerInfo with slurm_job_id -1 and
+        # the target's spec and node. Raises WorkerCreationError on any HTTP failure or
+        # aiohttp error.
         """Fork a single worker asynchronously.
 
         Parameters
@@ -648,6 +750,9 @@ class SlurmScheduler(Scheduler):
         idx: int,
         target_wi: SlurmWorkerInfo,
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: async; POSTs role and index to the parent's /kill_forked_worker,
+        # logging the response message or a warning; never raises.
         """Kill a single forked worker via its parent's RPC server."""
         target_url = f"http://{format_hostport(target_wi.worker.ip, int(target_wi.worker.worker_ports[0]))}/kill_forked_worker"
 
@@ -677,6 +782,10 @@ class SlurmScheduler(Scheduler):
         target_role: str,
         workers: list[SlurmWorkerInfo],
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: async; kills each given forked worker via its parent (matched by index
+        # in the target role) concurrently with a 30s session timeout. Warns and returns
+        # if the target role has no workers.
         """Cleanup forked workers by calling kill endpoint on parent workers."""
         target_workers = self._workers.get(target_role, [])
         if not target_workers:
@@ -708,6 +817,12 @@ class SlurmScheduler(Scheduler):
         target_workers: list[SlurmWorkerInfo],
         command: str | None = None,
     ) -> list[str]:
+        # [FUNCTION DOC]
+        # HELPER: async; forks one worker per target worker concurrently (120s session
+        # timeout). If any fork fails, logs, kills the successful ones and raises
+        # WorkerCreationError. Otherwise registers the workers under role, records the
+        # colocation mapping, configures them (blocking) when exp_config is set, and
+        # returns their ids.
         """Create forked workers concurrently using async requests.
 
         Parameters
@@ -782,6 +897,11 @@ class SlurmScheduler(Scheduler):
         target_role: str,
         command: str | None = None,
     ) -> list[str]:
+        # [FUNCTION DOC]
+        # Forks new processes for role on every worker of target_role
+        # (WorkerNotFoundError if absent) by running the async creator via
+        # run_async_task, optionally running a custom module. On failure removes any
+        # partial role state and re-raises. Returns worker ids.
         """Fork new worker processes from existing workers.
 
         Creates new worker processes by forking from existing workers of the target role.
@@ -834,6 +954,23 @@ class SlurmScheduler(Scheduler):
         nodelist: str | None,
         exclude: str | None,
     ) -> str:
+        # [FUNCTION DOC]
+        # HELPER: returns the sbatch script text. Raises ValueError if total_gpus is not
+        # a multiple of GPUs per node. SBATCH options: job name, output to /dev/null, no
+        # requeue, nodes, tasks per node (replicas // nodes), cpus per task, memory per
+        # node, full-node GPU gres when GPUs are requested, nodelist, exclude,
+        # reservation and exclusive from the first spec. The per-task bash command
+        # exports CUDA_VISIBLE_DEVICES (and ASCEND_RT_VISIBLE_DEVICES) from
+        # SLURM_LOCALID and gpus-per-task when GPUs are requested, runs the spec's
+        # additional bash commands, then the RPC server command (spec.cmd or the default
+        # module) with experiment, trial, role, name_resolve flags and fileroot. In
+        # apptainer mode it is wrapped in singularity exec with --nv, binds and --env
+        # flags for spec env vars and the image; otherwise run natively. A single srun
+        # (extra args, nodes, ntasks, cpus, mem per cpu, gres) is piped through the
+        # streaming log command.
+        # KNOWN ISSUE: env var values in --env flags are not shell-quoted; in native
+        # mode the spec env_vars are not applied at all in the script (they rely on the
+        # submitting environment being propagated by Slurm).
         """Generate sbatch script for worker job with single srun command."""
         ntasks_per_node = replicas // nodes if nodes > 0 else replicas
         spec = schedulings[0]  # Use first spec for global settings
@@ -967,6 +1104,19 @@ class SlurmScheduler(Scheduler):
         return sbatch_script
 
     def create_workers(self, job: Job, *args, **kwargs) -> list[str]:
+        # [FUNCTION DOC]
+        # Creates workers for job.role (ValueError if the role contains ":"; errors if
+        # it already exists or replicas <= 0). Prepares specs, then by strategy:
+        # colocation requires an existing target; equal replica counts either fork
+        # (strategy.fork) or simply reuse the target's workers (no job); differing
+        # counts submit a new job on the target's nodelist without GPU gres. Separation
+        # computes nodes from GPU count and uses the spec nodelist. Memory is spec.mem
+        # GB converted to MB. Writes the sbatch script, submits it (WorkerCreationError
+        # on failure or unparsable output), records undiscovered worker infos and the
+        # job id. Returns worker ids.
+        # KNOWN ISSUE: docstring says "job array" but a single job with one srun is
+        # used; the fork path ignores any custom command; colocated jobs with
+        # request_gpus 0 skip CUDA_VISIBLE_DEVICES setup.
         """Create workers via Slurm job array submission.
 
         Parameters
@@ -1161,6 +1311,14 @@ class SlurmScheduler(Scheduler):
         return worker_ids
 
     def get_workers(self, role: str, timeout: float | None = None) -> list[Worker]:
+        # [FUNCTION DOC]
+        # Returns ready Worker records for role. Forked roles: verifies each is healthy
+        # (WorkerFailedError otherwise). Pure colocated roles delegate to the target
+        # role. Otherwise loops until timeout (default startup_timeout): checks job
+        # status (raising on failure), logs once if PENDING, discovers new workers,
+        # sleeps until all are discovered, then health-checks all; when all are ready
+        # configures them (if exp_config) and returns. Raises WorkerNotFoundError or
+        # WorkerTimeoutError.
         """Wait for workers to be ready and return their information.
 
         Parameters
@@ -1280,6 +1438,12 @@ class SlurmScheduler(Scheduler):
     def _destroy_engines_on_workers(
         self, workers: list[SlurmWorkerInfo], timeout: float = 30.0
     ) -> None:
+        # [FUNCTION DOC]
+        # HELPER: concurrently POSTs a "destroy" /call to every worker (engine name =
+        # worker id) with a shared timeout (default 30s) so distributed teardown
+        # barriers can complete; per-worker failures and an overall failure are only
+        # logged as warnings.
+        # KNOWN ISSUE: engines created with a custom engine_name are not destroyed.
         """Call ``engine.destroy()`` on every worker via HTTP before killing jobs.
 
         All calls are dispatched concurrently so that the engine-side CPU
@@ -1291,6 +1455,9 @@ class SlurmScheduler(Scheduler):
             return
 
         async def _destroy_all():
+            # [FUNCTION DOC]
+            # HELPER: async body creating the session, issuing the requests and logging
+            # failures.
             destroy_timeout = aiohttp.ClientTimeout(total=timeout)
             async with aiohttp.ClientSession(
                 timeout=destroy_timeout,
@@ -1332,6 +1499,9 @@ class SlurmScheduler(Scheduler):
 
     @staticmethod
     async def _safe_destroy_request(coro):
+        # [FUNCTION DOC]
+        # HELPER: async; enters the request context, reads the body, and re-raises any
+        # error as RuntimeError (despite the docstring saying errors are suppressed).
         """Await an aiohttp context-manager response, suppressing errors."""
         try:
             async with coro as resp:
@@ -1340,6 +1510,12 @@ class SlurmScheduler(Scheduler):
             raise RuntimeError(str(e)) from e
 
     def delete_workers(self, role: str | None = None, reverse_order: bool = False):
+        # [FUNCTION DOC]
+        # Deletes one role or all (colocated/forked roles first). For colocated/forked
+        # roles only removes bookkeeping (forked processes are owned by the parent).
+        # Unknown roles log a warning. For job-owning roles: destroys engines, scancels
+        # with SIGTERM, waits 2s, SIGKILLs if still RUNNING, logs errors, then removes
+        # worker/job/cache state. reverse_order is ignored.
         """Delete workers and cancel Slurm jobs.
 
         Teardown follows a two-phase protocol analogous to the Ray and Local
@@ -1430,6 +1606,10 @@ class SlurmScheduler(Scheduler):
         logger.info(f"Successfully deleted workers for role '{role}'")
 
     async def set_worker_env(self, worker_id: str, env: dict[str, str]) -> None:
+        # [FUNCTION DOC]
+        # Async. Verifies the worker is alive, then (if env is non-empty) POSTs it to
+        # /set_env with a 30s timeout. Raises SchedulerError on non-200 or timeout, and
+        # RPCConnectionError (after a job status check) on connection errors.
         """Set environment variables on a worker before engine creation.
 
         Parameters
@@ -1481,6 +1661,14 @@ class SlurmScheduler(Scheduler):
         *args,
         **kwargs,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Async. Verifies the worker, defaults engine_name to worker_id, requires engine
+        # to be an import-path string (EngineCreationError otherwise), POSTs serialized
+        # init args/kwargs to /create_engine (300s timeout, 10MB buffer). Returns the
+        # "result" field on 200; 400 with "Failed to import" raises EngineImportError,
+        # other 400/500 or unexpected codes raise EngineCreationError; connection errors
+        # raise RPCConnectionError after a job status check; timeouts raise
+        # EngineCreationError.
         """Create an engine instance on a remote worker.
 
         Parameters
@@ -1597,6 +1785,18 @@ class SlurmScheduler(Scheduler):
         retry_delay: float = 1.0,
         **kwargs,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Synchronous RPC: serializes args/kwargs and POSTs method, engine_name (default
+        # worker id) and rpc_meta to /call with http_timeout (default 7200s). Up to
+        # max_retries attempts with exponential backoff (retry_delay doubling); checks
+        # job status before each attempt. 200 returns the deserialized result; 500 with
+        # "timeout" in the error and 503 are retried; other errors raise
+        # EngineCallError; request timeouts and connection errors are retried. Raises
+        # WorkerNotFoundError for unknown workers and EngineCallError after exhausting
+        # retries.
+        # KNOWN ISSUE: EngineCallError raised inside the try block is caught by the
+        # generic exception handler and retried, so non-retryable errors are retried and
+        # finally reported as "Unexpected error".
         """Call a method on an engine instance (synchronous).
 
         Parameters
@@ -1730,6 +1930,12 @@ class SlurmScheduler(Scheduler):
         retry_delay: float = 1.0,
         **kwargs,
     ) -> Any:
+        # [FUNCTION DOC]
+        # Async equivalent of call_engine using a fresh aiohttp session per attempt
+        # (10MB read buffer) and asyncio.sleep for backoff; same retry and error
+        # semantics.
+        # KNOWN ISSUE: same as call_engine, non-retryable EngineCallError is swallowed
+        # by the generic handler and retried.
         """Call a method on an engine instance (asynchronous).
 
         Parameters

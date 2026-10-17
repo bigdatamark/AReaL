@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Helpers to persist and read experiment metadata (git commit/branch/dirty state,
+# version string, experiment/trial names) as a JSON file named version.json under
+# <fileroot>/logs/<user>/<experiment>/<trial>.
 # SPDX-License-Identifier: Apache-2.0
 
 """Utility functions for saving and loading experiment metadata."""
@@ -10,6 +14,9 @@ from areal.version import version_info
 
 
 def get_metadata_dir(fileroot: str, experiment_name: str, trial_name: str) -> str:
+    # [FUNCTION DOC]
+    # Builds the path fileroot/logs/<current OS user>/experiment_name/trial_name,
+    # creates it (makedirs exist_ok) and returns it. Side effect: filesystem mkdir.
     """Get the directory path for storing experiment metadata."""
     path = os.path.join(
         fileroot, "logs", getpass.getuser(), experiment_name, trial_name
@@ -24,6 +31,11 @@ def save_experiment_metadata(
     trial_name: str,
     additional_metadata: dict | None = None,
 ) -> str:
+    # [FUNCTION DOC]
+    # Writes version.json into the metadata dir containing commit_id, branch, is_dirty,
+    # full version description (from areal.version.version_info), experiment_name and
+    # trial_name, merged with additional_metadata (which can override keys). Uses
+    # 4-space JSON indent. Returns the file path.
     """Save experiment metadata including commit id to a JSON file."""
     metadata_dir = get_metadata_dir(fileroot, experiment_name, trial_name)
     metadata_file = os.path.join(metadata_dir, "version.json")
@@ -51,6 +63,9 @@ def load_experiment_metadata(
     experiment_name: str,
     trial_name: str,
 ) -> dict | None:
+    # [FUNCTION DOC]
+    # Returns the parsed version.json dict from the metadata dir, or None if it does not
+    # exist. Side effect: creates the directory if missing (via get_metadata_dir).
     """Load experiment metadata from a JSON file."""
     metadata_dir = get_metadata_dir(fileroot, experiment_name, trial_name)
     metadata_file = os.path.join(metadata_dir, "version.json")

@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Shared helpers for converting HuggingFace configs to Megatron-Core TransformerConfig
+# kwargs (adapted from verl). Logger "MCoreCommon".
 # SPDX-License-Identifier: Apache-2.0
 
 from typing import TypeVar
@@ -22,6 +25,17 @@ def hf_to_mcore_base_args(
     dtype: torch.dtype,
     **override_transformer_config_kwargs,
 ) -> dict:
+    # [FUNCTION DOC]
+    # Builds a dict of TransformerConfig kwargs from an HF config: layer count, hidden
+    # size, attention heads, query groups (num_key_value_heads), FFN size, attention
+    # dropout, hidden dropout (default 0), kv_channels (head_dim or None), RMSNorm eps,
+    # SiLU gated linear units, add_bias_linear True, dtype for params/pipeline and bf16
+    # flag, all parallel sizes fixed to 1 (no sequence parallel, no p2p overlap),
+    # variable sequence lengths, masked softmax fusion and alltoall MoE dispatcher.
+    # Keyword overrides are merged last. Returns the dict.
+    # KNOWN ISSUE: parallel settings are hardcoded to 1 (TODO in code) and
+    # add_bias_linear defaults to True, which is wrong for bias-free models unless the
+    # caller overrides it.
     # TODO: add parallel configs for transformer configs
     # Common parallel state parameters
     # overlap_p2p_comm = (
@@ -76,6 +90,11 @@ def hf_to_mcore_base_args(
 # Modified from verl:
 # https://github.com/volcengine/verl/blob/ea885f32f04d86c3a81de18083db7eef0d781421/verl/models/mcore/config_converter.py
 def check_and_construct_configs(original_config: dict, cls: type[T]) -> T:
+    # [FUNCTION DOC]
+    # Removes keys of original_config (in place) that are not attributes of cls, warning
+    # about them, prints the final config to stdout, and returns cls(**original_config).
+    # KNOWN ISSUE: docstring says it returns a dict but it returns a cls instance; uses
+    # print instead of the logger and mutates the caller's dict.
     """
     Check and disable incompatible configurations for older Megatron version.
 

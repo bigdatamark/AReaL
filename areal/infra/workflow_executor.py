@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Asynchronous rollout execution. Provides trajectory format validation, a generic
+# BatchTaskDispatcher that runs a producer thread (moves queued inputs into an
+# AsyncTaskRunner subject to StalenessManager capacity) and a consumer thread (collects
+# finished results into a dict keyed by task id, firing optional HTTP callbacks), and
+# WorkflowExecutor, which wraps RolloutWorkflow.arun_episode calls with AReaL logic:
+# workflow context setup, format checks, conversion of interaction dicts to tensors,
+# acceptance filtering, staleness accounting, stats and perf-trace events, optional
+# JSONL trajectory dumps, and cleanup of remote RTensor shards for rejected
+# trajectories. Constants: fetch batch 100, thread shutdown timeout 2s, default wait
+# timeout 7 days, rejected-shard clear timeout 5s.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations  # noqa
@@ -55,6 +66,16 @@ def check_trajectory_format(
     expected_keys: set | None = None,
     logger: Any = None,
 ) -> bool:
+    # [FUNCTION DOC]
+    # Validates a workflow output. None is valid. Non-dict or empty dict raises
+    # ValueError. A dict whose values are all InteractionWithTokenLogpReward is valid.
+    # Otherwise requires input_ids and attention_mask, input_ids must be 2D (batch,
+    # seqlen) and match batch_size if given; other tensors whose dim 0 or dim 1 mismatch
+    # only produce warnings; a multi_modal_input key must be a non-empty list of dicts
+    # each containing pixel_values (else ValueError); other non-tensor values are logged
+    # at INFO. If expected_keys is given, missing keys raise ValueError. Returns True.
+    # KNOWN ISSUE: docstring says it returns False when invalid and that the default
+    # logger is "Workflow API"; code always raises instead and uses "WorkflowExecutor".
     """Check the format of trajectory data returned by workflow.arun_episode.
 
     This function validates trajectory data to ensure it conforms to one of three
@@ -233,6 +254,9 @@ def check_trajectory_format(
 
 @dataclass
 class _RolloutTaskInput:
+    # [CLASS DOC]
+    # HELPER: dataclass carrying one rollout request: task_id, data dict, workflow,
+    # optional should_accept_fn filter, and is_eval flag.
     """Internal wrapper for rollout-specific task input."""
 
     task_id: int
@@ -244,6 +268,8 @@ class _RolloutTaskInput:
 
 @dataclass
 class _RolloutResult:
+    # [CLASS DOC]
+    # HELPER: dataclass pairing a task_id with its accepted trajectory dict.
     task_id: int
     trajectory: dict[str, Any]
 
@@ -257,6 +283,8 @@ _DEFAULT_WAIT_TIMEOUT_SECONDS = float(7 * 24 * 3600)
 
 
 class WithTaskID(Protocol):
+    # [CLASS DOC]
+    # Protocol for task inputs exposing an integer task_id attribute.
     task_id: int
 
 
@@ -269,6 +297,11 @@ def _select_results(
     count: int,
     deterministic: bool,
 ) -> tuple[list, list]:
+    # [FUNCTION DOC]
+    # HELPER: sorts drained TimedResults in place by task_id (deterministic) or by
+    # create_time (oldest first), splits into the first count (selected) and the rest
+    # (pending), and shuffles selected unless deterministic. Returns (selected,
+    # pending).
     """Order drained results, then split them into (selected, pending).
 
     Normally results are taken oldest-first and the returned batch is
@@ -286,6 +319,12 @@ def _select_results(
 
 
 class BatchTaskDispatcher(Generic[TInput, TResult]):
+    # [CLASS DOC]
+    # Generic producer/consumer dispatcher over an AsyncTaskRunner. Inputs wait in an
+    # unbounded deque guarded by an input condition variable; finished results are kept
+    # in a dict by task id guarded by a result condition variable; active task ids are
+    # tracked for wait_for_task. Background-thread exceptions are stored and re-raised
+    # (fail-fast) in the main thread as RuntimeError.
     """Generic dispatcher for asynchronous task execution with staleness control.
 
     Manages background threads for task submission and result collection.
@@ -306,6 +345,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         enable_tracing: bool = False,
         deterministic_order: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Creates the AsyncTaskRunner (max_queue_size, tracing flag) and stores
+        # task_factory (maps an input to a zero-arg coroutine function), staleness
+        # manager, tracing and deterministic-order flags. Initializes the deque, result
+        # dict, active-id set, locks/condition variables, shutdown event, thread
+        # handles, exception slot and callback-address map. The logger is set later in
+        # initialize.
         self.runner = AsyncTaskRunner(
             max_queue_size=max_queue_size,
             enable_tracing=enable_tracing,
@@ -340,12 +386,18 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self._task_callbacks: dict[int, str] = {}
 
     def _set_thread_exception(self, exc: Exception):
+        # [FUNCTION DOC]
+        # HELPER: records the first background-thread exception under its lock; later
+        # ones are ignored.
         """Store exception from background thread for fail-fast behavior."""
         with self._thread_exception_lock:
             if self._thread_exception is None:
                 self._thread_exception = exc
 
     def _check_thread_exception(self):
+        # [FUNCTION DOC]
+        # HELPER: raises RuntimeError chained from the stored background exception, if
+        # any.
         """Check if any background thread has failed and raise if so."""
         with self._thread_exception_lock:
             if self._thread_exception is not None:
@@ -354,6 +406,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 ) from self._thread_exception
 
     def _has_runner_capacity(self) -> bool:
+        # [FUNCTION DOC]
+        # HELPER: True when the runner is not paused, staleness capacity is positive and
+        # the runner's input queue is below its max size.
         return (
             not self.runner.paused.is_set()
             and self.staleness_manager.get_capacity() > 0
@@ -361,17 +416,29 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         )
 
     def register_callback(self, task_id: int, callback_addr: str):
+        # [FUNCTION DOC]
+        # Associates a callback URL with task_id; the consumer posts to it when the
+        # result arrives.
         """Register a callback address for a task."""
         self._task_callbacks[task_id] = callback_addr
 
     def cancel_callback(self, task_id: int):
+        # [FUNCTION DOC]
+        # Removes any callback registered for task_id (no error if absent).
         """Remove a registered callback for a task (e.g., on timeout)."""
         self._task_callbacks.pop(task_id, None)
 
     def _send_callback(self, addr: str, task_id: int, result: TResult):
+        # [FUNCTION DOC]
+        # HELPER: submits a fire-and-forget job to the shared default executor that
+        # POSTs JSON with the task_id (30s timeout) to addr; request failures are logged
+        # as errors. The result argument is not sent.
         """Send task result to callback address (fire-and-forget)."""
 
         def post():
+            # [FUNCTION DOC]
+            # HELPER: performs the HTTP POST and raise_for_status, logging
+            # RequestException.
             try:
                 resp = requests.post(
                     addr,
@@ -385,6 +452,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         get_executor().submit(post)
 
     def _commit_loop(self) -> None:
+        # [FUNCTION DOC]
+        # Producer thread body. Until shutdown: checks for sibling-thread failures,
+        # blocks for the next submittable input, builds its task function and submits it
+        # to the runner, then calls on_rollout_submitted (and logs stats if tracing). If
+        # the runner queue is full, puts the input back at the front and waits on the
+        # input condition until shutdown or runner capacity. Any other exception is
+        # logged, stored, result waiters are notified and the loop exits.
         """Producer thread - continuously submits tasks based on capacity."""
         while not self._shutdown_event.is_set():
             try:
@@ -421,6 +495,12 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 break
 
     def _fetch_loop(self) -> None:
+        # [FUNCTION DOC]
+        # Consumer thread body. Until shutdown: checks for failures, asks the runner for
+        # between 1 and 100 results (based on output queue size) with a 50ms timeout
+        # (continuing on TimeoutError), stores each by task id, posts any registered
+        # callback, notifies result waiters, then notifies the producer that capacity
+        # may have freed. On exception logs, stores it, wakes both conditions and exits.
         """Consumer thread - continuously collects results from runner."""
         while not self._shutdown_event.is_set():
             try:
@@ -462,6 +542,11 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 break
 
     def _get_next_task_for_submission(self) -> TInput | None:
+        # [FUNCTION DOC]
+        # HELPER: under the input condition, loops until shutdown: raises stored
+        # exceptions, and pops the leftmost pending input when the runner is not paused
+        # and staleness capacity is positive; otherwise waits for notification. Returns
+        # None on shutdown.
         with self._input_cv:
             while not self._shutdown_event.is_set():
                 self._check_thread_exception()
@@ -477,6 +562,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         return None
 
     def initialize(self, logger: Logger):
+        # [FUNCTION DOC]
+        # Stores the logger, initializes the runner with it, clears the shutdown flag
+        # and starts the daemon producer and consumer threads.
         self.logger = logger
         self.runner.initialize(logger=logger)
 
@@ -489,6 +577,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self._fetch_thread.start()
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Sets shutdown, wakes both conditions, joins each thread up to 2s (warning if
+        # still alive), clears registered callbacks and destroys the runner.
         self._shutdown_event.set()
         with self._input_cv:
             self._input_cv.notify()
@@ -516,6 +607,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         self.runner.destroy()
 
     def pause(self):
+        # [FUNCTION DOC]
+        # Pauses the runner (no new tasks start; running ones finish) and wakes the
+        # producer.
         """Pause request submission for async tasks.
 
         After calling pause(), no new tasks will be started from the
@@ -526,6 +620,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             self._input_cv.notify()
 
     def resume(self):
+        # [FUNCTION DOC]
+        # Resumes the runner and wakes the producer.
         """Resume request submission for async tasks.
 
         Allows new tasks to be pulled from the input queue and started.
@@ -535,6 +631,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
             self._input_cv.notify()
 
     def is_paused(self) -> bool:
+        # [FUNCTION DOC]
+        # Returns whether the runner's paused event is set.
         """Check if the dispatcher is currently paused.
 
         Returns
@@ -545,6 +643,9 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         return self.runner.paused.is_set()
 
     def _rollout_stats(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER: formats the staleness manager's enqueued/running/accepted/rejected
+        # counts into a log string.
         stats = self.staleness_manager.get_stats()
         return (
             f"enqueued: {stats.enqueued}, "
@@ -554,6 +655,10 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         )
 
     def submit_task_input(self, task_input: TInput) -> None:
+        # [FUNCTION DOC]
+        # Raises any stored background error, then appends the input to the pending
+        # deque, calls on_rollout_enqueued, optionally logs stats, notifies the
+        # producer, and adds its task_id to the active set.
         """Submit a task input for processing.
 
         Parameters
@@ -574,6 +679,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
     def wait_results(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> list[TResult | None]:
+        # [FUNCTION DOC]
+        # Blocks until at least count results are buffered (ValueError if count <= 0),
+        # re-raising background errors while waiting. On timeout (default 7 days) raises
+        # TimeoutError or returns an empty list when raise_timeout is False. Then drains
+        # all buffered results, chooses count via _select_results, puts the remainder
+        # back, removes selected ids from the active set and returns their data (None
+        # entries represent rejected tasks).
         """Wait for the completion of `count` tasks.
 
         Parameters
@@ -635,6 +747,13 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> TResult | None:
+        # [FUNCTION DOC]
+        # Waits for the result of one task id. Raises ValueError if the id is not active
+        # (never submitted or already consumed). Re-raises background errors; on timeout
+        # raises TimeoutError or returns None. Pops the result, removes the id from the
+        # active set, notifies waiters and returns its data.
+        # KNOWN ISSUE: with raise_timeout False a timeout and a rejected task both
+        # return None and are indistinguishable.
         """Wait for a specific task result by task_id."""
         start_time = time.perf_counter()
         if timeout is None:
@@ -667,6 +786,20 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         batch_size: int,
         dynamic_bs: bool = False,
     ) -> list[TResult]:
+        # [FUNCTION DOC]
+        # Loops: computes capacity as min(pending limit minus queued inputs, runner max
+        # queue size minus (input queue size + batch_size)); raises ValueError if the
+        # runner queue size is smaller than batch_size; submits up to min(batch_size,
+        # capacity) inputs from the infinite generator (RuntimeError if it is
+        # exhausted); waits up to 1s for (batch_size - accepted) results. Non-None
+        # results are accepted and collected. Normal mode stops at batch_size accepted
+        # results; dynamic_bs mode counts rejected attempts too and stops when attempts
+        # reach batch_size, returning only accepted results. Returns the list of
+        # results.
+        # KNOWN ISSUE: results arriving in the same wait call after the stopping
+        # condition is hit are silently dropped (their capacity was already counted),
+        # which in dynamic_bs mode can happen because the wait count is based on
+        # accepted rather than total attempts.
         """Continuously submit tasks and wait until a full batch of results is ready.
 
         This method maintains overlap between submission and result collection
@@ -762,11 +895,18 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
 
 
 class TaskIdGenerator:
+    # [CLASS DOC]
+    # Thread-safe monotonically increasing integer id generator starting at 0.
     def __init__(self):
+        # [FUNCTION DOC]
+        # Initializes the counter to 0 and a lock.
         self._task_cnt = 0
         self._lock = threading.Lock()
 
     def next(self):
+        # [FUNCTION DOC]
+        # Returns the current counter value and increments it, atomically under the
+        # lock.
         with self._lock:
             task_id = self._task_cnt
             self._task_cnt += 1
@@ -774,6 +914,12 @@ class TaskIdGenerator:
 
 
 class WorkflowExecutor:
+    # [CLASS DOC]
+    # Rollout executor used by remote inference engines: owns the config, the inference
+    # engine (also the version provider), a StalenessManager (provided or built in
+    # initialize, scaled per data-parallel rank) and a BatchTaskDispatcher of rollout
+    # inputs/results. Exposes submit/wait/wait_for_task/rollout_batch/prepare_batch and
+    # pause/resume.
     """Executor for asynchronous workflow-based rollout generation.
 
     Orchestrates workflow execution with AReaL-specific features including
@@ -787,6 +933,12 @@ class WorkflowExecutor:
         inference_engine: RemoteInfEngine,
         staleness_manager: StalenessManager | None = None,
     ):
+        # [FUNCTION DOC]
+        # Reads max_concurrent_rollouts (falls back to consumer_batch_size when unset),
+        # consumer_batch_size and max_head_offpolicyness from config; stores config,
+        # engine and the optional staleness manager. Dispatcher is None until
+        # initialize; also sets up the task id generator, expected-trajectory-keys
+        # tracker and lazy tokenizer with lock.
         self.max_concurrent_rollouts = (
             config.max_concurrent_rollouts or config.consumer_batch_size
         )
@@ -815,6 +967,10 @@ class WorkflowExecutor:
         self._tokenizer_lock = threading.Lock()
 
     def _resolve_dp_world_size(self):
+        # [FUNCTION DOC]
+        # HELPER: returns 1 if torch.distributed is not initialized; otherwise
+        # Megatron's data-parallel world size if Megatron parallel state is initialized,
+        # else the full world size (also when Megatron is not installed).
         if not dist.is_initialized():
             return 1
 
@@ -828,6 +984,9 @@ class WorkflowExecutor:
             return dist.get_world_size()
 
     def _get_tokenizer(self):
+        # [FUNCTION DOC]
+        # HELPER: lazily loads (double-checked under a lock) and caches the HF tokenizer
+        # from config.tokenizer_path; returns None if no path is configured.
         """Lazy-load tokenizer for trajectory text decoding."""
         if self._tokenizer is not None:
             return self._tokenizer
@@ -846,6 +1005,10 @@ class WorkflowExecutor:
             return self._tokenizer
 
     def _get_dump_dir(self, is_eval: bool) -> str | None:
+        # [FUNCTION DOC]
+        # HELPER: returns <StatsLogger log path>/rollout (or eval-rollout when is_eval)
+        # for the configured fileroot/experiment/trial, or None if any of those is
+        # unset.
         """Get the dump directory based on config and is_eval flag."""
         config = self.config
         if not config.fileroot or not config.experiment_name or not config.trial_name:
@@ -865,6 +1028,10 @@ class WorkflowExecutor:
     def _compute_output_versions(
         sample_versions: list[int], mask: list[int]
     ) -> tuple[int, int, list[list[int]]]:
+        # [FUNCTION DOC]
+        # HELPER: keeps versions where mask is 1 and returns (min, max, run-length
+        # encoding as [version, count] pairs); min/max are -1 when no masked tokens
+        # exist.
         """Filter versions by loss_mask and compute head, tail, and RLE."""
         output_versions = [v for v, m in zip(sample_versions, mask) if m == 1]
         head = min(output_versions) if output_versions else -1
@@ -881,6 +1048,13 @@ class WorkflowExecutor:
     def _split_trajectory_for_dump(
         ids: list[int], mask: list[int], tokenizer
     ) -> dict[str, Any]:
+        # [FUNCTION DOC]
+        # HELPER: given token ids and loss mask (ValueError on length mismatch), the
+        # prompt ends at the first mask==1 position. Decodes prompt and completion text
+        # (special tokens kept). Counts contiguous generated runs; only if more than one
+        # (multi-turn) it decodes every contiguous same-mask segment labelled "prompt"
+        # (first non-gen), "context" (later non-gen) or "gen", with lengths. Returns
+        # dict with prompt_end, prompt_text, completion_text and segments (or None).
         if len(ids) != len(mask):
             raise ValueError(f"ids length {len(ids)} != mask length {len(mask)}")
         prompt_end = mask.index(1) if 1 in mask else len(ids)
@@ -941,6 +1115,19 @@ class WorkflowExecutor:
         task_id: int,
         is_eval: bool,
     ) -> tuple[bool, str]:
+        # [FUNCTION DOC]
+        # HELPER: async. Appends per-sample JSON lines for a tensor trajectory to <dump
+        # dir>/<max version>/<task_id>.jsonl. Localizes RTensors first. Returns (False,
+        # reason) when traj is None, dump dir or tokenizer is unavailable, or
+        # input_ids/rewards/loss_mask/attention_mask are missing. Uses the versions
+        # tensor (or the engine's current version with a warning) for directory naming
+        # and per sample head/tail/RLE versions. Skips samples with zero length or whose
+        # last valid token is not generated. Each record holds task_id, sample_idx,
+        # seqlen, prompt_len, versions, reward, prompt/completion text, segments when
+        # multi-turn and original_reward if present. Any exception yields (False, "dump
+        # failed: ..."); success returns (True, "").
+        # KNOWN ISSUE: assumes right padding (takes the first seqlen tokens where
+        # seqlen is the attention_mask sum), so left-padded inputs are mis-sliced.
         if traj is None:
             return False, "trajectory is None"
 
@@ -1044,6 +1231,14 @@ class WorkflowExecutor:
             return False, f"dump failed: {e}"
 
     def initialize(self, logger=None, train_data_parallel_size: int | None = None):
+        # [FUNCTION DOC]
+        # Sets the logger (default "WorkflowExecutor" or "WorkflowExecutor Rank N"). If
+        # no staleness manager was provided, divides max_concurrent_rollouts and
+        # consumer_batch_size by the DP world size (given or resolved, min 1 each) and
+        # builds one with the engine as version provider. Creates the dispatcher with
+        # queue size config.queue_size or 16 times max_concurrent_rollouts, the workflow
+        # task factory, tracing flag and deterministic_sampling flag, and starts its
+        # threads.
         """Initialize the workflow executor and start background threads.
 
         Creates and initializes BatchTaskDispatcher with StalenessManager.
@@ -1102,6 +1297,9 @@ class WorkflowExecutor:
         self._dispatcher.initialize(logger=logger)
 
     def destroy(self):
+        # [FUNCTION DOC]
+        # Destroys the dispatcher if created and force-flushes the session perf tracer
+        # if one exists.
         """Shutdown the workflow executor and clean up resources.
 
         Destroys the dispatcher (which stops background threads and AsyncTaskRunner),
@@ -1117,6 +1315,9 @@ class WorkflowExecutor:
             tracer.flush(force=True)
 
     def get_capacity(self):
+        # [FUNCTION DOC]
+        # Returns the staleness manager's current capacity (RuntimeError before
+        # initialize).
         """Get current available capacity for new rollouts.
 
         Returns
@@ -1127,6 +1328,9 @@ class WorkflowExecutor:
         return self.staleness_manager.get_capacity()
 
     def _rollout_stats(self) -> str:
+        # [FUNCTION DOC]
+        # HELPER: formats rollout counters for logging (same as the dispatcher's
+        # version).
         stats = self.staleness_manager.get_stats()
         return (
             f"enqueued: {stats.enqueued}, "
@@ -1136,12 +1340,18 @@ class WorkflowExecutor:
         )
 
     async def _clear_rejected_trajectory(self, traj: dict[str, Any] | None) -> None:
+        # [FUNCTION DOC]
+        # HELPER: async best-effort release of remote RTensor shards referenced by a
+        # rejected trajectory. Groups shards by node, clears each node concurrently with
+        # a 5s timeout, and logs timeouts or other failures as warnings without raising.
         """Best-effort cleanup for remote shards that will not reach training."""
         shards_by_node = RTensor.collect_shards(traj)
         if not shards_by_node:
             return
 
         async def _clear_node(node_addr: str, shard_ids: list[Any]) -> None:
+            # [FUNCTION DOC]
+            # HELPER: clears the given shard ids on one node, bounded by the timeout.
             await asyncio.wait_for(
                 RTensor.clear_node(node_addr, shard_ids),
                 timeout=_REJECTED_TRAJECTORY_CLEAR_TIMEOUT_SECONDS,
@@ -1171,6 +1381,9 @@ class WorkflowExecutor:
     def _create_workflow_task(
         self, pending_task: _RolloutTaskInput
     ) -> Callable[[], Awaitable[_RolloutResult | None]]:
+        # [FUNCTION DOC]
+        # Returns a zero-arg coroutine function bound to pending_task, used as the
+        # dispatcher's task factory.
         """Wrapper to create an async function that will be executed by AsyncTaskRunner.
 
         This is a synchronous function that returns an async function, which allows
@@ -1189,6 +1402,17 @@ class WorkflowExecutor:
         """
 
         async def _execute_workflow() -> _RolloutResult | None:
+            # [FUNCTION DOC]
+            # Runs one rollout: sets the perf-tracer task id and WorkflowContext, awaits
+            # workflow.arun_episode(engine, data). If configured, validates the format
+            # and records the first tensor trajectory's key set for later consistency
+            # checks. Converts an all-interaction dict to padded tensors (or to string
+            # interactions if any lack tensor data). Acceptance: None is rejected
+            # ("returned_none"); otherwise should_accept_fn decides (default accept).
+            # Optionally dumps to file (warning on failure). Accepted: increments
+            # accepted counters/stats, emits a finalized trace event and returns a
+            # _RolloutResult. Rejected or exception: marks rejected (status "rejected"
+            # or "failed"), logs exceptions, clears remote shards and returns None.
             """Execute workflow.arun_episode and apply AReaL-specific logic."""
             task_id = pending_task.task_id
 
@@ -1321,6 +1545,10 @@ class WorkflowExecutor:
         task_id: int | None = None,
         is_eval: bool = False,
     ) -> int:
+        # [FUNCTION DOC]
+        # Assigns a task id (generated if not given), registers it with the perf tracer,
+        # wraps the request in a _RolloutTaskInput and enqueues it on the dispatcher.
+        # Non-blocking; returns the task id.
         """Submit a rollout request to the workflow executor.
 
         Enqueues the request to _pending_inputs. The background producer thread
@@ -1346,6 +1574,11 @@ class WorkflowExecutor:
     def wait(
         self, count: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> list[dict[str, Any] | None]:
+        # [FUNCTION DOC]
+        # Waits for count results via the dispatcher and returns their trajectories
+        # (None for rejected). Logs readiness when tracing.
+        # KNOWN ISSUE: docstring says results are time-sorted and shuffled, but under
+        # deterministic sampling they are ordered by task id without shuffling.
         """Wait for the completion of `count` workflows.
 
         Returns a list of trajectory dictionaries (or None for rejected rollouts).
@@ -1363,6 +1596,12 @@ class WorkflowExecutor:
     def wait_for_task(
         self, task_id: int, timeout: float | None = None, raise_timeout: bool = True
     ) -> dict[str, Any] | None:
+        # [FUNCTION DOC]
+        # Waits for one task via the dispatcher and returns its trajectory, or None if
+        # rejected (or timed out with raise_timeout False). Raises ValueError for
+        # unknown ids and TimeoutError on timeout.
+        # KNOWN ISSUE: docstring says timeout None waits indefinitely; it actually uses
+        # a 7-day default.
         """
         Wait for a specific workflow task to complete.
         Parameters
@@ -1399,6 +1638,10 @@ class WorkflowExecutor:
         data: list[dict[str, Any]],
         workflow: RolloutWorkflow,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Perf-traced. Submits every item of data with the workflow, waits for all of
+        # them and returns the non-None trajectories (synchronous; for offline
+        # use/debugging).
         """Submit a batch of requests and wait for results.
 
         This method does not support asynchronous rollout and should be used for offline
@@ -1436,6 +1679,14 @@ class WorkflowExecutor:
         should_accept_fn: Callable[[dict[str, Any]], bool] = None,
         dynamic_bs: bool = False,
     ) -> list[dict[str, Any]]:
+        # [FUNCTION DOC]
+        # Perf-traced. On first call caches a generator (self.data_generator) that
+        # cycles the dataloader forever, yielding a _RolloutTaskInput per item with a
+        # new registered task id, the workflow and should_accept_fn. Then runs
+        # active_submit_and_wait with the dataloader's batch size (asserted non-None)
+        # and dynamic_bs, returning the accepted trajectories.
+        # KNOWN ISSUE: later calls ignore their dataloader/workflow/should_accept_fn
+        # arguments because the first generator is reused (documented in the docstring).
         """Prepare a batch with controlled staleness.
 
         Continuously submits from dataloader and waits for results, ensuring at least
@@ -1464,6 +1715,9 @@ class WorkflowExecutor:
         """
 
         def task_input_generator():
+            # [FUNCTION DOC]
+            # HELPER: infinite generator of rollout task inputs from the cycled
+            # dataloader.
             for data in cycle_dataloader(dataloader):
                 for item in data:
                     # Workflow is already resolved by RemoteInfEngine
@@ -1489,6 +1743,8 @@ class WorkflowExecutor:
         return [r.trajectory for r in results if r is not None]
 
     def pause(self):
+        # [FUNCTION DOC]
+        # Pauses task submission via the dispatcher.
         """Pause request submission for async rollout.
 
         See :meth:`~areal.api.engine_api.InferenceEngine.pause` for detailed
@@ -1497,6 +1753,8 @@ class WorkflowExecutor:
         self.dispatcher.pause()
 
     def resume(self):
+        # [FUNCTION DOC]
+        # Resumes task submission via the dispatcher.
         """Resume request submission for async rollout.
 
         See :meth:`~areal.api.engine_api.InferenceEngine.resume` for detailed
@@ -1505,10 +1763,15 @@ class WorkflowExecutor:
         self.dispatcher.resume()
 
     def is_paused(self):
+        # [FUNCTION DOC]
+        # Returns whether the dispatcher is paused.
         return self.dispatcher.is_paused()
 
     @property
     def staleness_manager(self) -> StalenessManager:
+        # [FUNCTION DOC]
+        # Property returning the staleness manager; raises RuntimeError if initialize
+        # has not created/received one.
         manager = self._staleness_manager
         if manager is None:
             raise RuntimeError(
@@ -1518,6 +1781,8 @@ class WorkflowExecutor:
 
     @property
     def dispatcher(self) -> BatchTaskDispatcher[_RolloutTaskInput, _RolloutResult]:
+        # [FUNCTION DOC]
+        # Property returning the dispatcher; raises RuntimeError before initialize.
         """Get the task dispatcher, ensuring initialization has been called."""
         if self._dispatcher is None:
             raise RuntimeError(
@@ -1527,5 +1792,7 @@ class WorkflowExecutor:
 
     @property
     def runner(self):
+        # [FUNCTION DOC]
+        # Backward-compatible property returning the dispatcher's AsyncTaskRunner.
         """For backward compatibility. The runner is now owned by the dispatcher."""
         return self.dispatcher.runner

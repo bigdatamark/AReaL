@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Concurrency helpers: a process-wide registry of named ThreadPoolExecutors (shut down
+# at exit), helpers to run coroutines from sync code, and an "asyncio-atexit" mechanism
+# that monkey-patches an event loop's close() so registered cleanup callbacks (sync or
+# async) run before the loop closes. Module globals: the executor dict plus its lock and
+# an atexit-registered flag, and a WeakKeyDictionary mapping loops to cleanup entries.
+# Logs via the "ConcurrentUtils" logger.
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -22,6 +29,11 @@ _atexit_registered = False
 def get_executor(
     scope: str = "default", *, max_workers: int = 4
 ) -> concurrent.futures.ThreadPoolExecutor:
+    # [FUNCTION DOC]
+    # Returns the cached ThreadPoolExecutor for scope, creating it lazily with
+    # max_workers threads (thread name prefix "exec_<scope>") using double-checked
+    # locking. max_workers is ignored if the scope already exists. On first creation
+    # registers the shutdown-all hook with atexit. Mutates module globals.
     """Get or create a named thread pool executor.
 
     Executors are lazily created per *scope* and cached for the process
@@ -61,6 +73,9 @@ def get_executor(
 
 
 def _shutdown_all_executors() -> None:
+    # [FUNCTION DOC]
+    # HELPER: atexit hook; under the lock calls shutdown(wait=False) on every cached
+    # executor and clears the registry.
     with _executors_lock:
         for executor in _executors.values():
             executor.shutdown(wait=False)
@@ -68,6 +83,13 @@ def _shutdown_all_executors() -> None:
 
 
 def run_async_task(func, *args, **kwargs):
+    # [FUNCTION DOC]
+    # Runs the coroutine produced by func(*args, **kwargs) to completion and returns its
+    # result. If an event loop is already running in this thread, runs it via
+    # asyncio.run on a thread of the "default" executor and blocks on the future;
+    # otherwise calls asyncio.run directly. Exceptions from the coroutine propagate.
+    # KNOWN ISSUE: when called from inside a running loop it blocks that loop's thread
+    # while waiting, and the coroutine object is created on the caller's thread.
     # Check if we're already in an async context
     try:
         loop = asyncio.get_running_loop()
@@ -84,6 +106,9 @@ def run_async_task(func, *args, **kwargs):
 
 
 def call_maybe_async(method, *args, **kwargs) -> None:
+    # [FUNCTION DOC]
+    # Calls method(*args, **kwargs); if the result is awaitable, awaits it to completion
+    # through run_async_task. Always returns None (the result value is discarded).
     """Call a callable and await it if it returns an awaitable.
 
     This helper lets sync call-sites invoke methods that may be implemented as
@@ -93,6 +118,8 @@ def call_maybe_async(method, *args, **kwargs) -> None:
     if inspect.isawaitable(result):
 
         async def _wait_result() -> None:
+            # [FUNCTION DOC]
+            # HELPER: coroutine wrapper that just awaits the captured awaitable result.
             await result
 
         run_async_task(_wait_result)
@@ -112,12 +139,18 @@ _loop_cleanup_registry: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 class _LoopCleanupEntry:
+    # [CLASS DOC]
+    # HELPER: per-loop registry record holding the ordered list of cleanup callbacks.
     """Registry entry for event loop cleanup callbacks.
 
     Stores a list of cleanup callbacks for an event loop.
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop):
+        # [FUNCTION DOC]
+        # Saves the loop's original close method as an attribute _cleanup_orig_close on
+        # the loop (only once, to avoid double patching) and initializes an empty
+        # callbacks list.
         # Save original close method (avoid double-patching)
         if not hasattr(loop, "_cleanup_orig_close"):
             loop._cleanup_orig_close = loop.close
@@ -126,6 +159,10 @@ class _LoopCleanupEntry:
 
 
 def register_loop_cleanup(callback, *, loop=None):
+    # [FUNCTION DOC]
+    # Appends callback (zero-arg, sync or async) to the cleanup list of loop (default:
+    # the currently running loop; raises RuntimeError if none). Patches the loop on
+    # first use. Callbacks later run in LIFO order when the loop closes.
     """Register a callback to run when the event loop closes.
 
     Like atexit.register, but runs when the asyncio loop closes.
@@ -158,6 +195,9 @@ def register_loop_cleanup(callback, *, loop=None):
 
 
 def unregister_loop_cleanup(callback, *, loop=None):
+    # [FUNCTION DOC]
+    # Removes every occurrence of callback from the cleanup list of loop (default: the
+    # running loop), patching/registering the loop if it was not yet registered.
     """Unregister a callback registered with register_loop_cleanup.
 
     Removes all instances of the callback from the registry for the
@@ -179,6 +219,9 @@ def unregister_loop_cleanup(callback, *, loop=None):
 
 
 def _get_loop_entry(loop=None):
+    # [FUNCTION DOC]
+    # HELPER: resolves loop (running loop when None), ensures it is registered/patched,
+    # and returns its _LoopCleanupEntry.
     """Get or create the registry entry for an event loop.
 
     Parameters
@@ -198,6 +241,9 @@ def _get_loop_entry(loop=None):
 
 
 def _register_loop(loop):
+    # [FUNCTION DOC]
+    # HELPER: if the loop is not yet in the registry, creates its entry and replaces
+    # loop.close with a partial of the patched close function bound to this loop.
     """Patch an event loop to support cleanup callbacks.
 
     Patches the loop's close() method if not already patched to run
@@ -216,6 +262,10 @@ def _register_loop(loop):
 
 
 async def _run_cleanup_callbacks(loop, callbacks):
+    # [FUNCTION DOC]
+    # HELPER: coroutine that invokes callbacks in reverse order, awaiting results that
+    # are awaitable; any exception is logged with traceback at ERROR and swallowed. The
+    # loop parameter is unused.
     """Run event loop cleanup callbacks.
 
     Executes in loop.close() via run_until_complete before closing.
@@ -242,6 +292,12 @@ async def _run_cleanup_callbacks(loop, callbacks):
 
 
 def _patched_loop_close(loop):
+    # [FUNCTION DOC]
+    # HELPER: replacement for loop.close(). If callbacks exist and the loop is not
+    # closed, runs them via run_until_complete; then clears the callback list and calls
+    # the saved original close, returning its result.
+    # KNOWN ISSUE: run_until_complete raises if close() is invoked while the loop is
+    # still running.
     """Patched EventLoop.close to run cleanup callbacks first.
 
     This is the core of the asyncio-atexit pattern. Runs all registered

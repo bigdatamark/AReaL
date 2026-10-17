@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Process utilities: building shell commands with env prefixes and line buffering,
+# streaming child output to the terminal plus role-specific and merged (role-prefixed)
+# log files, and killing process trees with psutil. Logger "ProcUtils".
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -30,6 +34,11 @@ def build_target_cmd(
     use_stdbuf: bool = False,
     target_env: dict[str, str] | None = None,
 ) -> str:
+    # [FUNCTION DOC]
+    # Returns a single shell string: optional "K=V ..." prefix from env_vars (values
+    # shell-quoted), then "stdbuf -oL" when use_stdbuf is set and LD_PRELOAD is absent
+    # from both env_vars and the effective target environment (target_env, or os.environ
+    # when None), then the command (a list is shlex-quoted and joined).
     """Build a shell command with optional environment and line buffering.
 
     GNU ``stdbuf`` injects ``libstdbuf`` through ``LD_PRELOAD``. Avoid wrapping a
@@ -70,6 +79,14 @@ def build_streaming_log_cmd(
     env_vars: dict[str, str] | None = None,
     target_env: dict[str, str] | None = None,
 ) -> str:
+    # [FUNCTION DOC]
+    # Builds a bash command running the target (via build_target_cmd, using stdbuf if
+    # available on PATH) with stderr merged into stdout, piped to tee which appends to
+    # log_file and, via process substitution, to a sed that prefixes each line with
+    # "[role]" padded to LOG_PREFIX_WIDTH and appends to merged_log; tee also echoes to
+    # stdout. Returns the string.
+    # KNOWN ISSUE: log_file/merged_log paths and role are not shell-quoted; spaces or
+    # special characters (e.g. "/" in role for sed) break the command.
     """Build a shell command that streams output to stdout and log files.
 
     The command uses tee/sed pattern:
@@ -130,6 +147,10 @@ def run_with_streaming_logs(
     env_vars_in_cmd: dict[str, str] | None = None,
     stdout: IO | None = None,
 ) -> subprocess.Popen:
+    # [FUNCTION DOC]
+    # Builds the streaming command and launches it with Popen(shell=True, /bin/bash)
+    # using env, sending stdout and stderr to the given stream (default sys.stdout).
+    # Returns the Popen handle; does not wait.
     """Run a command with streaming output to stdout and log files.
 
     Parameters
@@ -180,6 +201,17 @@ def kill_process_tree(
     skip_pid: int | None = None,
     graceful: bool = True,
 ) -> None:
+    # [FUNCTION DOC]
+    # Terminates parent_pid (default: current process, in which case include_parent is
+    # forced False) and all recursive children, excluding skip_pid. In the main thread
+    # first resets SIGCHLD to default. Returns early (INFO log) if the parent does not
+    # exist. Graceful mode: SIGTERM to children and parent, wait up to timeout seconds,
+    # SIGKILL survivors and wait 1s more, logging progress. Non-graceful: SIGKILL
+    # children; if include_parent, SIGKILL the parent (calling sys.exit(0) if it is the
+    # current process) and additionally send SIGQUIT for processes immune to SIGKILL
+    # (e.g. PID 1 in containers). NoSuchProcess errors are ignored.
+    # KNOWN ISSUE: killing the current process with SIGKILL means sys.exit(0) is
+    # effectively unreachable.
     # Remove sigchld handler to avoid spammy logs (only in main thread)
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGCHLD, signal.SIG_DFL)

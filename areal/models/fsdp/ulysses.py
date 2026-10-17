@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Ulysses sequence parallelism helpers for FSDP models (adapted from verl). Holds a
+# module-global SP process group and provides all-to-all redistribution between
+# sequence-sharded and head-sharded layouts (autograd-capable via functional
+# collectives), padding/slicing of packed inputs across SP ranks, and preparation of
+# per-rank micro-batch inputs including rolled labels.
 # SPDX-License-Identifier: Apache-2.0
 
 # Adapted from verl
@@ -12,6 +18,8 @@ _ULYSSES_SEQUENCE_PARALLEL_GROUP = None
 
 
 def set_ulysses_sequence_parallel_group(group: dist.ProcessGroup | None):
+    # [FUNCTION DOC]
+    # Sets the module-global Ulysses SP process group (None disables SP).
     """
     Set ulysses sequence parallel process group.
     """
@@ -20,6 +28,8 @@ def set_ulysses_sequence_parallel_group(group: dist.ProcessGroup | None):
 
 
 def get_ulysses_sequence_parallel_group() -> dist.ProcessGroup | None:
+    # [FUNCTION DOC]
+    # Returns the module-global SP process group or None.
     """
     Get ulysses sequence parallel process group.
     """
@@ -28,6 +38,8 @@ def get_ulysses_sequence_parallel_group() -> dist.ProcessGroup | None:
 
 
 def get_ulysses_sequence_parallel_world_size(group: ProcessGroup | None = None) -> int:
+    # [FUNCTION DOC]
+    # Returns the world size of group (default: the global SP group), or 1 if no group.
     """
     Get ulysses sequence parallel world size.
     """
@@ -36,6 +48,8 @@ def get_ulysses_sequence_parallel_world_size(group: ProcessGroup | None = None) 
 
 
 def get_ulysses_sequence_parallel_rank(group: ProcessGroup | None = None) -> int:
+    # [FUNCTION DOC]
+    # Returns this rank within group (default: the global SP group), or 0 if no group.
     """
     Get ulysses sequence parallel rank.
     """
@@ -50,6 +64,11 @@ def _gather_seq_scatter_heads(
     unpadded_dim_size: int = 0,
     group: ProcessGroup | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # HELPER: all-to-all from [.., seq/n, heads, ..] to [.., seq, heads/n, ..]: scatters
+    # head_dim and gathers seq_dim. Identity if group is None or size 1. If
+    # unpadded_dim_size is given and not divisible by the SP size, trims trailing
+    # padding on seq_dim back to that size.
     """All-to-All: [bsz, seq/n, h, ...] -> [bsz, seq, h/n, ...]"""
     if group is None:
         return x
@@ -74,6 +93,10 @@ def _gather_heads_scatter_seq(
     seq_dim: int,
     group: ProcessGroup | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # HELPER: inverse all-to-all from [.., seq, heads/n, ..] to [.., seq/n, heads, ..].
+    # Zero-pads seq_dim up to a multiple of the SP size first. Identity if group is None
+    # or size 1.
     """All-to-All: [bsz, seq, h/n, ...] -> [bsz, seq/n, h, ...]"""
     if group is None:
         return x
@@ -97,6 +120,9 @@ def gather_seq_scatter_heads(
     unpadded_dim_size: int = 0,
     group: ProcessGroup | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Public wrapper of the seq-gather/head-scatter all-to-all using the global SP group
+    # when group is None.
     """_gather_seq_scatter_heads with global group."""
     if group is None:
         group = get_ulysses_sequence_parallel_group()
@@ -109,6 +135,9 @@ def gather_heads_scatter_seq(
     seq_dim: int,
     group: ProcessGroup | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Public wrapper of the head-gather/seq-scatter all-to-all using the global SP group
+    # when group is None.
     """_gather_heads_scatter_seq with global group."""
     if group is None:
         group = get_ulysses_sequence_parallel_group()
@@ -116,6 +145,8 @@ def gather_heads_scatter_seq(
 
 
 def _pad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
+    # [FUNCTION DOC]
+    # HELPER: appends padding_size zeros (same dtype/device) along dim; returns x if 0.
     if padding_size == 0:
         return x
     shape = list(x.shape)
@@ -125,6 +156,8 @@ def _pad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
 
 
 def _unpad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
+    # [FUNCTION DOC]
+    # HELPER: removes the last padding_size entries along dim; returns x if 0.
     if padding_size == 0:
         return x
     slc = [slice(None)] * len(x.shape)
@@ -135,6 +168,13 @@ def _unpad_tensor(x: Tensor, dim: int, padding_size: int) -> Tensor:
 def slice_input_tensor(
     x: Tensor, dim: int, padding: bool = True, group: dist.ProcessGroup | None = None
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Returns this rank's contiguous chunk of x along dim for SP: optionally zero-pads
+    # dim to a multiple of the SP world size, then takes slice [rank*part,
+    # (rank+1)*part).
+    # KNOWN ISSUE: the world size comes from the given group but the rank always comes
+    # from the global SP group, so a non-default group yields wrong slices; with padding
+    # False a non-divisible size silently drops the remainder.
     group = get_ulysses_sequence_parallel_group() if group is None else group
     sp_world_size = dist.get_world_size(group)
     sp_rank = get_ulysses_sequence_parallel_rank()
@@ -156,6 +196,13 @@ def all_to_all_tensor(
     gather_dim: int,
     group: dist.ProcessGroup | None = None,
 ) -> Tensor:
+    # [FUNCTION DOC]
+    # Equal-split all-to-all over group (default global SP group): chunks local_input
+    # into world_size pieces along scatter_dim, stacks and flattens them, exchanges with
+    # all_to_all_single_autograd, reshapes and concatenates received pieces along
+    # gather_dim. Returns a contiguous tensor with scatter_dim divided and gather_dim
+    # multiplied by world_size. Collective; requires scatter_dim divisible by world
+    # size.
     """
     All-to-all communication for multi-dimensional tensors.
 
@@ -209,6 +256,11 @@ def ulysses_pad(
     position_ids_rmpad: torch.Tensor | None = None,
     sp_size: int = 1,
 ):
+    # [FUNCTION DOC]
+    # Right-pads packed input_ids [1, total_len] with 0 so the length is a multiple of
+    # sp_size; position ids (shape [1, L] or [3, 1, L] for mRoPE, asserted to match) are
+    # extended with 0..pad-1. Returns (input_ids, position_ids, pad_size); no-op with
+    # pad 0 when sp_size <= 1.
     if position_ids_rmpad is not None:
         assert position_ids_rmpad.size(-2) == 1
         assert input_ids_rmpad.size(-1) == position_ids_rmpad.size(-1)
@@ -235,6 +287,9 @@ def ulysses_pad_and_slice_inputs(
     position_ids_rmpad: torch.Tensor | None = None,
     sp_size: int = 1,
 ):
+    # [FUNCTION DOC]
+    # Pads via ulysses_pad, then slices input_ids and position ids along dim 1 to this
+    # rank's SP shard. Returns (ids, position ids, pad_size).
     input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
         input_ids_rmpad, position_ids_rmpad, sp_size
     )
@@ -252,6 +307,14 @@ def ulysses_prepare_inputs(
     ulysses_position_ids,
     sp_world_size,
 ):
+    # [FUNCTION DOC]
+    # Builds the per-rank model input dict from a padded micro-batch: shallow-copies it,
+    # replaces input_ids/position_ids with the given SP-sliced versions, and for other
+    # tensors whose first two dims match the padded input_ids: slices values, returns
+    # and loss_mask along the sequence (with padding) then squeezes batch dim 0; other
+    # such tensors are only squeezed (kept full length). Adds rolled_input_ids: full
+    # input_ids shifted left by one (labels), padded and sliced for this rank, squeezed.
+    # Returns the dict.
     # init inputs with padded_mb_input and ulysses_inputs
     inputs = padded_mb_input.copy()
     inputs["input_ids"] = ulysses_input_ids

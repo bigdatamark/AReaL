@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Ray helpers: cluster init, discovering a master address inside a placement group,
+# building Ray resource specs, and detecting the accelerator resource type.
 # SPDX-License-Identifier: Apache-2.0
 
 import ray
@@ -8,6 +11,9 @@ from areal.utils.network import find_free_ports, gethostip
 
 
 def initialize_ray() -> None:
+    # [FUNCTION DOC]
+    # No-op if Ray is initialized; otherwise tries ray.init(address="auto") to join an
+    # existing cluster and on ConnectionError starts a local Ray instance.
     """Connect to an existing Ray cluster, or start a local one."""
     if ray.is_initialized():
         return
@@ -21,7 +27,15 @@ def initialize_ray() -> None:
 def get_placement_group_master_ip_and_port(
     placement_group: PlacementGroup, placement_group_bundle_index: int = 0
 ):
+    # [FUNCTION DOC]
+    # Schedules a tiny Ray task (1 CPU, 0 GPU, 10MB memory) on the given bundle index of
+    # placement_group that returns (host IP, a free port in 10000-32767); blocks on
+    # ray.get and returns that tuple. Used to pick a rendezvous address on the node.
+    # KNOWN ISSUE: the inline comment says "Convert MB to bytes" but the value is a
+    # fixed 10MB literal; the port is only free at probe time (race).
     def _master_ip_and_port():
+        # [FUNCTION DOC]
+        # HELPER: remote body; returns this node's IP and one free port.
         host_ip = gethostip()
         port = find_free_ports(1, (10000, 32767))[0]
         return host_ip, port
@@ -39,6 +53,10 @@ def get_placement_group_master_ip_and_port(
 
 
 def create_resource_spec(device, cpu: int, gpu: int, mem_in_bytes: int):
+    # [FUNCTION DOC]
+    # Returns Ray resource kwargs: num_cpus=cpu, memory=mem_in_bytes, plus num_gpus=gpu
+    # when device is "GPU", or a custom resources dict {device: gpu} for other non-CPU
+    # devices (e.g. "NPU").
     res = {"num_cpus": cpu, "memory": mem_in_bytes}
     if device == "GPU":
         res["num_gpus"] = float(gpu)
@@ -48,6 +66,10 @@ def create_resource_spec(device, cpu: int, gpu: int, mem_in_bytes: int):
 
 
 def ray_resource_type():
+    # [FUNCTION DOC]
+    # Returns "NPU" if an NPU is available locally (checked first since MindSpeed
+    # patches CUDA availability), else "GPU" if CUDA is available, else the cluster-wide
+    # accelerator type or "CPU". Lazily imports torch and platform detection.
     # npu before cuda because mindspeed patches cuda.is_available
     import torch
 
@@ -63,6 +85,9 @@ def ray_resource_type():
 
 
 def _cluster_accelerator_type() -> str | None:
+    # [FUNCTION DOC]
+    # HELPER: if Ray is initialized, returns "NPU" or "GPU" when the cluster resources
+    # report a nonzero amount (NPU checked first), else None.
     # The driver may sit on a device-free node (e.g. a CPU-only head pod) while
     # accelerators live on remote workers, so local probing is not conclusive.
     if not ray.is_initialized():

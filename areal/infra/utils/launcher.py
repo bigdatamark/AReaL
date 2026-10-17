@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Launcher utilities shared by local/Slurm/Ray launchers: cache-dir and base environment
+# constants, thread-count env var computation, scheduling-spec lookup, worker
+# environment construction, job state/info types, waiting for rollout server addresses
+# via name_resolve, config validation, and the post-exit hook runner. Import side
+# effects: computes LOCAL_CACHE_DIR (env AREAL_CACHE_DIR or /tmp/areal-<user>), creates
+# torch-kernel, vLLM and Triton cache directories under it, locates the repo root (dir
+# with pyproject.toml) to extend PYTHONPATH, and defines BASE_ENVIRONS (tokenizers
+# parallelism, cache paths, CUDA_DEVICE_MAX_CONNECTIONS=1). Logger "LauncherUtils".
 # SPDX-License-Identifier: Apache-2.0
 
 import dataclasses
@@ -24,6 +33,9 @@ TRITON_CACHE_PATH = f"{LOCAL_CACHE_DIR}/.cache/{getpass.getuser()}/triton/"
 
 
 def _find_repo_root():
+    # [FUNCTION DOC]
+    # HELPER: walks up from this file's resolved path and returns the first directory
+    # containing pyproject.toml, or None for an installed (non-checkout) package.
     p = pathlib.Path(__file__).resolve()
     while p != p.parent:
         if (p / "pyproject.toml").exists():
@@ -67,6 +79,10 @@ def get_thread_env_vars(
     cpus_per_task: int | None = None,
     existing_env_vars: dict[str, str] | None = None,
 ) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # Returns a dict for OMP/MKL/OPENBLAS/VECLIB/NUMEXPR thread vars. Each var takes, in
+    # priority order, existing_env_vars[var], os.environ[var], or the computed count
+    # (cpus_per_task if positive, else 8). Logs at INFO which vars were auto-set.
     """Get thread control environment variables.
 
     Priority (from highest to lowest):
@@ -114,6 +130,11 @@ def get_thread_env_vars(
 
 
 def get_scheduling_spec(config_part):
+    # [FUNCTION DOC]
+    # Converts config_part.scheduling_spec[0] into a structured SchedulingSpec; returns
+    # a default SchedulingSpec if the attribute is missing (AttributeError). Lazily
+    # imports cli_args.
+    # KNOWN ISSUE: an empty scheduling_spec list raises IndexError, which is not caught.
     """Safely retrieve SchedulingSpec from config.
 
     Args:
@@ -131,6 +152,13 @@ def get_scheduling_spec(config_part):
 
 
 def get_env_vars(additional_env_vars: str | None = None) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # Builds the worker environment dict: BASE_ENVIRONS, then PYTHONPATH composed of
+    # cwd, non-empty non-zip sys.path entries and the module PYTHONPATH (deduplicated,
+    # order preserved), then entries parsed from additional_env_vars, a comma-separated
+    # "KEY=VALUE" string, which override earlier keys.
+    # KNOWN ISSUE: parsing splits each item on every "=", so values containing "=" or
+    # commas raise ValueError / are mis-parsed.
     """Returns the environment variables for the cluster.
 
     This function dynamically captures the current Python path (sys.path) to ensure
@@ -167,6 +195,9 @@ def get_env_vars(additional_env_vars: str | None = None) -> dict[str, str]:
 
 
 class JobState(enum.Enum):
+    # [CLASS DOC]
+    # Enum of scheduler job states: NOT_FOUND, PENDING, RUNNING, COMPLETED, FAILED,
+    # CANCELLED.
     NOT_FOUND = 0
     PENDING = 1
     RUNNING = 2
@@ -175,11 +206,18 @@ class JobState(enum.Enum):
     CANCELLED = 5
 
     def active(self):
+        # [FUNCTION DOC]
+        # Returns True if the state is PENDING or RUNNING.
         return self == self.PENDING or self == self.RUNNING
 
 
 class JobException(Exception):
+    # [CLASS DOC]
+    # Exception for a failed/terminated job, storing run_name, worker_type, host and
+    # reason (a JobState); message is "Job <run>:<worker_type> <reason> at node <host>".
     def __init__(self, run_name, worker_type, host, reason: JobState):
+        # [FUNCTION DOC]
+        # Builds the message, calls the base constructor and stores the four attributes.
         super().__init__(f"Job {run_name}:{worker_type} {reason} at node {host}")
         self.run_name = run_name
         self.worker_type = worker_type
@@ -189,6 +227,9 @@ class JobException(Exception):
 
 @dataclasses.dataclass
 class JobInfo:
+    # [CLASS DOC]
+    # Dataclass describing a job: name, state, host where it ran (None if never ran),
+    # submit_time, start_time (strings) and slurm_id (Slurm only).
     name: str
     state: JobState
     host: str | None = (
@@ -205,6 +246,11 @@ def wait_llm_server_addrs(
     n_rollout_servers: int = 1,
     timeout: int | None = 1200,
 ):
+    # [FUNCTION DOC]
+    # Polls name_resolve every second for the rollout-server subtree key of the given
+    # experiment/trial until at least n_rollout_servers addresses are registered, logs
+    # them and returns the list. Raises TimeoutError after timeout seconds (default
+    # 1200; None waits forever).
     # Get rollout nodes, find the hosts
     name = names.gen_servers(experiment_name, trial_name)
     start = time.perf_counter()
@@ -226,6 +272,11 @@ def wait_llm_server_addrs(
 
 
 def validate_config_for_launcher(config):
+    # [FUNCTION DOC]
+    # Validates an experiment config: requires an actor field; parses allocation_mode
+    # and requires a rollout field when the generation backend is sglang or vllm; checks
+    # cluster.fileroot (and nfs_record_root when name_resolve type is nfs) is a valid
+    # shared path. Raises RuntimeError (or whatever validate_shared_path raises).
     if not hasattr(config, "actor"):
         raise RuntimeError("`actor` field is required by all yaml configs.")
     allocation_mode = config.allocation_mode
@@ -248,6 +299,11 @@ def validate_config_for_launcher(config):
 
 
 def validate_config_for_distributed_launcher(config):
+    # [FUNCTION DOC]
+    # Runs validate_config_for_launcher, then for decoupled train allocations asserts
+    # gen + train world size equals n_nodes * n_gpus_per_node. Raises
+    # NotImplementedError for pipeline-parallel generation with SGLang or vLLM, and
+    # ValueError if vLLM TP size exceeds GPUs per node.
     validate_config_for_launcher(config)
     n_nodes = config.cluster.n_nodes
     n_gpus_per_node = config.cluster.n_gpus_per_node
@@ -278,6 +334,12 @@ def validate_config_for_distributed_launcher(config):
 
 
 def run_post_exit_hook(config) -> None:
+    # [FUNCTION DOC]
+    # If config.post_exit_hook is a non-blank string, runs it via the shell with a 600s
+    # timeout and captured output, with env LOG_DIR set to
+    # fileroot/logs/<user>/<experiment>/<trial> (best effort). Logs stdout at INFO,
+    # stderr and non-zero exit codes at WARNING. Timeouts and any exception are logged
+    # and never propagated. Returns None.
     """Run the post-exit hook command if configured.
 
     Executes ``config.post_exit_hook`` as a shell command with a 600-second

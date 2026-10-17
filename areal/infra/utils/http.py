@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# HTTP utility layer: shared capacity constants and factories for httpx clients and
+# uvicorn servers, admin-API-key safety validation, tenacity retry decorators
+# (async_http_retry: 8 attempts, exponential 1-30s on aiohttp/OS/Runtime errors;
+# async_httpx_retry: 4 attempts, 0.5-4s on httpx transport errors), an aiohttp request
+# helper with retries, and small status/URL helpers. Defaults: 1 retry, 3600s request
+# timeout, default admin key "areal-admin-key". Logger "HTTPUtils".
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
@@ -36,6 +43,9 @@ UVICORN_LIMIT_CONCURRENCY = 4096
 
 
 def get_default_httpx_limits() -> httpx.Limits:
+    # [FUNCTION DOC]
+    # Returns an httpx.Limits with max 4096 connections, 1024 keepalive connections and
+    # 30s keepalive expiry (module constants).
     """Return shared httpx.Limits for high-concurrency services."""
     return httpx.Limits(
         max_connections=HTTPX_MAX_CONNECTIONS,
@@ -45,6 +55,10 @@ def get_default_httpx_limits() -> httpx.Limits:
 
 
 def create_httpx_client(timeout: float | None = 120.0, **kwargs) -> httpx.AsyncClient:
+    # [FUNCTION DOC]
+    # Creates an httpx.AsyncClient with the given timeout (default 120s, None for no
+    # timeout) and an AsyncHTTPTransport using the shared limits and 3 transport-level
+    # connection retries; extra kwargs are forwarded to the client constructor.
     """Create an httpx.AsyncClient with shared pool limits and transport-level retries."""
     transport = httpx.AsyncHTTPTransport(
         retries=HTTPX_RETRIES,
@@ -54,6 +68,8 @@ def create_httpx_client(timeout: float | None = 120.0, **kwargs) -> httpx.AsyncC
 
 
 def get_default_uvicorn_kwargs() -> dict[str, Any]:
+    # [FUNCTION DOC]
+    # Returns a dict with backlog=4096 and limit_concurrency=4096 for uvicorn.run().
     """Return shared uvicorn capacity kwargs to spread into uvicorn.run()."""
     return {
         "backlog": UVICORN_BACKLOG,
@@ -67,6 +83,13 @@ def validate_admin_api_key(
     default_key: str = DEFAULT_ADMIN_API_KEY,
     config_field: str = "admin_api_key",
 ) -> None:
+    # [FUNCTION DOC]
+    # Returns silently when admin_api_key differs from default_key. Otherwise resolves
+    # wildcard hosts ("0.0.0.0"/"::") to the machine IP; if the host is loopback or env
+    # AREAL_ALLOW_DEFAULT_ADMIN_KEY == "1", logs a warning naming config_field and
+    # returns. Else raises RuntimeError refusing to start.
+    # KNOWN ISSUE: a wildcard bind resolves to the host IP, so it is never treated as
+    # loopback even on single-machine setups (intended but strict).
     """Refuse to start an HTTP service on a non-loopback bind with the default admin key.
 
     The default admin API key is publicly documented in the source tree, so
@@ -122,6 +145,9 @@ logger = logging.getLogger("HTTPUtils")
 
 
 def get_default_connector():
+    # [FUNCTION DOC]
+    # HELPER: returns an aiohttp TCPConnector with unlimited connections, no DNS cache
+    # and force_close (no keep-alive).
     return aiohttp.TCPConnector(limit=0, use_dns_cache=False, force_close=True)
 
 
@@ -136,6 +162,19 @@ async def arequest_with_retry(
     retry_delay: float = 1.0,
     verbose=False,
 ) -> dict | str | bytes:
+    # [FUNCTION DOC]
+    # Async HTTP request to http://<addr><endpoint> (addr parsed into host/port, with
+    # IPv6 bracketing; falls back to raw addr if unparseable). Supports GET, POST, PUT
+    # (JSON payload) and DELETE. Uses the given aiohttp session or creates a temporary
+    # one (10MB read buffer, default connector) that is closed afterwards. timeout
+    # (default 3600s) applies to total/connect/sock_connect. Up to max_retries attempts
+    # (default 1; 0 or None means default) with retry_delay sleep between; timeouts and
+    # aiohttp client errors (including non-2xx via raise_for_status) are logged as
+    # warnings and retried. Returns parsed JSON for application/json, text for text/*,
+    # else raw bytes. verbose logs progress at INFO. Raises RuntimeError after all
+    # attempts fail.
+    # KNOWN ISSUE: an unsupported method raises ValueError (not caught) and leaks the
+    # internally-created session; other unexpected exceptions also skip closing it.
     if timeout is None:
         timeout = DEFAULT_REQUEST_TIMEOUT
     last_exception = None
@@ -225,14 +264,20 @@ async def arequest_with_retry(
 
 
 def response_ok(http_code: int) -> bool:
+    # [FUNCTION DOC]
+    # Returns True iff the status code equals 200 OK.
     return http_code == HTTPStatus.OK
 
 
 def response_retryable(http_code: int) -> bool:
+    # [FUNCTION DOC]
+    # Returns True iff the status code equals 408 Request Timeout.
     return http_code == HTTPStatus.REQUEST_TIMEOUT
 
 
 def ensure_end_with_slash(url: str) -> str:
+    # [FUNCTION DOC]
+    # Returns url with a trailing "/" appended if it lacks one.
     if not url.endswith("/"):
         return url + "/"
     return url
